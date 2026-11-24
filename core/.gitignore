@@ -1,0 +1,12 @@
+# Secrets and the private configuration.
+.env
+config.yaml
+
+# Logs.
+logs/
+
+# Binaries.
+/core
+/etf-core
+*.test
+*.out
