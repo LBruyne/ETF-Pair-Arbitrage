@@ -1,0 +1,16 @@
+# The ETF-Pair boards. The directories under the path are the Grafana folders
+# (Arbitrage/ETF-Pair/combo-spread.json is the board Combo Spread in the
+# folder Arbitrage / ETF-Pair), so no folder is named here. deploy/install.sh
+# copies the generated boards into that path and this file into the
+# provisioning directory of the Grafana that serves them.
+apiVersion: 1
+
+providers:
+  - name: etf-pair
+    type: file
+    disableDeletion: true
+    updateIntervalSeconds: 30
+    allowUiUpdates: false
+    options:
+      path: /home/ubuntu/code/etf-pair-arbitrage/dashboard/grafana/dashboards/published
+      foldersFromFilesStructure: true

@@ -1,0 +1,21 @@
+# The etfpair data source of the ETF-Pair boards, read by the read-only role.
+# Its password comes from dashboard/grafana.env through a drop-in of the
+# Grafana unit. deploy/install.sh copies this file into the provisioning
+# directory of the Grafana that serves the boards.
+apiVersion: 1
+
+datasources:
+  - name: etfpair
+    uid: etfpair
+    type: grafana-postgresql-datasource
+    access: proxy
+    editable: false
+    url: 127.0.0.1:5432
+    user: etfpair_reader
+    secureJsonData:
+      password: $ETFPAIR_DB_READER_PASSWORD
+    jsonData:
+      database: etfpair
+      sslmode: disable
+      maxOpenConns: 5
+      postgresVersion: 1500

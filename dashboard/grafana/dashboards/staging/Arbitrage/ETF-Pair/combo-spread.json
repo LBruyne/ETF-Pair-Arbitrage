@@ -1,0 +1,7393 @@
+{
+ "panels": [
+  {
+   "id": 1,
+   "type": "row",
+   "title": "Market Snapshot · ${combo:text} · ${venue:text}",
+   "collapsed": false,
+   "gridPos": {
+    "x": 0,
+    "y": 0,
+    "w": 24,
+    "h": 1
+   },
+   "panels": []
+  },
+  {
+   "id": 2,
+   "type": "stat",
+   "title": "Prices · Latest Second",
+   "description": "The newest second at which both legs and ${ref} have a trade price, whatever the time range (ten minutes back at most).\n\n- **Phase**: US market phase now, in its band colour: Pre-Mkt, Regular, After-Hrs, Overnight · Closed: weekend or holiday.\n- **${bull} Price**: Perp last trade price before the second, USDT.\n- **${bull} Anchor**: The session's anchor, USD: the bell (F × Binance's index of the perp at the close; Bitget's before Binance lists the perp), then the issuer's NAV of that day once stable; less a dividend, or over a split's ratio, from the instant it takes effect.\n- **${ref} Price**: Perp of ${ref}, the unleveraged ETF of the same index.\n- **${ref} Return**: F·Price ÷ ${ref}'s bell anchor − 1, the bell adjusted from a dividend or split of ${ref}.",
+   "gridPos": {
+    "x": 0,
+    "y": 1,
+    "w": 24,
+    "h": 3
+   },
+   "datasource": {
+    "type": "grafana-postgresql-datasource",
+    "uid": "etfpair"
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "datasource": {
+      "type": "grafana-postgresql-datasource",
+      "uid": "etfpair"
+     },
+     "format": "table",
+     "rawQuery": true,
+     "editorMode": "code",
+     "rawSql": "WITH v AS MATERIALIZED (SELECT * FROM (SELECT (SELECT CASE m[3] WHEN 'k' THEN 1000 WHEN 'w' THEN 10000 WHEN '万' THEN 10000 ELSE 1 END * (replace(m[1], ',', '') || m[2])::numeric FROM regexp_match(regexp_replace(regexp_replace(lower(normalize('$notional', NFKC)), '[[:space:]_]', '', 'g'), 'u(sdt)?$', ''), '^([0-9]{1,3}(?:,[0-9]{3})+|[0-9]+)((?:[.][0-9]+)?)(k|w|万)?$') m) AS n, (SELECT CASE WHEN m[1]::numeric > 0 THEN m[1]::numeric END FROM regexp_match(regexp_replace(lower(normalize('$d', NFKC)), '[[:space:]_]', '', 'g'), '^([0-9]+(?:[.][0-9]+)?)(?:bps)?$') m) AS d, (SELECT CASE WHEN m[1]::integer > 0 THEN m[1]::integer END FROM regexp_match(regexp_replace(lower(normalize('$ma_minutes', NFKC)), '[[:space:]_]', '', 'g'), '^([0-9]{1,6})(?:min|m)?$') m) AS ma_n) v),\n     l AS MATERIALIZED (SELECT x.* FROM v CROSS JOIN LATERAL etfpair.combo_last('$combo', '$venue', '$ma', v.ma_n, v.n, v.d, (extract(epoch FROM now()) * 1000)::bigint) x)\nSELECT (SELECT phase FROM etfpair.etf_phase WHERE start_ms <= (extract(epoch FROM now()) * 1000)::bigint AND end_ms > (extract(epoch FROM now()) * 1000)::bigint) AS \"Phase\",\n       p.p_bull AS \"Bull Price\",\n       (floor((p.a_bull)::float8 * 1e2::float8 + 0.5) / 1e2::float8) AS \"Bull Anchor\",\n       p.p_bear AS \"Bear Price\",\n       (floor((p.a_bear)::float8 * 1e2::float8 + 0.5) / 1e2::float8) AS \"Bear Anchor\",\n       p.p_ref AS \"Ref Price\",\n       (floor((100 * (p.fx * p.p_ref / p.a_ref - 1))::float8 * 1e2::float8 + 0.5) / 1e2::float8) AS \"Ref Return\",\n       CASE WHEN b.basis IS NULL THEN NULL WHEN b.s_bps IS NOT NULL THEN (floor((b.s_bps)::float8 * 1e2::float8 + 0.5) / 1e2::float8) ELSE -4000000000 END AS \"Spread\",\n       CASE WHEN b.basis IS NULL THEN NULL WHEN b.mu_bps IS NOT NULL THEN (floor((b.mu_bps)::float8 * 1e2::float8 + 0.5) / 1e2::float8) WHEN b.s_bps IS NULL THEN -4000000000 WHEN b.past_t THEN -5000000000 ELSE -6000000000 END AS \"Mean\",\n       CASE WHEN b.basis IS NULL THEN NULL WHEN abs(b.s_bps - b.mu_bps) IS NOT NULL THEN (floor((abs(b.s_bps - b.mu_bps))::float8 * 1e2::float8 + 0.5) / 1e2::float8) WHEN b.s_bps IS NULL THEN -4000000000 WHEN b.past_t THEN -5000000000 ELSE -6000000000 END AS \"Deviation\",\n       b.anchor_status AS \"Anchor Status\",\n       b.fx AS \"USD/USDT\",\n       CASE WHEN b.basis IS NULL THEN NULL WHEN b.s_bps IS NULL THEN -4000000000 WHEN b.past_t THEN -5000000000 WHEN b.s_long_bps < b.mu_bps THEN (floor((abs(b.s_long_bps - b.mu_bps))::float8 * 1e2::float8 + 0.5) / 1e2::float8) WHEN abs(b.s_long_bps - b.mu_bps) IS NOT NULL THEN -10000000000 WHEN b.mu_bps IS NULL THEN -6000000000 WHEN NOT coalesce(v.n > 0, false) THEN -3000000000 ELSE -2000000000 END AS \"Real Long Deviation\",\n       CASE WHEN b.basis IS NULL THEN NULL WHEN b.s_bps IS NULL THEN -4000000000 WHEN b.past_t THEN -5000000000 WHEN b.s_short_bps > b.mu_bps THEN (floor((abs(b.s_short_bps - b.mu_bps))::float8 * 1e2::float8 + 0.5) / 1e2::float8) WHEN abs(b.s_short_bps - b.mu_bps) IS NOT NULL THEN -10000000000 WHEN b.mu_bps IS NULL THEN -6000000000 WHEN NOT coalesce(v.n > 0, false) THEN -3000000000 ELSE -2000000000 END AS \"Real Short Deviation\",\n       CASE WHEN b.basis IS NULL THEN NULL WHEN b.s_bps IS NULL THEN -4000000000 WHEN NOT coalesce(v.n > 0, false) THEN -3000000000 WHEN b.basis <> 'mid' THEN -2000000000 WHEN NOT b.partial_long THEN -8000000000 WHEN b.filled_long IS NOT NULL THEN (floor((b.filled_long)::float8 * 1e0::float8 + 0.5) / 1e0::float8) ELSE -2000000000 END AS \"Long Fill\",\n       CASE WHEN b.basis IS NULL THEN NULL WHEN b.s_bps IS NULL THEN -4000000000 WHEN NOT coalesce(v.n > 0, false) THEN -3000000000 WHEN b.basis <> 'mid' THEN -2000000000 WHEN NOT b.partial_short THEN -8000000000 WHEN b.filled_short IS NOT NULL THEN (floor((b.filled_short)::float8 * 1e0::float8 + 0.5) / 1e0::float8) ELSE -2000000000 END AS \"Short Fill\",\n       b.signal AS \"Signal\",\n       CASE WHEN b.basis IS NULL THEN NULL WHEN b.bid12_bull IS NOT NULL THEN (floor((b.bid12_bull)::float8 * 1e2::float8 + 0.5) / 1e2::float8) WHEN NOT b.book_bull THEN -2000000000 ELSE -7000000000 END AS \"Bid 1+2 Depth · Bull\",\n       CASE WHEN b.basis IS NULL THEN NULL WHEN b.bid12_bear IS NOT NULL THEN (floor((b.bid12_bear)::float8 * 1e2::float8 + 0.5) / 1e2::float8) WHEN NOT b.book_bear THEN -2000000000 ELSE -7000000000 END AS \"Bid 1+2 Depth · Bear\",\n       CASE WHEN b.basis IS NULL THEN NULL WHEN b.ask12_bull IS NOT NULL THEN (floor((b.ask12_bull)::float8 * 1e2::float8 + 0.5) / 1e2::float8) WHEN NOT b.book_bull THEN -2000000000 ELSE -7000000000 END AS \"Ask 1+2 Depth · Bull\",\n       CASE WHEN b.basis IS NULL THEN NULL WHEN b.ask12_bear IS NOT NULL THEN (floor((b.ask12_bear)::float8 * 1e2::float8 + 0.5) / 1e2::float8) WHEN NOT b.book_bear THEN -2000000000 ELSE -7000000000 END AS \"Ask 1+2 Depth · Bear\"\nFROM v LEFT JOIN l p ON p.kind = 'prices' LEFT JOIN l b ON b.kind = 'basis'"
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "color": {
+      "mode": "thresholds"
+     },
+     "custom": {},
+     "mappings": [
+      {
+       "type": "special",
+       "options": {
+        "match": "null",
+        "result": {
+         "text": "–",
+         "color": "#898781",
+         "index": 0
+        }
+       }
+      }
+     ],
+     "noValue": "–",
+     "thresholds": {
+      "mode": "absolute",
+      "steps": [
+       {
+        "color": "text",
+        "value": null
+       }
+      ]
+     }
+    },
+    "overrides": [
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "Phase"
+      },
+      "properties": [
+       {
+        "id": "mappings",
+        "value": [
+         {
+          "type": "value",
+          "options": {
+           "Pre-Market": {
+            "text": "Pre‑Mkt",
+            "color": "#b88a0a",
+            "index": 0
+           },
+           "Regular": {
+            "text": "Regular",
+            "color": "#898781",
+            "index": 1
+           },
+           "After-Hours": {
+            "text": "After‑Hrs",
+            "color": "#d55181",
+            "index": 2
+           },
+           "Overnight": {
+            "text": "Overnight",
+            "color": "#4f8fe6",
+            "index": 3
+           },
+           "Closed": {
+            "color": "#898781",
+            "index": 4
+           }
+          }
+         }
+        ]
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "Bull Price"
+      },
+      "properties": [
+       {
+        "id": "unit",
+        "value": "none"
+       },
+       {
+        "id": "decimals",
+        "value": 3
+       },
+       {
+        "id": "displayName",
+        "value": "${bull} Price"
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "Bull Anchor"
+      },
+      "properties": [
+       {
+        "id": "unit",
+        "value": "currencyUSD"
+       },
+       {
+        "id": "decimals",
+        "value": 2
+       },
+       {
+        "id": "displayName",
+        "value": "${bull} Anchor"
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "Bear Price"
+      },
+      "properties": [
+       {
+        "id": "unit",
+        "value": "none"
+       },
+       {
+        "id": "decimals",
+        "value": 3
+       },
+       {
+        "id": "displayName",
+        "value": "${bear} Price"
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "Bear Anchor"
+      },
+      "properties": [
+       {
+        "id": "unit",
+        "value": "currencyUSD"
+       },
+       {
+        "id": "decimals",
+        "value": 2
+       },
+       {
+        "id": "displayName",
+        "value": "${bear} Anchor"
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "Ref Price"
+      },
+      "properties": [
+       {
+        "id": "unit",
+        "value": "none"
+       },
+       {
+        "id": "decimals",
+        "value": 3
+       },
+       {
+        "id": "displayName",
+        "value": "${ref} Price"
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "Ref Return"
+      },
+      "properties": [
+       {
+        "id": "unit",
+        "value": "percent"
+       },
+       {
+        "id": "decimals",
+        "value": 2
+       },
+       {
+        "id": "thresholds",
+        "value": {
+         "mode": "absolute",
+         "steps": [
+          {
+           "color": "#d03b3b",
+           "value": null
+          },
+          {
+           "color": "text",
+           "value": 0
+          },
+          {
+           "color": "#0ca30c",
+           "value": 1e-06
+          }
+         ]
+        }
+       },
+       {
+        "id": "displayName",
+        "value": "${ref} Return"
+       }
+      ]
+     }
+    ]
+   },
+   "options": {
+    "reduceOptions": {
+     "calcs": [
+      "lastNotNull"
+     ],
+     "fields": "/.*/",
+     "values": false
+    },
+    "colorMode": "value",
+    "graphMode": "none",
+    "textMode": "value_and_name",
+    "justifyMode": "center",
+    "wideLayout": false,
+    "text": {
+     "titleSize": 12,
+     "valueSize": 20
+    },
+    "showPercentChange": false,
+    "orientation": "vertical"
+   },
+   "transformations": [
+    {
+     "id": "filterFieldsByName",
+     "options": {
+      "include": {
+       "names": [
+        "Phase",
+        "Bull Price",
+        "Bull Anchor",
+        "Bear Price",
+        "Bear Anchor",
+        "Ref Price",
+        "Ref Return"
+       ]
+      }
+     }
+    }
+   ]
+  },
+  {
+   "id": 3,
+   "type": "stat",
+   "title": "Spread · Latest Second",
+   "description": "The newest second at which both legs have a basis price: their books' mids, else their last trades (ten minutes back at most).\n\n- **Spread**: 10⁴ × (F·P_bull ÷ A_bull + F·P_bear ÷ A_bear − 2) · P: both legs' mid prices, (best bid + best ask) ÷ 2 of the recorded book, else both last trades · A: anchor · F: USD/USDT.\n- **Mean**: The same on each leg's ${ma:text} of its minute bars over the ${ma_text} min before, this session only · a bar: both legs' mids at the minute's end, else their trades, else their candle closes · No Mean: not ready, or Mean Scale is not a whole number of minutes.\n- **Deviation**: |Spread − Mean|, absolute: its side is in the Signal.\n- **Anchor Status**: NAV: both legs on the issuer's NAV, the same figure for 1 h · Bell: both legs on F × the perp's index at the close (Binance's; Bitget's before Binance lists it), provisional · Missing: no bell anchor yet, or none.\n- **USD/USDT**: F, Coinbase USDT-USD.",
+   "gridPos": {
+    "x": 0,
+    "y": 4,
+    "w": 24,
+    "h": 3
+   },
+   "datasource": {
+    "type": "datasource",
+    "uid": "-- Dashboard --"
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "datasource": {
+      "type": "datasource",
+      "uid": "-- Dashboard --"
+     },
+     "panelId": 2,
+     "withTransforms": false
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "color": {
+      "mode": "thresholds"
+     },
+     "custom": {},
+     "mappings": [
+      {
+       "type": "special",
+       "options": {
+        "match": "null",
+        "result": {
+         "text": "–",
+         "color": "#898781",
+         "index": 0
+        }
+       }
+      }
+     ],
+     "noValue": "–",
+     "thresholds": {
+      "mode": "absolute",
+      "steps": [
+       {
+        "color": "text",
+        "value": null
+       }
+      ]
+     }
+    },
+    "overrides": [
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "Spread"
+      },
+      "properties": [
+       {
+        "id": "unit",
+        "value": "suffix: bps"
+       },
+       {
+        "id": "decimals",
+        "value": 2
+       },
+       {
+        "id": "mappings",
+        "value": [
+         {
+          "type": "special",
+          "options": {
+           "match": "null",
+           "result": {
+            "text": "–",
+            "color": "#898781",
+            "index": 0
+           }
+          }
+         },
+         {
+          "type": "value",
+          "options": {
+           "-2000000000": {
+            "text": "No Book",
+            "color": "#898781",
+            "index": 0
+           },
+           "-3000000000": {
+            "text": "No Notional",
+            "color": "#fab219",
+            "index": 1
+           },
+           "-4000000000": {
+            "text": "No Anchor",
+            "color": "#898781",
+            "index": 2
+           },
+           "-5000000000": {
+            "text": "Past T",
+            "color": "#fab219",
+            "index": 3
+           },
+           "-6000000000": {
+            "text": "No Mean",
+            "color": "#898781",
+            "index": 4
+           },
+           "-7000000000": {
+            "text": "Not Recorded",
+            "color": "#898781",
+            "index": 5
+           },
+           "-9000000000": {
+            "text": "No Entry",
+            "color": "#fab219",
+            "index": 6
+           },
+           "-10000000000": {
+            "text": "Other Side",
+            "color": "#898781",
+            "index": 7
+           }
+          }
+         }
+        ]
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "Mean"
+      },
+      "properties": [
+       {
+        "id": "unit",
+        "value": "suffix: bps"
+       },
+       {
+        "id": "decimals",
+        "value": 2
+       },
+       {
+        "id": "mappings",
+        "value": [
+         {
+          "type": "special",
+          "options": {
+           "match": "null",
+           "result": {
+            "text": "–",
+            "color": "#898781",
+            "index": 0
+           }
+          }
+         },
+         {
+          "type": "value",
+          "options": {
+           "-2000000000": {
+            "text": "No Book",
+            "color": "#898781",
+            "index": 0
+           },
+           "-3000000000": {
+            "text": "No Notional",
+            "color": "#fab219",
+            "index": 1
+           },
+           "-4000000000": {
+            "text": "No Anchor",
+            "color": "#898781",
+            "index": 2
+           },
+           "-5000000000": {
+            "text": "Past T",
+            "color": "#fab219",
+            "index": 3
+           },
+           "-6000000000": {
+            "text": "No Mean",
+            "color": "#898781",
+            "index": 4
+           },
+           "-7000000000": {
+            "text": "Not Recorded",
+            "color": "#898781",
+            "index": 5
+           },
+           "-9000000000": {
+            "text": "No Entry",
+            "color": "#fab219",
+            "index": 6
+           },
+           "-10000000000": {
+            "text": "Other Side",
+            "color": "#898781",
+            "index": 7
+           }
+          }
+         }
+        ]
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "Deviation"
+      },
+      "properties": [
+       {
+        "id": "unit",
+        "value": "suffix: bps"
+       },
+       {
+        "id": "decimals",
+        "value": 2
+       },
+       {
+        "id": "mappings",
+        "value": [
+         {
+          "type": "special",
+          "options": {
+           "match": "null",
+           "result": {
+            "text": "–",
+            "color": "#898781",
+            "index": 0
+           }
+          }
+         },
+         {
+          "type": "value",
+          "options": {
+           "-2000000000": {
+            "text": "No Book",
+            "color": "#898781",
+            "index": 0
+           },
+           "-3000000000": {
+            "text": "No Notional",
+            "color": "#fab219",
+            "index": 1
+           },
+           "-4000000000": {
+            "text": "No Anchor",
+            "color": "#898781",
+            "index": 2
+           },
+           "-5000000000": {
+            "text": "Past T",
+            "color": "#fab219",
+            "index": 3
+           },
+           "-6000000000": {
+            "text": "No Mean",
+            "color": "#898781",
+            "index": 4
+           },
+           "-7000000000": {
+            "text": "Not Recorded",
+            "color": "#898781",
+            "index": 5
+           },
+           "-9000000000": {
+            "text": "No Entry",
+            "color": "#fab219",
+            "index": 6
+           },
+           "-10000000000": {
+            "text": "Other Side",
+            "color": "#898781",
+            "index": 7
+           }
+          }
+         }
+        ]
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "Anchor Status"
+      },
+      "properties": [
+       {
+        "id": "mappings",
+        "value": [
+         {
+          "type": "value",
+          "options": {
+           "NAV": {
+            "color": "text",
+            "index": 0
+           },
+           "Bell": {
+            "color": "#898781",
+            "index": 1
+           },
+           "Missing": {
+            "color": "#fab219",
+            "index": 2
+           }
+          }
+         }
+        ]
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "USD/USDT"
+      },
+      "properties": [
+       {
+        "id": "unit",
+        "value": "none"
+       },
+       {
+        "id": "decimals",
+        "value": 5
+       }
+      ]
+     }
+    ]
+   },
+   "options": {
+    "reduceOptions": {
+     "calcs": [
+      "lastNotNull"
+     ],
+     "fields": "/.*/",
+     "values": false
+    },
+    "colorMode": "value",
+    "graphMode": "none",
+    "textMode": "value_and_name",
+    "justifyMode": "center",
+    "wideLayout": false,
+    "text": {
+     "titleSize": 13,
+     "valueSize": 20
+    },
+    "showPercentChange": false,
+    "orientation": "vertical"
+   },
+   "transformations": [
+    {
+     "id": "filterFieldsByName",
+     "options": {
+      "include": {
+       "names": [
+        "Spread",
+        "Mean",
+        "Deviation",
+        "Anchor Status",
+        "USD/USDT"
+       ]
+      }
+     }
+    }
+   ]
+  },
+  {
+   "id": 4,
+   "type": "stat",
+   "title": "Signal · Latest Second · Notional ${n_text} USDT",
+   "description": "The same second, at the notional N (USDT, both legs together); the deviations are absolute, each shown on the side of the Mean its real spread can fill on, as the bright lines of Entry Points · Bps (Other Side on the other), and the Signal gives the side.\n\n- **Real Long Deviation**: |Real Long Spread − Mean| while Real Long Spread is below the Mean, the side a Long fills on · Other Side (grey): Real Long Spread at or above the Mean, where a Long cannot come (the tooltips still give |Real Long Spread − Mean| there) · Real Long Spread: the Spread on the average prices of buying both legs for N through their recorded asks (open Long, close Short).\n- **Real Short Deviation**: |Real Short Spread − Mean| while Real Short Spread is above the Mean, the side a Short fills on · Other Side: at or below the Mean · Real Short Spread: selling both legs for N through their recorded bids (open Short, close Long).\n- **Long Fill**: USDT of N the recorded asks of both legs fill, the quantities making q·A equal on both legs · Full: all of N · less where the recorded levels (now 5 a side at a 0.01 tick, 50 at 0.001; fewer earlier, see Data Coverage · Levels) hold less: the real spread is then on what they hold; the exchange's book may hold more.\n- **Short Fill**: The same on the recorded bids.\n- **Signal**: Long: Real Long Spread ≤ Mean − Entry · Short: Real Short Spread ≥ Mean + Entry · Partial: that side filled less than N · None: inside · No Anchor: not ready · No Mean: not ready, or Mean Scale is not a whole number of minutes from 1 to 999,999 · No Book: not on both legs' books (trade prices, as before the recorder) · No Notional: the typed notional is not a positive number (the title shows ? or 0), amber · No Entry: Entry is not a positive number, amber · Past T: a leg's dividend took effect without its amount, amber, no signal until the amount is known.",
+   "gridPos": {
+    "x": 0,
+    "y": 7,
+    "w": 24,
+    "h": 3
+   },
+   "datasource": {
+    "type": "datasource",
+    "uid": "-- Dashboard --"
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "datasource": {
+      "type": "datasource",
+      "uid": "-- Dashboard --"
+     },
+     "panelId": 2,
+     "withTransforms": false
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "color": {
+      "mode": "thresholds"
+     },
+     "custom": {},
+     "mappings": [
+      {
+       "type": "special",
+       "options": {
+        "match": "null",
+        "result": {
+         "text": "–",
+         "color": "#898781",
+         "index": 0
+        }
+       }
+      }
+     ],
+     "noValue": "–",
+     "thresholds": {
+      "mode": "absolute",
+      "steps": [
+       {
+        "color": "text",
+        "value": null
+       }
+      ]
+     }
+    },
+    "overrides": [
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "Real Long Deviation"
+      },
+      "properties": [
+       {
+        "id": "unit",
+        "value": "suffix: bps"
+       },
+       {
+        "id": "decimals",
+        "value": 2
+       },
+       {
+        "id": "mappings",
+        "value": [
+         {
+          "type": "special",
+          "options": {
+           "match": "null",
+           "result": {
+            "text": "–",
+            "color": "#898781",
+            "index": 0
+           }
+          }
+         },
+         {
+          "type": "value",
+          "options": {
+           "-2000000000": {
+            "text": "No Book",
+            "color": "#898781",
+            "index": 0
+           },
+           "-3000000000": {
+            "text": "No Notional",
+            "color": "#fab219",
+            "index": 1
+           },
+           "-4000000000": {
+            "text": "No Anchor",
+            "color": "#898781",
+            "index": 2
+           },
+           "-5000000000": {
+            "text": "Past T",
+            "color": "#fab219",
+            "index": 3
+           },
+           "-6000000000": {
+            "text": "No Mean",
+            "color": "#898781",
+            "index": 4
+           },
+           "-7000000000": {
+            "text": "Not Recorded",
+            "color": "#898781",
+            "index": 5
+           },
+           "-9000000000": {
+            "text": "No Entry",
+            "color": "#fab219",
+            "index": 6
+           },
+           "-10000000000": {
+            "text": "Other Side",
+            "color": "#898781",
+            "index": 7
+           }
+          }
+         }
+        ]
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "Real Short Deviation"
+      },
+      "properties": [
+       {
+        "id": "unit",
+        "value": "suffix: bps"
+       },
+       {
+        "id": "decimals",
+        "value": 2
+       },
+       {
+        "id": "mappings",
+        "value": [
+         {
+          "type": "special",
+          "options": {
+           "match": "null",
+           "result": {
+            "text": "–",
+            "color": "#898781",
+            "index": 0
+           }
+          }
+         },
+         {
+          "type": "value",
+          "options": {
+           "-2000000000": {
+            "text": "No Book",
+            "color": "#898781",
+            "index": 0
+           },
+           "-3000000000": {
+            "text": "No Notional",
+            "color": "#fab219",
+            "index": 1
+           },
+           "-4000000000": {
+            "text": "No Anchor",
+            "color": "#898781",
+            "index": 2
+           },
+           "-5000000000": {
+            "text": "Past T",
+            "color": "#fab219",
+            "index": 3
+           },
+           "-6000000000": {
+            "text": "No Mean",
+            "color": "#898781",
+            "index": 4
+           },
+           "-7000000000": {
+            "text": "Not Recorded",
+            "color": "#898781",
+            "index": 5
+           },
+           "-9000000000": {
+            "text": "No Entry",
+            "color": "#fab219",
+            "index": 6
+           },
+           "-10000000000": {
+            "text": "Other Side",
+            "color": "#898781",
+            "index": 7
+           }
+          }
+         }
+        ]
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "Long Fill"
+      },
+      "properties": [
+       {
+        "id": "unit",
+        "value": "locale"
+       },
+       {
+        "id": "decimals",
+        "value": 0
+       },
+       {
+        "id": "mappings",
+        "value": [
+         {
+          "type": "special",
+          "options": {
+           "match": "null",
+           "result": {
+            "text": "–",
+            "color": "#898781",
+            "index": 0
+           }
+          }
+         },
+         {
+          "type": "value",
+          "options": {
+           "-2000000000": {
+            "text": "No Book",
+            "color": "#898781",
+            "index": 0
+           },
+           "-3000000000": {
+            "text": "No Notional",
+            "color": "#fab219",
+            "index": 1
+           },
+           "-4000000000": {
+            "text": "No Anchor",
+            "color": "#898781",
+            "index": 2
+           },
+           "-5000000000": {
+            "text": "Past T",
+            "color": "#fab219",
+            "index": 3
+           },
+           "-6000000000": {
+            "text": "No Mean",
+            "color": "#898781",
+            "index": 4
+           },
+           "-7000000000": {
+            "text": "Not Recorded",
+            "color": "#898781",
+            "index": 5
+           },
+           "-9000000000": {
+            "text": "No Entry",
+            "color": "#fab219",
+            "index": 6
+           },
+           "-10000000000": {
+            "text": "Other Side",
+            "color": "#898781",
+            "index": 7
+           },
+           "-8000000000": {
+            "text": "Full",
+            "color": "text",
+            "index": 8
+           }
+          }
+         }
+        ]
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "Short Fill"
+      },
+      "properties": [
+       {
+        "id": "unit",
+        "value": "locale"
+       },
+       {
+        "id": "decimals",
+        "value": 0
+       },
+       {
+        "id": "mappings",
+        "value": [
+         {
+          "type": "special",
+          "options": {
+           "match": "null",
+           "result": {
+            "text": "–",
+            "color": "#898781",
+            "index": 0
+           }
+          }
+         },
+         {
+          "type": "value",
+          "options": {
+           "-2000000000": {
+            "text": "No Book",
+            "color": "#898781",
+            "index": 0
+           },
+           "-3000000000": {
+            "text": "No Notional",
+            "color": "#fab219",
+            "index": 1
+           },
+           "-4000000000": {
+            "text": "No Anchor",
+            "color": "#898781",
+            "index": 2
+           },
+           "-5000000000": {
+            "text": "Past T",
+            "color": "#fab219",
+            "index": 3
+           },
+           "-6000000000": {
+            "text": "No Mean",
+            "color": "#898781",
+            "index": 4
+           },
+           "-7000000000": {
+            "text": "Not Recorded",
+            "color": "#898781",
+            "index": 5
+           },
+           "-9000000000": {
+            "text": "No Entry",
+            "color": "#fab219",
+            "index": 6
+           },
+           "-10000000000": {
+            "text": "Other Side",
+            "color": "#898781",
+            "index": 7
+           },
+           "-8000000000": {
+            "text": "Full",
+            "color": "text",
+            "index": 8
+           }
+          }
+         }
+        ]
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "Signal"
+      },
+      "properties": [
+       {
+        "id": "mappings",
+        "value": [
+         {
+          "type": "value",
+          "options": {
+           "Long": {
+            "color": "#2a78d6",
+            "index": 0
+           },
+           "Short": {
+            "color": "#d95926",
+            "index": 1
+           },
+           "None": {
+            "color": "text",
+            "index": 2
+           },
+           "No Anchor": {
+            "color": "#898781",
+            "index": 3
+           },
+           "No Mean": {
+            "color": "#898781",
+            "index": 4
+           },
+           "Past T": {
+            "color": "#fab219",
+            "index": 5
+           },
+           "No Book": {
+            "color": "#898781",
+            "index": 6
+           },
+           "Long · Partial": {
+            "color": "#2a78d6",
+            "index": 7
+           },
+           "Short · Partial": {
+            "color": "#d95926",
+            "index": 8
+           },
+           "No Notional": {
+            "color": "#fab219",
+            "index": 9
+           },
+           "No Entry": {
+            "color": "#fab219",
+            "index": 10
+           }
+          }
+         }
+        ]
+       }
+      ]
+     }
+    ]
+   },
+   "options": {
+    "reduceOptions": {
+     "calcs": [
+      "lastNotNull"
+     ],
+     "fields": "/.*/",
+     "values": false
+    },
+    "colorMode": "value",
+    "graphMode": "none",
+    "textMode": "value_and_name",
+    "justifyMode": "center",
+    "wideLayout": false,
+    "text": {
+     "titleSize": 13,
+     "valueSize": 20
+    },
+    "showPercentChange": false,
+    "orientation": "vertical"
+   },
+   "transformations": [
+    {
+     "id": "filterFieldsByName",
+     "options": {
+      "include": {
+       "names": [
+        "Real Long Deviation",
+        "Real Short Deviation",
+        "Long Fill",
+        "Short Fill",
+        "Signal"
+       ]
+      }
+     }
+    }
+   ]
+  },
+  {
+   "id": 5,
+   "type": "stat",
+   "title": "Book · Latest Second · Contracts",
+   "description": "The same second: each leg's book, the contracts (ct) at its first two 0.01 price levels.\n\n- **Bid 1+2 Depth · ${bull}**: The size of the leg's first two bid levels at a 0.01 tick, ct: contracts (shares of the ETF), as recorded · Bitget SOXS (a 0.001 tick): its levels merged into 0.01 ones, bids down and asks up, as Bitget's own 0.01 depth · No Book: no usable book of the leg in that second · Not Recorded: its recorded levels end within the second 0.01 level (Binance SOXL, SOXS 11-19 19:15 to 11-20 18:43; Bitget SOXS before 11-22 12:16, at times).\n- **Ask 1+2 Depth · ${bull}**: The same on the asks.",
+   "gridPos": {
+    "x": 0,
+    "y": 10,
+    "w": 24,
+    "h": 3
+   },
+   "datasource": {
+    "type": "datasource",
+    "uid": "-- Dashboard --"
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "datasource": {
+      "type": "datasource",
+      "uid": "-- Dashboard --"
+     },
+     "panelId": 2,
+     "withTransforms": false
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "color": {
+      "mode": "thresholds"
+     },
+     "custom": {},
+     "mappings": [
+      {
+       "type": "special",
+       "options": {
+        "match": "null",
+        "result": {
+         "text": "–",
+         "color": "#898781",
+         "index": 0
+        }
+       }
+      }
+     ],
+     "noValue": "–",
+     "thresholds": {
+      "mode": "absolute",
+      "steps": [
+       {
+        "color": "text",
+        "value": null
+       }
+      ]
+     }
+    },
+    "overrides": [
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "Bid 1+2 Depth · Bull"
+      },
+      "properties": [
+       {
+        "id": "unit",
+        "value": "suffix: ct"
+       },
+       {
+        "id": "decimals",
+        "value": 2
+       },
+       {
+        "id": "displayName",
+        "value": "Bid 1+2 Depth · ${bull}"
+       },
+       {
+        "id": "mappings",
+        "value": [
+         {
+          "type": "special",
+          "options": {
+           "match": "null",
+           "result": {
+            "text": "–",
+            "color": "#898781",
+            "index": 0
+           }
+          }
+         },
+         {
+          "type": "value",
+          "options": {
+           "-2000000000": {
+            "text": "No Book",
+            "color": "#898781",
+            "index": 0
+           },
+           "-3000000000": {
+            "text": "No Notional",
+            "color": "#fab219",
+            "index": 1
+           },
+           "-4000000000": {
+            "text": "No Anchor",
+            "color": "#898781",
+            "index": 2
+           },
+           "-5000000000": {
+            "text": "Past T",
+            "color": "#fab219",
+            "index": 3
+           },
+           "-6000000000": {
+            "text": "No Mean",
+            "color": "#898781",
+            "index": 4
+           },
+           "-7000000000": {
+            "text": "Not Recorded",
+            "color": "#898781",
+            "index": 5
+           },
+           "-9000000000": {
+            "text": "No Entry",
+            "color": "#fab219",
+            "index": 6
+           },
+           "-10000000000": {
+            "text": "Other Side",
+            "color": "#898781",
+            "index": 7
+           }
+          }
+         }
+        ]
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "Bid 1+2 Depth · Bear"
+      },
+      "properties": [
+       {
+        "id": "unit",
+        "value": "suffix: ct"
+       },
+       {
+        "id": "decimals",
+        "value": 2
+       },
+       {
+        "id": "displayName",
+        "value": "Bid 1+2 Depth · ${bear}"
+       },
+       {
+        "id": "mappings",
+        "value": [
+         {
+          "type": "special",
+          "options": {
+           "match": "null",
+           "result": {
+            "text": "–",
+            "color": "#898781",
+            "index": 0
+           }
+          }
+         },
+         {
+          "type": "value",
+          "options": {
+           "-2000000000": {
+            "text": "No Book",
+            "color": "#898781",
+            "index": 0
+           },
+           "-3000000000": {
+            "text": "No Notional",
+            "color": "#fab219",
+            "index": 1
+           },
+           "-4000000000": {
+            "text": "No Anchor",
+            "color": "#898781",
+            "index": 2
+           },
+           "-5000000000": {
+            "text": "Past T",
+            "color": "#fab219",
+            "index": 3
+           },
+           "-6000000000": {
+            "text": "No Mean",
+            "color": "#898781",
+            "index": 4
+           },
+           "-7000000000": {
+            "text": "Not Recorded",
+            "color": "#898781",
+            "index": 5
+           },
+           "-9000000000": {
+            "text": "No Entry",
+            "color": "#fab219",
+            "index": 6
+           },
+           "-10000000000": {
+            "text": "Other Side",
+            "color": "#898781",
+            "index": 7
+           }
+          }
+         }
+        ]
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "Ask 1+2 Depth · Bull"
+      },
+      "properties": [
+       {
+        "id": "unit",
+        "value": "suffix: ct"
+       },
+       {
+        "id": "decimals",
+        "value": 2
+       },
+       {
+        "id": "displayName",
+        "value": "Ask 1+2 Depth · ${bull}"
+       },
+       {
+        "id": "mappings",
+        "value": [
+         {
+          "type": "special",
+          "options": {
+           "match": "null",
+           "result": {
+            "text": "–",
+            "color": "#898781",
+            "index": 0
+           }
+          }
+         },
+         {
+          "type": "value",
+          "options": {
+           "-2000000000": {
+            "text": "No Book",
+            "color": "#898781",
+            "index": 0
+           },
+           "-3000000000": {
+            "text": "No Notional",
+            "color": "#fab219",
+            "index": 1
+           },
+           "-4000000000": {
+            "text": "No Anchor",
+            "color": "#898781",
+            "index": 2
+           },
+           "-5000000000": {
+            "text": "Past T",
+            "color": "#fab219",
+            "index": 3
+           },
+           "-6000000000": {
+            "text": "No Mean",
+            "color": "#898781",
+            "index": 4
+           },
+           "-7000000000": {
+            "text": "Not Recorded",
+            "color": "#898781",
+            "index": 5
+           },
+           "-9000000000": {
+            "text": "No Entry",
+            "color": "#fab219",
+            "index": 6
+           },
+           "-10000000000": {
+            "text": "Other Side",
+            "color": "#898781",
+            "index": 7
+           }
+          }
+         }
+        ]
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "Ask 1+2 Depth · Bear"
+      },
+      "properties": [
+       {
+        "id": "unit",
+        "value": "suffix: ct"
+       },
+       {
+        "id": "decimals",
+        "value": 2
+       },
+       {
+        "id": "displayName",
+        "value": "Ask 1+2 Depth · ${bear}"
+       },
+       {
+        "id": "mappings",
+        "value": [
+         {
+          "type": "special",
+          "options": {
+           "match": "null",
+           "result": {
+            "text": "–",
+            "color": "#898781",
+            "index": 0
+           }
+          }
+         },
+         {
+          "type": "value",
+          "options": {
+           "-2000000000": {
+            "text": "No Book",
+            "color": "#898781",
+            "index": 0
+           },
+           "-3000000000": {
+            "text": "No Notional",
+            "color": "#fab219",
+            "index": 1
+           },
+           "-4000000000": {
+            "text": "No Anchor",
+            "color": "#898781",
+            "index": 2
+           },
+           "-5000000000": {
+            "text": "Past T",
+            "color": "#fab219",
+            "index": 3
+           },
+           "-6000000000": {
+            "text": "No Mean",
+            "color": "#898781",
+            "index": 4
+           },
+           "-7000000000": {
+            "text": "Not Recorded",
+            "color": "#898781",
+            "index": 5
+           },
+           "-9000000000": {
+            "text": "No Entry",
+            "color": "#fab219",
+            "index": 6
+           },
+           "-10000000000": {
+            "text": "Other Side",
+            "color": "#898781",
+            "index": 7
+           }
+          }
+         }
+        ]
+       }
+      ]
+     }
+    ]
+   },
+   "options": {
+    "reduceOptions": {
+     "calcs": [
+      "lastNotNull"
+     ],
+     "fields": "/.*/",
+     "values": false
+    },
+    "colorMode": "value",
+    "graphMode": "none",
+    "textMode": "value_and_name",
+    "justifyMode": "center",
+    "wideLayout": false,
+    "text": {
+     "titleSize": 13,
+     "valueSize": 20
+    },
+    "showPercentChange": false,
+    "orientation": "vertical"
+   },
+   "transformations": [
+    {
+     "id": "filterFieldsByName",
+     "options": {
+      "include": {
+       "names": [
+        "Bid 1+2 Depth · Bull",
+        "Bid 1+2 Depth · Bear",
+        "Ask 1+2 Depth · Bull",
+        "Ask 1+2 Depth · Bear"
+       ]
+      }
+     }
+    }
+   ]
+  },
+  {
+   "id": 6,
+   "type": "stat",
+   "title": "Trading Phases · UTC+8",
+   "description": "Key to the bands behind every chart: each phase's current or next hours · no band while closed.\n\n- **Pre-Market**: 04:00 – 09:30 New York.\n- **Regular**: 09:30 – 16:00 New York, 13:00 on an early close.\n- **After-Hours**: Four hours from the close.\n- **Overnight**: 20:00 – 04:00 New York before a trading day.\n- **Next Close**: The next regular close, the flatten deadline: 16:00 New York, 13:00 on an early close, as the calendar has it with its overrides.\n- **Calendar**: The calendar against Binance's schedule, checked hourly: OK to the last day the schedule covers (New York date) · Differ: the first date whose trading day or close differs, without an override, and +n more · Not compared: the schedule could not be read or compared · amber unless OK · detail and check time in Calendar Check; extended hours are not compared here.",
+   "gridPos": {
+    "x": 0,
+    "y": 13,
+    "w": 24,
+    "h": 3
+   },
+   "datasource": {
+    "type": "grafana-postgresql-datasource",
+    "uid": "etfpair"
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "datasource": {
+      "type": "grafana-postgresql-datasource",
+      "uid": "etfpair"
+     },
+     "format": "table",
+     "rawQuery": true,
+     "editorMode": "code",
+     "rawSql": "SELECT (SELECT to_char(to_timestamp(start_ms / 1000.0) AT TIME ZONE 'Etc/GMT-8', 'HH24:MI') || '–⁠' || to_char(to_timestamp(end_ms / 1000.0) AT TIME ZONE 'Etc/GMT-8', 'HH24:MI') FROM etfpair.etf_phase WHERE phase = 'Pre-Market' AND end_ms > (extract(epoch FROM now()) * 1000)::bigint ORDER BY start_ms LIMIT 1) AS \"Pre-Market\",\n       (SELECT to_char(to_timestamp(start_ms / 1000.0) AT TIME ZONE 'Etc/GMT-8', 'HH24:MI') || '–⁠' || to_char(to_timestamp(end_ms / 1000.0) AT TIME ZONE 'Etc/GMT-8', 'HH24:MI') FROM etfpair.etf_phase WHERE phase = 'Regular' AND end_ms > (extract(epoch FROM now()) * 1000)::bigint ORDER BY start_ms LIMIT 1) AS \"Regular\",\n       (SELECT to_char(to_timestamp(start_ms / 1000.0) AT TIME ZONE 'Etc/GMT-8', 'HH24:MI') || '–⁠' || to_char(to_timestamp(end_ms / 1000.0) AT TIME ZONE 'Etc/GMT-8', 'HH24:MI') FROM etfpair.etf_phase WHERE phase = 'After-Hours' AND end_ms > (extract(epoch FROM now()) * 1000)::bigint ORDER BY start_ms LIMIT 1) AS \"After-Hours\",\n       (SELECT to_char(to_timestamp(start_ms / 1000.0) AT TIME ZONE 'Etc/GMT-8', 'HH24:MI') || '–⁠' || to_char(to_timestamp(end_ms / 1000.0) AT TIME ZONE 'Etc/GMT-8', 'HH24:MI') FROM etfpair.etf_phase WHERE phase = 'Overnight' AND end_ms > (extract(epoch FROM now()) * 1000)::bigint ORDER BY start_ms LIMIT 1) AS \"Overnight\",\n       (SELECT to_char(to_timestamp(min(close_ms) / 1000.0) AT TIME ZONE 'Etc/GMT-8', 'MM-DD HH24:MI') FROM etfpair.etf_session WHERE close_ms > (extract(epoch FROM now()) * 1000)::bigint) AS \"Next Close\",\n       (SELECT CASE WHEN agree THEN 'OK to ' || to_char(to_timestamp((window_to_ms - 1) / 1000.0) AT TIME ZONE 'America/New_York', 'MM-DD') WHEN window_to_ms IS NULL THEN 'Not compared' ELSE (SELECT 'Differ · ' || substr(min(d[1]), 6) || CASE WHEN count(*) > 1 THEN ' +' || (count(*) - 1) ELSE '' END FROM regexp_matches(detail, '(\\d{4}-\\d\\d-\\d\\d):', 'g') d) END FROM etfpair.calendar_check) AS \"Calendar\""
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "color": {
+      "mode": "thresholds"
+     },
+     "custom": {},
+     "mappings": [
+      {
+       "type": "special",
+       "options": {
+        "match": "null",
+        "result": {
+         "text": "–",
+         "color": "#898781",
+         "index": 0
+        }
+       }
+      }
+     ],
+     "noValue": "–",
+     "thresholds": {
+      "mode": "absolute",
+      "steps": [
+       {
+        "color": "text",
+        "value": null
+       }
+      ]
+     }
+    },
+    "overrides": [
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "Pre-Market"
+      },
+      "properties": [
+       {
+        "id": "color",
+        "value": {
+         "mode": "fixed",
+         "fixedColor": "#b88a0a"
+        }
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "Regular"
+      },
+      "properties": [
+       {
+        "id": "color",
+        "value": {
+         "mode": "fixed",
+         "fixedColor": "#898781"
+        }
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "After-Hours"
+      },
+      "properties": [
+       {
+        "id": "color",
+        "value": {
+         "mode": "fixed",
+         "fixedColor": "#d55181"
+        }
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "Overnight"
+      },
+      "properties": [
+       {
+        "id": "color",
+        "value": {
+         "mode": "fixed",
+         "fixedColor": "#4f8fe6"
+        }
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "Calendar"
+      },
+      "properties": [
+       {
+        "id": "mappings",
+        "value": [
+         {
+          "type": "regex",
+          "options": {
+           "pattern": "^(Differ|Not\\scompared).*",
+           "result": {
+            "color": "#fab219",
+            "index": 0
+           }
+          }
+         }
+        ]
+       }
+      ]
+     }
+    ]
+   },
+   "options": {
+    "reduceOptions": {
+     "calcs": [
+      "lastNotNull"
+     ],
+     "fields": "/.*/",
+     "values": false
+    },
+    "colorMode": "value",
+    "graphMode": "none",
+    "textMode": "value_and_name",
+    "justifyMode": "center",
+    "wideLayout": false,
+    "text": {
+     "titleSize": 13,
+     "valueSize": 18
+    },
+    "showPercentChange": false,
+    "orientation": "vertical"
+   }
+  },
+  {
+   "id": 7,
+   "type": "table",
+   "title": "Next Actions · UTC+8",
+   "description": "Each ETF's coming dividend or split, from the dates known ahead\n\nEx-Date: New York · Action: ex D (USD per share as declared, ? until a source gives it) or split r:1 · Takes Effect: a dividend at 20:00 New York of the day before the ex-date, the anchor then less D; a split at each CEX's first trade after its halt · Status: Scheduled (date only), Known, None (no distribution); Past T: it has taken effect, its amount still unknown, amber · Source: where the newest reading came from · it stays until the ex-date has passed.",
+   "gridPos": {
+    "x": 0,
+    "y": 16,
+    "w": 14,
+    "h": 6
+   },
+   "datasource": {
+    "type": "grafana-postgresql-datasource",
+    "uid": "etfpair"
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "datasource": {
+      "type": "grafana-postgresql-datasource",
+      "uid": "etfpair"
+     },
+     "format": "table",
+     "rawQuery": true,
+     "editorMode": "code",
+     "rawSql": "SELECT l.ticker AS \"ETF\", to_char(a.ex_date, 'YYYY-MM-DD') AS \"Ex-Date\", CASE WHEN a.kind = 'dividend' THEN 'ex ' || coalesce(trim_scale(a.value)::text, '?') WHEN a.value >= 1 THEN 'split ' || trim_scale(a.value) || ':1' ELSE 'split 1:' || trim_scale(round(1 / a.value, 6)) END AS \"Action\",\n       CASE WHEN a.kind = 'split' THEN 'after its halt'\n            WHEN a.status <> 'None' THEN to_char(to_timestamp(s.start_ms / 1000.0) AT TIME ZONE 'Etc/GMT-8', 'MM-DD HH24:MI') END AS \"Takes Effect\",\n       a.status || CASE WHEN s.past_t THEN ' · Past T' ELSE '' END AS \"Status\", a.source AS \"Source\"\nFROM etfpair.combo c\nCROSS JOIN LATERAL (VALUES (1, c.bull_ticker), (2, c.bear_ticker), (3, c.ref_ticker)) l(i, ticker)\nLEFT JOIN LATERAL (\n    SELECT n.* FROM (SELECT DISTINCT ON (x.ex_date, x.kind) x.* FROM etfpair.etf_action x\n                     WHERE x.ticker = l.ticker AND x.ex_date >= (now() AT TIME ZONE 'America/New_York')::date ORDER BY x.ex_date, x.kind, x.known_ms DESC) n\n    ORDER BY n.ex_date, n.kind LIMIT 1) a ON true\nLEFT JOIN LATERAL etfpair.action_start(a.ex_date, a.status) s ON true\nWHERE c.combo_id = '$combo' AND l.ticker <> ''\nORDER BY l.i"
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "color": {
+      "mode": "fixed",
+      "fixedColor": "text"
+     },
+     "custom": {
+      "align": "auto",
+      "cellOptions": {
+       "type": "auto"
+      },
+      "filterable": false,
+      "inspect": false,
+      "minWidth": 60,
+      "wrapHeaderText": true
+     },
+     "mappings": [],
+     "noValue": "–"
+    },
+    "overrides": [
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "ETF"
+      },
+      "properties": [
+       {
+        "id": "custom.width",
+        "value": 64
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "Ex-Date"
+      },
+      "properties": [
+       {
+        "id": "custom.width",
+        "value": 96
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "Action"
+      },
+      "properties": [
+       {
+        "id": "custom.width",
+        "value": 120
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "Takes Effect"
+      },
+      "properties": [
+       {
+        "id": "custom.width",
+        "value": 110
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "Status"
+      },
+      "properties": [
+       {
+        "id": "custom.cellOptions",
+        "value": {
+         "type": "color-text"
+        }
+       },
+       {
+        "id": "mappings",
+        "value": [
+         {
+          "type": "regex",
+          "options": {
+           "pattern": ".*(Mismatch|Past T).*",
+           "result": {
+            "color": "#fab219",
+            "index": 0
+           }
+          }
+         }
+        ]
+       },
+       {
+        "id": "custom.width",
+        "value": 150
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "Source"
+      },
+      "properties": [
+       {
+        "id": "custom.minWidth",
+        "value": 100
+       }
+      ]
+     }
+    ]
+   },
+   "options": {
+    "showHeader": true,
+    "cellHeight": "sm",
+    "footer": {
+     "show": false
+    }
+   }
+  },
+  {
+   "id": 8,
+   "type": "table",
+   "title": "Calendar Check · UTC+8",
+   "description": "The latest hourly check of the calendar against Binance's schedule\n\nChecked: when · Binance Through: the last day its schedule covers, New York · Result: OK, Differ (a trading day or close differs on a date without an override), Not compared (the schedule could not be read or compared), amber unless OK · Detail: the differences (here UTC+8 against Binance) or the reason.",
+   "gridPos": {
+    "x": 14,
+    "y": 16,
+    "w": 10,
+    "h": 6
+   },
+   "datasource": {
+    "type": "grafana-postgresql-datasource",
+    "uid": "etfpair"
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "datasource": {
+      "type": "grafana-postgresql-datasource",
+      "uid": "etfpair"
+     },
+     "format": "table",
+     "rawQuery": true,
+     "editorMode": "code",
+     "rawSql": "SELECT to_timestamp(checked_ms / 1000.0) AS \"Checked\",\n       to_char(to_timestamp((window_to_ms - 1) / 1000.0) AT TIME ZONE 'America/New_York', 'MM-DD') AS \"Binance Through\",\n       CASE WHEN agree THEN 'OK' WHEN window_to_ms IS NULL THEN 'Not compared' ELSE 'Differ' END AS \"Result\", detail AS \"Detail\"\nFROM etfpair.calendar_check"
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "color": {
+      "mode": "fixed",
+      "fixedColor": "text"
+     },
+     "custom": {
+      "align": "auto",
+      "cellOptions": {
+       "type": "auto"
+      },
+      "filterable": false,
+      "inspect": false,
+      "minWidth": 60,
+      "wrapHeaderText": true
+     },
+     "mappings": [],
+     "noValue": "–"
+    },
+    "overrides": [
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "Checked"
+      },
+      "properties": [
+       {
+        "id": "unit",
+        "value": "time:MM-DD HH:mm"
+       },
+       {
+        "id": "custom.width",
+        "value": 96
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "Binance Through"
+      },
+      "properties": [
+       {
+        "id": "custom.width",
+        "value": 80
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "Result"
+      },
+      "properties": [
+       {
+        "id": "custom.cellOptions",
+        "value": {
+         "type": "color-text"
+        }
+       },
+       {
+        "id": "mappings",
+        "value": [
+         {
+          "type": "regex",
+          "options": {
+           "pattern": "^(Differ|Not\\scompared).*",
+           "result": {
+            "color": "#fab219",
+            "index": 0
+           }
+          }
+         }
+        ]
+       },
+       {
+        "id": "custom.width",
+        "value": 104
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "Detail"
+      },
+      "properties": [
+       {
+        "id": "custom.minWidth",
+        "value": 120
+       },
+       {
+        "id": "custom.wrapText",
+        "value": true
+       }
+      ]
+     }
+    ]
+   },
+   "options": {
+    "showHeader": true,
+    "cellHeight": "sm",
+    "footer": {
+     "show": false
+    }
+   }
+  },
+  {
+   "id": 9,
+   "type": "row",
+   "title": "Spread · ${ma:text} ${ma_text} min · Entry ${d_text} bps · Notional ${n_text} USDT (Both Legs)",
+   "collapsed": false,
+   "gridPos": {
+    "x": 0,
+    "y": 22,
+    "w": 24,
+    "h": 1
+   },
+   "panels": []
+  },
+  {
+   "id": 10,
+   "type": "timeseries",
+   "title": "Spread · Bps",
+   "description": "Spread = 10⁴ × (F·P_bull ÷ A_bull + F·P_bear ÷ A_bear − 2) · P: both legs' mid prices, else both last trades · Real Long, Real Short Spread: the same on the average prices of buying, selling both legs for the notional N through their recorded asks, bids · Long: Real Long Spread ≤ Mean − Entry · Short: Real Short Spread ≥ Mean + Entry\n\nDrawn: Spread, Mean and the band Mean ± Entry (not drawn when Entry is not a positive number: the Signal reads No Entry); the drawn Spread crossing the band is not a signal (see Deviation · Bps and Entry Points · Bps) · tooltip, in this order: Spread, Real Long Spread, Real Short Spread, Mean, Deviation, Real Long Deviation, Real Short Deviation, Signal, each leg's Bid 1+2 Depth and Ask 1+2 Depth (ct: contracts); each row is that second's value or the reason it has none (No Anchor, Past T, No Mean, No Notional, No Book, Not Recorded; No Mean also when Mean Scale is not a whole number of minutes from 1 to 999,999) · P: (best bid + best ask) ÷ 2 of both legs' recorded books in that second, else both legs' last trades before it (before the recorder: trades only, No Book) · Real Long Spread, Real Short Spread: what opening or closing a basket of N USDT (both legs together) as a taker gives in that second, the quantities making q·A equal on both legs; where the recorded levels (now 5 a side at a 0.01 tick, 50 at 0.001; fewer earlier, see Data Coverage · Levels) hold less than N, on what they hold, and the Signal reads Partial · Deviation, Real Long Deviation, Real Short Deviation: |Spread − Mean|, |Real Long Spread − Mean|, |Real Short Spread − Mean|, absolute (with their signs on Deviation · Bps) · Signal: as in Signal · Latest Second · 1+2 Depth: the contracts at a leg's first two 0.01 levels, as in Book · Latest Second · A: session anchor, less a dividend or over a split's ratio from the instant it takes effect (a mark there, with the expected and measured step; the mean restarts, also when a leg's dividend takes effect without its amount: A stays, the spread steps, Past T until the amount is known) · F: USD/USDT · Mean: the same on each leg's mean of its minute bars (both legs' mids at the minute's end, else their trades, else their candle closes) · each session is drawn on its own · points: the recorder's per-second rows, every second to about 83 min, 5 s to about 7 h, 10 s to about 14 h, 30 s to about 41 h, then every minute or more; a second without both legs' prices is a gap.",
+   "gridPos": {
+    "x": 0,
+    "y": 23,
+    "w": 24,
+    "h": 13
+   },
+   "datasource": {
+    "type": "grafana-postgresql-datasource",
+    "uid": "etfpair"
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "datasource": {
+      "type": "grafana-postgresql-datasource",
+      "uid": "etfpair"
+     },
+     "format": "table",
+     "rawQuery": true,
+     "editorMode": "code",
+     "rawSql": "WITH v AS MATERIALIZED (SELECT * FROM (SELECT (SELECT CASE m[3] WHEN 'k' THEN 1000 WHEN 'w' THEN 10000 WHEN '万' THEN 10000 ELSE 1 END * (replace(m[1], ',', '') || m[2])::numeric FROM regexp_match(regexp_replace(regexp_replace(lower(normalize('$notional', NFKC)), '[[:space:]_]', '', 'g'), 'u(sdt)?$', ''), '^([0-9]{1,3}(?:,[0-9]{3})+|[0-9]+)((?:[.][0-9]+)?)(k|w|万)?$') m) AS n, (SELECT CASE WHEN m[1]::numeric > 0 THEN m[1]::numeric END FROM regexp_match(regexp_replace(lower(normalize('$d', NFKC)), '[[:space:]_]', '', 'g'), '^([0-9]+(?:[.][0-9]+)?)(?:bps)?$') m) AS d, (SELECT CASE WHEN m[1]::integer > 0 THEN m[1]::integer END FROM regexp_match(regexp_replace(lower(normalize('$ma_minutes', NFKC)), '[[:space:]_]', '', 'g'), '^([0-9]{1,6})(?:min|m)?$') m) AS ma_n) v)\nSELECT to_timestamp(r.ts_ms / 1000.0) AS time,\n       (floor((r.s_bps)::float8 * 1e1::float8 + 0.5) / 1e1::float8) AS \"Spread\",\n       (floor((r.mu_bps)::float8 * 1e1::float8 + 0.5) / 1e1::float8) AS \"Mean\",\n       (floor((r.mu_bps + v.d)::float8 * 1e1::float8 + 0.5) / 1e1::float8) AS \"Mean + Entry\",\n       (floor((r.mu_bps - v.d)::float8 * 1e1::float8 + 0.5) / 1e1::float8) AS \"Mean − Entry\",\n       CASE WHEN r.basis IS NULL THEN NULL WHEN r.s_bps IS NOT NULL THEN (floor((r.s_bps)::float8 * 1e1::float8 + 0.5) / 1e1::float8) ELSE -4000000000 END AS \"Spread · Tooltip\",\n       CASE WHEN r.basis IS NULL THEN NULL WHEN r.s_long_bps IS NOT NULL THEN (floor((r.s_long_bps)::float8 * 1e1::float8 + 0.5) / 1e1::float8) WHEN r.s_bps IS NULL THEN -4000000000 WHEN NOT coalesce(v.n > 0, false) THEN -3000000000 ELSE -2000000000 END AS \"Real Long Spread\",\n       CASE WHEN r.basis IS NULL THEN NULL WHEN r.s_short_bps IS NOT NULL THEN (floor((r.s_short_bps)::float8 * 1e1::float8 + 0.5) / 1e1::float8) WHEN r.s_bps IS NULL THEN -4000000000 WHEN NOT coalesce(v.n > 0, false) THEN -3000000000 ELSE -2000000000 END AS \"Real Short Spread\",\n       CASE WHEN r.basis IS NULL THEN NULL WHEN r.mu_bps IS NOT NULL THEN (floor((r.mu_bps)::float8 * 1e1::float8 + 0.5) / 1e1::float8) WHEN r.s_bps IS NULL THEN -4000000000 WHEN r.past_t THEN -5000000000 ELSE -6000000000 END AS \"Mean · Tooltip\",\n       CASE WHEN r.basis IS NULL THEN NULL WHEN abs(r.s_bps - r.mu_bps) IS NOT NULL THEN (floor((abs(r.s_bps - r.mu_bps))::float8 * 1e1::float8 + 0.5) / 1e1::float8) WHEN r.s_bps IS NULL THEN -4000000000 WHEN r.past_t THEN -5000000000 ELSE -6000000000 END AS \"Deviation · Tooltip\",\n       CASE WHEN r.basis IS NULL THEN NULL WHEN r.s_bps IS NULL THEN -4000000000 WHEN r.past_t THEN -5000000000 WHEN abs(r.s_long_bps - r.mu_bps) IS NOT NULL THEN (floor((abs(r.s_long_bps - r.mu_bps))::float8 * 1e1::float8 + 0.5) / 1e1::float8) WHEN r.mu_bps IS NULL THEN -6000000000 WHEN NOT coalesce(v.n > 0, false) THEN -3000000000 ELSE -2000000000 END AS \"Real Long Deviation · Tooltip\",\n       CASE WHEN r.basis IS NULL THEN NULL WHEN r.s_bps IS NULL THEN -4000000000 WHEN r.past_t THEN -5000000000 WHEN abs(r.s_short_bps - r.mu_bps) IS NOT NULL THEN (floor((abs(r.s_short_bps - r.mu_bps))::float8 * 1e1::float8 + 0.5) / 1e1::float8) WHEN r.mu_bps IS NULL THEN -6000000000 WHEN NOT coalesce(v.n > 0, false) THEN -3000000000 ELSE -2000000000 END AS \"Real Short Deviation · Tooltip\",\n       CASE WHEN r.basis IS NOT NULL THEN CASE r.signal WHEN 'None' THEN 0 WHEN 'Long' THEN 1 WHEN 'Short' THEN 2 WHEN 'Long · Partial' THEN 3 WHEN 'Short · Partial' THEN 4 WHEN 'No Book' THEN -2000000000 WHEN 'No Notional' THEN -3000000000 WHEN 'No Anchor' THEN -4000000000 WHEN 'Past T' THEN -5000000000 WHEN 'No Mean' THEN -6000000000 WHEN 'No Entry' THEN -9000000000 END END AS \"Signal\",\n       CASE WHEN r.basis IS NULL THEN NULL WHEN r.bid12_bull IS NOT NULL THEN (floor((r.bid12_bull)::float8 * 1e2::float8 + 0.5) / 1e2::float8) WHEN NOT r.book_bull THEN -2000000000 ELSE -7000000000 END AS \"Bid 1+2 Depth · Bull\",\n       CASE WHEN r.basis IS NULL THEN NULL WHEN r.bid12_bear IS NOT NULL THEN (floor((r.bid12_bear)::float8 * 1e2::float8 + 0.5) / 1e2::float8) WHEN NOT r.book_bear THEN -2000000000 ELSE -7000000000 END AS \"Bid 1+2 Depth · Bear\",\n       CASE WHEN r.basis IS NULL THEN NULL WHEN r.ask12_bull IS NOT NULL THEN (floor((r.ask12_bull)::float8 * 1e2::float8 + 0.5) / 1e2::float8) WHEN NOT r.book_bull THEN -2000000000 ELSE -7000000000 END AS \"Ask 1+2 Depth · Bull\",\n       CASE WHEN r.basis IS NULL THEN NULL WHEN r.ask12_bear IS NOT NULL THEN (floor((r.ask12_bear)::float8 * 1e2::float8 + 0.5) / 1e2::float8) WHEN NOT r.book_bear THEN -2000000000 ELSE -7000000000 END AS \"Ask 1+2 Depth · Bear\",\n       CASE WHEN NOT r.past_t THEN (floor((r.s_bps - r.mu_bps)::float8 * 1e1::float8 + 0.5) / 1e1::float8) END AS \"Signed Deviation\",\n       CASE WHEN NOT r.past_t THEN (floor((r.s_long_bps - r.mu_bps)::float8 * 1e1::float8 + 0.5) / 1e1::float8) END AS \"Signed Real Long Deviation\",\n       CASE WHEN NOT r.past_t THEN (floor((r.s_short_bps - r.mu_bps)::float8 * 1e1::float8 + 0.5) / 1e1::float8) END AS \"Signed Real Short Deviation\",\n       CASE WHEN r.past_t THEN (floor((r.s_bps - r.mu_bps)::float8 * 1e1::float8 + 0.5) / 1e1::float8) END AS \"Signed Past T\",\n       -v.d AS \"−Entry\",\n       CASE WHEN r.basis IS NULL THEN NULL WHEN r.s_bps - r.mu_bps IS NOT NULL THEN (floor((r.s_bps - r.mu_bps)::float8 * 1e1::float8 + 0.5) / 1e1::float8) WHEN r.s_bps IS NULL THEN -4000000000 WHEN r.past_t THEN -5000000000 ELSE -6000000000 END AS \"Signed Deviation · Tooltip\",\n       CASE WHEN r.basis IS NULL THEN NULL WHEN r.s_bps IS NULL THEN -4000000000 WHEN r.past_t THEN -5000000000 WHEN r.s_long_bps - r.mu_bps IS NOT NULL THEN (floor((r.s_long_bps - r.mu_bps)::float8 * 1e1::float8 + 0.5) / 1e1::float8) WHEN r.mu_bps IS NULL THEN -6000000000 WHEN NOT coalesce(v.n > 0, false) THEN -3000000000 ELSE -2000000000 END AS \"Signed Real Long Deviation · Tooltip\",\n       CASE WHEN r.basis IS NULL THEN NULL WHEN r.s_bps IS NULL THEN -4000000000 WHEN r.past_t THEN -5000000000 WHEN r.s_short_bps - r.mu_bps IS NOT NULL THEN (floor((r.s_short_bps - r.mu_bps)::float8 * 1e1::float8 + 0.5) / 1e1::float8) WHEN r.mu_bps IS NULL THEN -6000000000 WHEN NOT coalesce(v.n > 0, false) THEN -3000000000 ELSE -2000000000 END AS \"Signed Real Short Deviation · Tooltip\",\n       count(*) FILTER (WHERE r.signal LIKE 'Long%') OVER w AS \"Long Points\",\n       count(*) FILTER (WHERE r.signal LIKE 'Short%') OVER w AS \"Short Points\",\n       CASE WHEN NOT r.past_t THEN (floor((abs(r.s_bps - r.mu_bps))::float8 * 1e1::float8 + 0.5) / 1e1::float8) END AS \"Deviation · Line\",\n       CASE WHEN NOT r.past_t THEN (floor((abs(r.s_long_bps - r.mu_bps))::float8 * 1e1::float8 + 0.5) / 1e1::float8) END AS \"Real Long Deviation · Faded\",\n       CASE WHEN NOT r.past_t THEN (floor((abs(r.s_short_bps - r.mu_bps))::float8 * 1e1::float8 + 0.5) / 1e1::float8) END AS \"Real Short Deviation · Faded\",\n       CASE WHEN NOT r.past_t AND r.s_long_bps < r.mu_bps THEN (floor((abs(r.s_long_bps - r.mu_bps))::float8 * 1e1::float8 + 0.5) / 1e1::float8) END AS \"Real Long Deviation\",\n       CASE WHEN NOT r.past_t AND r.s_short_bps > r.mu_bps THEN (floor((abs(r.s_short_bps - r.mu_bps))::float8 * 1e1::float8 + 0.5) / 1e1::float8) END AS \"Real Short Deviation\",\n       CASE WHEN r.past_t THEN (floor((abs(r.s_bps - r.mu_bps))::float8 * 1e1::float8 + 0.5) / 1e1::float8) END AS \"Past T\",\n       v.d AS \"+Entry\",\n       CASE WHEN r.signal LIKE 'Long%' THEN (floor((abs(r.s_long_bps - r.mu_bps))::float8 * 1e1::float8 + 0.5) / 1e1::float8) END AS \"Long Dots\",\n       CASE WHEN r.signal LIKE 'Short%' THEN (floor((abs(r.s_short_bps - r.mu_bps))::float8 * 1e1::float8 + 0.5) / 1e1::float8) END AS \"Short Dots\",\n       r.phase_sort AS \"Phase\",\n       CASE WHEN r.phase IS NOT NULL THEN (r.signal LIKE 'Long%')::integer END AS \"Long Point\",\n       CASE WHEN r.phase IS NOT NULL THEN (r.signal LIKE 'Short%')::integer END AS \"Short Point\",\n       CASE WHEN r.phase IS NOT NULL THEN (r.signal LIKE '% · Partial')::integer END AS \"Partial Point\",\n       CASE WHEN r.phase IS NOT NULL THEN (r.signal = 'Past T')::integer END AS \"Past T Point\",\n       CASE WHEN r.phase IS NOT NULL THEN (r.signal = 'No Book')::integer END AS \"No Book Point\",\n       CASE WHEN r.phase IS NOT NULL AND NOT r.past_t AND r.s_long_bps < r.mu_bps THEN (floor((r.mu_bps - r.s_long_bps)::float8 * 1e1::float8 + 0.5) / 1e1::float8) END AS \"Best Long\",\n       CASE WHEN r.phase IS NOT NULL AND NOT r.past_t AND r.s_short_bps > r.mu_bps THEN (floor((r.s_short_bps - r.mu_bps)::float8 * 1e1::float8 + 0.5) / 1e1::float8) END AS \"Best Short\"\nFROM v CROSS JOIN LATERAL etfpair.combo_range('$combo', '$venue', '$ma', v.ma_n, $__from, $__to, (SELECT CASE WHEN r <= 1000 THEN 1000 WHEN r <= 5000 THEN 5000 WHEN r <= 10000 THEN 10000 WHEN r <= 30000 THEN 30000 ELSE ceil(r / 60000) * 60000 END::bigint FROM (SELECT ($__to - $__from) / 5000.0 AS r) x), v.n, v.d) r\nWINDOW w AS (ORDER BY r.ts_ms)\nORDER BY r.ts_ms"
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "color": {
+      "mode": "fixed",
+      "fixedColor": "text"
+     },
+     "custom": {
+      "drawStyle": "line",
+      "lineInterpolation": "linear",
+      "lineWidth": 1,
+      "fillOpacity": 0,
+      "showPoints": "never",
+      "spanNulls": false,
+      "axisPlacement": "auto",
+      "axisBorderShow": false,
+      "axisWidth": 60,
+      "scaleDistribution": {
+       "type": "linear"
+      },
+      "hideFrom": {
+       "legend": false,
+       "tooltip": false,
+       "viz": false
+      }
+     },
+     "mappings": [],
+     "noValue": "No data for this selection",
+     "unit": "none",
+     "decimals": 1
+    },
+    "overrides": [
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "Spread"
+      },
+      "properties": [
+       {
+        "id": "color",
+        "value": {
+         "mode": "fixed",
+         "fixedColor": "#9b59d0"
+        }
+       },
+       {
+        "id": "custom.lineWidth",
+        "value": 2
+       },
+       {
+        "id": "custom.hideFrom",
+        "value": {
+         "legend": false,
+         "tooltip": true,
+         "viz": false
+        }
+       },
+       {
+        "id": "noValue",
+        "value": "–"
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "Mean"
+      },
+      "properties": [
+       {
+        "id": "color",
+        "value": {
+         "mode": "fixed",
+         "fixedColor": "text"
+        }
+       },
+       {
+        "id": "custom.lineWidth",
+        "value": 1
+       },
+       {
+        "id": "custom.hideFrom",
+        "value": {
+         "legend": false,
+         "tooltip": true,
+         "viz": false
+        }
+       },
+       {
+        "id": "noValue",
+        "value": "–"
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "Mean + Entry"
+      },
+      "properties": [
+       {
+        "id": "color",
+        "value": {
+         "mode": "fixed",
+         "fixedColor": "#4fc3d9"
+        }
+       },
+       {
+        "id": "custom.lineWidth",
+        "value": 1
+       },
+       {
+        "id": "custom.lineStyle",
+        "value": {
+         "fill": "dash",
+         "dash": [
+          6,
+          4
+         ]
+        }
+       },
+       {
+        "id": "custom.fillBelowTo",
+        "value": "Mean − Entry"
+       },
+       {
+        "id": "custom.fillOpacity",
+        "value": 8
+       },
+       {
+        "id": "custom.hideFrom",
+        "value": {
+         "legend": false,
+         "tooltip": true,
+         "viz": false
+        }
+       },
+       {
+        "id": "noValue",
+        "value": "–"
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "Mean − Entry"
+      },
+      "properties": [
+       {
+        "id": "color",
+        "value": {
+         "mode": "fixed",
+         "fixedColor": "#4fc3d9"
+        }
+       },
+       {
+        "id": "custom.lineWidth",
+        "value": 1
+       },
+       {
+        "id": "custom.lineStyle",
+        "value": {
+         "fill": "dash",
+         "dash": [
+          6,
+          4
+         ]
+        }
+       },
+       {
+        "id": "custom.hideFrom",
+        "value": {
+         "legend": true,
+         "tooltip": true,
+         "viz": false
+        }
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "Spread · Tooltip"
+      },
+      "properties": [
+       {
+        "id": "color",
+        "value": {
+         "mode": "fixed",
+         "fixedColor": "#9b59d0"
+        }
+       },
+       {
+        "id": "custom.hideFrom",
+        "value": {
+         "legend": true,
+         "tooltip": false,
+         "viz": true
+        }
+       },
+       {
+        "id": "mappings",
+        "value": [
+         {
+          "type": "value",
+          "options": {
+           "-2000000000": {
+            "text": "No Book",
+            "color": "#898781",
+            "index": 0
+           },
+           "-3000000000": {
+            "text": "No Notional",
+            "color": "#898781",
+            "index": 1
+           },
+           "-4000000000": {
+            "text": "No Anchor",
+            "color": "#898781",
+            "index": 2
+           },
+           "-5000000000": {
+            "text": "Past T",
+            "color": "#898781",
+            "index": 3
+           },
+           "-6000000000": {
+            "text": "No Mean",
+            "color": "#898781",
+            "index": 4
+           },
+           "-7000000000": {
+            "text": "Not Recorded",
+            "color": "#898781",
+            "index": 5
+           },
+           "-9000000000": {
+            "text": "No Entry",
+            "color": "#898781",
+            "index": 6
+           },
+           "-10000000000": {
+            "text": "Other Side",
+            "color": "#898781",
+            "index": 7
+           }
+          }
+         }
+        ]
+       },
+       {
+        "id": "displayName",
+        "value": "Spread​"
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "Real Long Spread"
+      },
+      "properties": [
+       {
+        "id": "color",
+        "value": {
+         "mode": "fixed",
+         "fixedColor": "#2a78d6"
+        }
+       },
+       {
+        "id": "custom.hideFrom",
+        "value": {
+         "legend": true,
+         "tooltip": false,
+         "viz": true
+        }
+       },
+       {
+        "id": "mappings",
+        "value": [
+         {
+          "type": "value",
+          "options": {
+           "-2000000000": {
+            "text": "No Book",
+            "color": "#898781",
+            "index": 0
+           },
+           "-3000000000": {
+            "text": "No Notional",
+            "color": "#898781",
+            "index": 1
+           },
+           "-4000000000": {
+            "text": "No Anchor",
+            "color": "#898781",
+            "index": 2
+           },
+           "-5000000000": {
+            "text": "Past T",
+            "color": "#898781",
+            "index": 3
+           },
+           "-6000000000": {
+            "text": "No Mean",
+            "color": "#898781",
+            "index": 4
+           },
+           "-7000000000": {
+            "text": "Not Recorded",
+            "color": "#898781",
+            "index": 5
+           },
+           "-9000000000": {
+            "text": "No Entry",
+            "color": "#898781",
+            "index": 6
+           },
+           "-10000000000": {
+            "text": "Other Side",
+            "color": "#898781",
+            "index": 7
+           }
+          }
+         }
+        ]
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "Real Short Spread"
+      },
+      "properties": [
+       {
+        "id": "color",
+        "value": {
+         "mode": "fixed",
+         "fixedColor": "#d95926"
+        }
+       },
+       {
+        "id": "custom.hideFrom",
+        "value": {
+         "legend": true,
+         "tooltip": false,
+         "viz": true
+        }
+       },
+       {
+        "id": "mappings",
+        "value": [
+         {
+          "type": "value",
+          "options": {
+           "-2000000000": {
+            "text": "No Book",
+            "color": "#898781",
+            "index": 0
+           },
+           "-3000000000": {
+            "text": "No Notional",
+            "color": "#898781",
+            "index": 1
+           },
+           "-4000000000": {
+            "text": "No Anchor",
+            "color": "#898781",
+            "index": 2
+           },
+           "-5000000000": {
+            "text": "Past T",
+            "color": "#898781",
+            "index": 3
+           },
+           "-6000000000": {
+            "text": "No Mean",
+            "color": "#898781",
+            "index": 4
+           },
+           "-7000000000": {
+            "text": "Not Recorded",
+            "color": "#898781",
+            "index": 5
+           },
+           "-9000000000": {
+            "text": "No Entry",
+            "color": "#898781",
+            "index": 6
+           },
+           "-10000000000": {
+            "text": "Other Side",
+            "color": "#898781",
+            "index": 7
+           }
+          }
+         }
+        ]
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "Mean · Tooltip"
+      },
+      "properties": [
+       {
+        "id": "color",
+        "value": {
+         "mode": "fixed",
+         "fixedColor": "text"
+        }
+       },
+       {
+        "id": "custom.hideFrom",
+        "value": {
+         "legend": true,
+         "tooltip": false,
+         "viz": true
+        }
+       },
+       {
+        "id": "mappings",
+        "value": [
+         {
+          "type": "value",
+          "options": {
+           "-2000000000": {
+            "text": "No Book",
+            "color": "#898781",
+            "index": 0
+           },
+           "-3000000000": {
+            "text": "No Notional",
+            "color": "#898781",
+            "index": 1
+           },
+           "-4000000000": {
+            "text": "No Anchor",
+            "color": "#898781",
+            "index": 2
+           },
+           "-5000000000": {
+            "text": "Past T",
+            "color": "#898781",
+            "index": 3
+           },
+           "-6000000000": {
+            "text": "No Mean",
+            "color": "#898781",
+            "index": 4
+           },
+           "-7000000000": {
+            "text": "Not Recorded",
+            "color": "#898781",
+            "index": 5
+           },
+           "-9000000000": {
+            "text": "No Entry",
+            "color": "#898781",
+            "index": 6
+           },
+           "-10000000000": {
+            "text": "Other Side",
+            "color": "#898781",
+            "index": 7
+           }
+          }
+         }
+        ]
+       },
+       {
+        "id": "displayName",
+        "value": "Mean​"
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "Deviation · Tooltip"
+      },
+      "properties": [
+       {
+        "id": "color",
+        "value": {
+         "mode": "fixed",
+         "fixedColor": "#898781"
+        }
+       },
+       {
+        "id": "custom.hideFrom",
+        "value": {
+         "legend": true,
+         "tooltip": false,
+         "viz": true
+        }
+       },
+       {
+        "id": "mappings",
+        "value": [
+         {
+          "type": "value",
+          "options": {
+           "-2000000000": {
+            "text": "No Book",
+            "color": "#898781",
+            "index": 0
+           },
+           "-3000000000": {
+            "text": "No Notional",
+            "color": "#898781",
+            "index": 1
+           },
+           "-4000000000": {
+            "text": "No Anchor",
+            "color": "#898781",
+            "index": 2
+           },
+           "-5000000000": {
+            "text": "Past T",
+            "color": "#898781",
+            "index": 3
+           },
+           "-6000000000": {
+            "text": "No Mean",
+            "color": "#898781",
+            "index": 4
+           },
+           "-7000000000": {
+            "text": "Not Recorded",
+            "color": "#898781",
+            "index": 5
+           },
+           "-9000000000": {
+            "text": "No Entry",
+            "color": "#898781",
+            "index": 6
+           },
+           "-10000000000": {
+            "text": "Other Side",
+            "color": "#898781",
+            "index": 7
+           }
+          }
+         }
+        ]
+       },
+       {
+        "id": "displayName",
+        "value": "Deviation"
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "Real Long Deviation · Tooltip"
+      },
+      "properties": [
+       {
+        "id": "color",
+        "value": {
+         "mode": "fixed",
+         "fixedColor": "#2a78d6"
+        }
+       },
+       {
+        "id": "custom.hideFrom",
+        "value": {
+         "legend": true,
+         "tooltip": false,
+         "viz": true
+        }
+       },
+       {
+        "id": "mappings",
+        "value": [
+         {
+          "type": "value",
+          "options": {
+           "-2000000000": {
+            "text": "No Book",
+            "color": "#898781",
+            "index": 0
+           },
+           "-3000000000": {
+            "text": "No Notional",
+            "color": "#898781",
+            "index": 1
+           },
+           "-4000000000": {
+            "text": "No Anchor",
+            "color": "#898781",
+            "index": 2
+           },
+           "-5000000000": {
+            "text": "Past T",
+            "color": "#898781",
+            "index": 3
+           },
+           "-6000000000": {
+            "text": "No Mean",
+            "color": "#898781",
+            "index": 4
+           },
+           "-7000000000": {
+            "text": "Not Recorded",
+            "color": "#898781",
+            "index": 5
+           },
+           "-9000000000": {
+            "text": "No Entry",
+            "color": "#898781",
+            "index": 6
+           },
+           "-10000000000": {
+            "text": "Other Side",
+            "color": "#898781",
+            "index": 7
+           }
+          }
+         }
+        ]
+       },
+       {
+        "id": "displayName",
+        "value": "Real Long Deviation"
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "Real Short Deviation · Tooltip"
+      },
+      "properties": [
+       {
+        "id": "color",
+        "value": {
+         "mode": "fixed",
+         "fixedColor": "#d95926"
+        }
+       },
+       {
+        "id": "custom.hideFrom",
+        "value": {
+         "legend": true,
+         "tooltip": false,
+         "viz": true
+        }
+       },
+       {
+        "id": "mappings",
+        "value": [
+         {
+          "type": "value",
+          "options": {
+           "-2000000000": {
+            "text": "No Book",
+            "color": "#898781",
+            "index": 0
+           },
+           "-3000000000": {
+            "text": "No Notional",
+            "color": "#898781",
+            "index": 1
+           },
+           "-4000000000": {
+            "text": "No Anchor",
+            "color": "#898781",
+            "index": 2
+           },
+           "-5000000000": {
+            "text": "Past T",
+            "color": "#898781",
+            "index": 3
+           },
+           "-6000000000": {
+            "text": "No Mean",
+            "color": "#898781",
+            "index": 4
+           },
+           "-7000000000": {
+            "text": "Not Recorded",
+            "color": "#898781",
+            "index": 5
+           },
+           "-9000000000": {
+            "text": "No Entry",
+            "color": "#898781",
+            "index": 6
+           },
+           "-10000000000": {
+            "text": "Other Side",
+            "color": "#898781",
+            "index": 7
+           }
+          }
+         }
+        ]
+       },
+       {
+        "id": "displayName",
+        "value": "Real Short Deviation"
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "Signal"
+      },
+      "properties": [
+       {
+        "id": "color",
+        "value": {
+         "mode": "fixed",
+         "fixedColor": "text"
+        }
+       },
+       {
+        "id": "custom.hideFrom",
+        "value": {
+         "legend": true,
+         "tooltip": false,
+         "viz": true
+        }
+       },
+       {
+        "id": "mappings",
+        "value": [
+         {
+          "type": "value",
+          "options": {
+           "0": {
+            "text": "None",
+            "color": "text",
+            "index": 0
+           },
+           "1": {
+            "text": "Long",
+            "color": "#2a78d6",
+            "index": 1
+           },
+           "2": {
+            "text": "Short",
+            "color": "#d95926",
+            "index": 2
+           },
+           "3": {
+            "text": "Long · Partial",
+            "color": "#2a78d6",
+            "index": 3
+           },
+           "4": {
+            "text": "Short · Partial",
+            "color": "#d95926",
+            "index": 4
+           },
+           "-2000000000": {
+            "text": "No Book",
+            "color": "#898781",
+            "index": 5
+           },
+           "-3000000000": {
+            "text": "No Notional",
+            "color": "#fab219",
+            "index": 6
+           },
+           "-4000000000": {
+            "text": "No Anchor",
+            "color": "#898781",
+            "index": 7
+           },
+           "-5000000000": {
+            "text": "Past T",
+            "color": "#fab219",
+            "index": 8
+           },
+           "-6000000000": {
+            "text": "No Mean",
+            "color": "#898781",
+            "index": 9
+           },
+           "-9000000000": {
+            "text": "No Entry",
+            "color": "#fab219",
+            "index": 10
+           }
+          }
+         }
+        ]
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "Bid 1+2 Depth · Bull"
+      },
+      "properties": [
+       {
+        "id": "unit",
+        "value": "suffix: ct"
+       },
+       {
+        "id": "decimals",
+        "value": 2
+       },
+       {
+        "id": "color",
+        "value": {
+         "mode": "fixed",
+         "fixedColor": "#d95926"
+        }
+       },
+       {
+        "id": "custom.hideFrom",
+        "value": {
+         "legend": true,
+         "tooltip": false,
+         "viz": true
+        }
+       },
+       {
+        "id": "mappings",
+        "value": [
+         {
+          "type": "value",
+          "options": {
+           "-2000000000": {
+            "text": "No Book",
+            "color": "#898781",
+            "index": 0
+           },
+           "-3000000000": {
+            "text": "No Notional",
+            "color": "#898781",
+            "index": 1
+           },
+           "-4000000000": {
+            "text": "No Anchor",
+            "color": "#898781",
+            "index": 2
+           },
+           "-5000000000": {
+            "text": "Past T",
+            "color": "#898781",
+            "index": 3
+           },
+           "-6000000000": {
+            "text": "No Mean",
+            "color": "#898781",
+            "index": 4
+           },
+           "-7000000000": {
+            "text": "Not Recorded",
+            "color": "#898781",
+            "index": 5
+           },
+           "-9000000000": {
+            "text": "No Entry",
+            "color": "#898781",
+            "index": 6
+           },
+           "-10000000000": {
+            "text": "Other Side",
+            "color": "#898781",
+            "index": 7
+           }
+          }
+         }
+        ]
+       },
+       {
+        "id": "displayName",
+        "value": "Bid 1+2 Depth · ${bull}"
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "Bid 1+2 Depth · Bear"
+      },
+      "properties": [
+       {
+        "id": "unit",
+        "value": "suffix: ct"
+       },
+       {
+        "id": "decimals",
+        "value": 2
+       },
+       {
+        "id": "color",
+        "value": {
+         "mode": "fixed",
+         "fixedColor": "#d95926"
+        }
+       },
+       {
+        "id": "custom.hideFrom",
+        "value": {
+         "legend": true,
+         "tooltip": false,
+         "viz": true
+        }
+       },
+       {
+        "id": "mappings",
+        "value": [
+         {
+          "type": "value",
+          "options": {
+           "-2000000000": {
+            "text": "No Book",
+            "color": "#898781",
+            "index": 0
+           },
+           "-3000000000": {
+            "text": "No Notional",
+            "color": "#898781",
+            "index": 1
+           },
+           "-4000000000": {
+            "text": "No Anchor",
+            "color": "#898781",
+            "index": 2
+           },
+           "-5000000000": {
+            "text": "Past T",
+            "color": "#898781",
+            "index": 3
+           },
+           "-6000000000": {
+            "text": "No Mean",
+            "color": "#898781",
+            "index": 4
+           },
+           "-7000000000": {
+            "text": "Not Recorded",
+            "color": "#898781",
+            "index": 5
+           },
+           "-9000000000": {
+            "text": "No Entry",
+            "color": "#898781",
+            "index": 6
+           },
+           "-10000000000": {
+            "text": "Other Side",
+            "color": "#898781",
+            "index": 7
+           }
+          }
+         }
+        ]
+       },
+       {
+        "id": "displayName",
+        "value": "Bid 1+2 Depth · ${bear}"
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "Ask 1+2 Depth · Bull"
+      },
+      "properties": [
+       {
+        "id": "unit",
+        "value": "suffix: ct"
+       },
+       {
+        "id": "decimals",
+        "value": 2
+       },
+       {
+        "id": "color",
+        "value": {
+         "mode": "fixed",
+         "fixedColor": "#2a78d6"
+        }
+       },
+       {
+        "id": "custom.hideFrom",
+        "value": {
+         "legend": true,
+         "tooltip": false,
+         "viz": true
+        }
+       },
+       {
+        "id": "mappings",
+        "value": [
+         {
+          "type": "value",
+          "options": {
+           "-2000000000": {
+            "text": "No Book",
+            "color": "#898781",
+            "index": 0
+           },
+           "-3000000000": {
+            "text": "No Notional",
+            "color": "#898781",
+            "index": 1
+           },
+           "-4000000000": {
+            "text": "No Anchor",
+            "color": "#898781",
+            "index": 2
+           },
+           "-5000000000": {
+            "text": "Past T",
+            "color": "#898781",
+            "index": 3
+           },
+           "-6000000000": {
+            "text": "No Mean",
+            "color": "#898781",
+            "index": 4
+           },
+           "-7000000000": {
+            "text": "Not Recorded",
+            "color": "#898781",
+            "index": 5
+           },
+           "-9000000000": {
+            "text": "No Entry",
+            "color": "#898781",
+            "index": 6
+           },
+           "-10000000000": {
+            "text": "Other Side",
+            "color": "#898781",
+            "index": 7
+           }
+          }
+         }
+        ]
+       },
+       {
+        "id": "displayName",
+        "value": "Ask 1+2 Depth · ${bull}"
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "Ask 1+2 Depth · Bear"
+      },
+      "properties": [
+       {
+        "id": "unit",
+        "value": "suffix: ct"
+       },
+       {
+        "id": "decimals",
+        "value": 2
+       },
+       {
+        "id": "color",
+        "value": {
+         "mode": "fixed",
+         "fixedColor": "#2a78d6"
+        }
+       },
+       {
+        "id": "custom.hideFrom",
+        "value": {
+         "legend": true,
+         "tooltip": false,
+         "viz": true
+        }
+       },
+       {
+        "id": "mappings",
+        "value": [
+         {
+          "type": "value",
+          "options": {
+           "-2000000000": {
+            "text": "No Book",
+            "color": "#898781",
+            "index": 0
+           },
+           "-3000000000": {
+            "text": "No Notional",
+            "color": "#898781",
+            "index": 1
+           },
+           "-4000000000": {
+            "text": "No Anchor",
+            "color": "#898781",
+            "index": 2
+           },
+           "-5000000000": {
+            "text": "Past T",
+            "color": "#898781",
+            "index": 3
+           },
+           "-6000000000": {
+            "text": "No Mean",
+            "color": "#898781",
+            "index": 4
+           },
+           "-7000000000": {
+            "text": "Not Recorded",
+            "color": "#898781",
+            "index": 5
+           },
+           "-9000000000": {
+            "text": "No Entry",
+            "color": "#898781",
+            "index": 6
+           },
+           "-10000000000": {
+            "text": "Other Side",
+            "color": "#898781",
+            "index": 7
+           }
+          }
+         }
+        ]
+       },
+       {
+        "id": "displayName",
+        "value": "Ask 1+2 Depth · ${bear}"
+       }
+      ]
+     }
+    ]
+   },
+   "options": {
+    "legend": {
+     "displayMode": "table",
+     "placement": "right",
+     "width": 400,
+     "showLegend": true,
+     "calcs": [
+      "lastNotNull",
+      "min",
+      "max"
+     ]
+    },
+    "tooltip": {
+     "mode": "multi",
+     "sort": "none",
+     "hideZeros": false
+    }
+   },
+   "transformations": [
+    {
+     "id": "filterFieldsByName",
+     "options": {
+      "include": {
+       "names": [
+        "time",
+        "Spread",
+        "Mean",
+        "Mean + Entry",
+        "Mean − Entry",
+        "Spread · Tooltip",
+        "Real Long Spread",
+        "Real Short Spread",
+        "Mean · Tooltip",
+        "Deviation · Tooltip",
+        "Real Long Deviation · Tooltip",
+        "Real Short Deviation · Tooltip",
+        "Signal",
+        "Bid 1+2 Depth · Bull",
+        "Bid 1+2 Depth · Bear",
+        "Ask 1+2 Depth · Bull",
+        "Ask 1+2 Depth · Bear"
+       ]
+      }
+     }
+    }
+   ]
+  },
+  {
+   "id": 11,
+   "type": "timeseries",
+   "title": "Deviation · Bps",
+   "description": "Deviation = Spread − Mean · Real Long / Short Deviation = Real Long / Short Spread − Mean · Long: Real Long Deviation ≤ −Entry · Short: Real Short Deviation ≥ +Entry\n\nThe Spread chart with its Mean at zero, with signs · purple: Deviation on the mids (trades where there is no book; the only line before the recorder) · blue: Real Long Deviation, buying both legs for N through their recorded asks, never below purple · orange: Real Short Deviation, selling through the bids, never above it · a Long needs blue at or under −Entry (blue dashed), a Short orange at or over +Entry (orange dashed), Partial included; blue over +Entry or orange under −Entry is no signal · legend Min of blue, Max of orange: how far each side came toward or past its Entry (Entry Points' Best) · tooltip: each second's value or why it has none, and the Signal · Past T (amber): no signal until the dividend's amount is known · no band with No Entry · absolute values and signal dots: Entry Points · Bps.",
+   "gridPos": {
+    "x": 0,
+    "y": 36,
+    "w": 24,
+    "h": 13
+   },
+   "datasource": {
+    "type": "datasource",
+    "uid": "-- Dashboard --"
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "datasource": {
+      "type": "datasource",
+      "uid": "-- Dashboard --"
+     },
+     "panelId": 10,
+     "withTransforms": false
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "color": {
+      "mode": "fixed",
+      "fixedColor": "text"
+     },
+     "custom": {
+      "drawStyle": "line",
+      "lineInterpolation": "linear",
+      "lineWidth": 1,
+      "fillOpacity": 0,
+      "showPoints": "never",
+      "spanNulls": false,
+      "axisPlacement": "auto",
+      "axisBorderShow": false,
+      "axisWidth": 60,
+      "scaleDistribution": {
+       "type": "linear"
+      },
+      "hideFrom": {
+       "legend": false,
+       "tooltip": false,
+       "viz": false
+      },
+      "thresholdsStyle": {
+       "mode": "dashed"
+      },
+      "axisCenteredZero": true
+     },
+     "mappings": [],
+     "noValue": "No data for this selection",
+     "unit": "none",
+     "decimals": 1,
+     "thresholds": {
+      "mode": "absolute",
+      "steps": [
+       {
+        "color": "transparent",
+        "value": null
+       },
+       {
+        "color": "#898781",
+        "value": 0
+       }
+      ]
+     }
+    },
+    "overrides": [
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "Band Top"
+      },
+      "properties": [
+       {
+        "id": "color",
+        "value": {
+         "mode": "fixed",
+         "fixedColor": "#4fc3d9"
+        }
+       },
+       {
+        "id": "custom.lineWidth",
+        "value": 0
+       },
+       {
+        "id": "custom.fillBelowTo",
+        "value": "Band Bottom"
+       },
+       {
+        "id": "custom.fillOpacity",
+        "value": 8
+       },
+       {
+        "id": "custom.hideFrom",
+        "value": {
+         "legend": true,
+         "tooltip": true,
+         "viz": false
+        }
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "Band Bottom"
+      },
+      "properties": [
+       {
+        "id": "color",
+        "value": {
+         "mode": "fixed",
+         "fixedColor": "#4fc3d9"
+        }
+       },
+       {
+        "id": "custom.lineWidth",
+        "value": 0
+       },
+       {
+        "id": "custom.hideFrom",
+        "value": {
+         "legend": true,
+         "tooltip": true,
+         "viz": false
+        }
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "Deviation"
+      },
+      "properties": [
+       {
+        "id": "color",
+        "value": {
+         "mode": "fixed",
+         "fixedColor": "#9b59d0"
+        }
+       },
+       {
+        "id": "custom.lineWidth",
+        "value": 2
+       },
+       {
+        "id": "custom.hideFrom",
+        "value": {
+         "legend": false,
+         "tooltip": true,
+         "viz": false
+        }
+       },
+       {
+        "id": "noValue",
+        "value": "–"
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "Real Long Deviation"
+      },
+      "properties": [
+       {
+        "id": "color",
+        "value": {
+         "mode": "fixed",
+         "fixedColor": "#2a78d6"
+        }
+       },
+       {
+        "id": "custom.lineWidth",
+        "value": 1
+       },
+       {
+        "id": "custom.hideFrom",
+        "value": {
+         "legend": false,
+         "tooltip": true,
+         "viz": false
+        }
+       },
+       {
+        "id": "noValue",
+        "value": "–"
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "Real Short Deviation"
+      },
+      "properties": [
+       {
+        "id": "color",
+        "value": {
+         "mode": "fixed",
+         "fixedColor": "#d95926"
+        }
+       },
+       {
+        "id": "custom.lineWidth",
+        "value": 1
+       },
+       {
+        "id": "custom.hideFrom",
+        "value": {
+         "legend": false,
+         "tooltip": true,
+         "viz": false
+        }
+       },
+       {
+        "id": "noValue",
+        "value": "–"
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "+Entry"
+      },
+      "properties": [
+       {
+        "id": "color",
+        "value": {
+         "mode": "fixed",
+         "fixedColor": "#d95926"
+        }
+       },
+       {
+        "id": "custom.lineWidth",
+        "value": 1.5
+       },
+       {
+        "id": "custom.lineStyle",
+        "value": {
+         "fill": "dash",
+         "dash": [
+          6,
+          4
+         ]
+        }
+       },
+       {
+        "id": "custom.hideFrom",
+        "value": {
+         "legend": true,
+         "tooltip": true,
+         "viz": false
+        }
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "−Entry"
+      },
+      "properties": [
+       {
+        "id": "color",
+        "value": {
+         "mode": "fixed",
+         "fixedColor": "#2a78d6"
+        }
+       },
+       {
+        "id": "custom.lineWidth",
+        "value": 1.5
+       },
+       {
+        "id": "custom.lineStyle",
+        "value": {
+         "fill": "dash",
+         "dash": [
+          6,
+          4
+         ]
+        }
+       },
+       {
+        "id": "custom.hideFrom",
+        "value": {
+         "legend": true,
+         "tooltip": true,
+         "viz": false
+        }
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "Past T"
+      },
+      "properties": [
+       {
+        "id": "color",
+        "value": {
+         "mode": "fixed",
+         "fixedColor": "#fab219"
+        }
+       },
+       {
+        "id": "custom.lineWidth",
+        "value": 2
+       },
+       {
+        "id": "custom.hideFrom",
+        "value": {
+         "legend": true,
+         "tooltip": true,
+         "viz": false
+        }
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "Signed Deviation · Tooltip"
+      },
+      "properties": [
+       {
+        "id": "color",
+        "value": {
+         "mode": "fixed",
+         "fixedColor": "#9b59d0"
+        }
+       },
+       {
+        "id": "custom.hideFrom",
+        "value": {
+         "legend": true,
+         "tooltip": false,
+         "viz": true
+        }
+       },
+       {
+        "id": "mappings",
+        "value": [
+         {
+          "type": "value",
+          "options": {
+           "-2000000000": {
+            "text": "No Book",
+            "color": "#898781",
+            "index": 0
+           },
+           "-3000000000": {
+            "text": "No Notional",
+            "color": "#898781",
+            "index": 1
+           },
+           "-4000000000": {
+            "text": "No Anchor",
+            "color": "#898781",
+            "index": 2
+           },
+           "-5000000000": {
+            "text": "Past T",
+            "color": "#898781",
+            "index": 3
+           },
+           "-6000000000": {
+            "text": "No Mean",
+            "color": "#898781",
+            "index": 4
+           },
+           "-7000000000": {
+            "text": "Not Recorded",
+            "color": "#898781",
+            "index": 5
+           },
+           "-9000000000": {
+            "text": "No Entry",
+            "color": "#898781",
+            "index": 6
+           },
+           "-10000000000": {
+            "text": "Other Side",
+            "color": "#898781",
+            "index": 7
+           }
+          }
+         }
+        ]
+       },
+       {
+        "id": "displayName",
+        "value": "Deviation​"
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "Signed Real Long Deviation · Tooltip"
+      },
+      "properties": [
+       {
+        "id": "color",
+        "value": {
+         "mode": "fixed",
+         "fixedColor": "#2a78d6"
+        }
+       },
+       {
+        "id": "custom.hideFrom",
+        "value": {
+         "legend": true,
+         "tooltip": false,
+         "viz": true
+        }
+       },
+       {
+        "id": "mappings",
+        "value": [
+         {
+          "type": "value",
+          "options": {
+           "-2000000000": {
+            "text": "No Book",
+            "color": "#898781",
+            "index": 0
+           },
+           "-3000000000": {
+            "text": "No Notional",
+            "color": "#898781",
+            "index": 1
+           },
+           "-4000000000": {
+            "text": "No Anchor",
+            "color": "#898781",
+            "index": 2
+           },
+           "-5000000000": {
+            "text": "Past T",
+            "color": "#898781",
+            "index": 3
+           },
+           "-6000000000": {
+            "text": "No Mean",
+            "color": "#898781",
+            "index": 4
+           },
+           "-7000000000": {
+            "text": "Not Recorded",
+            "color": "#898781",
+            "index": 5
+           },
+           "-9000000000": {
+            "text": "No Entry",
+            "color": "#898781",
+            "index": 6
+           },
+           "-10000000000": {
+            "text": "Other Side",
+            "color": "#898781",
+            "index": 7
+           }
+          }
+         }
+        ]
+       },
+       {
+        "id": "displayName",
+        "value": "Real Long Deviation​"
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "Signed Real Short Deviation · Tooltip"
+      },
+      "properties": [
+       {
+        "id": "color",
+        "value": {
+         "mode": "fixed",
+         "fixedColor": "#d95926"
+        }
+       },
+       {
+        "id": "custom.hideFrom",
+        "value": {
+         "legend": true,
+         "tooltip": false,
+         "viz": true
+        }
+       },
+       {
+        "id": "mappings",
+        "value": [
+         {
+          "type": "value",
+          "options": {
+           "-2000000000": {
+            "text": "No Book",
+            "color": "#898781",
+            "index": 0
+           },
+           "-3000000000": {
+            "text": "No Notional",
+            "color": "#898781",
+            "index": 1
+           },
+           "-4000000000": {
+            "text": "No Anchor",
+            "color": "#898781",
+            "index": 2
+           },
+           "-5000000000": {
+            "text": "Past T",
+            "color": "#898781",
+            "index": 3
+           },
+           "-6000000000": {
+            "text": "No Mean",
+            "color": "#898781",
+            "index": 4
+           },
+           "-7000000000": {
+            "text": "Not Recorded",
+            "color": "#898781",
+            "index": 5
+           },
+           "-9000000000": {
+            "text": "No Entry",
+            "color": "#898781",
+            "index": 6
+           },
+           "-10000000000": {
+            "text": "Other Side",
+            "color": "#898781",
+            "index": 7
+           }
+          }
+         }
+        ]
+       },
+       {
+        "id": "displayName",
+        "value": "Real Short Deviation​"
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "Signal"
+      },
+      "properties": [
+       {
+        "id": "color",
+        "value": {
+         "mode": "fixed",
+         "fixedColor": "text"
+        }
+       },
+       {
+        "id": "custom.hideFrom",
+        "value": {
+         "legend": true,
+         "tooltip": false,
+         "viz": true
+        }
+       },
+       {
+        "id": "mappings",
+        "value": [
+         {
+          "type": "value",
+          "options": {
+           "0": {
+            "text": "None",
+            "color": "text",
+            "index": 0
+           },
+           "1": {
+            "text": "Long",
+            "color": "#2a78d6",
+            "index": 1
+           },
+           "2": {
+            "text": "Short",
+            "color": "#d95926",
+            "index": 2
+           },
+           "3": {
+            "text": "Long · Partial",
+            "color": "#2a78d6",
+            "index": 3
+           },
+           "4": {
+            "text": "Short · Partial",
+            "color": "#d95926",
+            "index": 4
+           },
+           "-2000000000": {
+            "text": "No Book",
+            "color": "#898781",
+            "index": 5
+           },
+           "-3000000000": {
+            "text": "No Notional",
+            "color": "#fab219",
+            "index": 6
+           },
+           "-4000000000": {
+            "text": "No Anchor",
+            "color": "#898781",
+            "index": 7
+           },
+           "-5000000000": {
+            "text": "Past T",
+            "color": "#fab219",
+            "index": 8
+           },
+           "-6000000000": {
+            "text": "No Mean",
+            "color": "#898781",
+            "index": 9
+           },
+           "-9000000000": {
+            "text": "No Entry",
+            "color": "#fab219",
+            "index": 10
+           }
+          }
+         }
+        ]
+       }
+      ]
+     }
+    ]
+   },
+   "options": {
+    "legend": {
+     "displayMode": "table",
+     "placement": "right",
+     "width": 400,
+     "showLegend": true,
+     "calcs": [
+      "lastNotNull",
+      "min",
+      "max"
+     ]
+    },
+    "tooltip": {
+     "mode": "multi",
+     "sort": "none",
+     "hideZeros": false
+    }
+   },
+   "transformations": [
+    {
+     "id": "filterFieldsByName",
+     "options": {
+      "include": {
+       "names": [
+        "time",
+        "Signed Deviation",
+        "Signed Real Long Deviation",
+        "Signed Real Short Deviation",
+        "+Entry",
+        "−Entry",
+        "Signed Past T",
+        "Signed Deviation · Tooltip",
+        "Signed Real Long Deviation · Tooltip",
+        "Signed Real Short Deviation · Tooltip",
+        "Signal"
+       ]
+      }
+     }
+    },
+    {
+     "id": "calculateField",
+     "options": {
+      "mode": "reduceRow",
+      "reduce": {
+       "include": [
+        "+Entry"
+       ],
+       "reducer": "lastNotNull"
+      },
+      "alias": "Band Top",
+      "replaceFields": false
+     }
+    },
+    {
+     "id": "calculateField",
+     "options": {
+      "mode": "reduceRow",
+      "reduce": {
+       "include": [
+        "−Entry"
+       ],
+       "reducer": "lastNotNull"
+      },
+      "alias": "Band Bottom",
+      "replaceFields": false
+     }
+    },
+    {
+     "id": "organize",
+     "options": {
+      "indexByName": {
+       "time": 0,
+       "Band Top": 1,
+       "Band Bottom": 2,
+       "Signed Deviation": 3,
+       "Signed Real Long Deviation": 4,
+       "Signed Real Short Deviation": 5,
+       "+Entry": 6,
+       "−Entry": 7,
+       "Signed Past T": 8,
+       "Signed Deviation · Tooltip": 9,
+       "Signed Real Long Deviation · Tooltip": 10,
+       "Signed Real Short Deviation · Tooltip": 11,
+       "Signal": 12
+      },
+      "renameByName": {
+       "Signed Deviation": "Deviation",
+       "Signed Real Long Deviation": "Real Long Deviation",
+       "Signed Real Short Deviation": "Real Short Deviation",
+       "Signed Past T": "Past T"
+      },
+      "excludeByName": {}
+     }
+    }
+   ]
+  },
+  {
+   "id": 12,
+   "type": "timeseries",
+   "title": "Entry Points · Bps",
+   "description": "Deviation = |Spread − Mean| · Real Long Deviation = |Real Long Spread − Mean| · Real Short Deviation = |Real Short Spread − Mean| · Long: Real Long Spread ≤ Mean − Entry · Short: Real Short Spread ≥ Mean + Entry\n\nAll three are absolute (with their signs: Deviation · Bps); each real line is bright on the side of the Mean its real spread can fill on and faded on the other: Real Long Deviation (blue) bright while Real Long Spread is below the Mean, Real Short Deviation (orange) bright while Real Short Spread is above it, so a bright line above Entry (dashed) is a signal of its side and a faded one is none (Signal · Latest Second shows a faded side as Other Side) · Long Points, Short Points: a dot on the blue, orange line at each drawn second whose Signal is Long, Short (Partial included), counted in the legend · Real Long, Real Short Deviation: buying, selling both legs for the notional through their recorded levels, the Signal's spreads; none without both legs' books · Deviation (grey): on the basis prices, the only line before the recorder · legend Last, Max: the newest and the largest value of each bright line (Max: Entry Points' Best of the range), the counts in the range · tooltip: each row is that second's value, absolute whatever its side, or the reason it has none (No Anchor, Past T, No Mean, No Notional, No Book), and the Signal · No Entry (Entry not a positive number): no Entry line, no dots · empty until the session's mean is ready, and with no valid Mean Scale · Past T, amber: the deviation from the instant a leg's dividend takes effect without its amount until it is known, no signal and not counted · points are coarser on longer ranges, so counts do not compare across ranges.",
+   "gridPos": {
+    "x": 0,
+    "y": 49,
+    "w": 24,
+    "h": 13
+   },
+   "datasource": {
+    "type": "datasource",
+    "uid": "-- Dashboard --"
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "datasource": {
+      "type": "datasource",
+      "uid": "-- Dashboard --"
+     },
+     "panelId": 10,
+     "withTransforms": false
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "color": {
+      "mode": "fixed",
+      "fixedColor": "text"
+     },
+     "custom": {
+      "drawStyle": "line",
+      "lineInterpolation": "linear",
+      "lineWidth": 1,
+      "fillOpacity": 0,
+      "showPoints": "never",
+      "spanNulls": false,
+      "axisPlacement": "auto",
+      "axisBorderShow": false,
+      "axisWidth": 60,
+      "scaleDistribution": {
+       "type": "linear"
+      },
+      "hideFrom": {
+       "legend": false,
+       "tooltip": false,
+       "viz": false
+      },
+      "axisSoftMin": 0,
+      "thresholdsStyle": {
+       "mode": "dashed"
+      }
+     },
+     "mappings": [],
+     "noValue": "No data for this selection",
+     "unit": "none",
+     "decimals": 1,
+     "thresholds": {
+      "mode": "absolute",
+      "steps": [
+       {
+        "color": "transparent",
+        "value": null
+       },
+       {
+        "color": "#898781",
+        "value": 0
+       }
+      ]
+     }
+    },
+    "overrides": [
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "Long Points"
+      },
+      "properties": [
+       {
+        "id": "color",
+        "value": {
+         "mode": "fixed",
+         "fixedColor": "#2a78d6"
+        }
+       },
+       {
+        "id": "custom.lineWidth",
+        "value": 0
+       },
+       {
+        "id": "custom.axisPlacement",
+        "value": "hidden"
+       },
+       {
+        "id": "unit",
+        "value": "locale"
+       },
+       {
+        "id": "decimals",
+        "value": 0
+       },
+       {
+        "id": "custom.thresholdsStyle",
+        "value": {
+         "mode": "off"
+        }
+       },
+       {
+        "id": "custom.hideFrom",
+        "value": {
+         "legend": false,
+         "tooltip": true,
+         "viz": false
+        }
+       },
+       {
+        "id": "noValue",
+        "value": "–"
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "Short Points"
+      },
+      "properties": [
+       {
+        "id": "color",
+        "value": {
+         "mode": "fixed",
+         "fixedColor": "#d95926"
+        }
+       },
+       {
+        "id": "custom.lineWidth",
+        "value": 0
+       },
+       {
+        "id": "custom.axisPlacement",
+        "value": "hidden"
+       },
+       {
+        "id": "unit",
+        "value": "locale"
+       },
+       {
+        "id": "decimals",
+        "value": 0
+       },
+       {
+        "id": "custom.thresholdsStyle",
+        "value": {
+         "mode": "off"
+        }
+       },
+       {
+        "id": "custom.hideFrom",
+        "value": {
+         "legend": false,
+         "tooltip": true,
+         "viz": false
+        }
+       },
+       {
+        "id": "noValue",
+        "value": "–"
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "Deviation"
+      },
+      "properties": [
+       {
+        "id": "color",
+        "value": {
+         "mode": "fixed",
+         "fixedColor": "#898781"
+        }
+       },
+       {
+        "id": "custom.lineWidth",
+        "value": 1
+       },
+       {
+        "id": "custom.hideFrom",
+        "value": {
+         "legend": false,
+         "tooltip": true,
+         "viz": false
+        }
+       },
+       {
+        "id": "noValue",
+        "value": "–"
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "Real Long Deviation · Faded"
+      },
+      "properties": [
+       {
+        "id": "color",
+        "value": {
+         "mode": "fixed",
+         "fixedColor": "#2a78d640"
+        }
+       },
+       {
+        "id": "custom.lineWidth",
+        "value": 1.5
+       },
+       {
+        "id": "custom.hideFrom",
+        "value": {
+         "legend": true,
+         "tooltip": true,
+         "viz": false
+        }
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "Real Short Deviation · Faded"
+      },
+      "properties": [
+       {
+        "id": "color",
+        "value": {
+         "mode": "fixed",
+         "fixedColor": "#d9592640"
+        }
+       },
+       {
+        "id": "custom.lineWidth",
+        "value": 1.5
+       },
+       {
+        "id": "custom.hideFrom",
+        "value": {
+         "legend": true,
+         "tooltip": true,
+         "viz": false
+        }
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "Real Long Deviation"
+      },
+      "properties": [
+       {
+        "id": "color",
+        "value": {
+         "mode": "fixed",
+         "fixedColor": "#2a78d6"
+        }
+       },
+       {
+        "id": "custom.lineWidth",
+        "value": 1.5
+       },
+       {
+        "id": "custom.hideFrom",
+        "value": {
+         "legend": false,
+         "tooltip": true,
+         "viz": false
+        }
+       },
+       {
+        "id": "noValue",
+        "value": "–"
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "Real Short Deviation"
+      },
+      "properties": [
+       {
+        "id": "color",
+        "value": {
+         "mode": "fixed",
+         "fixedColor": "#d95926"
+        }
+       },
+       {
+        "id": "custom.lineWidth",
+        "value": 1.5
+       },
+       {
+        "id": "custom.hideFrom",
+        "value": {
+         "legend": false,
+         "tooltip": true,
+         "viz": false
+        }
+       },
+       {
+        "id": "noValue",
+        "value": "–"
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "Past T"
+      },
+      "properties": [
+       {
+        "id": "color",
+        "value": {
+         "mode": "fixed",
+         "fixedColor": "#fab219"
+        }
+       },
+       {
+        "id": "custom.lineWidth",
+        "value": 2
+       },
+       {
+        "id": "custom.hideFrom",
+        "value": {
+         "legend": true,
+         "tooltip": true,
+         "viz": false
+        }
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "+Entry"
+      },
+      "properties": [
+       {
+        "id": "color",
+        "value": {
+         "mode": "fixed",
+         "fixedColor": "#4fc3d9"
+        }
+       },
+       {
+        "id": "custom.lineWidth",
+        "value": 1
+       },
+       {
+        "id": "custom.lineStyle",
+        "value": {
+         "fill": "dash",
+         "dash": [
+          6,
+          4
+         ]
+        }
+       },
+       {
+        "id": "custom.hideFrom",
+        "value": {
+         "legend": true,
+         "tooltip": true,
+         "viz": false
+        }
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "Long Dots"
+      },
+      "properties": [
+       {
+        "id": "color",
+        "value": {
+         "mode": "fixed",
+         "fixedColor": "#2a78d6"
+        }
+       },
+       {
+        "id": "custom.drawStyle",
+        "value": "points"
+       },
+       {
+        "id": "custom.pointSize",
+        "value": 9
+       },
+       {
+        "id": "custom.hideFrom",
+        "value": {
+         "legend": true,
+         "tooltip": true,
+         "viz": false
+        }
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "Short Dots"
+      },
+      "properties": [
+       {
+        "id": "color",
+        "value": {
+         "mode": "fixed",
+         "fixedColor": "#d95926"
+        }
+       },
+       {
+        "id": "custom.drawStyle",
+        "value": "points"
+       },
+       {
+        "id": "custom.pointSize",
+        "value": 9
+       },
+       {
+        "id": "custom.hideFrom",
+        "value": {
+         "legend": true,
+         "tooltip": true,
+         "viz": false
+        }
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "Deviation · Tooltip"
+      },
+      "properties": [
+       {
+        "id": "color",
+        "value": {
+         "mode": "fixed",
+         "fixedColor": "#898781"
+        }
+       },
+       {
+        "id": "custom.hideFrom",
+        "value": {
+         "legend": true,
+         "tooltip": false,
+         "viz": true
+        }
+       },
+       {
+        "id": "mappings",
+        "value": [
+         {
+          "type": "value",
+          "options": {
+           "-2000000000": {
+            "text": "No Book",
+            "color": "#898781",
+            "index": 0
+           },
+           "-3000000000": {
+            "text": "No Notional",
+            "color": "#898781",
+            "index": 1
+           },
+           "-4000000000": {
+            "text": "No Anchor",
+            "color": "#898781",
+            "index": 2
+           },
+           "-5000000000": {
+            "text": "Past T",
+            "color": "#898781",
+            "index": 3
+           },
+           "-6000000000": {
+            "text": "No Mean",
+            "color": "#898781",
+            "index": 4
+           },
+           "-7000000000": {
+            "text": "Not Recorded",
+            "color": "#898781",
+            "index": 5
+           },
+           "-9000000000": {
+            "text": "No Entry",
+            "color": "#898781",
+            "index": 6
+           },
+           "-10000000000": {
+            "text": "Other Side",
+            "color": "#898781",
+            "index": 7
+           }
+          }
+         }
+        ]
+       },
+       {
+        "id": "displayName",
+        "value": "Deviation​"
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "Real Long Deviation · Tooltip"
+      },
+      "properties": [
+       {
+        "id": "color",
+        "value": {
+         "mode": "fixed",
+         "fixedColor": "#2a78d6"
+        }
+       },
+       {
+        "id": "custom.hideFrom",
+        "value": {
+         "legend": true,
+         "tooltip": false,
+         "viz": true
+        }
+       },
+       {
+        "id": "mappings",
+        "value": [
+         {
+          "type": "value",
+          "options": {
+           "-2000000000": {
+            "text": "No Book",
+            "color": "#898781",
+            "index": 0
+           },
+           "-3000000000": {
+            "text": "No Notional",
+            "color": "#898781",
+            "index": 1
+           },
+           "-4000000000": {
+            "text": "No Anchor",
+            "color": "#898781",
+            "index": 2
+           },
+           "-5000000000": {
+            "text": "Past T",
+            "color": "#898781",
+            "index": 3
+           },
+           "-6000000000": {
+            "text": "No Mean",
+            "color": "#898781",
+            "index": 4
+           },
+           "-7000000000": {
+            "text": "Not Recorded",
+            "color": "#898781",
+            "index": 5
+           },
+           "-9000000000": {
+            "text": "No Entry",
+            "color": "#898781",
+            "index": 6
+           },
+           "-10000000000": {
+            "text": "Other Side",
+            "color": "#898781",
+            "index": 7
+           }
+          }
+         }
+        ]
+       },
+       {
+        "id": "displayName",
+        "value": "Real Long Deviation​"
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "Real Short Deviation · Tooltip"
+      },
+      "properties": [
+       {
+        "id": "color",
+        "value": {
+         "mode": "fixed",
+         "fixedColor": "#d95926"
+        }
+       },
+       {
+        "id": "custom.hideFrom",
+        "value": {
+         "legend": true,
+         "tooltip": false,
+         "viz": true
+        }
+       },
+       {
+        "id": "mappings",
+        "value": [
+         {
+          "type": "value",
+          "options": {
+           "-2000000000": {
+            "text": "No Book",
+            "color": "#898781",
+            "index": 0
+           },
+           "-3000000000": {
+            "text": "No Notional",
+            "color": "#898781",
+            "index": 1
+           },
+           "-4000000000": {
+            "text": "No Anchor",
+            "color": "#898781",
+            "index": 2
+           },
+           "-5000000000": {
+            "text": "Past T",
+            "color": "#898781",
+            "index": 3
+           },
+           "-6000000000": {
+            "text": "No Mean",
+            "color": "#898781",
+            "index": 4
+           },
+           "-7000000000": {
+            "text": "Not Recorded",
+            "color": "#898781",
+            "index": 5
+           },
+           "-9000000000": {
+            "text": "No Entry",
+            "color": "#898781",
+            "index": 6
+           },
+           "-10000000000": {
+            "text": "Other Side",
+            "color": "#898781",
+            "index": 7
+           }
+          }
+         }
+        ]
+       },
+       {
+        "id": "displayName",
+        "value": "Real Short Deviation​"
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "Signal"
+      },
+      "properties": [
+       {
+        "id": "color",
+        "value": {
+         "mode": "fixed",
+         "fixedColor": "text"
+        }
+       },
+       {
+        "id": "custom.hideFrom",
+        "value": {
+         "legend": true,
+         "tooltip": false,
+         "viz": true
+        }
+       },
+       {
+        "id": "mappings",
+        "value": [
+         {
+          "type": "value",
+          "options": {
+           "0": {
+            "text": "None",
+            "color": "text",
+            "index": 0
+           },
+           "1": {
+            "text": "Long",
+            "color": "#2a78d6",
+            "index": 1
+           },
+           "2": {
+            "text": "Short",
+            "color": "#d95926",
+            "index": 2
+           },
+           "3": {
+            "text": "Long · Partial",
+            "color": "#2a78d6",
+            "index": 3
+           },
+           "4": {
+            "text": "Short · Partial",
+            "color": "#d95926",
+            "index": 4
+           },
+           "-2000000000": {
+            "text": "No Book",
+            "color": "#898781",
+            "index": 5
+           },
+           "-3000000000": {
+            "text": "No Notional",
+            "color": "#fab219",
+            "index": 6
+           },
+           "-4000000000": {
+            "text": "No Anchor",
+            "color": "#898781",
+            "index": 7
+           },
+           "-5000000000": {
+            "text": "Past T",
+            "color": "#fab219",
+            "index": 8
+           },
+           "-6000000000": {
+            "text": "No Mean",
+            "color": "#898781",
+            "index": 9
+           },
+           "-9000000000": {
+            "text": "No Entry",
+            "color": "#fab219",
+            "index": 10
+           }
+          }
+         }
+        ]
+       }
+      ]
+     }
+    ]
+   },
+   "options": {
+    "legend": {
+     "displayMode": "table",
+     "placement": "right",
+     "width": 400,
+     "showLegend": true,
+     "calcs": [
+      "max"
+     ]
+    },
+    "tooltip": {
+     "mode": "multi",
+     "sort": "none",
+     "hideZeros": false
+    }
+   },
+   "transformations": [
+    {
+     "id": "filterFieldsByName",
+     "options": {
+      "include": {
+       "names": [
+        "time",
+        "Long Points",
+        "Short Points",
+        "Deviation · Line",
+        "Real Long Deviation · Faded",
+        "Real Short Deviation · Faded",
+        "Real Long Deviation",
+        "Real Short Deviation",
+        "Past T",
+        "+Entry",
+        "Long Dots",
+        "Short Dots",
+        "Deviation · Tooltip",
+        "Real Long Deviation · Tooltip",
+        "Real Short Deviation · Tooltip",
+        "Signal"
+       ]
+      }
+     }
+    },
+    {
+     "id": "organize",
+     "options": {
+      "indexByName": {
+       "time": 0,
+       "Long Points": 1,
+       "Short Points": 2,
+       "Deviation · Line": 3,
+       "Real Long Deviation · Faded": 4,
+       "Real Short Deviation · Faded": 5,
+       "Real Long Deviation": 6,
+       "Real Short Deviation": 7,
+       "Past T": 8,
+       "+Entry": 9,
+       "Long Dots": 10,
+       "Short Dots": 11,
+       "Deviation · Tooltip": 12,
+       "Real Long Deviation · Tooltip": 13,
+       "Real Short Deviation · Tooltip": 14,
+       "Signal": 15
+      },
+      "renameByName": {
+       "Deviation · Line": "Deviation"
+      },
+      "excludeByName": {}
+     }
+    }
+   ]
+  },
+  {
+   "id": 13,
+   "type": "table",
+   "title": "Entry Points by Phase · Bps",
+   "description": "Long Points: Real Long Spread ≤ Mean − Entry · Short Points: Real Short Spread ≥ Mean + Entry · Best: the largest absolute deviation on the favourable side\n\nThe drawn points of the time range with a deviation, by the US market phase they fall in, counted as the Signal reads them, at the notional (none Long, Short or No Book with No Entry or No Notional) · Partial Points: Long and Short points whose side the recorded levels filled less than N, already in Long Points and Short Points · Best Long: the largest Real Long Deviation of the points whose Real Long Spread is below the Mean, Best Short: the largest Real Short Deviation of those whose Real Short Spread is above it (the legend Max of the bright lines on Entry Points · Bps); how far each side came toward or past its Entry (not past T; – where none) · Past T Points: points past the instant a leg's dividend took effect without its amount, amber · No Book Points: points without both legs' books (on trade prices) · these two are in neither Long nor Short Points · Points: every point with a deviation, these included · counts depend on the range, as in the chart.",
+   "gridPos": {
+    "x": 0,
+    "y": 62,
+    "w": 24,
+    "h": 8
+   },
+   "datasource": {
+    "type": "datasource",
+    "uid": "-- Dashboard --"
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "datasource": {
+      "type": "datasource",
+      "uid": "-- Dashboard --"
+     },
+     "panelId": 10,
+     "withTransforms": false
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "color": {
+      "mode": "fixed",
+      "fixedColor": "text"
+     },
+     "custom": {
+      "align": "auto",
+      "cellOptions": {
+       "type": "auto"
+      },
+      "filterable": false,
+      "inspect": false,
+      "minWidth": 60,
+      "wrapHeaderText": true
+     },
+     "mappings": [],
+     "noValue": "–"
+    },
+    "overrides": [
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "Phase"
+      },
+      "properties": [
+       {
+        "id": "custom.cellOptions",
+        "value": {
+         "type": "color-text"
+        }
+       },
+       {
+        "id": "mappings",
+        "value": [
+         {
+          "type": "value",
+          "options": {
+           "1": {
+            "text": "Pre-Market",
+            "color": "#b88a0a",
+            "index": 0
+           },
+           "2": {
+            "text": "Regular",
+            "color": "#898781",
+            "index": 1
+           },
+           "3": {
+            "text": "After-Hours",
+            "color": "#d55181",
+            "index": 2
+           },
+           "4": {
+            "text": "Overnight",
+            "color": "#4f8fe6",
+            "index": 3
+           },
+           "5": {
+            "text": "Closed",
+            "color": "#898781",
+            "index": 4
+           }
+          }
+         }
+        ]
+       },
+       {
+        "id": "custom.width",
+        "value": 96
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "Long Points"
+      },
+      "properties": [
+       {
+        "id": "custom.align",
+        "value": "right"
+       },
+       {
+        "id": "unit",
+        "value": "locale"
+       },
+       {
+        "id": "decimals",
+        "value": 0
+       },
+       {
+        "id": "custom.width",
+        "value": 80
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "Short Points"
+      },
+      "properties": [
+       {
+        "id": "custom.align",
+        "value": "right"
+       },
+       {
+        "id": "unit",
+        "value": "locale"
+       },
+       {
+        "id": "decimals",
+        "value": 0
+       },
+       {
+        "id": "custom.width",
+        "value": 80
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "Partial Points"
+      },
+      "properties": [
+       {
+        "id": "custom.align",
+        "value": "right"
+       },
+       {
+        "id": "unit",
+        "value": "locale"
+       },
+       {
+        "id": "decimals",
+        "value": 0
+       },
+       {
+        "id": "custom.width",
+        "value": 80
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "Best Long"
+      },
+      "properties": [
+       {
+        "id": "custom.align",
+        "value": "right"
+       },
+       {
+        "id": "unit",
+        "value": "none"
+       },
+       {
+        "id": "decimals",
+        "value": 1
+       },
+       {
+        "id": "custom.width",
+        "value": 80
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "Best Short"
+      },
+      "properties": [
+       {
+        "id": "custom.align",
+        "value": "right"
+       },
+       {
+        "id": "unit",
+        "value": "none"
+       },
+       {
+        "id": "decimals",
+        "value": 1
+       },
+       {
+        "id": "custom.width",
+        "value": 80
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "Past T Points"
+      },
+      "properties": [
+       {
+        "id": "custom.cellOptions",
+        "value": {
+         "type": "color-text"
+        }
+       },
+       {
+        "id": "color",
+        "value": {
+         "mode": "thresholds"
+        }
+       },
+       {
+        "id": "thresholds",
+        "value": {
+         "mode": "absolute",
+         "steps": [
+          {
+           "color": "text",
+           "value": null
+          },
+          {
+           "color": "#fab219",
+           "value": 1
+          }
+         ]
+        }
+       },
+       {
+        "id": "custom.align",
+        "value": "right"
+       },
+       {
+        "id": "unit",
+        "value": "locale"
+       },
+       {
+        "id": "decimals",
+        "value": 0
+       },
+       {
+        "id": "custom.width",
+        "value": 80
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "No Book Points"
+      },
+      "properties": [
+       {
+        "id": "custom.align",
+        "value": "right"
+       },
+       {
+        "id": "unit",
+        "value": "locale"
+       },
+       {
+        "id": "decimals",
+        "value": 0
+       },
+       {
+        "id": "custom.width",
+        "value": 80
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "Points"
+      },
+      "properties": [
+       {
+        "id": "custom.align",
+        "value": "right"
+       },
+       {
+        "id": "unit",
+        "value": "locale"
+       },
+       {
+        "id": "decimals",
+        "value": 0
+       },
+       {
+        "id": "custom.width",
+        "value": 80
+       }
+      ]
+     }
+    ]
+   },
+   "options": {
+    "showHeader": true,
+    "cellHeight": "sm",
+    "footer": {
+     "show": false
+    }
+   },
+   "transformations": [
+    {
+     "id": "filterByValue",
+     "options": {
+      "filters": [
+       {
+        "fieldName": "Phase",
+        "config": {
+         "id": "isNotNull",
+         "options": {}
+        }
+       }
+      ],
+      "type": "include",
+      "match": "any"
+     }
+    },
+    {
+     "id": "groupBy",
+     "options": {
+      "fields": {
+       "Phase": {
+        "operation": "groupby",
+        "aggregations": []
+       },
+       "Long Point": {
+        "operation": "aggregate",
+        "aggregations": [
+         "sum",
+         "count"
+        ]
+       },
+       "Short Point": {
+        "operation": "aggregate",
+        "aggregations": [
+         "sum"
+        ]
+       },
+       "Partial Point": {
+        "operation": "aggregate",
+        "aggregations": [
+         "sum"
+        ]
+       },
+       "Past T Point": {
+        "operation": "aggregate",
+        "aggregations": [
+         "sum"
+        ]
+       },
+       "No Book Point": {
+        "operation": "aggregate",
+        "aggregations": [
+         "sum"
+        ]
+       },
+       "Best Long": {
+        "operation": "aggregate",
+        "aggregations": [
+         "max"
+        ]
+       },
+       "Best Short": {
+        "operation": "aggregate",
+        "aggregations": [
+         "max"
+        ]
+       }
+      }
+     }
+    },
+    {
+     "id": "sortBy",
+     "options": {
+      "fields": {},
+      "sort": [
+       {
+        "field": "Phase",
+        "desc": false
+       }
+      ]
+     }
+    },
+    {
+     "id": "organize",
+     "options": {
+      "indexByName": {
+       "Phase": 0,
+       "Long Point (sum)": 1,
+       "Short Point (sum)": 2,
+       "Partial Point (sum)": 3,
+       "Best Long (max)": 4,
+       "Best Short (max)": 5,
+       "Past T Point (sum)": 6,
+       "No Book Point (sum)": 7,
+       "Long Point (count)": 8
+      },
+      "renameByName": {
+       "Long Point (sum)": "Long Points",
+       "Short Point (sum)": "Short Points",
+       "Partial Point (sum)": "Partial Points",
+       "Best Long (max)": "Best Long",
+       "Best Short (max)": "Best Short",
+       "Past T Point (sum)": "Past T Points",
+       "No Book Point (sum)": "No Book Points",
+       "Long Point (count)": "Points"
+      },
+      "excludeByName": {}
+     }
+    }
+   ]
+  },
+  {
+   "id": 14,
+   "type": "row",
+   "title": "Prices · ${venue:text}",
+   "collapsed": false,
+   "gridPos": {
+    "x": 0,
+    "y": 70,
+    "w": 24,
+    "h": 1
+   },
+   "panels": []
+  },
+  {
+   "id": 15,
+   "type": "timeseries",
+   "title": "${bull} Price · USDT",
+   "description": "Return = Price ÷ Anchor (USDT) − 1 · Anchor (USDT) = Anchor (USD) ÷ F\n\nPrice: perp last trade as of each point's time, at the seconds both legs have one, none during a split's halt · Anchor (USD): the session's anchor, the bell, F × Binance's index of the perp at the close (Bitget's before Binance lists the perp), replaced for the whole session by the issuer's NAV once stable; less a dividend, or over a split's ratio, from the instant it takes effect; legend and tooltip only · Anchor (USDT): the price where Return is 0, moves slightly with F · F: USD/USDT · Return: right axis, %.",
+   "gridPos": {
+    "x": 0,
+    "y": 71,
+    "w": 24,
+    "h": 10
+   },
+   "datasource": {
+    "type": "grafana-postgresql-datasource",
+    "uid": "etfpair"
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "datasource": {
+      "type": "grafana-postgresql-datasource",
+      "uid": "etfpair"
+     },
+     "format": "table",
+     "rawQuery": true,
+     "editorMode": "code",
+     "rawSql": "SELECT to_timestamp(p.ts_ms / 1000.0) AS time,\n       p.p_bull AS \"Bull Price\",\n       (floor((p.a_bull / p.fx)::float8 * 1e2::float8 + 0.5) / 1e2::float8) AS \"Bull Anchor (USDT)\",\n       (floor((p.a_bull)::float8 * 1e2::float8 + 0.5) / 1e2::float8) AS \"Bull Anchor (USD)\",\n       (floor((100 * (p.fx * p.p_bull / p.a_bull - 1))::float8 * 1e2::float8 + 0.5) / 1e2::float8) AS \"Bull Return\",\n       p.p_bear AS \"Bear Price\",\n       (floor((p.a_bear / p.fx)::float8 * 1e2::float8 + 0.5) / 1e2::float8) AS \"Bear Anchor (USDT)\",\n       (floor((p.a_bear)::float8 * 1e2::float8 + 0.5) / 1e2::float8) AS \"Bear Anchor (USD)\",\n       (floor((100 * (p.fx * p.p_bear / p.a_bear - 1))::float8 * 1e2::float8 + 0.5) / 1e2::float8) AS \"Bear Return\",\n       p.p_ref AS \"Ref Price\",\n       (floor((p.a_ref / p.fx)::float8 * 1e2::float8 + 0.5) / 1e2::float8) AS \"Ref Anchor (USDT)\",\n       (floor((p.a_ref)::float8 * 1e2::float8 + 0.5) / 1e2::float8) AS \"Ref Anchor (USD)\",\n       (floor((100 * (p.fx * p.p_ref / p.a_ref - 1))::float8 * 1e2::float8 + 0.5) / 1e2::float8) AS \"Ref Return\",\n       (floor((100 * (p.fx * p.p_bull / p.a_bull + p.fx * p.p_bear / p.a_bear - 2) / 3)::float8 * 1e3::float8 + 0.5) / 1e3::float8) AS \"Sum\",\n       (floor((100 * (p.fx * p.p_bull / p.a_bull - 1) / 3)::float8 * 1e2::float8 + 0.5) / 1e2::float8) AS \"Bull Leg\",\n       (floor((100 * (p.fx * p.p_bear / p.a_bear - 1) / 3)::float8 * 1e2::float8 + 0.5) / 1e2::float8) AS \"Bear Leg\"\nFROM etfpair.combo_prices('$combo', '$venue', $__from, $__to, (SELECT CASE WHEN r <= 1000 THEN 1000 WHEN r <= 5000 THEN 5000 WHEN r <= 10000 THEN 10000 WHEN r <= 30000 THEN 30000 ELSE ceil(r / 60000) * 60000 END::bigint FROM (SELECT ($__to - $__from) / 5000.0 AS r) x)) p\nORDER BY p.ts_ms"
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "color": {
+      "mode": "fixed",
+      "fixedColor": "text"
+     },
+     "custom": {
+      "drawStyle": "line",
+      "lineInterpolation": "linear",
+      "lineWidth": 1,
+      "fillOpacity": 0,
+      "showPoints": "never",
+      "spanNulls": false,
+      "axisPlacement": "auto",
+      "axisBorderShow": false,
+      "axisWidth": 60,
+      "scaleDistribution": {
+       "type": "linear"
+      },
+      "hideFrom": {
+       "legend": false,
+       "tooltip": false,
+       "viz": false
+      }
+     },
+     "mappings": [],
+     "noValue": "No data for this selection",
+     "unit": "none",
+     "decimals": 2
+    },
+    "overrides": [
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "Price"
+      },
+      "properties": [
+       {
+        "id": "color",
+        "value": {
+         "mode": "fixed",
+         "fixedColor": "#2a78d6"
+        }
+       },
+       {
+        "id": "custom.lineWidth",
+        "value": 2
+       },
+       {
+        "id": "noValue",
+        "value": "–"
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "Anchor (USDT)"
+      },
+      "properties": [
+       {
+        "id": "color",
+        "value": {
+         "mode": "fixed",
+         "fixedColor": "#a8a69e"
+        }
+       },
+       {
+        "id": "custom.lineWidth",
+        "value": 1
+       },
+       {
+        "id": "custom.lineStyle",
+        "value": {
+         "fill": "dash",
+         "dash": [
+          8,
+          4
+         ]
+        }
+       },
+       {
+        "id": "noValue",
+        "value": "–"
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "Anchor (USD)"
+      },
+      "properties": [
+       {
+        "id": "color",
+        "value": {
+         "mode": "fixed",
+         "fixedColor": "#a8a69e"
+        }
+       },
+       {
+        "id": "custom.lineWidth",
+        "value": 0
+       },
+       {
+        "id": "custom.axisPlacement",
+        "value": "hidden"
+       },
+       {
+        "id": "noValue",
+        "value": "–"
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "Return"
+      },
+      "properties": [
+       {
+        "id": "color",
+        "value": {
+         "mode": "fixed",
+         "fixedColor": "#898781"
+        }
+       },
+       {
+        "id": "custom.lineWidth",
+        "value": 1
+       },
+       {
+        "id": "custom.axisPlacement",
+        "value": "right"
+       },
+       {
+        "id": "unit",
+        "value": "percent"
+       },
+       {
+        "id": "decimals",
+        "value": 2
+       },
+       {
+        "id": "noValue",
+        "value": "–"
+       }
+      ]
+     }
+    ]
+   },
+   "options": {
+    "legend": {
+     "displayMode": "table",
+     "placement": "right",
+     "width": 348,
+     "showLegend": true,
+     "calcs": [
+      "lastNotNull",
+      "min",
+      "max"
+     ]
+    },
+    "tooltip": {
+     "mode": "multi",
+     "sort": "none",
+     "hideZeros": false
+    }
+   },
+   "transformations": [
+    {
+     "id": "filterFieldsByName",
+     "options": {
+      "include": {
+       "names": [
+        "time",
+        "Bull Price",
+        "Bull Anchor (USDT)",
+        "Bull Anchor (USD)",
+        "Bull Return"
+       ]
+      }
+     }
+    },
+    {
+     "id": "organize",
+     "options": {
+      "indexByName": {
+       "time": 0,
+       "Bull Price": 1,
+       "Bull Anchor (USDT)": 2,
+       "Bull Anchor (USD)": 3,
+       "Bull Return": 4
+      },
+      "renameByName": {
+       "Bull Price": "Price",
+       "Bull Anchor (USDT)": "Anchor (USDT)",
+       "Bull Anchor (USD)": "Anchor (USD)",
+       "Bull Return": "Return"
+      },
+      "excludeByName": {}
+     }
+    }
+   ]
+  },
+  {
+   "id": 16,
+   "type": "timeseries",
+   "title": "${bear} Price · USDT",
+   "description": "Return = Price ÷ Anchor (USDT) − 1 · Anchor (USDT) = Anchor (USD) ÷ F\n\nPrice: perp last trade as of each point's time, at the seconds both legs have one, none during a split's halt · Anchor (USD): the session's anchor, the bell, F × Binance's index of the perp at the close (Bitget's before Binance lists the perp), replaced for the whole session by the issuer's NAV once stable; less a dividend, or over a split's ratio, from the instant it takes effect; legend and tooltip only · Anchor (USDT): the price where Return is 0, moves slightly with F · F: USD/USDT · Return: right axis, %.",
+   "gridPos": {
+    "x": 0,
+    "y": 81,
+    "w": 24,
+    "h": 10
+   },
+   "datasource": {
+    "type": "datasource",
+    "uid": "-- Dashboard --"
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "datasource": {
+      "type": "datasource",
+      "uid": "-- Dashboard --"
+     },
+     "panelId": 15,
+     "withTransforms": false
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "color": {
+      "mode": "fixed",
+      "fixedColor": "text"
+     },
+     "custom": {
+      "drawStyle": "line",
+      "lineInterpolation": "linear",
+      "lineWidth": 1,
+      "fillOpacity": 0,
+      "showPoints": "never",
+      "spanNulls": false,
+      "axisPlacement": "auto",
+      "axisBorderShow": false,
+      "axisWidth": 60,
+      "scaleDistribution": {
+       "type": "linear"
+      },
+      "hideFrom": {
+       "legend": false,
+       "tooltip": false,
+       "viz": false
+      }
+     },
+     "mappings": [],
+     "noValue": "No data for this selection",
+     "unit": "none",
+     "decimals": 2
+    },
+    "overrides": [
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "Price"
+      },
+      "properties": [
+       {
+        "id": "color",
+        "value": {
+         "mode": "fixed",
+         "fixedColor": "#d95926"
+        }
+       },
+       {
+        "id": "custom.lineWidth",
+        "value": 2
+       },
+       {
+        "id": "noValue",
+        "value": "–"
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "Anchor (USDT)"
+      },
+      "properties": [
+       {
+        "id": "color",
+        "value": {
+         "mode": "fixed",
+         "fixedColor": "#a8a69e"
+        }
+       },
+       {
+        "id": "custom.lineWidth",
+        "value": 1
+       },
+       {
+        "id": "custom.lineStyle",
+        "value": {
+         "fill": "dash",
+         "dash": [
+          8,
+          4
+         ]
+        }
+       },
+       {
+        "id": "noValue",
+        "value": "–"
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "Anchor (USD)"
+      },
+      "properties": [
+       {
+        "id": "color",
+        "value": {
+         "mode": "fixed",
+         "fixedColor": "#a8a69e"
+        }
+       },
+       {
+        "id": "custom.lineWidth",
+        "value": 0
+       },
+       {
+        "id": "custom.axisPlacement",
+        "value": "hidden"
+       },
+       {
+        "id": "noValue",
+        "value": "–"
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "Return"
+      },
+      "properties": [
+       {
+        "id": "color",
+        "value": {
+         "mode": "fixed",
+         "fixedColor": "#898781"
+        }
+       },
+       {
+        "id": "custom.lineWidth",
+        "value": 1
+       },
+       {
+        "id": "custom.axisPlacement",
+        "value": "right"
+       },
+       {
+        "id": "unit",
+        "value": "percent"
+       },
+       {
+        "id": "decimals",
+        "value": 2
+       },
+       {
+        "id": "noValue",
+        "value": "–"
+       }
+      ]
+     }
+    ]
+   },
+   "options": {
+    "legend": {
+     "displayMode": "table",
+     "placement": "right",
+     "width": 348,
+     "showLegend": true,
+     "calcs": [
+      "lastNotNull",
+      "min",
+      "max"
+     ]
+    },
+    "tooltip": {
+     "mode": "multi",
+     "sort": "none",
+     "hideZeros": false
+    }
+   },
+   "transformations": [
+    {
+     "id": "filterFieldsByName",
+     "options": {
+      "include": {
+       "names": [
+        "time",
+        "Bear Price",
+        "Bear Anchor (USDT)",
+        "Bear Anchor (USD)",
+        "Bear Return"
+       ]
+      }
+     }
+    },
+    {
+     "id": "organize",
+     "options": {
+      "indexByName": {
+       "time": 0,
+       "Bear Price": 1,
+       "Bear Anchor (USDT)": 2,
+       "Bear Anchor (USD)": 3,
+       "Bear Return": 4
+      },
+      "renameByName": {
+       "Bear Price": "Price",
+       "Bear Anchor (USDT)": "Anchor (USDT)",
+       "Bear Anchor (USD)": "Anchor (USD)",
+       "Bear Return": "Return"
+      },
+      "excludeByName": {}
+     }
+    }
+   ]
+  },
+  {
+   "id": 17,
+   "type": "timeseries",
+   "title": "${ref} Price · USDT",
+   "description": "Return = Price ÷ Anchor (USDT) − 1 · Anchor (USDT) = Anchor (USD) ÷ F\n\nPrice: perp last trade as of each point's time, at the seconds both legs have one, none during a split's halt · Anchor (USD): the session's anchor, the bell, F × Binance's index of the perp at the close (Bitget's before Binance lists the perp); less a dividend, or over a split's ratio, from the instant it takes effect; legend and tooltip only · Anchor (USDT): the price where Return is 0, moves slightly with F · F: USD/USDT · Return: right axis, % · ${ref}: the unleveraged ETF of the same index.",
+   "gridPos": {
+    "x": 0,
+    "y": 91,
+    "w": 24,
+    "h": 10
+   },
+   "datasource": {
+    "type": "datasource",
+    "uid": "-- Dashboard --"
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "datasource": {
+      "type": "datasource",
+      "uid": "-- Dashboard --"
+     },
+     "panelId": 15,
+     "withTransforms": false
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "color": {
+      "mode": "fixed",
+      "fixedColor": "text"
+     },
+     "custom": {
+      "drawStyle": "line",
+      "lineInterpolation": "linear",
+      "lineWidth": 1,
+      "fillOpacity": 0,
+      "showPoints": "never",
+      "spanNulls": false,
+      "axisPlacement": "auto",
+      "axisBorderShow": false,
+      "axisWidth": 60,
+      "scaleDistribution": {
+       "type": "linear"
+      },
+      "hideFrom": {
+       "legend": false,
+       "tooltip": false,
+       "viz": false
+      }
+     },
+     "mappings": [],
+     "noValue": "No data for this selection",
+     "unit": "none",
+     "decimals": 2
+    },
+    "overrides": [
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "Price"
+      },
+      "properties": [
+       {
+        "id": "color",
+        "value": {
+         "mode": "fixed",
+         "fixedColor": "text"
+        }
+       },
+       {
+        "id": "custom.lineWidth",
+        "value": 2
+       },
+       {
+        "id": "noValue",
+        "value": "–"
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "Anchor (USDT)"
+      },
+      "properties": [
+       {
+        "id": "color",
+        "value": {
+         "mode": "fixed",
+         "fixedColor": "#a8a69e"
+        }
+       },
+       {
+        "id": "custom.lineWidth",
+        "value": 1
+       },
+       {
+        "id": "custom.lineStyle",
+        "value": {
+         "fill": "dash",
+         "dash": [
+          8,
+          4
+         ]
+        }
+       },
+       {
+        "id": "noValue",
+        "value": "–"
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "Anchor (USD)"
+      },
+      "properties": [
+       {
+        "id": "color",
+        "value": {
+         "mode": "fixed",
+         "fixedColor": "#a8a69e"
+        }
+       },
+       {
+        "id": "custom.lineWidth",
+        "value": 0
+       },
+       {
+        "id": "custom.axisPlacement",
+        "value": "hidden"
+       },
+       {
+        "id": "noValue",
+        "value": "–"
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "Return"
+      },
+      "properties": [
+       {
+        "id": "color",
+        "value": {
+         "mode": "fixed",
+         "fixedColor": "#898781"
+        }
+       },
+       {
+        "id": "custom.lineWidth",
+        "value": 1
+       },
+       {
+        "id": "custom.axisPlacement",
+        "value": "right"
+       },
+       {
+        "id": "unit",
+        "value": "percent"
+       },
+       {
+        "id": "decimals",
+        "value": 2
+       },
+       {
+        "id": "noValue",
+        "value": "–"
+       }
+      ]
+     }
+    ]
+   },
+   "options": {
+    "legend": {
+     "displayMode": "table",
+     "placement": "right",
+     "width": 348,
+     "showLegend": true,
+     "calcs": [
+      "lastNotNull",
+      "min",
+      "max"
+     ]
+    },
+    "tooltip": {
+     "mode": "multi",
+     "sort": "none",
+     "hideZeros": false
+    }
+   },
+   "transformations": [
+    {
+     "id": "filterFieldsByName",
+     "options": {
+      "include": {
+       "names": [
+        "time",
+        "Ref Price",
+        "Ref Anchor (USDT)",
+        "Ref Anchor (USD)",
+        "Ref Return"
+       ]
+      }
+     }
+    },
+    {
+     "id": "organize",
+     "options": {
+      "indexByName": {
+       "time": 0,
+       "Ref Price": 1,
+       "Ref Anchor (USDT)": 2,
+       "Ref Anchor (USD)": 3,
+       "Ref Return": 4
+      },
+      "renameByName": {
+       "Ref Price": "Price",
+       "Ref Anchor (USDT)": "Anchor (USDT)",
+       "Ref Anchor (USD)": "Anchor (USD)",
+       "Ref Return": "Return"
+      },
+      "excludeByName": {}
+     }
+    }
+   ]
+  },
+  {
+   "id": 18,
+   "type": "timeseries",
+   "title": "Implied Return · %",
+   "description": "Bull Leg = (F·p_bull ÷ A_bull − 1) ÷ 3 · Bear Leg = (F·p_bear ÷ A_bear − 1) ÷ 3 · Sum = Bull Leg + Bear Leg\n\nThe index return each leg implies since the close, on the perps' last trades · Sum: the spread on those trades ÷ 3 in % (0.01 % = 1 bps), right axis; the drawn Spread is on mid prices, apart from it by the trades against the mids · Reference: ${ref}'s own return · each on its anchor less a dividend, or over a split's ratio, from the instant it takes effect.",
+   "gridPos": {
+    "x": 0,
+    "y": 101,
+    "w": 24,
+    "h": 10
+   },
+   "datasource": {
+    "type": "datasource",
+    "uid": "-- Dashboard --"
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "datasource": {
+      "type": "datasource",
+      "uid": "-- Dashboard --"
+     },
+     "panelId": 15,
+     "withTransforms": false
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "color": {
+      "mode": "fixed",
+      "fixedColor": "text"
+     },
+     "custom": {
+      "drawStyle": "line",
+      "lineInterpolation": "linear",
+      "lineWidth": 1,
+      "fillOpacity": 0,
+      "showPoints": "never",
+      "spanNulls": false,
+      "axisPlacement": "auto",
+      "axisBorderShow": false,
+      "axisWidth": 60,
+      "scaleDistribution": {
+       "type": "linear"
+      },
+      "hideFrom": {
+       "legend": false,
+       "tooltip": false,
+       "viz": false
+      },
+      "thresholdsStyle": {
+       "mode": "dashed"
+      }
+     },
+     "mappings": [],
+     "noValue": "No data for this selection",
+     "unit": "none",
+     "decimals": 2,
+     "thresholds": {
+      "mode": "absolute",
+      "steps": [
+       {
+        "color": "transparent",
+        "value": null
+       },
+       {
+        "color": "#898781",
+        "value": 0
+       }
+      ]
+     }
+    },
+    "overrides": [
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "Sum"
+      },
+      "properties": [
+       {
+        "id": "custom.axisCenteredZero",
+        "value": true
+       },
+       {
+        "id": "color",
+        "value": {
+         "mode": "fixed",
+         "fixedColor": "#9b59d0"
+        }
+       },
+       {
+        "id": "custom.lineWidth",
+        "value": 1
+       },
+       {
+        "id": "custom.axisPlacement",
+        "value": "right"
+       },
+       {
+        "id": "decimals",
+        "value": 3
+       },
+       {
+        "id": "custom.thresholdsStyle",
+        "value": {
+         "mode": "off"
+        }
+       },
+       {
+        "id": "noValue",
+        "value": "–"
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "Reference"
+      },
+      "properties": [
+       {
+        "id": "custom.axisCenteredZero",
+        "value": true
+       },
+       {
+        "id": "color",
+        "value": {
+         "mode": "fixed",
+         "fixedColor": "text"
+        }
+       },
+       {
+        "id": "custom.lineWidth",
+        "value": 1
+       },
+       {
+        "id": "noValue",
+        "value": "–"
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "Bull Leg"
+      },
+      "properties": [
+       {
+        "id": "custom.axisCenteredZero",
+        "value": true
+       },
+       {
+        "id": "color",
+        "value": {
+         "mode": "fixed",
+         "fixedColor": "#2a78d6"
+        }
+       },
+       {
+        "id": "custom.lineWidth",
+        "value": 1
+       },
+       {
+        "id": "noValue",
+        "value": "–"
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "Bear Leg"
+      },
+      "properties": [
+       {
+        "id": "custom.axisCenteredZero",
+        "value": true
+       },
+       {
+        "id": "color",
+        "value": {
+         "mode": "fixed",
+         "fixedColor": "#d95926"
+        }
+       },
+       {
+        "id": "custom.lineWidth",
+        "value": 1
+       },
+       {
+        "id": "noValue",
+        "value": "–"
+       }
+      ]
+     }
+    ]
+   },
+   "options": {
+    "legend": {
+     "displayMode": "table",
+     "placement": "right",
+     "width": 348,
+     "showLegend": true,
+     "calcs": [
+      "lastNotNull",
+      "min",
+      "max"
+     ]
+    },
+    "tooltip": {
+     "mode": "multi",
+     "sort": "none",
+     "hideZeros": false
+    }
+   },
+   "transformations": [
+    {
+     "id": "filterFieldsByName",
+     "options": {
+      "include": {
+       "names": [
+        "time",
+        "Sum",
+        "Ref Return",
+        "Bull Leg",
+        "Bear Leg"
+       ]
+      }
+     }
+    },
+    {
+     "id": "organize",
+     "options": {
+      "indexByName": {
+       "time": 0,
+       "Sum": 1,
+       "Ref Return": 2,
+       "Bull Leg": 3,
+       "Bear Leg": 4
+      },
+      "renameByName": {
+       "Ref Return": "Reference"
+      },
+      "excludeByName": {}
+     }
+    }
+   ]
+  },
+  {
+   "id": 19,
+   "type": "row",
+   "title": "Costs · Entry ${d_text} bps",
+   "collapsed": false,
+   "gridPos": {
+    "x": 0,
+    "y": 111,
+    "w": 24,
+    "h": 1
+   },
+   "panels": []
+  },
+  {
+   "id": 20,
+   "type": "table",
+   "title": "Fee Levels · ${venue:text} · Bps",
+   "description": "Breakeven Entry = 2 × Taker · Net at Entry = Entry − Breakeven Entry\n\nOne round trip across the band, bps of both legs' notional: four taker fills; the Signal is on the real spreads of the notional, so crossing the spread and going down the levels are inside it · Half Spreads: both legs' half spreads in the newest second with a book of both, what crossing the best levels costs now · Net at Entry: – when Entry is not a positive number · funding not included.",
+   "gridPos": {
+    "x": 0,
+    "y": 112,
+    "w": 24,
+    "h": 5
+   },
+   "datasource": {
+    "type": "grafana-postgresql-datasource",
+    "uid": "etfpair"
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "datasource": {
+      "type": "grafana-postgresql-datasource",
+      "uid": "etfpair"
+     },
+     "format": "table",
+     "rawQuery": true,
+     "editorMode": "code",
+     "rawSql": "SELECT f.label AS \"Level\", f.taker_bps AS \"Taker\", c.half_bps AS \"Half Spreads\",\n       2 * f.taker_bps AS \"Breakeven Entry\", v.d - 2 * f.taker_bps AS \"Net at Entry\", f.source AS \"Source\"\nFROM etfpair.fee_level f\nCROSS JOIN (SELECT (SELECT CASE WHEN m[1]::numeric > 0 THEN m[1]::numeric END FROM regexp_match(regexp_replace(lower(normalize('$d', NFKC)), '[[:space:]_]', '', 'g'), '^([0-9]+(?:[.][0-9]+)?)(?:bps)?$') m) AS d) v\nLEFT JOIN (SELECT 10000 * ((b.ask_px[1] - b.bid_px[1]) / (b.ask_px[1] + b.bid_px[1]) + (s.ask_px[1] - s.bid_px[1]) / (s.ask_px[1] + s.bid_px[1])) AS half_bps\n           FROM etfpair.combo_market k\n           JOIN etfpair.perp_second b ON b.venue = k.venue AND b.symbol = k.bull_symbol\n           JOIN etfpair.perp_second s ON s.venue = k.venue AND s.symbol = k.bear_symbol AND s.second_ms = b.second_ms\n           WHERE k.combo_id = '$combo' AND k.venue = '$venue' AND b.second_ms > (extract(epoch FROM now()) * 1000)::bigint - 600000\n             AND b.bid_px[1] IS NOT NULL AND b.ask_px[1] IS NOT NULL AND s.bid_px[1] IS NOT NULL AND s.ask_px[1] IS NOT NULL\n           ORDER BY b.second_ms DESC LIMIT 1) c ON true\nWHERE f.venue = '$venue' ORDER BY f.sort"
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "color": {
+      "mode": "fixed",
+      "fixedColor": "text"
+     },
+     "custom": {
+      "align": "auto",
+      "cellOptions": {
+       "type": "auto"
+      },
+      "filterable": false,
+      "inspect": false,
+      "minWidth": 60,
+      "wrapHeaderText": true
+     },
+     "mappings": [],
+     "noValue": "–"
+    },
+    "overrides": [
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "Level"
+      },
+      "properties": [
+       {
+        "id": "custom.width",
+        "value": 150
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "Taker"
+      },
+      "properties": [
+       {
+        "id": "custom.align",
+        "value": "right"
+       },
+       {
+        "id": "unit",
+        "value": "none"
+       },
+       {
+        "id": "decimals",
+        "value": 2
+       },
+       {
+        "id": "custom.width",
+        "value": 76
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "Half Spreads"
+      },
+      "properties": [
+       {
+        "id": "custom.align",
+        "value": "right"
+       },
+       {
+        "id": "unit",
+        "value": "none"
+       },
+       {
+        "id": "decimals",
+        "value": 2
+       },
+       {
+        "id": "custom.width",
+        "value": 116
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "Breakeven Entry"
+      },
+      "properties": [
+       {
+        "id": "custom.align",
+        "value": "right"
+       },
+       {
+        "id": "unit",
+        "value": "none"
+       },
+       {
+        "id": "decimals",
+        "value": 2
+       },
+       {
+        "id": "custom.width",
+        "value": 136
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "Net at Entry"
+      },
+      "properties": [
+       {
+        "id": "custom.cellOptions",
+        "value": {
+         "type": "color-text"
+        }
+       },
+       {
+        "id": "color",
+        "value": {
+         "mode": "thresholds"
+        }
+       },
+       {
+        "id": "thresholds",
+        "value": {
+         "mode": "absolute",
+         "steps": [
+          {
+           "color": "#d03b3b",
+           "value": null
+          },
+          {
+           "color": "text",
+           "value": 0
+          },
+          {
+           "color": "#0ca30c",
+           "value": 1e-06
+          }
+         ]
+        }
+       },
+       {
+        "id": "custom.align",
+        "value": "right"
+       },
+       {
+        "id": "unit",
+        "value": "none"
+       },
+       {
+        "id": "decimals",
+        "value": 2
+       },
+       {
+        "id": "custom.width",
+        "value": 116
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "Source"
+      },
+      "properties": [
+       {
+        "id": "custom.minWidth",
+        "value": 320
+       }
+      ]
+     }
+    ]
+   },
+   "options": {
+    "showHeader": true,
+    "cellHeight": "sm",
+    "footer": {
+     "show": false
+    }
+   }
+  },
+  {
+   "id": 21,
+   "type": "row",
+   "title": "Data Quality",
+   "collapsed": false,
+   "gridPos": {
+    "x": 0,
+    "y": 117,
+    "w": 24,
+    "h": 1
+   },
+   "panels": []
+  },
+  {
+   "id": 22,
+   "type": "table",
+   "title": "Anchors · Bell and NAV",
+   "description": "Anchor = both legs' NAV once the issuer has given the same figure for 1 h, else both legs' Bell = F × the perp's index at the close\n\nSession: the New York day whose close starts it · Bell: F × the close of the perp's one-minute index kline that ends at the close, Binance's, or Bitget's before Binance lists the perp, USD · NAV: the issuer's current figure · Known Time: when the anchor in use became known (a bell filled in later: close + 2 min; a NAV loaded from the issuer's history: its load time) · Missing: no bell anchor yet, or none · Actions: the session's dividends (ex, USD as declared) and splits, when each takes effect on this CEX and its status: Scheduled, Known, None (no instant), then Applied, Verified, Mismatch, and known MM-DD HH:MM when the amount came after that instant; amber: Mismatch, or Past T without an amount · anchors shown are the session's start, before an action; coming actions: Next Actions · times UTC+8.",
+   "gridPos": {
+    "x": 0,
+    "y": 118,
+    "w": 24,
+    "h": 11
+   },
+   "datasource": {
+    "type": "grafana-postgresql-datasource",
+    "uid": "etfpair"
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "datasource": {
+      "type": "grafana-postgresql-datasource",
+      "uid": "etfpair"
+     },
+     "format": "table",
+     "rawQuery": true,
+     "editorMode": "code",
+     "rawSql": "SELECT to_char(cs.session_date, 'YYYY-MM-DD') AS \"Session\", to_timestamp(cs.close_ms / 1000.0) AS \"Close Time\",\n       cs.bell_bull AS \"${bull} Bell\", cs.bell_bear AS \"${bear} Bell\", cs.a_ref AS \"${ref} Bell\", cs.nav_bull AS \"${bull} NAV\", cs.nav_bear AS \"${bear} NAV\",\n       cs.a_bull AS \"${bull} Anchor\", cs.a_bear AS \"${bear} Anchor\", to_timestamp(cs.known_ms / 1000.0) AS \"Known Time\",\n       cs.status AS \"Status\", ac.actions AS \"Actions\"\nFROM etfpair.combo_sessions('$combo') cs\nLEFT JOIN (SELECT a.session_date, string_agg(a.ticker || ' ' || CASE WHEN a.kind = 'dividend' THEN 'ex ' || coalesce(trim_scale(a.value)::text, '?') WHEN a.value >= 1 THEN 'split ' || trim_scale(a.value) || ':1' ELSE 'split 1:' || trim_scale(round(1 / a.value, 6)) END || coalesce(' · ' || to_char(to_timestamp(CASE WHEN a.status <> 'None' THEN a.effective_ms END / 1000.0)\n                                                                                  AT TIME ZONE 'Etc/GMT-8', 'MM-DD HH24:MI'), '') || ' · ' || a.shown\n                                             || coalesce(' · known ' || to_char(to_timestamp(CASE WHEN a.status = 'Known' AND a.known_ms > a.effective_ms\n                                                                                              THEN a.known_ms END / 1000.0) AT TIME ZONE 'Etc/GMT-8', 'MM-DD HH24:MI'), ''),\n                                             '; ' ORDER BY a.ex_date, a.ticker) AS actions\n           FROM etfpair.combo_actions('$combo', '$venue') a GROUP BY a.session_date) ac ON ac.session_date = cs.session_date\nWHERE cs.close_ms <= extract(epoch FROM now()) * 1000\nORDER BY cs.close_ms DESC LIMIT 6"
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "color": {
+      "mode": "fixed",
+      "fixedColor": "text"
+     },
+     "custom": {
+      "align": "auto",
+      "cellOptions": {
+       "type": "auto"
+      },
+      "filterable": false,
+      "inspect": false,
+      "minWidth": 60,
+      "wrapHeaderText": true
+     },
+     "mappings": [],
+     "noValue": "–"
+    },
+    "overrides": [
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "Session"
+      },
+      "properties": [
+       {
+        "id": "custom.width",
+        "value": 96
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "Close Time"
+      },
+      "properties": [
+       {
+        "id": "unit",
+        "value": "time:MM-DD HH:mm"
+       },
+       {
+        "id": "custom.width",
+        "value": 96
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byRegexp",
+       "options": "^.+\\ Bell$"
+      },
+      "properties": [
+       {
+        "id": "custom.align",
+        "value": "right"
+       },
+       {
+        "id": "unit",
+        "value": "currencyUSD"
+       },
+       {
+        "id": "decimals",
+        "value": 2
+       },
+       {
+        "id": "custom.width",
+        "value": 84
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byRegexp",
+       "options": "^.+\\ NAV$"
+      },
+      "properties": [
+       {
+        "id": "custom.align",
+        "value": "right"
+       },
+       {
+        "id": "unit",
+        "value": "currencyUSD"
+       },
+       {
+        "id": "decimals",
+        "value": 2
+       },
+       {
+        "id": "custom.width",
+        "value": 84
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byRegexp",
+       "options": "^.+\\ Anchor$"
+      },
+      "properties": [
+       {
+        "id": "custom.align",
+        "value": "right"
+       },
+       {
+        "id": "unit",
+        "value": "currencyUSD"
+       },
+       {
+        "id": "decimals",
+        "value": 2
+       },
+       {
+        "id": "custom.width",
+        "value": 88
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "Known Time"
+      },
+      "properties": [
+       {
+        "id": "unit",
+        "value": "time:MM-DD HH:mm"
+       },
+       {
+        "id": "custom.width",
+        "value": 96
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "Status"
+      },
+      "properties": [
+       {
+        "id": "custom.cellOptions",
+        "value": {
+         "type": "color-text"
+        }
+       },
+       {
+        "id": "mappings",
+        "value": [
+         {
+          "type": "value",
+          "options": {
+           "NAV": {
+            "color": "text",
+            "index": 0
+           },
+           "Bell": {
+            "color": "#898781",
+            "index": 1
+           },
+           "Missing": {
+            "color": "#fab219",
+            "index": 2
+           }
+          }
+         }
+        ]
+       },
+       {
+        "id": "custom.width",
+        "value": 72
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "Actions"
+      },
+      "properties": [
+       {
+        "id": "custom.minWidth",
+        "value": 240
+       },
+       {
+        "id": "custom.wrapText",
+        "value": true
+       },
+       {
+        "id": "custom.cellOptions",
+        "value": {
+         "type": "color-text"
+        }
+       },
+       {
+        "id": "mappings",
+        "value": [
+         {
+          "type": "regex",
+          "options": {
+           "pattern": ".*(Mismatch|Past T).*",
+           "result": {
+            "color": "#fab219",
+            "index": 0
+           }
+          }
+         }
+        ]
+       }
+      ]
+     }
+    ]
+   },
+   "options": {
+    "showHeader": true,
+    "cellHeight": "sm",
+    "footer": {
+     "show": false
+    }
+   }
+  },
+  {
+   "id": 23,
+   "type": "table",
+   "title": "Data Coverage · Time Range",
+   "description": "Missing Minutes = minutes of the range without a candle close · Book Age = seconds since the newest second with a book\n\nSeconds: the recorder's per-second rows with a last price, which give the points and the mean's minute bars · Book Seconds: those with a best bid and a best ask · Levels: the fewest levels the thinner side and the most the deeper side of those books held, the depth the real spreads can take (Bitget SOXS: 5 until 11-20 18:43, 10 until 11-22 12:16, 50 since; Binance SOXL, SOXS: 1 from 11-19 19:15 to 11-20 18:43) · Candle Minutes: the exchanges' one-minute candles, the mean's bar only where a minute's end has neither both legs' books nor both legs' trades; a minute without any bar restarts the mean · Book Age amber from 60 s, red from 300 s.",
+   "gridPos": {
+    "x": 0,
+    "y": 129,
+    "w": 24,
+    "h": 6
+   },
+   "datasource": {
+    "type": "grafana-postgresql-datasource",
+    "uid": "etfpair"
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "datasource": {
+      "type": "grafana-postgresql-datasource",
+      "uid": "etfpair"
+     },
+     "format": "table",
+     "rawQuery": true,
+     "editorMode": "code",
+     "rawSql": "SELECT k.symbol AS \"Contract\", m.minutes AS \"Candle Minutes\",\n       least($__to, (extract(epoch FROM now()) * 1000)::bigint) / 60000 - ($__from + 59999) / 60000 - m.minutes AS \"Missing Minutes\",\n       p.seconds AS \"Seconds\", p.books AS \"Book Seconds\",\n       CASE WHEN p.least_levels = p.most_levels THEN p.least_levels::text ELSE p.least_levels || '–' || p.most_levels END AS \"Levels\",\n       round(extract(epoch FROM now()) - (SELECT t.second_ms FROM etfpair.perp_second t WHERE t.venue = k.venue AND t.symbol = k.symbol\n                                          AND t.bid_px[1] IS NOT NULL AND t.ask_px[1] IS NOT NULL ORDER BY t.second_ms DESC LIMIT 1) / 1000.0) AS \"Book Age s\"\nFROM (SELECT m.venue, u.symbol, u.leg FROM etfpair.combo_market m, unnest(ARRAY[m.bull_symbol, m.bear_symbol, m.ref_symbol]) WITH ORDINALITY AS u(symbol, leg)\n      WHERE m.combo_id = '$combo' AND m.venue = '$venue') k\nCROSS JOIN LATERAL (SELECT count(*) AS minutes FROM etfpair.perp_minute m\n                    WHERE m.venue = k.venue AND m.symbol = k.symbol AND m.minute_ms >= $__from AND m.minute_ms + 60000 <= least($__to, (extract(epoch FROM now()) * 1000)::bigint)) m\nCROSS JOIN LATERAL etfpair.perp_coverage(k.venue, k.symbol, $__from, least($__to, (extract(epoch FROM now()) * 1000)::bigint)) p\nORDER BY k.leg"
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "color": {
+      "mode": "fixed",
+      "fixedColor": "text"
+     },
+     "custom": {
+      "align": "auto",
+      "cellOptions": {
+       "type": "auto"
+      },
+      "filterable": false,
+      "inspect": false,
+      "minWidth": 60,
+      "wrapHeaderText": true
+     },
+     "mappings": [],
+     "noValue": "–"
+    },
+    "overrides": [
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "Contract"
+      },
+      "properties": [
+       {
+        "id": "custom.width",
+        "value": 104
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "Candle Minutes"
+      },
+      "properties": [
+       {
+        "id": "custom.align",
+        "value": "right"
+       },
+       {
+        "id": "unit",
+        "value": "locale"
+       },
+       {
+        "id": "decimals",
+        "value": 0
+       },
+       {
+        "id": "custom.width",
+        "value": 130
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "Missing Minutes"
+      },
+      "properties": [
+       {
+        "id": "custom.align",
+        "value": "right"
+       },
+       {
+        "id": "unit",
+        "value": "locale"
+       },
+       {
+        "id": "decimals",
+        "value": 0
+       },
+       {
+        "id": "custom.width",
+        "value": 144
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "Seconds"
+      },
+      "properties": [
+       {
+        "id": "custom.align",
+        "value": "right"
+       },
+       {
+        "id": "unit",
+        "value": "locale"
+       },
+       {
+        "id": "decimals",
+        "value": 0
+       },
+       {
+        "id": "custom.width",
+        "value": 104
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "Book Seconds"
+      },
+      "properties": [
+       {
+        "id": "custom.align",
+        "value": "right"
+       },
+       {
+        "id": "unit",
+        "value": "locale"
+       },
+       {
+        "id": "decimals",
+        "value": 0
+       },
+       {
+        "id": "custom.width",
+        "value": 120
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "Levels"
+      },
+      "properties": [
+       {
+        "id": "custom.align",
+        "value": "right"
+       },
+       {
+        "id": "custom.width",
+        "value": 80
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "Book Age s"
+      },
+      "properties": [
+       {
+        "id": "custom.align",
+        "value": "right"
+       },
+       {
+        "id": "unit",
+        "value": "none"
+       },
+       {
+        "id": "decimals",
+        "value": 0
+       },
+       {
+        "id": "custom.cellOptions",
+        "value": {
+         "type": "color-text"
+        }
+       },
+       {
+        "id": "color",
+        "value": {
+         "mode": "thresholds"
+        }
+       },
+       {
+        "id": "thresholds",
+        "value": {
+         "mode": "absolute",
+         "steps": [
+          {
+           "color": "text",
+           "value": null
+          },
+          {
+           "color": "#fab219",
+           "value": 60
+          },
+          {
+           "color": "#d03b3b",
+           "value": 300
+          }
+         ]
+        }
+       },
+       {
+        "id": "custom.width",
+        "value": 116
+       }
+      ]
+     }
+    ]
+   },
+   "options": {
+    "showHeader": true,
+    "cellHeight": "sm",
+    "footer": {
+     "show": false
+    }
+   }
+  }
+ ],
+ "templating": {
+  "list": [
+   {
+    "name": "combo",
+    "label": "Combo",
+    "description": "The bull and bear ETF perps traded as one basket.",
+    "type": "query",
+    "datasource": {
+     "type": "grafana-postgresql-datasource",
+     "uid": "etfpair"
+    },
+    "definition": "SELECT title AS __text, combo_id AS __value FROM etfpair.combo ORDER BY 1",
+    "query": "SELECT title AS __text, combo_id AS __value FROM etfpair.combo ORDER BY 1",
+    "refresh": 1,
+    "sort": 0,
+    "multi": false,
+    "includeAll": false,
+    "current": {},
+    "options": [],
+    "hide": 0,
+    "allowCustomValue": false
+   },
+   {
+    "name": "venue",
+    "label": "CEX",
+    "description": "The exchange whose perps price the combo.",
+    "type": "query",
+    "datasource": {
+     "type": "grafana-postgresql-datasource",
+     "uid": "etfpair"
+    },
+    "definition": "SELECT initcap(venue) AS __text, venue AS __value FROM etfpair.combo_market WHERE combo_id = '$combo' ORDER BY 1",
+    "query": "SELECT initcap(venue) AS __text, venue AS __value FROM etfpair.combo_market WHERE combo_id = '$combo' ORDER BY 1",
+    "refresh": 1,
+    "sort": 0,
+    "multi": false,
+    "includeAll": false,
+    "current": {},
+    "options": [],
+    "hide": 0,
+    "allowCustomValue": false
+   },
+   {
+    "name": "ma",
+    "label": "EMA/SMA",
+    "description": "SMA: plain average · EMA: alpha = 2 ÷ (Mean Scale + 1).",
+    "type": "custom",
+    "query": "EMA : ema,SMA : sma",
+    "options": [
+     {
+      "text": "EMA",
+      "value": "ema",
+      "selected": false
+     },
+     {
+      "text": "SMA",
+      "value": "sma",
+      "selected": true
+     }
+    ],
+    "current": {
+     "text": "SMA",
+     "value": "sma",
+     "selected": true
+    },
+    "multi": false,
+    "includeAll": false,
+    "hide": 0,
+    "allowCustomValue": false
+   },
+   {
+    "name": "ma_minutes",
+    "label": "Mean Scale (min)",
+    "description": "Minutes the mean covers, a whole number from 1 to 999,999 (60, 60min); it restarts at each close · anything else: no mean, the Mean, the deviations and the Signal read No Mean.",
+    "type": "textbox",
+    "query": "60",
+    "current": {
+     "text": "60",
+     "value": "60"
+    },
+    "options": [
+     {
+      "selected": true,
+      "text": "60",
+      "value": "60"
+     }
+    ],
+    "hide": 0
+   },
+   {
+    "name": "d",
+    "label": "Entry (bps)",
+    "description": "Long: Real Long Spread ≤ Mean − Entry · Short: Real Short Spread ≥ Mean + Entry · a positive number (10, 7.5, 10bps); anything else: the Signal reads No Entry and Mean ± Entry is not drawn.",
+    "type": "textbox",
+    "query": "10",
+    "current": {
+     "text": "10",
+     "value": "10"
+    },
+    "options": [
+     {
+      "selected": true,
+      "text": "10",
+      "value": "10"
+     }
+    ],
+    "hide": 0
+   },
+   {
+    "name": "notional",
+    "label": "Notional (USDT)",
+    "description": "N, both legs together: the Real spreads and the Signal fill N through both legs' recorded levels, on what they hold where they hold less · pick one or type another and press Enter: 20000, 20,000, 20k, 2万, 20000U · Enter picks the first listed size whose text contains what is typed, so 0, 1, 5, 10, 50 and 100 need a U (100U) · the titles show the N in use.",
+    "type": "custom",
+    "query": "1\\,000 : 1000,5\\,000 : 5000,10\\,000 : 10000,50\\,000 : 50000,100\\,000 : 100000",
+    "options": [
+     {
+      "text": "1,000",
+      "value": "1000",
+      "selected": false
+     },
+     {
+      "text": "5,000",
+      "value": "5000",
+      "selected": false
+     },
+     {
+      "text": "10,000",
+      "value": "10000",
+      "selected": true
+     },
+     {
+      "text": "50,000",
+      "value": "50000",
+      "selected": false
+     },
+     {
+      "text": "100,000",
+      "value": "100000",
+      "selected": false
+     }
+    ],
+    "current": {
+     "text": "10,000",
+     "value": "10000",
+     "selected": true
+    },
+    "multi": false,
+    "includeAll": false,
+    "hide": 0,
+    "allowCustomValue": true
+   },
+   {
+    "name": "bull",
+    "label": "Bull",
+    "description": "",
+    "type": "query",
+    "datasource": {
+     "type": "grafana-postgresql-datasource",
+     "uid": "etfpair"
+    },
+    "definition": "SELECT bull_ticker FROM etfpair.combo WHERE combo_id = '$combo'",
+    "query": "SELECT bull_ticker FROM etfpair.combo WHERE combo_id = '$combo'",
+    "refresh": 1,
+    "sort": 0,
+    "multi": false,
+    "includeAll": false,
+    "current": {},
+    "options": [],
+    "hide": 2,
+    "allowCustomValue": false
+   },
+   {
+    "name": "bear",
+    "label": "Bear",
+    "description": "",
+    "type": "query",
+    "datasource": {
+     "type": "grafana-postgresql-datasource",
+     "uid": "etfpair"
+    },
+    "definition": "SELECT bear_ticker FROM etfpair.combo WHERE combo_id = '$combo'",
+    "query": "SELECT bear_ticker FROM etfpair.combo WHERE combo_id = '$combo'",
+    "refresh": 1,
+    "sort": 0,
+    "multi": false,
+    "includeAll": false,
+    "current": {},
+    "options": [],
+    "hide": 2,
+    "allowCustomValue": false
+   },
+   {
+    "name": "ref",
+    "label": "Reference",
+    "description": "",
+    "type": "query",
+    "datasource": {
+     "type": "grafana-postgresql-datasource",
+     "uid": "etfpair"
+    },
+    "definition": "SELECT ref_ticker FROM etfpair.combo WHERE combo_id = '$combo'",
+    "query": "SELECT ref_ticker FROM etfpair.combo WHERE combo_id = '$combo'",
+    "refresh": 1,
+    "sort": 0,
+    "multi": false,
+    "includeAll": false,
+    "current": {},
+    "options": [],
+    "hide": 2,
+    "allowCustomValue": false
+   },
+   {
+    "name": "n_text",
+    "label": "Notional in Use",
+    "description": "",
+    "type": "query",
+    "datasource": {
+     "type": "grafana-postgresql-datasource",
+     "uid": "etfpair"
+    },
+    "definition": "SELECT coalesce(rtrim(rtrim(to_char((SELECT CASE m[3] WHEN 'k' THEN 1000 WHEN 'w' THEN 10000 WHEN '万' THEN 10000 ELSE 1 END * (replace(m[1], ',', '') || m[2])::numeric FROM regexp_match(regexp_replace(regexp_replace(lower(normalize('$notional', NFKC)), '[[:space:]_]', '', 'g'), 'u(sdt)?$', ''), '^([0-9]{1,3}(?:,[0-9]{3})+|[0-9]+)((?:[.][0-9]+)?)(k|w|万)?$') m), 'FM999,999,999,999,990.999999'), '0'), '.'), '?')",
+    "query": "SELECT coalesce(rtrim(rtrim(to_char((SELECT CASE m[3] WHEN 'k' THEN 1000 WHEN 'w' THEN 10000 WHEN '万' THEN 10000 ELSE 1 END * (replace(m[1], ',', '') || m[2])::numeric FROM regexp_match(regexp_replace(regexp_replace(lower(normalize('$notional', NFKC)), '[[:space:]_]', '', 'g'), 'u(sdt)?$', ''), '^([0-9]{1,3}(?:,[0-9]{3})+|[0-9]+)((?:[.][0-9]+)?)(k|w|万)?$') m), 'FM999,999,999,999,990.999999'), '0'), '.'), '?')",
+    "refresh": 1,
+    "sort": 0,
+    "multi": false,
+    "includeAll": false,
+    "current": {},
+    "options": [],
+    "hide": 2,
+    "allowCustomValue": false
+   },
+   {
+    "name": "d_text",
+    "label": "Entry in Use",
+    "description": "",
+    "type": "query",
+    "datasource": {
+     "type": "grafana-postgresql-datasource",
+     "uid": "etfpair"
+    },
+    "definition": "SELECT coalesce(rtrim(rtrim(to_char((SELECT CASE WHEN m[1]::numeric > 0 THEN m[1]::numeric END FROM regexp_match(regexp_replace(lower(normalize('$d', NFKC)), '[[:space:]_]', '', 'g'), '^([0-9]+(?:[.][0-9]+)?)(?:bps)?$') m), 'FM999,999,990.999999'), '0'), '.'), '?')",
+    "query": "SELECT coalesce(rtrim(rtrim(to_char((SELECT CASE WHEN m[1]::numeric > 0 THEN m[1]::numeric END FROM regexp_match(regexp_replace(lower(normalize('$d', NFKC)), '[[:space:]_]', '', 'g'), '^([0-9]+(?:[.][0-9]+)?)(?:bps)?$') m), 'FM999,999,990.999999'), '0'), '.'), '?')",
+    "refresh": 1,
+    "sort": 0,
+    "multi": false,
+    "includeAll": false,
+    "current": {},
+    "options": [],
+    "hide": 2,
+    "allowCustomValue": false
+   },
+   {
+    "name": "ma_text",
+    "label": "Mean Scale in Use",
+    "description": "",
+    "type": "query",
+    "datasource": {
+     "type": "grafana-postgresql-datasource",
+     "uid": "etfpair"
+    },
+    "definition": "SELECT coalesce(((SELECT CASE WHEN m[1]::integer > 0 THEN m[1]::integer END FROM regexp_match(regexp_replace(lower(normalize('$ma_minutes', NFKC)), '[[:space:]_]', '', 'g'), '^([0-9]{1,6})(?:min|m)?$') m))::text, '?')",
+    "query": "SELECT coalesce(((SELECT CASE WHEN m[1]::integer > 0 THEN m[1]::integer END FROM regexp_match(regexp_replace(lower(normalize('$ma_minutes', NFKC)), '[[:space:]_]', '', 'g'), '^([0-9]{1,6})(?:min|m)?$') m))::text, '?')",
+    "refresh": 1,
+    "sort": 0,
+    "multi": false,
+    "includeAll": false,
+    "current": {},
+    "options": [],
+    "hide": 2,
+    "allowCustomValue": false
+   }
+  ]
+ },
+ "annotations": {
+  "list": [
+   {
+    "name": "Pre-Market",
+    "datasource": {
+     "type": "grafana-postgresql-datasource",
+     "uid": "etfpair"
+    },
+    "enable": true,
+    "hide": true,
+    "iconColor": "#b88a0a",
+    "rawQuery": "SELECT greatest(start_ms, $__from) AS time, least(end_ms, $__to) AS time_end, 'Pre-Market' AS text FROM etfpair.etf_phase WHERE phase = 'Pre-Market' AND end_ms > $__from AND start_ms < $__to",
+    "format": "table",
+    "mappings": {
+     "time": {
+      "source": "field",
+      "value": "time"
+     },
+     "timeEnd": {
+      "source": "field",
+      "value": "time_end"
+     },
+     "text": {
+      "source": "field",
+      "value": "text"
+     }
+    }
+   },
+   {
+    "name": "Regular",
+    "datasource": {
+     "type": "grafana-postgresql-datasource",
+     "uid": "etfpair"
+    },
+    "enable": true,
+    "hide": true,
+    "iconColor": "#a8a69e",
+    "rawQuery": "SELECT greatest(start_ms, $__from) AS time, least(end_ms, $__to) AS time_end, 'Regular' AS text FROM etfpair.etf_phase WHERE phase = 'Regular' AND end_ms > $__from AND start_ms < $__to",
+    "format": "table",
+    "mappings": {
+     "time": {
+      "source": "field",
+      "value": "time"
+     },
+     "timeEnd": {
+      "source": "field",
+      "value": "time_end"
+     },
+     "text": {
+      "source": "field",
+      "value": "text"
+     }
+    }
+   },
+   {
+    "name": "After-Hours",
+    "datasource": {
+     "type": "grafana-postgresql-datasource",
+     "uid": "etfpair"
+    },
+    "enable": true,
+    "hide": true,
+    "iconColor": "#d55181",
+    "rawQuery": "SELECT greatest(start_ms, $__from) AS time, least(end_ms, $__to) AS time_end, 'After-Hours' AS text FROM etfpair.etf_phase WHERE phase = 'After-Hours' AND end_ms > $__from AND start_ms < $__to",
+    "format": "table",
+    "mappings": {
+     "time": {
+      "source": "field",
+      "value": "time"
+     },
+     "timeEnd": {
+      "source": "field",
+      "value": "time_end"
+     },
+     "text": {
+      "source": "field",
+      "value": "text"
+     }
+    }
+   },
+   {
+    "name": "Overnight",
+    "datasource": {
+     "type": "grafana-postgresql-datasource",
+     "uid": "etfpair"
+    },
+    "enable": true,
+    "hide": true,
+    "iconColor": "#4f8fe6",
+    "rawQuery": "SELECT greatest(start_ms, $__from) AS time, least(end_ms, $__to) AS time_end, 'Overnight' AS text FROM etfpair.etf_phase WHERE phase = 'Overnight' AND end_ms > $__from AND start_ms < $__to",
+    "format": "table",
+    "mappings": {
+     "time": {
+      "source": "field",
+      "value": "time"
+     },
+     "timeEnd": {
+      "source": "field",
+      "value": "time_end"
+     },
+     "text": {
+      "source": "field",
+      "value": "text"
+     }
+    }
+   },
+   {
+    "name": "Corporate Actions",
+    "datasource": {
+     "type": "grafana-postgresql-datasource",
+     "uid": "etfpair"
+    },
+    "enable": true,
+    "hide": true,
+    "iconColor": "#9b59d0",
+    "rawQuery": "SELECT a.effective_ms AS time, string_agg(a.ticker || ' ' || CASE WHEN a.kind = 'dividend' THEN 'ex ' || coalesce(trim_scale(a.value)::text, '?') WHEN a.value >= 1 THEN 'split ' || trim_scale(a.value) || ':1' ELSE 'split 1:' || trim_scale(round(1 / a.value, 6)) END || coalesce(' · expected ' || round(a.expected, CASE a.kind WHEN 'dividend' THEN 1 ELSE 4 END) || CASE a.kind WHEN 'dividend' THEN ' bps' ELSE ' log' END, '') || CASE WHEN a.status = 'Known' THEN ' · measured ' || coalesce(round(a.observed, CASE a.kind WHEN 'dividend' THEN 1 ELSE 4 END) || CASE a.kind WHEN 'dividend' THEN ' bps' ELSE ' log' END, '–') || coalesce(' · NAV check ' || round(a.nav_bps, 1) || ' bps', '') ELSE '' END || ' · ' || a.shown, '; ' ORDER BY a.ticker, a.kind) AS text\nFROM etfpair.combo_actions('$combo', '$venue') a\nWHERE a.status <> 'None' AND a.effective_ms > $__from AND a.effective_ms <= $__to\nGROUP BY a.effective_ms",
+    "format": "table",
+    "mappings": {
+     "time": {
+      "source": "field",
+      "value": "time"
+     },
+     "text": {
+      "source": "field",
+      "value": "text"
+     }
+    },
+    "filter": {
+     "exclude": false,
+     "ids": [
+      10
+     ]
+    }
+   }
+  ]
+ },
+ "links": [
+  {
+   "title": "Reset",
+   "type": "link",
+   "icon": "bolt",
+   "url": "/d/arb-etf-pair-combo-spread/combo-spread?orgId=1&from=now-6h&to=now&refresh=30s&var-combo=${combo}&var-venue=${venue}&var-ma=sma&var-ma_minutes=60&var-d=10&var-notional=10000",
+   "tooltip": "Settings, time range and refresh back to defaults; Combo and CEX stay.",
+   "targetBlank": false,
+   "keepTime": false,
+   "includeVars": false
+  }
+ ],
+ "time": {
+  "from": "now-6h",
+  "to": "now"
+ },
+ "refresh": "30s",
+ "timepicker": {
+  "refresh_intervals": [
+   "10s",
+   "30s",
+   "1m",
+   "5m"
+  ]
+ },
+ "tags": [],
+ "description": "Basket spread of a bull and a bear ETF perp on one exchange, against its moving mean and the entry band, session by session.",
+ "uid": "arb-etf-pair-combo-spread",
+ "title": "Combo Spread",
+ "timezone": "Etc/GMT-8",
+ "editable": false,
+ "schemaVersion": 42,
+ "graphTooltip": 1
+}
