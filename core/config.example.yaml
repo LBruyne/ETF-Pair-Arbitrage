@@ -1,0 +1,64 @@
+# core configuration. Copy to config.yaml and edit; secrets live in a separate
+# JSON file (see .env.example), never here. Unknown keys are rejected at start.
+#
+# Units: keys ending in _d are in spread units (1 unit = 0.5 bps of the two
+# legs' combined notional: on 10,000 USDT, 1 unit is 0.5 USDT); keys ending in
+# _bps are basis points of a notional or a price. Amounts in quotes are exact
+# decimals.
+
+# Log level: debug, info, warn, error.
+log_level: info
+
+# The exchange side and the reference data behind the spread.
+cex:
+  # The one pair this process trades. symbol is the contract, ticker the ETF
+  # whose anchor it uses, book_topic the depth topic subscribed (books5 or
+  # books50): choose the topics that cover the same price range on each leg.
+  pair:
+    bull: { symbol: SOXLUSDT, ticker: SOXL, book_topic: books5 }
+    bear: { symbol: SOXSUSDT, ticker: SOXS, book_topic: books50 }
+  depth_max_age: 10s          # a leg's depth, or its best price, older than this is not usable
+  fx_max_age: 60s             # F (USDT-USD) older than this stops entries; exits go on with the last value
+  nav_settle_delay: 1h        # a NAV unchanged this long replaces the bell anchor
+  # Trading days the built-in calendar does not know, in New York time:
+  #   - { date: 2026-12-24, close: "13:00", source: "..." }   an early close
+  #   - { date: 2026-12-25, close: closed, source: "..." }    no regular session
+  calendar_overrides: []
+  # Planned ex-dates, kept by hand together with dashboard/config.yaml. Entries
+  # are banned around an ex-date and the anchor is adjusted when it takes effect.
+  # kind: dividend or split.
+  corporate_actions:
+    - { ticker: SOXL, ex_date: 2026-12-22, kind: dividend, source: "..." }
+    - { ticker: SOXS, ex_date: 2026-12-22, kind: dividend, source: "..." }
+
+# The signal and the sizes. mean_model, mean_minutes, sigma_minutes, d_in,
+# d_out and taker_fee_bps have no default and must be written; the values
+# here are examples.
+strategy:
+  mean_model: ema             # ema | sma: how the mean of the spread is taken
+  mean_minutes: 30            # X: the span of the mean, in minutes
+  sigma_minutes: 30           # Y: the window of the standard deviation, in minutes
+  d_in: 2                     # entry line, in sigmas from the mean
+  d_out: -0.5                 # exit line on the entry's axis, in sigmas; -0.5 is half a sigma past the mean. Must satisfy -d_in <= d_out < d_in
+  taker_fee_bps: 0.65         # the trading account's taker fee per leg, of the traded notional; it enters the entry condition and the fee estimates
+  cost_margin_d: 0            # extra the entry asks on top of the round-trip fee, in spread units
+  level_bucket: "0.01"        # effective levels fold raw levels into price buckets of this size, USDT
+  level_min_qty: "1"          # a bucket below this many shares is skipped
+  take_ratio: "0.5"           # the share of the first two effective levels one batch takes
+  entry_spacing: 60s          # a same-side entry sooner than this needs entry_step_d more
+  entry_step_d: 1             # in spread units
+  completion_window: 5s       # this long after a batch is sent, its short leg may still be completed; later it is trimmed back
+  forced_slip_bps: 10         # forced exits and trims give up this much past the best price, of each leg's price
+  forced_exit_before_close: 1m   # positions are closed this long before the regular close
+  rewarm_on_anchor_change: false # true: the mean and sigma warm up again after the anchor changes from bell to NAV
+
+# The capital and the quota. Both keys must be written.
+inventory:
+  capital: "1000"             # M, USDT
+  leverage: "10"              # L: the quota is L x (M + min(0, R)); the two contracts must be set to it on the account
+
+# Execution.
+exec:
+  live: false                 # false: paper mode, no order leaves the process and the exchange key is not read; true needs -env pointing at the service's credentials file
+  sim_order_latency: { bull: 15ms, bear: 15ms }   # paper and replay: an order meets its leg's book this long after it is sent; must be written
+  stop_alarm_after: 60s       # not flat this long after a stop signal: alarm, and again every interval
