@@ -1,0 +1,26 @@
+# Tracked: core/ (the trading program), dashboard/ (boards, collector, recorder), the project
+# documents, and the root Go module that dashboard/ builds with. Everything else at the root
+# (experiments, research, notes, virtualenv) stays local.
+/*
+!/.gitignore
+!/core/
+!/dashboard/
+!/PRD.md
+!/README.md
+!/AGENTS.md
+!/SOURCES.md
+!/DATA.md
+!/go.mod
+!/go.sum
+
+# Secrets and local configuration
+.env
+/dashboard/grafana.env
+/dashboard/config.yaml
+/core/config.yaml
+
+# Runtime and generated files
+__pycache__/
+logs/
+/dashboard/run/
+/dashboard/grafana/dashboards/published/
