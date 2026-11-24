@@ -1,0 +1,90 @@
+# pairscan: the collector of the Combo Spread board. Public data only; the
+# PostgreSQL DSN comes from the environment variable below, the key of the
+# data API of Direxion's website (nav_source direxion) from
+# DIREXION_SITE_API_KEY. Without that key SOXL and SOXS keep their bell anchors.
+# The ETFs' dividends and splits come from ProShares (TQQQ, SQQQ), Nasdaq
+# (QQQ, SOXX, TQQQ, SQQQ), Direxion's site API with the same key (SOXL, SOXS)
+# and Bitget's split records (all six); the coming dates that no source lists
+# ahead are entered below (corporate_actions).
+dsn_env: ETFPAIR_BOARD_DSN
+
+# A combo is a bull and a bear ETF and the perpetual contracts that trade
+# them on each venue; ref is the unleveraged ETF of the same index and its
+# contract, shown for reference. The board's Combo and CEX pickers list these.
+# Each ETF's bell anchor is USD per USDT times Binance's index price of its
+# contract at the close (Bitget's for a session before Binance lists the
+# contract), so every combo needs a binance market.
+combos:
+  - id: SOXL-SOXS
+    title: "SOXL / SOXS"
+    bull_ticker: SOXL
+    bear_ticker: SOXS
+    ref_ticker: SOXX
+    nav_source: direxion       # the issuer's NAVs, read through its website's data API, replace the bell anchors once stable
+    markets:
+      - { venue: binance, bull_symbol: SOXLUSDT, bear_symbol: SOXSUSDT, ref_symbol: SOXXUSDT }
+      - { venue: bitget,  bull_symbol: SOXLUSDT, bear_symbol: SOXSUSDT, ref_symbol: SOXXUSDT }
+  - id: TQQQ-SQQQ
+    title: "TQQQ / SQQQ"
+    bull_ticker: TQQQ
+    bear_ticker: SQQQ
+    ref_ticker: QQQ
+    nav_source: proshares      # the product page's NAV (and the issuer's NAV files for past days) replaces the bell anchors once stable
+    markets:
+      - { venue: binance, bull_symbol: TQQQUSDT, bear_symbol: SQQQUSDT, ref_symbol: QQQUSDT }
+      - { venue: bitget,  bull_symbol: TQQQUSDT, bear_symbol: SQQQUSDT, ref_symbol: QQQUSDT }
+
+# Fee levels of each venue, in bps of notional (negative maker = rebate), for
+# the board's Fee Levels table. source says where each rate comes from; a
+# rate without evidence is labelled as a scenario. The account rates were
+# read or confirmed for the SOXL and SOXS contracts only.
+fee_levels:
+  - { venue: bitget,  level: account, label: "PRO 6",           taker_bps: "0.65", maker_bps: "0", source: "Bitget PRO 6, stock futures group (official fee page, saved 2026-11-19); account read 2026-11-17: taker 0.65, maker -0.1" }
+  - { venue: bitget,  level: default, label: "Public Default",  taker_bps: "6",    maker_bps: "2", source: "instruments takerFeeRate / makerFeeRate, read 2026-11-17" }
+  - { venue: binance, level: account, label: "VIP 3",           taker_bps: "2.5",  maker_bps: "0", source: "confirmed by the account owner 2026-11-19; not read from the API" }
+  - { venue: binance, level: vip7,    label: "VIP 7 (planned)", taker_bps: "1.1",  maker_bps: "0", source: "the owner's planned upgrade, stated 2026-11-19; not a current account rate" }
+
+history_start: 2026-07-16    # the first session, and the day the one-minute candle history goes back to (UTC): SOXS trades post-split and on both venues from here
+fx_poll: 10s                # Coinbase USDT-USD
+anchor_poll: 5m             # a missing bell anchor, or a NAV not yet confirmed, is asked for again this often
+nav_settle_delay: 1h        # the issuer must have given the same NAV of both legs this long before it replaces the bell anchor
+
+# Dividends and splits entered by hand: the dates of the coming dividends
+# that their sources list only once declared, Direxion's of SOXL and SOXS
+# (declared after the close of the day before the ex-date), Nasdaq's of SOXX
+# and QQQ, and ProShares' of TQQQ and SQQQ until its schedule page lists the
+# year. Until a source gives the amount the action is Scheduled; the
+# collector reads the sources at every anchor_poll in its window (Nasdaq,
+# ProShares: from 04:00 New York of the trading day before the ex-date until
+# the ex-date ends; Direxion: from that day's close until the end of the
+# trading day after the ex-date), and the source's amount then replaces the
+# entry. value: USD per share as declared (per pre-split share),
+# or a split's new shares per old share (3 for 3-for-1, 0.1 for 1-for-10),
+# for an amount no source gives; without a value the action is Scheduled
+# (date known, amount not yet: from the instant it takes effect so, the
+# board shows Past T in amber and no signal); status: None for a round in
+# which the fund pays nothing (the collector sets ProShares' None once the
+# ex-date has closed without one in its year's table, and for a December
+# round the next year's too, and a Direxion fund's when Direxion lists the
+# round for its other fund only). A dividend takes effect at 20:00 New York of
+# the day before the ex-date. Add the next round of each fund every quarter.
+corporate_actions:
+  - { ticker: SOXL, ex_date: 2026-12-22, kind: dividend, source: "expected December round: Direxion's 2026 rounds were Tuesdays (03-24, 06-23, 09-22), 2025's ex 12-23; SOXL paid nothing in December 2025" }
+  - { ticker: SOXS, ex_date: 2026-12-22, kind: dividend, source: "expected December round: Direxion's 2026 rounds were Tuesdays (03-24, 06-23, 09-22), 2025's ex 12-23 (SOXS 0.04087)" }
+  - { ticker: SOXX, ex_date: 2026-12-15, kind: dividend, source: "iShares and BlackRock ETFs distribution schedule 2026-2028 (PDF dated 2026-11-18, https://www.ishares.com/us/literature/shareholder-letters/isharesandblackrocketfsdistributionschedule.pdf): quarterly, declaration 14-Dec-26 after the close, ex 15-Dec-26, pay 18-Dec-26" }
+  - { ticker: QQQ,  ex_date: 2026-12-21, kind: dividend, source: "expected: Nasdaq's QQQ ex-dates are the Monday after the third Friday of the quarter's last month (2024-12-23, 2025-12-22, 2026-03-23, 06-22, 09-21; https://api.nasdaq.com/api/quote/QQQ/dividends?assetclass=etf); Invesco publishes no US schedule" }
+  - { ticker: SOXX, ex_date: 2026-12-30, kind: dividend, source: "iShares schedule PDF (2026-11-18): potential excise-tax distribution, declaration 29-Dec-26, ex 30-Dec-26, pay 5-Jan-27; often none: set status None when iShares' announcement of 12-29 does not list SOXX" }
+  - { ticker: SOXX, ex_date: 2027-03-16, kind: dividend, source: "iShares schedule PDF (2026-11-18): 2027 ex-dates 16-Mar, 10-Jun, 14-Sep, 14-Dec (3 business days before the third Friday)" }
+  - { ticker: QQQ,  ex_date: 2027-03-22, kind: dividend, source: "expected: the Monday after the third Friday of March (see QQQ 2026-12-21)" }
+  - { ticker: SOXL, ex_date: 2027-03-23, kind: dividend, source: "expected March round: Direxion's March rounds were Tuesdays (2025-03-25, 2026-03-24); not published yet" }
+  - { ticker: SOXS, ex_date: 2027-03-23, kind: dividend, source: "expected March round: Direxion's March rounds were Tuesdays (2025-03-25, 2026-03-24); not published yet" }
+  - { ticker: TQQQ, ex_date: 2027-03-24, kind: dividend, source: "expected March round: ProShares' March ex-dates were Wednesdays (2025-03-26, 2026-03-25; https://www.proshares.com/resources/distributions/distribution-schedule); its 2027 schedule is not published yet" }
+  - { ticker: SQQQ, ex_date: 2027-03-24, kind: dividend, source: "expected March round: ProShares' March ex-dates were Wednesdays (2025-03-26, 2026-03-25; https://www.proshares.com/resources/distributions/distribution-schedule); its 2027 schedule is not published yet" }
+
+# Unscheduled closures and moved closes of US equity trading days, read at
+# start (calendar.go holds NYSE's holidays and early closes of 2026-2028):
+# close "closed" removes the trading day, "HH:MM" (New York) gives it that
+# regular close; After-Hours ends four hours after the close. The source is
+# the exchange's notice (NYSE press release, Nasdaq Trader alert).
+calendar_overrides: []
+#  - { date: 2027-01-09, close: closed, source: "https://ir.theice.com/press/news-details/..." }
