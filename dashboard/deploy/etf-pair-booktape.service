@@ -1,0 +1,19 @@
+[Unit]
+Description=booktape recorder of the venues' WebSocket frames and per-second rows for the ETF-Pair Combo Spread board
+After=network-online.target postgresql.service
+Wants=network-online.target
+
+[Service]
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/home/ubuntu/code/etf-pair-arbitrage
+# The PostgreSQL DSN (deploy/install.sh writes it).
+EnvironmentFile=/home/ubuntu/code/etf-pair-arbitrage/dashboard/.env
+ExecStart=/home/ubuntu/code/etf-pair-arbitrage/dashboard/run/booktape -config dashboard/config.yaml -output experiments/book_tape
+StandardOutput=append:/home/ubuntu/code/etf-pair-arbitrage/dashboard/run/booktape.log
+StandardError=inherit
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
