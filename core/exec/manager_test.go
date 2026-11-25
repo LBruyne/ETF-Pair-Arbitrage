@@ -3,12 +3,15 @@ package exec
 import (
 	"context"
 	"errors"
+	"math"
 	"strings"
 	"syscall"
 	"testing"
 	"time"
 
+	"etf-pair-arbitrage/core/cex"
 	"etf-pair-arbitrage/core/inventory"
+	"etf-pair-arbitrage/core/store"
 )
 
 // NewManager refuses a configuration that does not validate: the defaults
@@ -120,5 +123,24 @@ func TestSignalsQueuedBeforeTheFirstRound(t *testing.T) {
 	<-done
 	if n := len(r.orders()); n != 0 {
 		t.Errorf("%d orders sent with no new entries asked for before Run", n)
+	}
+}
+
+// Each second's signal_sample carries both legs' bid1/ask1 midpoints, for
+// the board; a leg without a best bid and ask has none (NULL).
+func TestSignalSampleCarriesTheMidpoints(t *testing.T) {
+	start := utc8Time(11, 25, 5, 1, 0)
+	r := newRig(t, start, rigOptions{})
+	r.stepAt(start)
+	first := r.sink.Last("signal_sample").(store.SignalSampleRow)
+	if !math.IsNaN(first.MidBull) || !math.IsNaN(first.MidBear) {
+		t.Errorf("mids before any book %v / %v, want NaN", first.MidBull, first.MidBear)
+	}
+	r.best(cex.Bull, lv("40.38", "10"), lv("40.39", "10"))
+	r.best(cex.Bear, lv("59.41", "10"), lv("59.43", "10"))
+	r.stepAt(start.Add(time.Second))
+	got := r.sink.Last("signal_sample").(store.SignalSampleRow)
+	if got.TsMs != start.Add(time.Second).UnixMilli() || math.Abs(got.MidBull-40.385) > 1e-9 || math.Abs(got.MidBear-59.42) > 1e-9 {
+		t.Errorf("sample at %d mids %v / %v, want 40.385 / 59.42 a second later", got.TsMs, got.MidBull, got.MidBear)
 	}
 }

@@ -1,9 +1,12 @@
 package inventory
 
 import (
+	"context"
 	"errors"
 	"testing"
 	"time"
+
+	"github.com/shopspring/decimal"
 
 	"etf-pair-arbitrage/core/cex"
 	"etf-pair-arbitrage/core/store"
@@ -131,6 +134,43 @@ func TestSampleBeforePositionsAreRead(t *testing.T) {
 	r.m.sample(r.clock.Now())
 	if s = lastOf(t, r.sink, func(store.InventorySampleRow) bool { return true }); !s.PosBull.Valid || !s.PosBull.Decimal.IsZero() {
 		t.Errorf("sample after a read = %+v, want venue positions of zero", s)
+	}
+}
+
+// The sample also carries, for the board, what the venue reports with each
+// held position - mark, unrealised PnL, liquidation price - and the
+// account's equity and margin ratio. What was not reported is NULL: all of
+// it before the first read, a leg's fields the venue left out, and the
+// account's values on the paper venue, which has no account read.
+func TestSampleCarriesTheVenueFigures(t *testing.T) {
+	r := newRig(t, "1000", "10")
+	r.m.sample(r.clock.Now())
+	s := lastOf(t, r.sink, func(store.InventorySampleRow) bool { return true })
+	if s.MarkBull.Valid || s.UplBear.Valid || s.LiqBull.Valid || s.Equity.Valid || s.MarginRatio.Valid {
+		t.Errorf("sample before any read = %+v, want the venue's figures NULL", s)
+	}
+
+	r.cex.setPositions("10", "-5")
+	r.cex.mu.Lock()
+	r.cex.board[testPair.Bull.Symbol] = cex.Position{MarkPrice: decimal.NewNullDecimal(dec("43.02")), UnrealisedPnL: decimal.NewNullDecimal(dec("1.02")), LiqPrice: decimal.NewNullDecimal(dec("0"))}
+	r.cex.mu.Unlock()
+	if _, err := r.cex.ReadPositions(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	r.m.sample(r.clock.Now())
+	s = lastOf(t, r.sink, func(store.InventorySampleRow) bool { return true })
+	if !s.MarkBull.Decimal.Equal(dec("43.02")) || !s.UplBull.Decimal.Equal(dec("1.02")) || !s.LiqBull.Valid || !s.LiqBull.Decimal.IsZero() ||
+		s.MarkBear.Valid || s.UplBear.Valid || s.LiqBear.Valid || s.Equity.Valid || s.MarginRatio.Valid {
+		t.Errorf("sample = %+v, want the bull leg's mark 43.02, PnL 1.02, liquidation 0 and nothing else", s)
+	}
+
+	r.cex.mu.Lock()
+	r.cex.assets = &cex.AccountAssets{Equity: dec("1234.5"), MarginRatio: dec("0.0123")}
+	r.cex.mu.Unlock()
+	r.m.sample(r.clock.Now())
+	s = lastOf(t, r.sink, func(store.InventorySampleRow) bool { return true })
+	if !s.Equity.Valid || !s.Equity.Decimal.Equal(dec("1234.5")) || !s.MarginRatio.Valid || !s.MarginRatio.Decimal.Equal(dec("0.0123")) {
+		t.Errorf("sample = %+v, want equity 1234.5 and margin ratio 0.0123", s)
 	}
 }
 

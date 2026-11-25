@@ -262,6 +262,10 @@ type cexSource interface {
 	// AccountChanged is closed when the positions or the funding records are
 	// next published.
 	AccountChanged() <-chan struct{}
+	// AccountAssets is the last read of the account's equity and margin
+	// ratio, for the samples only; ok is false before one and on the paper
+	// venue.
+	AccountAssets() (assets cex.AccountAssets, ok bool)
 	// FinancialRecords lists the funding records of the two legs read so
 	// far, oldest first. The slice is shared and is not changed.
 	FinancialRecords() []cex.FinancialRecord

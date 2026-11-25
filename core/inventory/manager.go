@@ -528,9 +528,12 @@ func (m *InventoryManager) legOf(symbol cex.Symbol) (cex.Leg, bool) {
 // --- samples and status ---
 
 // sample records one inventory_sample row: the venue's positions as cex
-// last published them (NULL while none was read) against the ledger.
+// last published them (NULL while none was read) against the ledger. For
+// the board it adds what the venue reported with each held position and the
+// account's last equity and margin ratio; nothing is decided from them.
 func (m *InventoryManager) sample(now time.Time) {
 	positions := m.cex.Positions()
+	assets, assetsRead := m.cex.AccountAssets()
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	ledger := m.ledgerQty()
@@ -541,6 +544,12 @@ func (m *InventoryManager) sample(now time.Time) {
 		venue := m.legQty(positions)
 		row.PosBull = decimal.NullDecimal{Decimal: venue[cex.Bull], Valid: true}
 		row.PosBear = decimal.NullDecimal{Decimal: venue[cex.Bear], Valid: true}
+	}
+	bull, bear := positions.BySymbol[m.symbols[cex.Bull]], positions.BySymbol[m.symbols[cex.Bear]]
+	row.MarkBull, row.UplBull, row.LiqBull = bull.MarkPrice, bull.UnrealisedPnL, bull.LiqPrice
+	row.MarkBear, row.UplBear, row.LiqBear = bear.MarkPrice, bear.UnrealisedPnL, bear.LiqPrice
+	if assetsRead {
+		row.Equity, row.MarginRatio = decimal.NewNullDecimal(assets.Equity), decimal.NewNullDecimal(assets.MarginRatio)
 	}
 	m.record(row)
 }

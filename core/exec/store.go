@@ -107,7 +107,17 @@ func (m *ExecManager) sampleRow(r *round, v view) store.SignalSampleRow {
 		row.CycleID, row.Direction, row.HoldBull, row.HoldBear = string(c.ID), string(c.Direction), hold[cex.Bull], hold[cex.Bear]
 	}
 	_, _, row.QuotaLeft = m.inv.Quota()
+	row.MidBull, row.MidBear = sampleMid(r.books.ByLeg[cex.Bull]), sampleMid(r.books.ByLeg[cex.Bear])
 	return row
+}
+
+// sampleMid is a leg's midpoint for the sample, recorded for the board:
+// NaN (NULL) when the book has no best bid and ask.
+func sampleMid(b *cex.Book) float64 {
+	if !hasMid(b) {
+		return math.NaN()
+	}
+	return mid(b)
 }
 
 // finite is v for a JSON detail, or nil when v is not a finite number: JSON

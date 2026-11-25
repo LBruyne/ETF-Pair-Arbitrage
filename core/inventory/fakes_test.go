@@ -66,18 +66,21 @@ type fakeCex struct {
 	reads     int                            // ReadPositions calls that succeeded
 	records   []cex.FinancialRecord
 	rates     [2]map[int64]decimal.Decimal // by leg: settlement in unix ms -> rate
+	board     map[cex.Symbol]cex.Position  // the mark, unrealised PnL and liquidation price the venue reports with a held position
+	assets    *cex.AccountAssets           // the account read; nil: none, as on the paper venue
 	changed   chan struct{}
 }
 
 func newFakeCex() *fakeCex {
-	return &fakeCex{positions: map[cex.Symbol]decimal.Decimal{}, rates: [2]map[int64]decimal.Decimal{{}, {}}, changed: make(chan struct{})}
+	return &fakeCex{positions: map[cex.Symbol]decimal.Decimal{}, rates: [2]map[int64]decimal.Decimal{{}, {}}, board: map[cex.Symbol]cex.Position{}, changed: make(chan struct{})}
 }
 
 func (f *fakeCex) set() cex.PositionSet {
 	set := cex.PositionSet{BySymbol: map[cex.Symbol]cex.Position{}, Loaded: true}
 	for symbol, qty := range f.positions {
 		if !qty.IsZero() {
-			set.BySymbol[symbol] = cex.Position{Symbol: symbol, Qty: qty}
+			b := f.board[symbol]
+			set.BySymbol[symbol] = cex.Position{Symbol: symbol, Qty: qty, MarkPrice: b.MarkPrice, UnrealisedPnL: b.UnrealisedPnL, LiqPrice: b.LiqPrice}
 		}
 	}
 	return set
@@ -107,6 +110,15 @@ func (f *fakeCex) AccountChanged() <-chan struct{} {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return f.changed
+}
+
+func (f *fakeCex) AccountAssets() (cex.AccountAssets, bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.assets == nil {
+		return cex.AccountAssets{}, false
+	}
+	return *f.assets, true
 }
 
 func (f *fakeCex) FinancialRecords() []cex.FinancialRecord {
