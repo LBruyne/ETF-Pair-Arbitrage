@@ -63,7 +63,7 @@ func (s *Strategy) EvaluateEntry(in EntryInput) (*EntryPlan, Reason) {
 
 		// Step 6: condition 1. A long needs x <= -d_in x sigma, a short
 		// x >= +d_in x sigma.
-		x := levelSpread(levels, in.F, in.Anchors) - mu
+		x := Spread(in.F, pBull, aBull, pBear, aBear) - mu
 		if !s.AtEntryLine(dir, x, sigma) {
 			reason = ReasonNoSignal
 			continue

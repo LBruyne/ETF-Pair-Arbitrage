@@ -533,3 +533,45 @@ func TestDeviation(t *testing.T) {
 		t.Errorf("Deviation without a pricing level = %v, %t; want NaN, false", x, ok)
 	}
 }
+
+// The entry's x is the spread at the pricing levels minus the mean, to the
+// last bit the same as Deviation's (which the record and the exit use), for
+// both directions and several F.
+func TestEntryDeviationBitIdentical(t *testing.T) {
+	s := newStrategy(t, nil)
+	for _, books := range [][2]*cex.Book{shortBooks(), longBooks()} {
+		for _, f := range []float64{1, 1 + 1e-7, 1 - 3e-8, 1.0000123} {
+			in := entryInput(books)
+			in.F = f
+			plan, reason := s.EvaluateEntry(in)
+			if plan == nil {
+				t.Fatalf("F %v: no plan: %s", f, reason)
+			}
+			x, _ := s.Deviation(in.Books, plan.Direction, in.F, in.Anchors, in.Stats)
+			if math.Float64bits(plan.X) != math.Float64bits(x) {
+				t.Errorf("F %v, %s: entry x %v, Deviation %v", f, plan.Direction, plan.X, x)
+			}
+		}
+	}
+}
+
+// BenchmarkEvaluateEntryNoSignal is the decision of almost every round:
+// both directions priced and neither at the line (d_in = 3: example 1's
+// short x = +10 is under 3 x 4).
+func BenchmarkEvaluateEntryNoSignal(b *testing.B) {
+	cfg := DefaultConfig
+	cfg.MeanModel, cfg.MeanMinutes, cfg.SigmaMinutes = MeanEMA, 30, 30
+	cfg.DIn, cfg.DOut, cfg.TakerFeeBps = 3, -0.5, 0.65
+	s, err := New(cfg)
+	if err != nil {
+		b.Fatal(err)
+	}
+	in := entryInput(shortBooks())
+	if plan, reason := s.EvaluateEntry(in); plan != nil || reason != ReasonNoSignal {
+		b.Fatalf("plan %v, reason %q; want no signal", plan, reason)
+	}
+	b.ReportAllocs()
+	for b.Loop() {
+		s.EvaluateEntry(in)
+	}
+}
