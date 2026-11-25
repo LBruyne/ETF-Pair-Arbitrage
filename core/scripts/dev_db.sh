@@ -69,6 +69,30 @@ GRANT SELECT ON ALL TABLES IN SCHEMA trade TO etfpair_trade_reader;
 ALTER DEFAULT PRIVILEGES FOR ROLE etfpair_trade IN SCHEMA trade GRANT SELECT ON TABLES TO etfpair_trade_reader;
 SQL
 
+  # The recorder's per-second table (dashboard/internal/booktape/schema.sql,
+  # its columns only): the process reads it at a restart. No recorder writes
+  # it here, so the writer may also insert and delete rows, for the tests;
+  # production grants SELECT only.
+  sql etfpair <<'SQL'
+SET client_min_messages = warning;
+CREATE SCHEMA IF NOT EXISTS etfpair;
+CREATE TABLE IF NOT EXISTS etfpair.perp_second (
+    venue     text      NOT NULL,
+    symbol    text      NOT NULL,
+    second_ms bigint    NOT NULL,
+    price     numeric,
+    trade_ms  bigint,
+    bid_px    numeric[],
+    bid_sz    numeric[],
+    ask_px    numeric[],
+    ask_sz    numeric[],
+    book_ms   bigint,
+    PRIMARY KEY (venue, symbol, second_ms)
+);
+GRANT USAGE ON SCHEMA etfpair TO etfpair_trade;
+GRANT SELECT, INSERT, DELETE ON etfpair.perp_second TO etfpair_trade;
+SQL
+
   echo "core dev database is running on $HOST:$PORT (data: $DATA)"
   echo "  export ETFPAIR_TRADE_TEST_DSN=postgres://etfpair_trade@$HOST:$PORT/etfpair"
 }

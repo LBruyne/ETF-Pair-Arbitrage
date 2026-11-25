@@ -165,12 +165,19 @@ func run(cfg *config.Config, signals <-chan os.Signal) error {
 	// settle delay continue instead of starting over, and the ledger (R,
 	// the dust, the booked funding and the unfinished cycle with its lots
 	// and orders).
+	// A read that fails is tried again: nothing stored is taken for nothing
+	// held. A stop signal meanwhile waits in the channel for exec.
 	sessionID := cmgr.Session(started).ID
-	loadCtx, cancelLoad := context.WithTimeout(context.Background(), stateLoadTimeout)
-	state, err := st.LoadState(loadCtx, sessionID)
-	cancelLoad()
-	if err != nil {
-		return fmt.Errorf("the stored state was not read: %w", err)
+	var state store.State
+	for attempt := 1; ; attempt++ {
+		loadCtx, cancelLoad := context.WithTimeout(context.Background(), stateLoadTimeout)
+		state, err = st.LoadState(loadCtx, sessionID)
+		cancelLoad()
+		if err == nil {
+			break
+		}
+		log.Warn("ETF-arbitrage core: the stored state was not read; retrying", "attempt", attempt, "err", err, "retry_in", stateLoadRetry)
+		time.Sleep(stateLoadRetry)
 	}
 	// The unfinished cycle's orders go into cex's order table first, which
 	// gives each record this process's UpdateSeq and turns those without a
@@ -189,8 +196,12 @@ func run(cfg *config.Config, signals <-chan os.Signal) error {
 	if paper != nil {
 		paper.SeedPositions(imgr.LedgerPositions())
 	}
+	// The loop's own: the Session's minutes, the last built entry, and the
+	// recorder's per-second rows for the minutes it did not record. Its
+	// recovery (reading the venue's orders and positions) runs in Run.
+	emgr.Restore(state.MinuteBars, state.LastEntry, st)
 	log.Info("ETF-arbitrage core state loaded", "session", sessionID, "anchor_facts", len(state.AnchorFacts),
-		"unfinished_cycle", state.Cycle != nil, "orders", len(orders), "funding_records", len(state.Funding))
+		"unfinished_cycle", state.Cycle != nil, "orders", len(orders), "funding_records", len(state.Funding), "minute_bars", len(state.MinuteBars))
 
 	mgrCtx, stopManagers := context.WithCancel(context.Background())
 	var managers sync.WaitGroup
@@ -219,8 +230,12 @@ func run(cfg *config.Config, signals <-chan os.Signal) error {
 	return err
 }
 
-// stateLoadTimeout is the limit of reading the stored state at start.
-const stateLoadTimeout = 10 * time.Second
+// stateLoadTimeout is the limit of reading the stored state at start, and
+// stateLoadRetry the wait before a failed read is tried again.
+const (
+	stateLoadTimeout = 10 * time.Second
+	stateLoadRetry   = 5 * time.Second
+)
 
 // processRunRow is the process_run row of this start: the effective
 // configuration, with nothing from the secrets file.

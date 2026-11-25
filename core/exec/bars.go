@@ -35,7 +35,7 @@ func (m *ExecManager) closeMinutes(now time.Time) {
 					"mu_d", m.stats.Mu(m.anchors), "sigma_d", m.stats.Sigma(m.anchors))
 			}
 		}
-		m.record(minuteBarRow(m.session.ID, bar))
+		m.record(minuteBarRow(m.session.ID, bar, sourceOwn))
 		log.Debug("exec: minute closed", "minute", showTime(bar.Minute), "valid", bar.Valid, "mid_bull", bar.MidBull, "mid_bear", bar.MidBear, "f", bar.F,
 			"run_minutes", len(m.bars)-m.runStart, "stats_ready", m.stats.Ready)
 		m.minute, m.obs = m.minute.Add(time.Minute), nil

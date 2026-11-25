@@ -14,6 +14,7 @@ import (
 
 	"etf-pair-arbitrage/core/cex"
 	"etf-pair-arbitrage/core/inventory"
+	"etf-pair-arbitrage/core/store"
 	"etf-pair-arbitrage/core/strategy"
 )
 
@@ -168,6 +169,18 @@ type cexSource interface {
 	ReadPositions(ctx context.Context) (cex.PositionSet, error)
 	// MarkNeverArrived ends an order of unknown outcome as never_arrived.
 	MarkNeverArrived(id cex.ClientOrderID)
+	// RecoverOrders books the venue's orders of the unfinished cycle the
+	// table lacks and returns them; SetOrderLot stores the lot of one.
+	RecoverOrders(ctx context.Context, cycleID string) ([]cex.OrderRecord, error)
+	SetOrderLot(id cex.ClientOrderID, lotID string)
+	// FXMinuteCloses reads the source's minute closes of F of [from, to).
+	FXMinuteCloses(ctx context.Context, from, to time.Time) ([]cex.FXMinute, error)
+}
+
+// minuteSource reads the recorder's per-second rows of the two contracts
+// (store), for the minutes a restart finds the process did not record.
+type minuteSource interface {
+	LoadPerpMinutes(ctx context.Context, bull, bear string, from, to time.Time) ([]store.PerpMinuteRow, error)
 }
 
 // unknownOrder is what the loop keeps of an order whose outcome is unknown.
@@ -197,9 +210,10 @@ type timings struct {
 	reconcileEvery time.Duration // with nothing in flight the venue's positions are compared with the ledger this often
 	reconcileAgain time.Duration // a comparison that differs is repeated this soon: two that differ make a mismatch (inventory)
 	mismatchAlarm  time.Duration // while positions do not match, the alarm is repeated this often
+	recoverRetry   time.Duration // a recovery step that could not read its facts is tried again after this
 }
 
 // defaultTimings are the values the process runs with.
 var defaultTimings = timings{clock: time.Now, step: 200 * time.Millisecond, resend: 200 * time.Millisecond, rejectBackoff: time.Second,
 	sample: time.Second, statusLog: 30 * time.Second, readTimeout: 2 * time.Second, closeRetry: time.Second,
-	unknownAlarm: 30 * time.Second, positionsRead: time.Second, reconcileEvery: 10 * time.Second, reconcileAgain: time.Second, mismatchAlarm: time.Minute}
+	unknownAlarm: 30 * time.Second, positionsRead: time.Second, reconcileEvery: 10 * time.Second, reconcileAgain: time.Second, mismatchAlarm: time.Minute, recoverRetry: 5 * time.Second}

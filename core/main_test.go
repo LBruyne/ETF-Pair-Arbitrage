@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"etf-pair-arbitrage/core/internal/dbtest"
 	"fmt"
 	"os"
 	osexec "os/exec"
@@ -111,19 +112,31 @@ func TestStoredProcessRunConfigHoldsNoSecrets(t *testing.T) {
 
 // testDSN returns the test database's connection string, or skips. These
 // tests write rows: like the store's tests they run only against a
-// development database, never the production port.
+// development database, never the production port, and hold it against the
+// other packages' tests (dbtest.Lock).
 func testDSN(t *testing.T) string {
 	t.Helper()
-	dsn := os.Getenv("ETFPAIR_TRADE_TEST_DSN")
-	if dsn == "" {
-		t.Skip("ETFPAIR_TRADE_TEST_DSN is not set: database test skipped (scripts/dev_db.sh start prints the value)")
-	}
-	if pc, err := pgx.ParseConfig(dsn); err != nil {
-		t.Fatal("ETFPAIR_TRADE_TEST_DSN cannot be parsed")
-	} else if pc.Port == 5432 {
-		t.Fatal("ETFPAIR_TRADE_TEST_DSN points at port 5432: this test writes and runs only against a development database")
-	}
-	return dsn
+	dbtest.Lock(t)
+	return dbtest.DSN(t)
+}
+
+// syncBuffer is a child process's output: the process writes it while the
+// test may read it.
+type syncBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *syncBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *syncBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
 }
 
 // schemaLockKey is the advisory lock the store takes while it applies the
@@ -138,6 +151,7 @@ const schemaLockKey int64 = 0x65746670_74726164
 // exit code 0 and writes the stop time of its run.
 func TestStopSignalDuringStartupIsHonoured(t *testing.T) {
 	dsn := testDSN(t)
+	dbtest.Clear(t) // the process reads back what it finds: nothing another test left
 	ctx := context.Background()
 	dir := t.TempDir()
 
@@ -175,7 +189,7 @@ func TestStopSignalDuringStartupIsHonoured(t *testing.T) {
 	if _, err := locker.Exec(ctx, "SELECT pg_advisory_lock($1)", schemaLockKey); err != nil {
 		t.Fatal(err)
 	}
-	var output bytes.Buffer
+	var output syncBuffer
 	cmd := osexec.Command(bin, "-config", configPath, "-env", envPath)
 	cmd.Dir, cmd.Stdout, cmd.Stderr = dir, &output, &output
 	began := time.Now()

@@ -6,6 +6,7 @@ import (
 	"errors"
 	"os"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -129,12 +130,13 @@ func (v *fakeVenue) feed(ev cex.BookEvent) bool {
 type gateVenue struct {
 	*cex.PaperVenue
 	mu     sync.Mutex
-	held   cex.Symbol
+	held   map[cex.Symbol]bool
 	queue  []cex.PrivateEvent
 	on     func(cex.PrivateEvent)
-	parked cex.Symbol
+	parked map[cex.Symbol]bool
 	waits  []cex.OrderRequest
 	lost   cex.Symbol
+	unread atomic.Bool // the positions cannot be read
 	refuse func(req cex.OrderRequest) error
 	placed map[cex.ClientOrderID]int // PlaceOrder calls per order
 }
@@ -145,7 +147,7 @@ func (g *gateVenue) PlaceOrder(ctx context.Context, req cex.OrderRequest) (cex.O
 		g.placed = map[cex.ClientOrderID]int{}
 	}
 	g.placed[req.ClientOrderID]++
-	refuse, park, lose := g.refuse, g.parked == req.Symbol, g.lost == req.Symbol
+	refuse, park, lose := g.refuse, g.parked[req.Symbol], g.lost == req.Symbol
 	if park {
 		g.waits = append(g.waits, req)
 	}
@@ -165,9 +167,16 @@ func (g *gateVenue) PlaceOrder(ctx context.Context, req cex.OrderRequest) (cex.O
 	return ack, err
 }
 
+func (g *gateVenue) Positions(ctx context.Context, symbols []cex.Symbol) (cex.PositionSet, error) {
+	if g.unread.Load() {
+		return cex.PositionSet{}, errors.New("the test makes the positions unreadable")
+	}
+	return g.PaperVenue.Positions(ctx, symbols)
+}
+
 func (g *gateVenue) OrderByClientID(ctx context.Context, symbol cex.Symbol, id cex.ClientOrderID) (cex.OrderRecord, error) {
 	g.mu.Lock()
-	held := g.held == symbol
+	held := g.held[symbol]
 	g.mu.Unlock()
 	if held {
 		return cex.OrderRecord{}, errors.New("the test holds this contract's queries")
@@ -175,9 +184,16 @@ func (g *gateVenue) OrderByClientID(ctx context.Context, symbol cex.Symbol, id c
 	return g.PaperVenue.OrderByClientID(ctx, symbol, id)
 }
 
-// park keeps symbol's next orders from the venue; lose loses the answer to
-// them.
-func (g *gateVenue) park(symbol cex.Symbol) { g.mu.Lock(); g.parked = symbol; g.mu.Unlock() }
+// park keeps the symbols' next orders from the venue; lose loses the
+// answer to them.
+func (g *gateVenue) park(symbols ...cex.Symbol) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.parked = map[cex.Symbol]bool{}
+	for _, s := range symbols {
+		g.parked[s] = true
+	}
+}
 func (g *gateVenue) lose(symbol cex.Symbol) { g.mu.Lock(); g.lost = symbol; g.mu.Unlock() }
 
 // setRefuse sets what answers the orders instead of the venue; nil lets
@@ -192,7 +208,7 @@ func (g *gateVenue) setRefuse(f func(req cex.OrderRequest) error) {
 func (g *gateVenue) releaseParked() {
 	g.mu.Lock()
 	waits := g.waits
-	g.waits, g.parked = nil, ""
+	g.waits, g.parked = nil, nil
 	g.mu.Unlock()
 	for _, req := range waits {
 		g.PaperVenue.PlaceOrder(context.Background(), req)
@@ -206,6 +222,27 @@ func (g *gateVenue) placeCalls(id cex.ClientOrderID) int {
 	return g.placed[id]
 }
 
+// RecentOrders gives the paper venue's orders as a real venue would: it
+// knows nothing of the lots they were sent for.
+func (g *gateVenue) RecentOrders(ctx context.Context, symbol cex.Symbol, since time.Time) ([]cex.OrderRecord, error) {
+	recs, err := g.PaperVenue.RecentOrders(ctx, symbol, since)
+	for i := range recs {
+		recs[i].Request.LotID = ""
+	}
+	return recs, err
+}
+
+// placedTotal is the number of PlaceOrder calls of every order.
+func (g *gateVenue) placedTotal() int {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	n := 0
+	for _, c := range g.placed {
+		n += c
+	}
+	return n
+}
+
 func (g *gateVenue) SubscribePrivate(ctx context.Context, symbols []cex.Symbol, onEvent func(cex.PrivateEvent), onDown func(error)) error {
 	g.mu.Lock()
 	g.on = onEvent
@@ -216,7 +253,7 @@ func (g *gateVenue) SubscribePrivate(ctx context.Context, symbols []cex.Symbol, 
 // deliver passes an event on, or keeps it while its contract is held.
 func (g *gateVenue) deliver(ev cex.PrivateEvent) {
 	g.mu.Lock()
-	held := g.held != "" && (ev.Positions != nil || (ev.Order != nil && ev.Order.Request.Symbol == g.held) || (ev.Fill != nil && ev.Fill.Symbol == g.held))
+	held := len(g.held) > 0 && (ev.Positions != nil || (ev.Order != nil && g.held[ev.Order.Request.Symbol]) || (ev.Fill != nil && g.held[ev.Fill.Symbol]))
 	if held {
 		g.queue = append(g.queue, ev)
 	}
@@ -227,18 +264,21 @@ func (g *gateVenue) deliver(ev cex.PrivateEvent) {
 	}
 }
 
-// hold starts keeping the events of symbol's orders.
-func (g *gateVenue) hold(symbol cex.Symbol) {
+// hold starts keeping the events of the symbols' orders.
+func (g *gateVenue) hold(symbols ...cex.Symbol) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
-	g.held = symbol
+	g.held = map[cex.Symbol]bool{}
+	for _, s := range symbols {
+		g.held[s] = true
+	}
 }
 
 // release delivers what was kept, in order, and opens the gate.
 func (g *gateVenue) release() {
 	g.mu.Lock()
 	queue, on := g.queue, g.on
-	g.queue, g.held = nil, ""
+	g.queue, g.held = nil, nil
 	g.mu.Unlock()
 	for _, ev := range queue {
 		on(ev)
@@ -290,6 +330,19 @@ type testCex struct {
 	notReady    bool
 	settingsBad bool
 	notFound    map[cex.ClientOrderID]bool // orders cex reports as NotFound: its own verdict takes 30 s of wall time
+	fxCloses    []cex.FXMinute             // the source's minute closes of F; cex's source has none in tests
+}
+
+func (c *testCex) FXMinuteCloses(_ context.Context, from, to time.Time) ([]cex.FXMinute, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	var out []cex.FXMinute
+	for _, m := range c.fxCloses {
+		if !m.Minute.Before(from) && m.Minute.Before(to) {
+			out = append(out, m)
+		}
+	}
+	return out, nil
 }
 
 // CycleOrders is cex's snapshot with the orders the test names marked
@@ -365,9 +418,37 @@ func (c *testCex) setFX(price string, at time.Time) {
 
 // rigOptions changes the defaults of a rig.
 type rigOptions struct {
-	capital string        // M, USDT; default 2000 (PRD appendix A)
-	latency time.Duration // the paper venue's order latency on both legs; default 1 ms
-	state   *store.State  // what the ledger is restored from, as at a restart; nil is an empty ledger. The paper positions are seeded from it
+	capital  string        // M, USDT; default 2000 (PRD appendix A)
+	latency  time.Duration // the paper venue's order latency on both legs; default 1 ms
+	state    *store.State  // what a restart read back: the ledger, the cycle's orders, the minutes and the last entry; nil is a first start
+	exchange *exchange     // the exchange of an earlier process, which keeps its orders and positions; nil makes a new one, whose positions are seeded from the ledger
+	sink     store.Sink    // where the rows go besides the rig's fake; nil: the fake alone
+	perp     minuteSource  // the recorder's minutes for the loop's recovery
+}
+
+// exchange is what outlives a process: the venue behind the paper venue,
+// the paper venue with its orders and positions, and the gate on it.
+type exchange struct {
+	venue *fakeVenue
+	paper *cex.PaperVenue
+	gate  *gateVenue
+	seq   [2]uint64 // the last book sequence fed per leg: the venue's books go on
+}
+
+// teeSink records into the rig's fake and a real store: the helpers read
+// the fake, a restart reads the database.
+type teeSink struct {
+	fake *store.Fake
+	real store.Sink
+}
+
+func (s teeSink) Record(rows ...store.Row) { s.real.Record(rows...); s.fake.Record(rows...) }
+func (s teeSink) Healthy() bool            { return s.real.Healthy() }
+func (s teeSink) WriteSync(rows ...store.Row) error {
+	if err := s.real.WriteSync(rows...); err != nil {
+		return err
+	}
+	return s.fake.WriteSync(rows...)
 }
 
 // rig is one loop on the real components, with its clock in the test's
@@ -378,17 +459,18 @@ type rig struct {
 	now     time.Time
 	fxFixed bool // F is not refreshed when the clock moves: it goes stale
 
-	venue   *fakeVenue
-	paper   *cex.PaperVenue
-	gate    *gateVenue // the paper venue as cex sees it
-	cex     *cex.CexManager
-	src     *testCex
-	inv     *inventory.InventoryManager
-	m       *ExecManager
-	sink    *store.Fake
-	signals chan os.Signal
-	seq     [2]uint64
-	cal     int // calibration books pushed so far, to alternate them
+	exchange *exchange
+	venue    *fakeVenue
+	paper    *cex.PaperVenue
+	gate     *gateVenue // the paper venue as cex sees it
+	stopCex  func()     // ends cex's loops, once
+	cex      *cex.CexManager
+	src      *testCex
+	inv      *inventory.InventoryManager
+	m        *ExecManager
+	sink     *store.Fake
+	signals  chan os.Signal
+	cal      int // calibration books pushed so far, to alternate them
 }
 
 // testStrategy is the strategy of the tests: PRD appendix A's lines and fee,
@@ -411,31 +493,51 @@ func newRig(t *testing.T, now time.Time, opts rigOptions) *rig {
 	if opts.latency == 0 {
 		opts.latency = time.Millisecond
 	}
-	r := &rig{t: t, now: now, venue: &fakeVenue{t: t, stream: map[cex.Symbol]func(cex.BookEvent){}}, sink: &store.Fake{}, signals: make(chan os.Signal, 8)}
+	r := &rig{t: t, now: now, sink: &store.Fake{}, signals: make(chan os.Signal, 8)}
+	var sink store.Sink = r.sink
+	if opts.sink != nil {
+		sink = teeSink{fake: r.sink, real: opts.sink}
+	}
 
 	pair := cex.Pair{Bull: cex.LegConfig{Symbol: "SOXLUSDT", Ticker: "SOXL", BookTopic: cex.TopicBooks5}, Bear: cex.LegConfig{Symbol: "SOXSUSDT", Ticker: "SOXS", BookTopic: cex.TopicBooks5}}
 	cexCfg := cex.DefaultConfig
 	cexCfg.Pair, cexCfg.BookConnections = pair, 1
-	r.paper = cex.NewPaperVenue(r.venue, cex.PaperConfig{Pair: pair, Latency: [2]time.Duration{opts.latency, opts.latency}, TakerFeeBps: 0.65, Leverage: 10})
-	r.paper.UseStore(r.sink)
-	r.gate = &gateVenue{PaperVenue: r.paper}
+	shared := opts.exchange != nil
+	if !shared {
+		ex := &exchange{venue: &fakeVenue{t: t, stream: map[cex.Symbol]func(cex.BookEvent){}}}
+		ex.paper = cex.NewPaperVenue(ex.venue, cex.PaperConfig{Pair: pair, Latency: [2]time.Duration{opts.latency, opts.latency}, TakerFeeBps: 0.65, Leverage: 10})
+		ex.paper.UseStore(sink)
+		ex.gate = &gateVenue{PaperVenue: ex.paper}
+		opts.exchange = ex
+	}
+	r.exchange = opts.exchange
+	r.venue, r.paper, r.gate = r.exchange.venue, r.exchange.paper, r.exchange.gate
 	var err error
 	if r.cex, err = cex.NewManager(cexCfg, r.gate, silentSources{}, silentSources{}, silentSources{}); err != nil {
 		t.Fatal(err)
 	}
-	r.cex.UseStore(r.sink)
+	r.cex.UseStore(sink)
 	if r.inv, err = inventory.NewManager(inventory.Config{Capital: dec(opts.capital), Leverage: dec("10")}, pair, r.cex); err != nil {
 		t.Fatal(err)
 	}
-	r.inv.UseStore(r.sink)
+	r.inv.UseStore(sink)
 	state := store.State{}
 	if opts.state != nil {
 		state = *opts.state
 	}
-	if err := r.inv.Restore(state, nil); err != nil {
+	// As main reads back: the cycle's orders into cex, the ledger on them;
+	// a new paper account starts with the ledger's positions.
+	orders := cex.OrderRecordsFromRows(state.Orders)
+	r.cex.Restore(nil, orders)
+	if state.Cycle != nil {
+		orders = r.cex.CycleOrders(state.Cycle.CycleID)
+	}
+	if err := r.inv.Restore(state, orders); err != nil {
 		t.Fatal(err)
 	}
-	r.paper.SeedPositions(r.inv.LedgerPositions())
+	if !shared {
+		r.paper.SeedPositions(r.inv.LedgerPositions())
+	}
 	strat, err := strategy.New(testStrategy())
 	if err != nil {
 		t.Fatal(err)
@@ -449,15 +551,18 @@ func newRig(t *testing.T, now time.Time, opts rigOptions) *rig {
 	if r.m, err = NewManager(cfg, r.src, r.inv, strat, r.signals); err != nil {
 		t.Fatal(err)
 	}
-	r.m.UseStore(r.sink)
+	r.m.UseStore(sink)
+	r.m.Restore(state.MinuteBars, state.LastEntry, opts.perp)
 	r.m.timing.clock = r.clock
+	r.m.timing.recoverRetry = 20 * time.Millisecond
 
 	// cex runs its own loops; its first reference pass reads the rules, the
 	// paper account's settings and positions.
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
 	go func() { r.cex.Run(ctx); close(done) }()
-	t.Cleanup(func() { cancel(); <-done })
+	r.stopCex = func() { cancel(); <-done }
+	t.Cleanup(r.crash)
 	waitFor(t, "cex ready", func() bool {
 		return r.cex.TradingReady() && r.cex.Positions().Loaded && r.venue.feedable("SOXLUSDT") && r.venue.feedable("SOXSUSDT")
 	})
@@ -467,6 +572,15 @@ func newRig(t *testing.T, now time.Time, opts rigOptions) *rig {
 	r.m.ctx = ctx
 	r.m.start(now)
 	return r
+}
+
+// crash ends this process's cex loops, as a crash would: the exchange and
+// the database stay.
+func (r *rig) crash() {
+	if r.stopCex != nil {
+		r.stopCex()
+		r.stopCex = nil
+	}
 }
 
 // feedable reports whether the leg's book stream is subscribed.
@@ -506,8 +620,8 @@ func (r *rig) stepAt(t time.Time) bool {
 // publishes it.
 func (r *rig) depth(leg cex.Leg, bids, asks side) {
 	r.t.Helper()
-	r.seq[leg]++
-	seq, symbol := r.seq[leg], legSymbol(leg)
+	r.exchange.seq[leg]++
+	seq, symbol := r.exchange.seq[leg], legSymbol(leg)
 	ev := cex.BookEvent{Symbol: symbol, Topic: cex.TopicBooks5, Action: cex.ActionSnapshot, Bids: bids, Asks: asks, Seq: seq, ExchangeTime: r.clock(), ReceivedAt: r.clock()}
 	if !r.venue.feed(ev) {
 		r.t.Fatalf("%s is not subscribed", symbol)
@@ -519,8 +633,8 @@ func (r *rig) depth(leg cex.Leg, bids, asks side) {
 // until cex publishes it.
 func (r *rig) best(leg cex.Leg, bid, ask cex.BookLevel) {
 	r.t.Helper()
-	r.seq[leg]++
-	ev := cex.BookEvent{Symbol: legSymbol(leg), Topic: cex.TopicBooks1, Action: cex.ActionSnapshot, Bids: side{bid}, Asks: side{ask}, Seq: r.seq[leg], ExchangeTime: r.clock(), ReceivedAt: r.clock()}
+	r.exchange.seq[leg]++
+	ev := cex.BookEvent{Symbol: legSymbol(leg), Topic: cex.TopicBooks1, Action: cex.ActionSnapshot, Bids: side{bid}, Asks: side{ask}, Seq: r.exchange.seq[leg], ExchangeTime: r.clock(), ReceivedAt: r.clock()}
 	r.venue.feed(ev)
 	waitFor(r.t, "the best price published", func() bool {
 		b := r.cex.Books().ByLeg[leg]

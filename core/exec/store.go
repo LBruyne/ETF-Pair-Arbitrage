@@ -39,10 +39,16 @@ func (m *ExecManager) recordDecision(now time.Time, kind string, c *inventory.Cy
 	m.record(row)
 }
 
+// Where a minute bar's inputs come from, as minute_bar.source stores it.
+const (
+	sourceOwn        = "own"         // the loop's own observation
+	sourcePerpSecond = "perp_second" // the recorder's per-second rows, read at a restart
+)
+
 // minuteBarRow is the minute_bar row of one finished minute: its raw inputs
 // only, which do not depend on the parameters.
-func minuteBarRow(sessionID string, b strategy.MinuteBar) store.MinuteBarRow {
-	return store.MinuteBarRow{MinuteMs: b.Minute.UnixMilli(), SessionID: sessionID, MidBull: b.MidBull, MidBear: b.MidBear, F: b.F, Valid: b.Valid, Source: "own"}
+func minuteBarRow(sessionID string, b strategy.MinuteBar, source string) store.MinuteBarRow {
+	return store.MinuteBarRow{MinuteMs: b.Minute.UnixMilli(), SessionID: sessionID, MidBull: b.MidBull, MidBear: b.MidBear, F: b.F, Valid: b.Valid, Source: source}
 }
 
 // view computes the round's statistics under the current anchors.

@@ -55,6 +55,13 @@ type ExecManager struct {
 	lastReduceAt [2]time.Time        // by leg: when the last reducing order of a forced exit or a gap was sent
 	nextCloseTry time.Time           // a cycle whose close failed is not tried again before this
 
+	// bound by Restore, before Run
+	restoredBars []store.MinuteBarRow // the Session's minutes the previous run recorded
+	perp         minuteSource         // the recorder's per-second rows; nil: none
+
+	// owned by Run: recovery
+	recovered struct{ orders, minutes bool } // the recovery steps done, so that a retry does not repeat them
+
 	// owned by Run: the exceptions
 	unknown           map[cex.ClientOrderID]*unknownOrder // the orders of unknown outcome
 	nextPositionsRead time.Time                           // the venue's positions are not read again for an unknown outcome before this
@@ -103,6 +110,9 @@ func (m *ExecManager) Run(ctx context.Context) error {
 		default:
 			drained = true
 		}
+	}
+	if err := m.recover(ctx); err != nil {
+		return err
 	}
 	log.Info("exec: running", "live", m.cfg.Live, "mean_model", m.scfg.MeanModel, "mean_minutes", m.scfg.MeanMinutes, "sigma_minutes", m.scfg.SigmaMinutes,
 		"d_in", m.scfg.DIn, "d_out", m.scfg.DOut, "taker_fee_bps", m.scfg.TakerFeeBps, "leverage", m.leverage,
