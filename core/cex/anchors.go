@@ -97,10 +97,12 @@ func (m *CexManager) bindCorporateActions() {
 // Restore hands the manager what the previous run stored, before Run: the
 // anchor facts of the Session the process restarts in, so the bell anchor,
 // the NAV's settle delay and every known-at time continue instead of
-// starting over. The order records are not used: this manager keeps no order
-// table.
-func (m *CexManager) Restore(facts []AnchorFact, _ []OrderRecord) {
+// starting over, and the unfinished cycle's order records, which go into the
+// order table. An order read back without a final state becomes unknown and
+// is queried at the venue.
+func (m *CexManager) Restore(facts []AnchorFact, orders []OrderRecord) {
 	m.restored = facts
+	m.restoreOrders(orders)
 }
 
 // Anchors returns the anchors as last published. They may still be those of

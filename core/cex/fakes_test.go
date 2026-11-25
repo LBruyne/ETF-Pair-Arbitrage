@@ -2,7 +2,7 @@ package cex
 
 import (
 	"context"
-	"errors"
+	"fmt"
 	"log/slog"
 	"strings"
 	"sync"
@@ -42,9 +42,11 @@ func (c *fakeClock) Set(t time.Time) {
 	c.now = t
 }
 
-// testConfig is the example pair with the default ages and delays.
+// testConfig is the configuration of the tests: the default with the pair,
+// and one book connection per leg - a test of several sets the number.
 func testConfig() Config {
 	cfg := DefaultConfig
+	cfg.BookConnections = 1
 	cfg.Pair = Pair{Bull: LegConfig{Symbol: "SOXLUSDT", Ticker: "SOXL", BookTopic: TopicBooks5}, Bear: LegConfig{Symbol: "SOXSUSDT", Ticker: "SOXS", BookTopic: TopicBooks50}}
 	return cfg
 }
@@ -171,12 +173,25 @@ type fakeVenue struct {
 
 	recordsSince []time.Time // the since of each FinancialRecords call
 	calls        map[string]int
+
+	// orders: what PlaceOrder answers, what the venue knows of each order,
+	// its fills and its recent orders; and what it was asked
+	place       func(req OrderRequest) (OrderAck, error) // nil: ErrNotSent
+	placed      []OrderRequest
+	orderInfo   map[ClientOrderID]OrderRecord // OrderByClientID; an id not held is ErrUnknownOrder
+	orderErr    error                         // returned by OrderByClientID while set
+	fillsRead   []Fill
+	fillsSince  []time.Time // the since of each Fills call
+	recent      map[Symbol][]OrderRecord
+	recentErr   map[Symbol]error   // returned by RecentOrders of the contract while set
+	recentSince []time.Time        // the since of each RecentOrders call
+	private     func(PrivateEvent) // the subscriber of the private stream
 }
 
 var _ Venue = (*fakeVenue)(nil)
 
 func newFakeVenue() *fakeVenue {
-	return &fakeVenue{calls: map[string]int{}, funding: map[Symbol][]FundingSettlement{}}
+	return &fakeVenue{calls: map[string]int{}, funding: map[Symbol][]FundingSettlement{}, orderInfo: map[ClientOrderID]OrderRecord{}, recent: map[Symbol][]OrderRecord{}}
 }
 
 func (v *fakeVenue) called(name string) error {
@@ -228,15 +243,36 @@ func (v *fakeVenue) Positions(ctx context.Context, symbols []Symbol) (PositionSe
 }
 
 func (v *fakeVenue) OrderByClientID(ctx context.Context, symbol Symbol, id ClientOrderID) (OrderRecord, error) {
-	return OrderRecord{}, errors.New("fake venue: no orders in these tests")
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	v.calls["OrderByClientID"]++
+	if v.orderErr != nil {
+		return OrderRecord{}, v.orderErr
+	}
+	rec, ok := v.orderInfo[id]
+	if !ok {
+		return OrderRecord{}, fmt.Errorf("code 25204: %w", ErrUnknownOrder)
+	}
+	return rec, nil
 }
 
 func (v *fakeVenue) RecentOrders(ctx context.Context, symbol Symbol, since time.Time) ([]OrderRecord, error) {
-	return nil, errors.New("fake venue: no orders in these tests")
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	v.calls["RecentOrders"]++
+	v.recentSince = append(v.recentSince, since)
+	if err := v.recentErr[symbol]; err != nil {
+		return nil, err
+	}
+	return v.recent[symbol], v.err
 }
 
 func (v *fakeVenue) Fills(ctx context.Context, since time.Time) ([]Fill, error) {
-	return nil, errors.New("fake venue: no fills in these tests")
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	v.calls["Fills"]++
+	v.fillsSince = append(v.fillsSince, since)
+	return v.fillsRead, nil
 }
 
 func (v *fakeVenue) FinancialRecords(ctx context.Context, since time.Time) ([]FinancialRecord, error) {
@@ -266,12 +302,34 @@ func (v *fakeVenue) SubscribeBooks(ctx context.Context, subs []BookSubscription,
 }
 
 func (v *fakeVenue) SubscribePrivate(ctx context.Context, symbols []Symbol, onEvent func(PrivateEvent), onDown func(error)) error {
-	return errors.New("fake venue: no private stream in these tests")
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	v.calls["SubscribePrivate"]++
+	v.private = onEvent
+	return nil
 }
 
 func (v *fakeVenue) PlaceOrder(ctx context.Context, req OrderRequest) (OrderAck, error) {
-	v.called("PlaceOrder")
-	return OrderAck{}, ErrNotSent
+	v.mu.Lock()
+	v.calls["PlaceOrder"]++
+	v.placed = append(v.placed, req)
+	place := v.place
+	v.mu.Unlock()
+	if place == nil {
+		return OrderAck{}, ErrNotSent
+	}
+	return place(req)
+}
+
+// placedIDs returns the ids of the orders PlaceOrder received, in order.
+func (v *fakeVenue) placedIDs() []ClientOrderID {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	var out []ClientOrderID
+	for _, req := range v.placed {
+		out = append(out, req.ClientOrderID)
+	}
+	return out
 }
 
 // subscriptionsOf returns the SubscribeBooks calls made for symbol, oldest

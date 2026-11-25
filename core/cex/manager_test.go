@@ -2,6 +2,7 @@ package cex
 
 import (
 	"context"
+	"slices"
 	"testing"
 	"time"
 )
@@ -225,6 +226,139 @@ func TestManagerConnectionLossKeepsTheDepthsBestPrice(t *testing.T) {
 	}
 }
 
+// The book loop opens book_connections connections for each leg, each with
+// the leg's depth topic and books1.
+func TestManagerOpensEveryBookConnection(t *testing.T) {
+	cfg := testConfig()
+	cfg.BookConnections = 3
+	r := newRig(t, cfg, t0)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { r.m.runBooks(ctx); close(done) }()
+	t.Cleanup(func() { cancel(); <-done })
+	waitFor(t, "three connections per leg", func() bool {
+		return len(r.venue.subscriptionsOf("SOXLUSDT")) == 3 && len(r.venue.subscriptionsOf("SOXSUSDT")) == 3
+	})
+	for _, symbol := range []Symbol{"SOXLUSDT", "SOXSUSDT"} {
+		for i, c := range r.venue.subscriptionsOf(symbol) {
+			if len(c.subs) != 2 || c.subs[0].Symbol != symbol || c.subs[1] != (BookSubscription{symbol, TopicBooks1}) {
+				t.Errorf("%s connection %d subscribed %v, want the leg's depth topic and books1", symbol, i, c.subs)
+			}
+		}
+	}
+	// A frame on the third connection of a leg reaches the published book.
+	r.venue.subscriptionsOf("SOXLUSDT")[2].onEvent(legFrame("SOXLUSDT", TopicBooks5, ActionSnapshot, 100, 0, lv("40.45", "10"), lv("40.46", "5"), t0))
+	waitFor(t, "the frame of the third connection", func() bool { b := r.m.Books().ByLeg[Bull]; return b.DepthSeq == 100 && b.Connected })
+}
+
+// A leg has three connections that deliver the same frames, one of them
+// tens of milliseconds late. The book takes each sequence number from the
+// connection that brings it first; the late copies change nothing. Losing
+// one connection, or two, leaves the leg's depth in place; losing the last
+// drops it. The status line's numbers say which connection is the slow one.
+func TestManagerMergesSeveralConnectionsPerLeg(t *testing.T) {
+	cfg := testConfig()
+	cfg.BookConnections = 3
+	r := newRig(t, cfg, t0)
+	ctx := context.Background()
+	for conn := 0; conn < 3; conn++ {
+		r.m.openBookStream(ctx, Bull, conn)
+	}
+	conns := r.venue.subscriptionsOf("SOXLUSDT")
+	if len(conns) != 3 {
+		t.Fatalf("%d subscriptions for the bull leg, want three connections", len(conns))
+	}
+	for i, c := range conns {
+		if len(c.subs) != 2 || c.subs[0] != (BookSubscription{"SOXLUSDT", TopicBooks5}) || c.subs[1] != (BookSubscription{"SOXLUSDT", TopicBooks1}) {
+			t.Errorf("connection %d subscribed %v, want the depth topic and books1", i, c.subs)
+		}
+	}
+	// apply runs the book loop's part for everything queued.
+	apply := func() {
+		for len(r.m.bookInputs) > 0 {
+			r.m.handleBookInput(ctx, <-r.m.bookInputs)
+		}
+	}
+	// deliver sends one frame of the venue's time `at` on a connection,
+	// arriving `delay` later.
+	deliver := func(conn int, topic string, seq uint64, bidQty string, at time.Time, delay time.Duration) {
+		ev := legFrame("SOXLUSDT", topic, ActionSnapshot, seq, 0, lv("40.45", bidQty), lv("40.46", "5"), at.Add(delay))
+		ev.ExchangeTime = at
+		conns[conn].onEvent(ev)
+		apply()
+	}
+	ms := time.Millisecond
+
+	// Sequence 100 (depth): connection 0 first, then 1, then the slow 2.
+	deliver(0, TopicBooks5, 100, "10", t0, 3*ms)
+	deliver(1, TopicBooks5, 100, "10", t0, 5*ms)
+	// Sequence 101 (books1): connection 1 first this time.
+	deliver(1, TopicBooks1, 101, "9", t0.Add(10*ms), 2*ms)
+	deliver(0, TopicBooks1, 101, "9", t0.Add(10*ms), 4*ms)
+	// Sequence 102 (depth) on the two fast ones.
+	deliver(0, TopicBooks5, 102, "8", t0.Add(20*ms), 3*ms)
+	deliver(1, TopicBooks5, 102, "8", t0.Add(20*ms), 6*ms)
+	want := r.m.Books().ByLeg[Bull]
+	if want.DepthSeq != 102 || !want.DepthReceivedAt.Equal(t0.Add(23*ms)) || !want.Bids[0].Qty.Equal(dec("8")) || !want.Connected {
+		t.Fatalf("book after the fast connections = %+v, want seq 102 as connection 0 delivered it", want)
+	}
+	// The slow connection now delivers all three, 40 ms late: nothing moves,
+	// nothing is published and no reader is woken.
+	changed := r.m.BookChanged()
+	deliver(2, TopicBooks5, 100, "10", t0, 40*ms)
+	deliver(2, TopicBooks1, 101, "9", t0.Add(10*ms), 41*ms)
+	deliver(2, TopicBooks5, 102, "8", t0.Add(20*ms), 45*ms)
+	if got := r.m.Books().ByLeg[Bull]; got != want || changedSince(changed) {
+		t.Errorf("book after the late copies = %+v, published anew %t; want the same book, not published", got, got != want)
+	}
+
+	// The status numbers of the period: frames per connection, who came
+	// first (0: sequences 100 and 102; 1: sequence 101; 2: never), and the
+	// median delay.
+	frames, firstPct, delayMs := r.m.streamStats(Bull)
+	if !slices.Equal(frames, []uint64{3, 3, 3}) || !slices.Equal(firstPct, []int{67, 33, 0}) || !slices.Equal(delayMs, []float64{3, 5, 41}) {
+		t.Errorf("frames %v, first %v %%, median delay %v ms; want [3 3 3], [67 33 0], [3 5 41]", frames, firstPct, delayMs)
+	}
+	if frames, firstPct, delayMs := r.m.streamStats(Bull); !slices.Equal(frames, []uint64{0, 0, 0}) || !slices.Equal(firstPct, []int{0, 0, 0}) || !slices.Equal(delayMs, []float64{-1, -1, -1}) {
+		t.Errorf("a period without frames: %v, %v, %v", frames, firstPct, delayMs)
+	}
+
+	// One connection drops, then a second: the depth stays, kept current
+	// by what is left.
+	logs := captureLogs(t)
+	conns[0].onDown(context.DeadlineExceeded)
+	apply()
+	deliver(1, TopicBooks5, 103, "7", t0.Add(30*ms), 6*ms)
+	conns[1].onDown(context.DeadlineExceeded)
+	apply()
+	deliver(2, TopicBooks5, 104, "6", t0.Add(40*ms), 44*ms)
+	if b := r.m.Books().ByLeg[Bull]; b.DepthSeq != 104 || !b.Connected || !r.m.Books().DepthUsable(Bull, t0.Add(time.Second)) || r.m.connectedStreams(Bull) != 1 {
+		t.Errorf("with one connection left: book %+v, %d up; want seq 104, connected and usable", b, r.m.connectedStreams(Bull))
+	}
+	if got := logs.take(); !slices.Equal(got, []string{"INFO cex: book connection down", "INFO cex: book connection down"}) {
+		t.Errorf("two of three connections lost logged %q, want one line each and no book down", got)
+	}
+	// A lost connection that comes back counts again.
+	deliver(0, TopicBooks5, 105, "5", t0.Add(50*ms), 3*ms)
+	if r.m.connectedStreams(Bull) != 2 {
+		t.Errorf("%d connections up after one came back, want 2", r.m.connectedStreams(Bull))
+	}
+	// The last ones drop: the depth goes, the price stays for a while.
+	conns[0].onDown(context.DeadlineExceeded)
+	conns[2].onDown(context.DeadlineExceeded)
+	apply()
+	now := t0.Add(time.Second)
+	if b := r.m.Books().ByLeg[Bull]; b.Connected || len(b.Bids) != 0 || r.m.Books().DepthUsable(Bull, now) || !r.m.Books().HasPrice(Bull, now) {
+		t.Errorf("with every connection lost: book %+v, want no depth, not connected, a price", b)
+	}
+	if got := logs.take(); !slices.Equal(got, []string{"INFO cex: book connection down", "INFO cex: book down"}) {
+		t.Errorf("the last connections lost logged %q", got)
+	}
+	if len(r.venue.subscriptionsOf("SOXLUSDT")) != 3 {
+		t.Error("a connection loss made the manager subscribe again: the venue reconnects")
+	}
+}
+
 // The inbox never blocks the stream's reader. While the book loop does not
 // take its inputs, the inbox fills; every input after that is dropped and
 // counted, and the reader's callback returns at once. The inputs kept are
@@ -234,7 +368,7 @@ func TestManagerFullInboxDropsWithoutBlocking(t *testing.T) {
 	r.m.bookInputs = make(chan bookInput, 8)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	r.m.openBookStream(ctx, Bull) // subscribed, with no loop reading the inbox
+	r.m.openBookStream(ctx, Bull, 0) // subscribed, with no loop reading the inbox
 	bull := r.venue.subscriptionsOf("SOXLUSDT")[0]
 	delivered := make(chan struct{})
 	go func() {

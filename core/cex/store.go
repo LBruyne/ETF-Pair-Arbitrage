@@ -66,3 +66,60 @@ func AnchorFactsFromRows(rows []store.AnchorFactRow) []AnchorFact {
 	}
 	return out
 }
+
+// orderRow is the cex_order row of an order record.
+func orderRow(r OrderRecord) store.OrderRow {
+	q := r.Request
+	return store.OrderRow{ClientOrderID: string(q.ClientOrderID), CycleID: q.CycleID, LotID: q.LotID, Leg: q.Leg.String(), Symbol: string(q.Symbol),
+		Purpose: string(q.Purpose), Side: string(q.Side), ReduceOnly: q.ReduceOnly, Price: q.Price, Qty: q.Qty, QuotaPrice: q.QuotaPrice,
+		Status: string(r.Status), Unknown: r.Unknown, OrderID: string(r.OrderID), CumExecQty: r.CumExecQty, CumExecValue: r.CumExecValue, AvgPrice: r.AvgPrice,
+		Fee: r.Fee, FeeKnown: r.FeeKnown, NotFound: r.NotFound, CancelReason: r.CancelReason, ErrorCode: r.ErrorCode, ErrorMessage: r.ErrorMessage,
+		UnknownSinceMs: unixMs(r.UnknownSince), SubmittedMs: unixMs(r.SubmittedAt), SentMs: unixMs(r.SentAt), AckedMs: unixMs(r.AckedAt),
+		UpdateReceivedMs: unixMs(r.UpdateReceivedAt), ExchangeUpdatedMs: unixMs(r.ExchangeUpdatedAt),
+		AcceptedMs: unixMs(r.AcceptedAt), ExchangeCreatedMs: unixMs(r.ExchangeCreatedAt), FinalMs: unixMs(r.FinalAt)}
+}
+
+// OrderRecordsFromRows converts the cex_order rows read back at start into
+// order records for Restore. UpdateSeq is not stored: Restore gives each
+// record this process's own.
+func OrderRecordsFromRows(rows []store.OrderRow) []OrderRecord {
+	out := make([]OrderRecord, 0, len(rows))
+	for _, row := range rows {
+		leg := Bull
+		if row.Leg == Bear.String() {
+			leg = Bear
+		}
+		out = append(out, OrderRecord{
+			Request: OrderRequest{ClientOrderID: ClientOrderID(row.ClientOrderID), Symbol: Symbol(row.Symbol), Leg: leg, Side: Side(row.Side), Price: row.Price, Qty: row.Qty,
+				QuotaPrice: row.QuotaPrice, ReduceOnly: row.ReduceOnly, Purpose: OrderPurpose(row.Purpose), CycleID: row.CycleID, LotID: row.LotID},
+			OrderID: OrderID(row.OrderID), Status: OrderStatus(row.Status), Unknown: row.Unknown, UnknownSince: fromUnixMs(row.UnknownSinceMs),
+			FeeKnown: row.FeeKnown, NotFound: row.NotFound, CumExecQty: row.CumExecQty, CumExecValue: row.CumExecValue, AvgPrice: row.AvgPrice, Fee: row.Fee,
+			CancelReason: row.CancelReason, ErrorCode: row.ErrorCode, ErrorMessage: row.ErrorMessage,
+			SubmittedAt: fromUnixMs(row.SubmittedMs), SentAt: fromUnixMs(row.SentMs), AckedAt: fromUnixMs(row.AckedMs),
+			ExchangeUpdatedAt: fromUnixMs(row.ExchangeUpdatedMs), UpdateReceivedAt: fromUnixMs(row.UpdateReceivedMs),
+			AcceptedAt: fromUnixMs(row.AcceptedMs), ExchangeCreatedAt: fromUnixMs(row.ExchangeCreatedMs), FinalAt: fromUnixMs(row.FinalMs)})
+	}
+	return out
+}
+
+// fillRow is the cex_fill row of a fill.
+func fillRow(f Fill) store.FillRow {
+	return store.FillRow{ExecID: f.ExecID, ClientOrderID: string(f.ClientOrderID), OrderID: string(f.OrderID), Symbol: string(f.Symbol), Side: string(f.Side),
+		Price: f.Price, Qty: f.Qty, Value: f.Value, Fee: f.Fee, ExecMs: unixMs(f.ExecTime), ReceivedMs: unixMs(f.ReceivedAt)}
+}
+
+// unixMs is a time as a *_ms column: zero for the zero time.
+func unixMs(t time.Time) int64 {
+	if t.IsZero() {
+		return 0
+	}
+	return t.UnixMilli()
+}
+
+// fromUnixMs reads a *_ms column: the zero time for zero.
+func fromUnixMs(ms int64) time.Time {
+	if ms == 0 {
+		return time.Time{}
+	}
+	return time.UnixMilli(ms)
+}

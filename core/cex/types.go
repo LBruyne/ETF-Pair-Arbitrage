@@ -9,6 +9,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/shopspring/decimal"
@@ -19,6 +20,8 @@ import (
 // Config is the `cex:` section of config.yaml.
 type Config struct {
 	Pair              Pair               `yaml:"pair"`               // the two legs of the one pair this process trades
+	BookConnections   int                `yaml:"book_connections"`   // public connections per leg, each carrying the leg's depth topic and books1; the frame of a sequence number that arrives first is used
+	OrderTransport    OrderTransport     `yaml:"order_transport"`    // how an order reaches the venue: ws (the default) or rest
 	DepthMaxAge       time.Duration      `yaml:"depth_max_age"`      // a leg's depth, or its best price, older than this is not usable
 	FXMaxAge          time.Duration      `yaml:"fx_max_age"`         // F older than this stops entries; exits go on with the last value
 	NAVSettleDelay    time.Duration      `yaml:"nav_settle_delay"`   // a NAV unchanged for this long replaces the bell anchor
@@ -28,7 +31,21 @@ type Config struct {
 
 // DefaultConfig holds the values a key left out of config.yaml keeps. The
 // pair has no default: it must be written.
-var DefaultConfig = Config{DepthMaxAge: 10 * time.Second, FXMaxAge: 60 * time.Second, NAVSettleDelay: time.Hour}
+var DefaultConfig = Config{BookConnections: 3, OrderTransport: OrderTransportWS, DepthMaxAge: 10 * time.Second, FXMaxAge: 60 * time.Second, NAVSettleDelay: time.Hour}
+
+// OrderTransport names the way orders are sent to the venue. The default
+// is ws: on real orders it created the order about 9 ms sooner than rest
+// (core/SPEC.md 5.7).
+type OrderTransport string
+
+const (
+	OrderTransportWS   OrderTransport = "ws"   // a frame on a logged-in WebSocket connection kept for orders; an order goes by REST while that connection is not up
+	OrderTransportREST OrderTransport = "rest" // one signed HTTP request per order, on a connection kept warm
+)
+
+// maxBookConnections bounds book_connections: the venue limits connections
+// per address, and every connection's frames are parsed.
+const maxBookConnections = 5
 
 // Pair names the two legs: bull is the leveraged long ETF's contract, bear
 // the leveraged short ETF's.
@@ -92,6 +109,12 @@ func (c Config) Validate() error {
 	errs = append(errs, c.Pair.Bull.validate("cex.pair.bull"), c.Pair.Bear.validate("cex.pair.bear"))
 	if c.Pair.Bull.Symbol != "" && c.Pair.Bull.Symbol == c.Pair.Bear.Symbol {
 		errs = append(errs, fmt.Errorf("cex.pair.bear.symbol must differ from cex.pair.bull.symbol, both are %s", c.Pair.Bull.Symbol))
+	}
+	if c.BookConnections < 1 || c.BookConnections > maxBookConnections {
+		errs = append(errs, fmt.Errorf("cex.book_connections must be 1 to %d, got %d", maxBookConnections, c.BookConnections))
+	}
+	if c.OrderTransport != OrderTransportREST && c.OrderTransport != OrderTransportWS {
+		errs = append(errs, fmt.Errorf("cex.order_transport must be %s (the default) or %s, got %q", OrderTransportWS, OrderTransportREST, c.OrderTransport))
 	}
 	if c.DepthMaxAge <= 0 {
 		errs = append(errs, fmt.Errorf("cex.depth_max_age must be positive, got %s", c.DepthMaxAge))
@@ -229,6 +252,11 @@ const (
 // of an order.
 type ClientOrderID string
 
+// OwnOrder reports whether a client order id carries this program's prefix.
+// On an account that other programs trade too, a venue adapter keeps only
+// such orders and fills of the private stream.
+func OwnOrder(id ClientOrderID) bool { return strings.HasPrefix(string(id), clientOrderPrefix) }
+
 // OrderID is the id the venue assigns to an order it accepted.
 type OrderID string
 
@@ -283,7 +311,7 @@ type Book struct {
 	Conflict         bool        // books1 is newer than the depth and one best price differs: wait for a newer depth
 	BestBid, BestAsk BookLevel   // from the newer of the depth and books1, by sequence number
 	BestReceivedAt   time.Time   // local arrival of the frame BestBid and BestAsk come from
-	Connected        bool        // the leg's connection is up and has delivered a frame
+	Connected        bool        // one of the leg's connections is up and has delivered a frame
 }
 
 // BookAction is the kind of a depth frame.
@@ -475,22 +503,34 @@ type OrderRequest struct {
 	LotID         string       // recorded, not sent to the venue
 }
 
-// OrderRecord is one order with everything known about its outcome.
+// OrderRecord is one order with everything known about its outcome. It is
+// also the shape of a venue's report of an order, by push or by query; what
+// a report must hold is said at Venue.
 type OrderRecord struct {
 	Request      OrderRequest
 	OrderID      OrderID
 	Status       OrderStatus
 	Unknown      bool      // the outcome is not known yet: being queried, never resent
 	UnknownSince time.Time // when Unknown was set
-	FeeKnown     bool      // the venue has reported the fee of what was filled; an order without a fill needs none
+	FeeKnown     bool      // Fee is the fee of the whole of CumExecQty; false while the fee of any part of it is not reported. An order without a fill needs none
 	NotFound     bool      // unknown for 30 s, the venue says there is no such order, and no fill carries its id
 
 	CumExecQty, CumExecValue, AvgPrice decimal.Decimal
-	Fee                                decimal.Decimal // USDT; positive is paid
+	Fee                                decimal.Decimal // USDT; positive is paid; what has been reported so far
 	CancelReason                       string
 	ErrorCode, ErrorMessage            string
+	ErrorKind                          ErrorKind // why the venue did not carry the order out, when it said: of a refusal, and ErrorPriceLimit of an order the venue cancelled for its price. Empty otherwise. Kept in memory only: cex_order has no column for it
 
+	// The order's way, for measuring where its time goes. Local clock:
+	// registered, handed to the venue, the venue's acceptance in hand, the
+	// final state in hand. The venue's clock: its gateway took the request,
+	// it created the order, its last change. The two clocks differ by an
+	// offset that is not known exactly, so only differences on one clock are
+	// exact.
 	SubmittedAt, SentAt, AckedAt time.Time // local clock
+	FinalAt                      time.Time // local clock: the final state arrived; zero until then
+	AcceptedAt                   time.Time // the venue's clock: its gateway took the request; zero when the venue did not say
+	ExchangeCreatedAt            time.Time // the venue's clock: it created the order; zero until a report or the acceptance says
 	ExchangeUpdatedAt            time.Time // the venue's time of its last change
 	UpdateReceivedAt             time.Time // local arrival of the last report
 	UpdateSeq                    uint64    // grows with every change of the record
@@ -501,6 +541,8 @@ type OrderRecord struct {
 type OrderAck struct {
 	OrderID    OrderID
 	ReceivedAt time.Time
+	AcceptedAt time.Time // the venue's clock: its gateway took the request; zero when the venue does not say
+	CreatedAt  time.Time // the venue's clock: it created the order; zero when the acceptance does not say
 }
 
 // Fill is one execution as the venue reported it.
@@ -518,7 +560,8 @@ type Fill struct {
 }
 
 // PrivateEvent is one push of the private stream. Exactly one of Order, Fill
-// and Positions is set.
+// and Positions is set. Positions is always the whole set of the two legs:
+// it replaces what was published, so a leg it leaves out is flat.
 type PrivateEvent struct {
 	Order      *OrderRecord
 	Fill       *Fill
@@ -602,12 +645,20 @@ type Venue interface {
 	//
 	// A subscription lives until ctx ends and reconnects by itself. Its
 	// handlers run on the connection's read goroutine and must not block.
-	// onDown is called after every loss of the connection.
+	// onDown is called after every loss of the connection. The events of
+	// one subscription are delivered one at a time, in the order the venue
+	// produced them.
 
 	// SubscribeBooks streams the given topics over one connection.
 	SubscribeBooks(ctx context.Context, subs []BookSubscription, onEvent func(BookEvent), onDown func(error)) error
 	// SubscribePrivate streams the account's orders, fills and positions of
-	// the given contracts.
+	// the given contracts. What the order table relies on:
+	//   - a report of an order (here and from OrderByClientID) is the
+	//     order's whole state. Its Status is StatusAcked for every state
+	//     that is not final, whatever the venue calls it;
+	//   - FeeKnown is true only when Fee covers all of CumExecQty;
+	//   - a position event is the whole set of the given contracts, a flat
+	//     one left out.
 	SubscribePrivate(ctx context.Context, symbols []Symbol, onEvent func(PrivateEvent), onDown func(error)) error
 
 	// --- command ---
@@ -616,6 +667,23 @@ type Venue interface {
 	// process. *VenueError: the venue refused it. ErrOrderStateUnknown: the
 	// venue may have it.
 	PlaceOrder(ctx context.Context, req OrderRequest) (OrderAck, error)
+}
+
+// VenueStatus is implemented by a venue that has connections of its own
+// worth a place in the status line: StatusAttrs returns their state as log
+// keys and values.
+type VenueStatus interface {
+	StatusAttrs() []any
+}
+
+// PrivateStreamStatus is implemented by a venue whose order outcomes and
+// position changes arrive over a connection that can be lost: the real
+// exchange. The paper venue matches inside the process and does not
+// implement it.
+type PrivateStreamStatus interface {
+	// PrivateUp reports whether the private stream is logged in with its
+	// topics subscribed.
+	PrivateUp() bool
 }
 
 // IndexSource reads the index price behind the bell anchor and the venue's
@@ -682,6 +750,13 @@ type timings struct {
 	fundingRates    int           // and this many of them per leg
 	schedulePoll    time.Duration // the calendar is compared with the venue's schedule this often
 	sourceCall      time.Duration // the limit of one read of a venue or a source
+
+	placeTimeout  time.Duration // the limit of one PlaceOrder call; past it the order's outcome is unknown
+	ackGrace      time.Duration // an accepted order without a final state for this long is unknown: its push may be lost
+	orderTick     time.Duration // the order table is checked for what is due this often
+	orderQuery    time.Duration // an order that needs a query is queried this often
+	queryTimeout  time.Duration // the limit of one order query or fills read
+	notFoundAfter time.Duration // an unknown order the venue says it does not have counts as not found only after this long
 }
 
 // defaultTimings are the values used against the real sources.
@@ -690,4 +765,5 @@ var defaultTimings = timings{clock: time.Now, bookInbox: 4096, statusLog: 30 * t
 	anchorTick: time.Second, bellDelay: time.Minute, anchorPoll: 5 * time.Minute, distributionPoll: 24 * time.Hour,
 	referenceTick: time.Second, referenceRetry: 5 * time.Second, rulesPoll: time.Hour, settingsPoll: time.Minute,
 	recordsPoll: time.Minute, recordsLookback: 7 * 24 * time.Hour, fundingPoll: 5 * time.Minute, fundingRates: 100,
-	schedulePoll: time.Hour, sourceCall: 10 * time.Second}
+	schedulePoll: time.Hour, sourceCall: 10 * time.Second,
+	placeTimeout: time.Second, ackGrace: time.Second, orderTick: 200 * time.Millisecond, orderQuery: time.Second, queryTimeout: 2 * time.Second, notFoundAfter: 30 * time.Second}

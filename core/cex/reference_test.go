@@ -5,8 +5,11 @@ import (
 	"errors"
 	"slices"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/shopspring/decimal"
 
 	"etf-pair-arbitrage/core/store"
 )
@@ -81,6 +84,53 @@ func TestRulesAndTradingReady(t *testing.T) {
 	r.m.readRules(ctx, t0)
 	if r.m.TradingReady() {
 		t.Error("ready with the bear contract offline")
+	}
+}
+
+// streamVenue is a venue that reports its private stream, as the real
+// exchange's client does.
+type streamVenue struct {
+	*fakeVenue
+	up atomic.Bool
+}
+
+func (v *streamVenue) PrivateUp() bool { return v.up.Load() }
+
+// At a venue that reports its private stream, trading is ready only while
+// that stream is up. The paper venue around the same client has no stream
+// to wait for: it is ready with the rules alone.
+func TestTradingReadyNeedsThePrivateStream(t *testing.T) {
+	ctx := context.Background()
+	venue := &streamVenue{fakeVenue: newFakeVenue()}
+	venue.rules = map[Symbol]MarketRule{"SOXLUSDT": soxlRule, "SOXSUSDT": soxsRule}
+	live, err := NewManager(testConfig(), venue, &fakeIndex{}, &fakeFX{}, &fakeIssuer{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := live.readRules(ctx, t0); err != nil {
+		t.Fatal(err)
+	}
+	if live.TradingReady() {
+		t.Error("ready with the rules loaded and the private stream down")
+	}
+	venue.up.Store(true)
+	if !live.TradingReady() {
+		t.Error("not ready with the rules loaded and the private stream up")
+	}
+	venue.up.Store(false)
+	if live.TradingReady() {
+		t.Error("still ready after the private stream went down")
+	}
+
+	paper, err := NewManager(testConfig(), NewPaperVenue(venue, PaperConfig{Pair: testConfig().Pair, TakerFeeBps: 0.65, Leverage: 10}), &fakeIndex{}, &fakeFX{}, &fakeIssuer{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := paper.readRules(ctx, t0); err != nil {
+		t.Fatal(err)
+	}
+	if !paper.TradingReady() {
+		t.Error("the paper venue is not ready with the rules loaded: it has no private stream to wait for")
 	}
 }
 
@@ -177,6 +227,50 @@ func TestPositions(t *testing.T) {
 	published := r.m.Positions()
 	if !got.Loaded || !published.Loaded || len(published.BySymbol) != 1 || !published.BySymbol["SOXLUSDT"].Qty.Equal(dec("12.5")) || !published.ReceivedAt.Equal(t0) {
 		t.Errorf("positions = %+v, want only the bull leg's 12.5, received now", published)
+	}
+}
+
+// pushDuringRead is a venue whose position read lets a push land while it
+// is out and then answers what the venue held when the read began.
+type pushDuringRead struct {
+	*fakeVenue
+	during func()
+	read   PositionSet
+}
+
+func (v *pushDuringRead) Positions(context.Context, []Symbol) (PositionSet, error) {
+	v.during()
+	return v.read, nil
+}
+
+// A REST read began flat; while it was out, both legs filled and the
+// position push arrived. The read comes back flat: it is returned to its
+// caller, and the push stays published.
+func TestPositionsReadDoesNotReplaceANewerPush(t *testing.T) {
+	v := &pushDuringRead{fakeVenue: newFakeVenue(), read: PositionSet{BySymbol: map[Symbol]Position{}, Loaded: true}}
+	m, err := NewManager(testConfig(), v, &fakeIndex{closes: map[Symbol]map[int64]decimal.Decimal{}}, &fakeFX{candles: map[int64]decimal.Decimal{}},
+		&fakeIssuer{navs: map[string]decimal.Decimal{}, distributions: map[string][]Distribution{}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	v.during = func() {
+		m.onPrivateEvent(PrivateEvent{Positions: &PositionSet{BySymbol: map[Symbol]Position{
+			"SOXLUSDT": {Symbol: "SOXLUSDT", Qty: dec("10")}, "SOXSUSDT": {Symbol: "SOXSUSDT", Qty: dec("8")}}, Loaded: true}})
+	}
+	got, err := m.ReadPositions(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !got.Loaded || len(got.BySymbol) != 0 {
+		t.Errorf("the read returned %+v, want the flat set it read", got)
+	}
+	if p := m.Positions(); len(p.BySymbol) != 2 || !p.BySymbol["SOXLUSDT"].Qty.Equal(dec("10")) || !p.BySymbol["SOXSUSDT"].Qty.Equal(dec("8")) {
+		t.Errorf("published %v, want the push's 10 / 8", p.BySymbol)
+	}
+	// With no push during it, the next read publishes.
+	v.during = func() {}
+	if _, err := m.ReadPositions(context.Background()); err != nil || len(m.Positions().BySymbol) != 0 {
+		t.Errorf("a read without a push meanwhile: %v, published %v; want it published", err, m.Positions().BySymbol)
 	}
 }
 

@@ -119,10 +119,15 @@ func (m *CexManager) Rule(leg Leg) (MarketRule, bool) {
 }
 
 // TradingReady reports whether the venue side is ready for orders: the rules
-// are loaded and both contracts are online.
+// are loaded, both contracts are online, and the venue's private stream is
+// up. The last holds for a venue that has such a stream - the real exchange,
+// where an order's outcome arrives by push; the paper venue has none.
 func (m *CexManager) TradingReady() bool {
 	bull, okBull := m.Rule(Bull)
 	bear, okBear := m.Rule(Bear)
+	if stream, has := m.venue.(PrivateStreamStatus); has && !stream.PrivateUp() {
+		return false
+	}
 	return okBull && okBear && bull.Online && bear.Online
 }
 
@@ -187,20 +192,45 @@ func (m *CexManager) SettingsOK(leverage int) (ok bool, detail string) {
 func (m *CexManager) Positions() PositionSet { return m.account.Load().positions }
 
 // ReadPositions reads the two legs' positions from the venue now, publishes
-// them and returns them.
+// them and returns them. A position push that arrived while the read was out
+// is newer than the read: it stays published, and the read is only
+// returned.
 func (m *CexManager) ReadPositions(ctx context.Context) (PositionSet, error) {
+	pushes := m.account.Load().positionPushes
 	read, err := m.venue.Positions(ctx, m.symbols[:])
 	if err != nil {
 		return PositionSet{}, err
 	}
+	positions := m.legPositions(read)
+	m.editAccount(func(v *accountView) bool {
+		if v.positionPushes != pushes {
+			return false
+		}
+		v.positions = positions
+		return true
+	})
+	return positions, nil
+}
+
+// publishPositions publishes a position set pushed by the private stream.
+func (m *CexManager) publishPositions(pushed PositionSet) {
+	positions := m.legPositions(pushed)
+	m.editAccount(func(v *accountView) bool {
+		v.positions, v.positionPushes = positions, v.positionPushes+1
+		return true
+	})
+}
+
+// legPositions is the two legs' positions of a set read or pushed, received
+// now.
+func (m *CexManager) legPositions(read PositionSet) PositionSet {
 	positions := PositionSet{BySymbol: map[Symbol]Position{}, ReceivedAt: m.timing.clock(), Loaded: true}
 	for _, symbol := range m.symbols {
 		if p, ok := read.BySymbol[symbol]; ok {
 			positions.BySymbol[symbol] = p
 		}
 	}
-	m.editAccount(func(v *accountView) { v.positions = positions })
-	return positions, nil
+	return positions
 }
 
 // --- funding records and settled rates ---
@@ -237,7 +267,10 @@ func (m *CexManager) readFinancialRecords(ctx context.Context, now time.Time) er
 	}
 	records := append(append([]FinancialRecord(nil), held...), fresh...)
 	sort.SliceStable(records, func(i, j int) bool { return records[i].At.Before(records[j].At) })
-	m.editAccount(func(v *accountView) { v.records = records })
+	m.editAccount(func(v *accountView) bool {
+		v.records = records
+		return true
+	})
 	for _, r := range fresh {
 		logger.GlobalLogger.Info("cex: funding record", "id", r.ID, "symbol", r.Symbol, "type", r.Type, "amount_usdt", r.Amount, "at", showTime(r.At))
 	}
