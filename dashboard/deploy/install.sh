@@ -2,12 +2,13 @@
 # Publishes the ETF-Pair boards on this host: the database etfpair and its
 # roles in the local PostgreSQL, the collectors pairscan and booktape as
 # systemd services,
-# and the data source, the boards and their addresses in the Grafana and
+# and the data sources (etfpair; etfpair-trade for the Live Monitor, whose
+# role core/scripts/install_trade_db.sh makes), the boards and their addresses in the Grafana and
 # nginx that already serve the other boards (this module has none of its
 # own). Idempotent; re-run after changing the collector or a board. Needs
 # sudo for the PostgreSQL roles, systemd and nginx.
 #
-# The shared Grafana is restarted only when this module's data source,
+# The shared Grafana is restarted only when this module's data sources,
 # provider or password file changed, and those are taken back if it does
 # not come up; nginx is reloaded only when the address rules changed.
 set -euo pipefail
@@ -63,6 +64,23 @@ GRANT SELECT ON ALL TABLES IN SCHEMA etfpair TO etfpair_reader;
 ALTER DEFAULT PRIVILEGES FOR ROLE etfpair_writer IN SCHEMA etfpair GRANT SELECT ON TABLES TO etfpair_reader;
 SQL
 (umask 077 && echo "ETFPAIR_DB_READER_PASSWORD=$r" > "$REPO/grafana.env.new")
+# The Live Monitor's data source etfpair-trade reads schema trade as etfpair_trade_reader, a role that
+# core/scripts/install_trade_db.sh creates; its password is the one in core/.env.reader (JSON), copied
+# into grafana.env without passing through a command line or the terminal.
+if [ -f "$ROOT/core/.env.reader" ]; then
+  (umask 077 && python3 -I -c 'import json, sys, urllib.parse as u
+try:
+    pw = u.unquote(u.urlparse(json.load(open(sys.argv[1]))["store"]["dsn"]).password or "")
+except Exception:
+    pw = ""
+if pw:
+    print("ETFPAIR_TRADE_READER_PASSWORD=" + pw)
+else:
+    sys.stderr.write("core/.env.reader holds no store.dsn with a password: the Live Monitor data source will not connect\n")' \
+    "$ROOT/core/.env.reader" >> "$REPO/grafana.env.new")
+else
+  echo "core/.env.reader is missing: the Live Monitor's data source will not connect (run core/scripts/install_trade_db.sh)" >&2
+fi
 
 # Build first; nothing running is touched until the binaries and the boards exist.
 (cd "$ROOT" && python3 dashboard/grafana/gen_dashboard.py >/dev/null \
@@ -98,7 +116,7 @@ install_service booktape
 mkdir -p "$REPO/grafana/dashboards/published"
 rsync -a --delete "$REPO/grafana/dashboards/staging/" "$REPO/grafana/dashboards/published/"
 
-# Grafana: this module's data source and board provider go next to the other
+# Grafana: this module's data sources and board provider go next to the other
 # modules', and its unit also reads this module's grafana.env.
 DROPIN_DIR="/etc/systemd/system/$GRAFANA_UNIT.d"
 BACKUP=$(mktemp -d)
@@ -120,6 +138,7 @@ cmp -s "$REPO/grafana.env.new" "$REPO/grafana.env" 2>/dev/null || GRAFANA_CHANGE
 mv "$REPO/grafana.env.new" "$REPO/grafana.env"
 sudo mkdir -p "$DROPIN_DIR"
 place "$REPO/grafana/provisioning/datasources/etfpair.yml" "$GRAFANA_PROVISIONING/datasources/etfpair.yml"
+place "$REPO/grafana/provisioning/datasources/etfpair-trade.yml" "$GRAFANA_PROVISIONING/datasources/etfpair-trade.yml"
 place "$REPO/grafana/provisioning/dashboards/etf-pair.yml" "$GRAFANA_PROVISIONING/dashboards/etf-pair.yml"
 place "$REPO/deploy/grafana-etf-pair.conf" "$DROPIN_DIR/etf-pair.conf" sudo
 sudo systemctl daemon-reload
@@ -136,13 +155,14 @@ if [ "$GRAFANA_CHANGED" = 1 ]; then
   if ! grafana_up; then
     echo "Grafana did not come up with this module's files; taking them back" >&2
     restore "$GRAFANA_PROVISIONING/datasources/etfpair.yml"
+    restore "$GRAFANA_PROVISIONING/datasources/etfpair-trade.yml"
     restore "$GRAFANA_PROVISIONING/dashboards/etf-pair.yml"
     restore "$DROPIN_DIR/etf-pair.conf" sudo
     sudo systemctl daemon-reload
     sudo systemctl restart "$GRAFANA_UNIT"
     exit 1
   fi
-  echo "Grafana restarted with the etfpair data source and the etf-pair provider"
+  echo "Grafana restarted with the etfpair and etfpair-trade data sources and the etf-pair provider"
 else
   echo "Grafana files unchanged; Grafana not restarted"
 fi
