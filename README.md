@@ -1,6 +1,6 @@
 # ETF Pair Arbitrage
 
-交易 SOXL / SOXS 永续的均值回归策略（首版只做 Bitget，用户 2026-11-23）。交易程序尚未实现（实现设计 [core/SPEC.md](core/SPEC.md) 0.5：外部审计 2026-11-24 批复第 0 步可以开始，0.4 是按批复修订的版本；代码将写在 `core/`，等用户说开始）。2026-11-19 用户另行授权的 **Bitget Python实盘试验**已按用户要求结束，11月19日18:49（UTC+8）整体盈利平仓、11月20日再次确认零持仓；实现于 `live_pair/`，规则与操作见 [本次试验](docs/LIVE_BITGET_20261119.md)，不能等同于完整 SPEC 已交付。
+交易 SOXL / SOXS 永续的均值回归策略（首版只做 Bitget，用户 2026-11-23）。交易程序在 `core/` 里按实现设计 [core/SPEC.md](core/SPEC.md)（0.8，经外部审计五次批复）分步实现：到 2026-11-25，第 0–4 步（脚手架、落库、行情与锚点、策略计算、库存账本）已实现并通过测试，第 5 步（订单、纸面撮合、Bitget 账户侧）实施中；执行循环、看板和回放还没有，任何模式下都不发真实订单。2026-11-19 用户另行授权的 **Bitget Python实盘试验**已按用户要求结束，11月19日18:49（UTC+8）整体盈利平仓、11月20日再次确认零持仓；实现于 `live_pair/`，规则与操作见 [本次试验](docs/LIVE_BITGET_20261119.md)，不能等同于完整 SPEC 已交付。
 
 ## 当前在运行（2026-11-23，UTC+8）
 
@@ -15,7 +15,7 @@
 ## 当前文档
 
 - [PRD.md](PRD.md)：交易程序唯一的规则文档（2026-11-24 按用户要求从零重写，现为 3.3）：范围、数据、价差与均线、开仓、额度、仓位与记账、平仓、流程、参数、回测要求和验收；标【取法】的是 lead 自己定的地方。
-- 根目录的 SPEC.md（交易程序的架构设计）已于 2026-11-24 按用户要求删除，最后的副本在 `experiments/decisions_20261123/prd_rewrite_20261124/before/`，只作历史。新的实现设计是 [core/SPEC.md](core/SPEC.md)（2026-11-24，用户第 41 条；交易程序的模块、接口、算法的参考代码、表和实施步骤；Live Monitor 看板的设计在 dashboard/SPEC.md 第 7 节），审计 2026-11-24 已看过 0.3 并批复，0.4 按批复修订；PRD 现为 3.4（1.4 节列出首版的收窄）。
+- 根目录的 SPEC.md（交易程序的架构设计）已于 2026-11-24 按用户要求删除，最后的副本在 `experiments/decisions_20261123/prd_rewrite_20261124/before/`，只作历史。新的实现设计是 [core/SPEC.md](core/SPEC.md)（2026-11-24，用户第 41 条；交易程序的模块、接口、算法的参考代码、表和实施步骤；Live Monitor 看板的设计在 dashboard/SPEC.md 第 7 节），审计 2026-11-24 已看过 0.3 并批复，0.4 按批复修订；PRD 现为 3.6（1.4 节列出首版的收窄）。
 - [dashboard/SPEC.md](dashboard/SPEC.md)、[dashboard/README.md](dashboard/README.md)：`Arbitrage/ETF-Pair` 看板、采集器和录制服务的设计与运维。Combo Spread 已实现并发布；Live Monitor 仍是设计。改看板、采集器、录制服务或它们的表要同步更新这两份文件。
 - [DATA.md](DATA.md)：数据清单。
 - [SOURCES.md](SOURCES.md)：在用的外部来源、读取节奏和授权；历史核验记录。
