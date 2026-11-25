@@ -28,7 +28,7 @@ import (
 
 // rowTypes is one zero row of every table.
 var rowTypes = []Row{ProcessRunRow{}, MinuteBarRow{}, SignalSampleRow{}, AnchorFactRow{}, CycleRow{}, LotRow{}, OrderRow{},
-	FillRow{}, DecisionRow{}, FundingRow{}, InventorySampleRow{}, InventoryStateRow{}, EventRow{}}
+	FillRow{}, DecisionRow{}, FundingRow{}, FundingRateRow{}, InventorySampleRow{}, InventoryStateRow{}, EventRow{}}
 
 func dec(s string) decimal.Decimal { return decimal.RequireFromString(s) }
 
@@ -387,7 +387,7 @@ func asMap(t testing.TB, row any) map[string]any {
 }
 
 // Every row type fits its table: a zero row, with every `omitempty` and JSON
-// column NULL, is accepted by each of the 13 tables.
+// column NULL, is accepted by each of the 14 tables.
 func TestEveryTableTakesItsRow(t *testing.T) {
 	s, check := startStore(t, Config{}, testConfig(t), testTimings())
 	clearTables(t, check)
@@ -457,6 +457,40 @@ func TestWriteRules(t *testing.T) {
 	}
 	if !s.Healthy() || s.Dropped() != 0 {
 		t.Errorf("healthy = %t, dropped = %d after plain writes", s.Healthy(), s.Dropped())
+	}
+}
+
+// The records kept for the board only: the settled funding rates (a fact,
+// a settlement read again is ignored), the venue's mark price, unrealised
+// PnL and liquidation price of each leg with the account's equity and
+// margin ratio in inventory_sample, and each leg's midpoint in
+// signal_sample. A value that was not read is NULL.
+func TestDisplayRecords(t *testing.T) {
+	s, check := startStore(t, Config{Live: true}, testConfig(t), testTimings())
+	clearTables(t, check)
+	rate := FundingRateRow{Leg: "bull", Symbol: "SOXLUSDT", SettlementMs: 1_795_564_800_000, Rate: dec("0.0001")}
+	s.Record(rate)
+	rate.Rate = dec("0.5")
+	s.Record(rate, FundingRateRow{Leg: "bear", Symbol: "SOXSUSDT", SettlementMs: 1_795_564_800_000, Rate: dec("-0.00002")})
+	s.Record(InventorySampleRow{TsMs: 10_000, MarkBull: decimal.NewNullDecimal(dec("43.02")), MarkBear: decimal.NewNullDecimal(dec("49.5")),
+		UplBull: decimal.NewNullDecimal(dec("1.02")), UplBear: decimal.NewNullDecimal(dec("-0.4")), LiqBull: decimal.NewNullDecimal(dec("0")),
+		Equity: decimal.NewNullDecimal(dec("1234.5")), MarginRatio: decimal.NewNullDecimal(dec("0.0123"))},
+		InventorySampleRow{TsMs: 20_000})
+	s.Record(SignalSampleRow{TsMs: 10_000, SessionID: "2026-11-24", Phase: "off_hours", MidBull: 43.015, MidBear: math.NaN()})
+	flushed(t, s)
+
+	if got := query1[string](t, check, "SELECT string_agg(leg || ':' || symbol || ':' || settlement_ms::text || ':' || rate::text || ':' || live::text, ',' ORDER BY leg) FROM trade.funding_rate"); got != "bear:SOXSUSDT:1795564800000:-0.00002:true,bull:SOXLUSDT:1795564800000:0.0001:true" {
+		t.Errorf("funding rates %s, want both legs' settlement once, the first write kept", got)
+	}
+	const sample = "SELECT concat_ws('/', mark_bull, mark_bear, upl_bull, upl_bear, liq_bull, coalesce(liq_bear::text, 'NULL'), equity, margin_ratio) FROM trade.inventory_sample WHERE ts_ms = $1"
+	if got := query1[string](t, check, sample, 10_000); got != "43.02/49.5/1.02/-0.4/0/NULL/1234.5/0.0123" {
+		t.Errorf("inventory sample %s, want the read values and NULL for the liquidation price not read", got)
+	}
+	if n := query1[int64](t, check, "SELECT count(*) FROM trade.inventory_sample WHERE ts_ms = 20000 AND mark_bull IS NULL AND upl_bear IS NULL AND equity IS NULL AND margin_ratio IS NULL"); n != 1 {
+		t.Error("a sample without the venue's values must store NULL")
+	}
+	if got := query1[string](t, check, "SELECT mid_bull::text || '/' || coalesce(mid_bear::text, 'NULL') FROM trade.signal_sample WHERE ts_ms = 10000"); got != "43.015/NULL" {
+		t.Errorf("signal sample mids %s, want 43.015/NULL", got)
 	}
 }
 
@@ -1048,6 +1082,9 @@ func TestReaderRoleIsReadOnly(t *testing.T) {
 
 	if n := query1[int64](t, reader, "SELECT count(*) FROM trade.event WHERE run_id = $1", string(s.run)); n != 1 {
 		t.Errorf("the reader sees %d rows of this run, want 1", n)
+	}
+	if n := query1[int64](t, reader, "SELECT count(*) FROM trade.funding_rate"); n < 0 {
+		t.Errorf("the reader counts %d funding rates", n)
 	}
 	const insert = "INSERT INTO trade.event (run_id, seq, live, ts_ms, module, level, kind, message) VALUES ('reader', 1, false, 1, 'm', 'l', 'k', 'x')"
 	sqlState := func(err error) string {

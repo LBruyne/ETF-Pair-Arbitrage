@@ -316,3 +316,46 @@ DO $$ BEGIN
             ADD COLUMN final_ms            BIGINT;  -- local clock: the final state arrived
     END IF;
 END $$;
+
+-- funding_rate (fact): every settled funding rate the process read of the
+-- two contracts, public data of both paper and live. Recorded for the
+-- board only (owner item 61); nothing reads it back.
+CREATE TABLE IF NOT EXISTS trade.funding_rate (
+    live           BOOLEAN NOT NULL,
+    symbol         TEXT NOT NULL,
+    settlement_ms  BIGINT NOT NULL,         -- the settlement the rate was applied at
+    run_id         TEXT NOT NULL,           -- the run that read it first
+    leg            TEXT NOT NULL,           -- bull or bear
+    rate           NUMERIC NOT NULL,        -- the settled rate as the venue publishes it, signed
+    PRIMARY KEY (live, symbol, settlement_ms)
+);
+
+-- signal_sample: each leg's midpoint, so the board can value an open cycle
+-- in paper mode. Recorded for the board only (owner item 61). Added only
+-- when missing (see the note at the top).
+DO $$ BEGIN
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema = 'trade' AND table_name = 'signal_sample' AND column_name = 'mid_bear') THEN
+        ALTER TABLE trade.signal_sample
+            ADD COLUMN mid_bull DOUBLE PRECISION,  -- bull leg's bid1/ask1 midpoint at the sample, USDT; NULL while it has no best bid and ask
+            ADD COLUMN mid_bear DOUBLE PRECISION;  -- the same for the bear leg
+    END IF;
+END $$;
+
+-- inventory_sample: what the venue reports beside the positions, for the
+-- board only (owner item 61): the program takes no decision from any of it
+-- (PRD 6.6). NULL when the venue did not report it, and always NULL for the
+-- account's equity and margin ratio in paper mode, which reads no private
+-- endpoint. Added only when missing (see the note at the top).
+DO $$ BEGIN
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema = 'trade' AND table_name = 'inventory_sample' AND column_name = 'margin_ratio') THEN
+        ALTER TABLE trade.inventory_sample
+            ADD COLUMN mark_bull    NUMERIC,  -- bull leg's mark price as the venue reports it with the position, USDT
+            ADD COLUMN mark_bear    NUMERIC,
+            ADD COLUMN upl_bull     NUMERIC,  -- bull leg's unrealised PnL as the venue reports it, USDT
+            ADD COLUMN upl_bear     NUMERIC,
+            ADD COLUMN liq_bull     NUMERIC,  -- bull leg's liquidation price as the venue reports it, USDT
+            ADD COLUMN liq_bear     NUMERIC,
+            ADD COLUMN equity       NUMERIC,  -- the whole account's equity, USDT (Bitget usdtEquity); the account also holds other programs' positions
+            ADD COLUMN margin_ratio NUMERIC;  -- the whole account's margin ratio as the venue reports it (Bitget mgnRatio: maintenance margin / equity, cross margin); account-wide like equity
+    END IF;
+END $$;

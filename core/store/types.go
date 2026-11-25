@@ -110,6 +110,7 @@ var tables = map[string]tableSpec{
 	"cex_fill":         {kind: kindFact, key: []string{"live", "exec_id"}},
 	"decision":         {kind: kindFact, key: []string{"run_id", "seq"}, seq: true},
 	"funding":          {kind: kindFact, key: []string{"live", "record_id"}},
+	"funding_rate":     {kind: kindFact, key: []string{"live", "symbol", "settlement_ms"}},
 	"inventory_sample": {kind: kindSample, key: []string{"ts_ms", "run_id"}},
 	"inventory_state":  {kind: kindState, key: []string{"live"}},
 	"event":            {kind: kindFact, key: []string{"run_id", "seq"}, seq: true},
@@ -172,6 +173,8 @@ type SignalSampleRow struct {
 	HoldBull     decimal.Decimal `json:"hold_bull"`
 	HoldBear     decimal.Decimal `json:"hold_bear"`
 	QuotaLeft    decimal.Decimal `json:"quota_left"`
+	MidBull      float64         `json:"mid_bull"` // NaN (NULL) while the leg has no best bid and ask
+	MidBear      float64         `json:"mid_bear"`
 }
 
 func (SignalSampleRow) Table() string { return "signal_sample" }
@@ -334,20 +337,41 @@ type FundingRow struct {
 
 func (FundingRow) Table() string { return "funding" }
 
+// FundingRateRow is one settled funding rate of a contract (funding_rate,
+// written by cex). It is recorded for the board; nothing reads it back.
+type FundingRateRow struct {
+	Leg          string          `json:"leg"`
+	Symbol       string          `json:"symbol"`
+	SettlementMs int64           `json:"settlement_ms"`
+	Rate         decimal.Decimal `json:"rate"`
+}
+
+func (FundingRateRow) Table() string { return "funding_rate" }
+
 // InventorySampleRow is the exchange's positions against the ledger at one
 // moment (inventory_sample, written by inventory). PosBull and PosBear are
 // not valid (NULL) while the positions have not been read; a read position
-// of zero is a valid 0.
+// of zero is a valid 0. The venue's mark, unrealised PnL and liquidation
+// price of each leg and the account's equity and margin ratio are recorded
+// for the board only; each is not valid when the venue did not report it.
 type InventorySampleRow struct {
-	TsMs       int64               `json:"ts_ms"`
-	PosBull    decimal.NullDecimal `json:"pos_bull"`
-	PosBear    decimal.NullDecimal `json:"pos_bear"`
-	LedgerBull decimal.Decimal     `json:"ledger_bull"`
-	LedgerBear decimal.Decimal     `json:"ledger_bear"`
-	R          decimal.Decimal     `json:"r"`
-	QuotaTotal decimal.Decimal     `json:"quota_total"`
-	QuotaUsed  decimal.Decimal     `json:"quota_used"`
-	Mismatch   bool                `json:"mismatch"`
+	TsMs        int64               `json:"ts_ms"`
+	PosBull     decimal.NullDecimal `json:"pos_bull"`
+	PosBear     decimal.NullDecimal `json:"pos_bear"`
+	LedgerBull  decimal.Decimal     `json:"ledger_bull"`
+	LedgerBear  decimal.Decimal     `json:"ledger_bear"`
+	R           decimal.Decimal     `json:"r"`
+	QuotaTotal  decimal.Decimal     `json:"quota_total"`
+	QuotaUsed   decimal.Decimal     `json:"quota_used"`
+	Mismatch    bool                `json:"mismatch"`
+	MarkBull    decimal.NullDecimal `json:"mark_bull"`
+	MarkBear    decimal.NullDecimal `json:"mark_bear"`
+	UplBull     decimal.NullDecimal `json:"upl_bull"`
+	UplBear     decimal.NullDecimal `json:"upl_bear"`
+	LiqBull     decimal.NullDecimal `json:"liq_bull"`
+	LiqBear     decimal.NullDecimal `json:"liq_bear"`
+	Equity      decimal.NullDecimal `json:"equity"`
+	MarginRatio decimal.NullDecimal `json:"margin_ratio"`
 }
 
 func (InventorySampleRow) Table() string { return "inventory_sample" }
