@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"etf-pair-arbitrage/core/cex"
+	"etf-pair-arbitrage/core/strategy"
 )
 
 // The secrets files the cases use. Every value is fake.
@@ -64,11 +65,11 @@ func TestExampleFilesLoad(t *testing.T) {
 	if cfg.Exec.Live || cfg.Store.Live {
 		t.Errorf("the example must be paper mode, got exec.live=%t store.live=%t", cfg.Exec.Live, cfg.Store.Live)
 	}
-	if cfg.Cex.Pair.Bull.Symbol != "SOXLUSDT" || cfg.Cex.Pair.Bear.BookTopic != cex.TopicBooks50 {
-		t.Errorf("pair not read: %+v", cfg.Cex.Pair)
+	if cfg.Cex.Pair.Bull.Symbol != "SOXLUSDT" || cfg.Cex.Pair.Bull.BookTopic != cex.TopicBooks5 || cfg.Cex.Pair.Bear.BookTopic != cex.TopicBooks5 {
+		t.Errorf("pair not read: %+v, want books5 on both legs", cfg.Cex.Pair)
 	}
-	if got := cfg.Strategy.LevelBucket.String(); got != "0.01" {
-		t.Errorf("strategy.level_bucket = %s, want 0.01", got)
+	if got := cfg.Strategy.PricingLevel; got != (strategy.LegLevels{Bull: 2, Bear: 5}) {
+		t.Errorf("strategy.pricing_level = %+v, want bull 2, bear 5", got)
 	}
 	if got := cfg.Cex.CorporateActions; len(got) != 2 || got[0].ExDate != "2026-12-22" {
 		t.Errorf("cex.corporate_actions = %+v, want two actions on 2026-12-22", got)
@@ -115,6 +116,14 @@ func TestLoad(t *testing.T) {
 			wantErr: []string{"strategy.d_out must satisfy -d_in <= d_out < d_in"}},
 		{name: "d_out below minus d_in", edits: []edit{{"d_out: -0.5 ", "d_out: -2.5 "}}, env: envFull,
 			wantErr: []string{"strategy.d_out must satisfy -d_in <= d_out < d_in"}},
+		{name: "pricing_level left out keeps the default", edits: []edit{{"  pricing_level: {", "  # pricing_level: {"}}, env: envFull},
+		{name: "pricing_level of one leg written", edits: []edit{{"pricing_level: { bull: 2, bear: 5 }", "pricing_level: { bear: 4 }"}}, env: envFull},
+		{name: "pricing_level out of range", edits: []edit{{"pricing_level: { bull: 2, bear: 5 }", "pricing_level: { bull: 0, bear: 6 }"}}, env: envFull,
+			wantErr: []string{"strategy.pricing_level.bull must be 1 to 5, got 0", "strategy.pricing_level.bear must be 1 to 5, got 6"}},
+		{name: "pricing_level in the old words", edits: []edit{{"pricing_level: { bull: 2, bear: 5 }", "pricing_level: { bull: second, bear: worst }"}}, env: envFull,
+			wantErr: []string{"cannot unmarshal !!str `second` into int"}},
+		{name: "the removed level_bucket is refused", edits: []edit{{"  take_ratio:", "  level_bucket: \"0.01\"\n  take_ratio:"}}, env: envFull,
+			wantErr: []string{"level_bucket"}},
 		{name: "unknown mean model", edits: []edit{{"mean_model: ema", "mean_model: wma"}}, env: envFull,
 			wantErr: []string{"strategy.mean_model"}},
 

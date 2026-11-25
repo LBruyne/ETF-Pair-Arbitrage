@@ -12,11 +12,14 @@ log_level: info
 # The exchange side and the reference data behind the spread.
 cex:
   # The one pair this process trades. symbol is the contract, ticker the ETF
-  # whose anchor it uses, book_topic the depth topic subscribed (books5 or
-  # books50): choose the topics that cover the same price range on each leg.
+  # whose anchor it uses, book_topic the depth topic subscribed: books5 on
+  # both legs, so that their books arrive with the same delay (books50 is
+  # still accepted). strategy.pricing_level says how each leg's book is read.
   pair:
     bull: { symbol: SOXLUSDT, ticker: SOXL, book_topic: books5 }
-    bear: { symbol: SOXSUSDT, ticker: SOXS, book_topic: books50 }
+    bear: { symbol: SOXSUSDT, ticker: SOXS, book_topic: books5 }
+  book_connections: 3         # public connections per leg (1 to 5), each with the leg's depth topic and books1; the first copy of a frame to arrive is used, so one slow connection does not delay the book
+  order_transport: ws         # how orders are sent: ws, the default (a logged-in WebSocket connection kept for orders and chosen by its ping; an order goes by REST while it is not up) or rest (a signed request on a connection kept warm)
   depth_max_age: 10s          # a leg's depth, or its best price, older than this is not usable
   fx_max_age: 60s             # F (USDT-USD) older than this stops entries; exits go on with the last value
   nav_settle_delay: 1h        # a NAV unchanged this long replaces the bell anchor
@@ -42,9 +45,9 @@ strategy:
   d_out: -0.5                 # exit line on the entry's axis, in sigmas; -0.5 is half a sigma past the mean. Must satisfy -d_in <= d_out < d_in
   taker_fee_bps: 0.65         # the trading account's taker fee per leg, of the traded notional; it enters the entry condition and the fee estimates
   cost_margin_d: 0            # extra the entry asks on top of the round-trip fee, in spread units
-  level_bucket: "0.01"        # effective levels fold raw levels into price buckets of this size, USDT
-  level_min_qty: "1"          # a bucket below this many shares is skipped
-  take_ratio: "0.5"           # the share of the first two effective levels one batch takes
+  pricing_level: { bull: 2, bear: 5 }   # per leg, 1 to 5: the N-th level of the book as received (1 = the best) on the side an entry or a line exit takes. Its price is the order's limit and the leg's price in the spread; levels 1 to N are the quantity counted. A side with fewer than N levels gives no such order
+  take_ratio: "0.5"           # the share of the quantity down to that level one batch takes
+  min_batch_notional: "100"  # USDT, both legs together at their limit prices: a smaller entry batch is not sent
   entry_spacing: 60s          # a same-side entry sooner than this needs entry_step_d more
   entry_step_d: 1             # in spread units
   completion_window: 5s       # this long after a batch is sent, its short leg may still be completed; later it is trimmed back

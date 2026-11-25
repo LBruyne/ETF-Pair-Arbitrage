@@ -126,8 +126,20 @@ func run(cfg *config.Config, signals <-chan os.Signal) error {
 	// ledger on top of them, strategy the pure computation, exec the loop
 	// that drives all three. The exchange client holds the account's key in
 	// live mode only: in paper mode cfg.Env.Bitget is empty and the client
-	// can read public data and nothing else.
-	venue := bitget.NewClient(cfg.Env.Bitget)
+	// can read public data and nothing else. Paper mode wraps it in the
+	// paper venue, which keeps the whole account side local: no order and
+	// no account request reaches the exchange.
+	exchange := bitget.NewClient(cfg.Env.Bitget)
+	exchange.UseOrderTransport(cfg.Cex.OrderTransport)
+	var venue cex.Venue = exchange
+	var paper *cex.PaperVenue
+	if !cfg.Exec.Live {
+		paper = cex.NewPaperVenue(venue, cex.PaperConfig{Pair: cfg.Cex.Pair,
+			Latency:     [2]time.Duration{cex.Bull: cfg.Exec.SimOrderLatency.Bull, cex.Bear: cfg.Exec.SimOrderLatency.Bear},
+			TakerFeeBps: cfg.Strategy.TakerFeeBps, Leverage: int(cfg.Inventory.Leverage.IntPart())})
+		paper.UseStore(st)
+		venue = paper
+	}
 	cmgr, err := cex.NewManager(cfg.Cex, venue, binance.NewClient(), coinbase.NewClient(), direxion.NewClient(cfg.Env.Direxion.SiteAPIKey))
 	if err != nil {
 		return err
@@ -151,7 +163,8 @@ func run(cfg *config.Config, signals <-chan os.Signal) error {
 	// What the previous run stored is read back before any manager runs:
 	// the current Session's anchor facts, so the bell anchor and the NAV's
 	// settle delay continue instead of starting over, and the ledger (R,
-	// the dust, the booked funding and the unfinished cycle with its lots).
+	// the dust, the booked funding and the unfinished cycle with its lots
+	// and orders).
 	sessionID := cmgr.Session(started).ID
 	loadCtx, cancelLoad := context.WithTimeout(context.Background(), stateLoadTimeout)
 	state, err := st.LoadState(loadCtx, sessionID)
@@ -159,19 +172,36 @@ func run(cfg *config.Config, signals <-chan os.Signal) error {
 	if err != nil {
 		return fmt.Errorf("the stored state was not read: %w", err)
 	}
-	cmgr.Restore(cex.AnchorFactsFromRows(state.AnchorFacts), nil)
-	// Restore is given no order records: the process keeps no order table,
-	// so the lots of an unfinished cycle stand with their stored amounts.
-	if err := imgr.Restore(state, nil); err != nil {
+	// The unfinished cycle's orders go into cex's order table first, which
+	// gives each record this process's UpdateSeq and turns those without a
+	// final state into unknown ones; the ledger is then rebuilt from the
+	// table's snapshot, so both hold the same records.
+	orders := cex.OrderRecordsFromRows(state.Orders)
+	cmgr.Restore(cex.AnchorFactsFromRows(state.AnchorFacts), orders)
+	if state.Cycle != nil {
+		orders = cmgr.CycleOrders(state.Cycle.CycleID)
+	}
+	if err := imgr.Restore(state, orders); err != nil {
 		return fmt.Errorf("the stored ledger was not restored: %w", err)
 	}
+	// The paper account starts with what the ledger holds, the dust
+	// included: the position check then starts in agreement.
+	if paper != nil {
+		paper.SeedPositions(imgr.LedgerPositions())
+	}
 	log.Info("ETF-arbitrage core state loaded", "session", sessionID, "anchor_facts", len(state.AnchorFacts),
-		"unfinished_cycle", state.Cycle != nil, "funding_records", len(state.Funding))
+		"unfinished_cycle", state.Cycle != nil, "orders", len(orders), "funding_records", len(state.Funding))
 
 	mgrCtx, stopManagers := context.WithCancel(context.Background())
 	var managers sync.WaitGroup
 	managers.Go(func() { cmgr.Run(mgrCtx) })
 	managers.Go(func() { imgr.Run(mgrCtx) })
+	if cfg.Exec.Live {
+		// Orders go through the exchange client: it keeps its REST
+		// connection warm and, with the ws transport, its trade
+		// connection up. A paper run sends it no order.
+		managers.Go(func() { exchange.Run(mgrCtx) })
+	}
 
 	// Signals do not cancel anything here: the loop reads them, including
 	// any that arrived since the process started, and decides when the
