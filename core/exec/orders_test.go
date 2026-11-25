@@ -3,7 +3,6 @@ package exec
 import (
 	"context"
 	"errors"
-	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -176,28 +175,5 @@ func TestFlatCycleInTheCloseWindowKeepsItsEndReason(t *testing.T) {
 	}
 	if r.m.forced != "" {
 		t.Errorf("forced exit %q begun for a flat cycle", r.m.forced)
-	}
-}
-
-// A gap no order is sent for is reported once, not every round, also
-// without a batch of this loop (a cycle restored with SOXL 105.30 against
-// SOXS 60.00: 612 USD to trim).
-func TestUnevenFillsWarnedOnce(t *testing.T) {
-	start := utc8Time(11, 25, 5, 1, 0)
-	warns := captureWarns(t)
-	r := newRig(t, start, rigOptions{state: heldState(start, "2000", "60", "3565.86")})
-	r.at(start.Add(30 * time.Second))
-	r.books(entryBook())
-	for i := range 3 {
-		r.idleAt(start.Add(time.Duration(30+i)*time.Second), reasonUnevenFills)
-	}
-	n := 0
-	for message, count := range warns.snapshot() {
-		if strings.HasPrefix(message, "exec: the legs filled unevenly") {
-			n += count
-		}
-	}
-	if n != 1 {
-		t.Errorf("%d warnings of the uneven fill in three rounds, want 1", n)
 	}
 }

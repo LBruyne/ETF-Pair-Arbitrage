@@ -87,6 +87,48 @@ func (m *ExecManager) settle(r *round) {
 	r.cycle = m.inv.Cycle()
 }
 
+// --- the gap ---
+
+// sendGap sends the one order strategy chose for the cycle's gap. While the
+// entry batch is being built it is a completion, which opens and counts
+// against the quota at its quota price, or a trim, booked on that batch's
+// lot (PRD 7.4). After an exit the larger leg is reduced further as an exit,
+// first in first out (PRD 8.7). The order joins the batch: the next
+// decision waits for its result, and the completion window keeps the
+// batch's first send as its start. A trim is reduce-only.
+func (m *ExecManager) sendGap(r *round, a strategy.GapAction) {
+	c, b := r.cycle, m.batch
+	purpose, lot := cex.PurposeExit, inventory.LotID("")
+	if b != nil && b.kind == cex.PurposeEntry && !b.settled {
+		purpose, lot = cex.PurposeTrim, b.lotID
+		if a.Kind == strategy.GapComplete {
+			purpose = cex.PurposeComplete
+		}
+	}
+	if b == nil { // a cycle this loop did not open: its gap is only reduced
+		m.batch = &batchState{kind: cex.PurposeExit, sentAt: r.now}
+	}
+	req := m.orderRequest(c, r.orders, a.Leg, purpose, a.Side, a.Price, a.Qty, r.rules[a.Leg].Symbol)
+	req.LotID = string(lot)
+	if a.Kind == strategy.GapComplete {
+		req.QuotaPrice = a.QuotaPrice
+	} else {
+		req.ReduceOnly = true
+		m.lastReduceAt[a.Leg] = r.now
+	}
+	hold := c.Hold()
+	_, _, left := m.inv.Quota()
+	logger.GlobalLogger.Info("exec: gap", "cycle", c.ID, "lot", lot, "order", string(a.Kind), "purpose", string(purpose), "leg", a.Leg.String(), "side", string(a.Side),
+		"price", a.Price, "qty", a.Qty, "loss_complete_usdt", a.LossComplete, "loss_trim_usdt", a.LossTrim, "hold_bull", hold[cex.Bull], "hold_bear", hold[cex.Bear],
+		"quota_left_usdt", left, "since_batch_sent", r.now.Sub(m.batch.sentAt).Round(time.Millisecond))
+	m.recordDecision(r.now, string(a.Kind), c, lot, c.Direction, "", map[string]any{
+		"purpose": purpose, "leg": a.Leg.String(), "side": a.Side, "price": a.Price, "qty": a.Qty, "quota_price": a.QuotaPrice,
+		"loss_complete_usdt": a.LossComplete, "loss_trim_usdt": a.LossTrim, "hold_bull": hold[cex.Bull], "hold_bear": hold[cex.Bear],
+		"quota_left": left, "batch_sent_ms": m.batch.sentAt.UnixMilli(), "pair_anchor_bull": c.PairAnchors.Bull, "pair_anchor_bear": c.PairAnchors.Bear,
+		"depth_seq_bull": r.books.ByLeg[cex.Bull].DepthSeq, "depth_seq_bear": r.books.ByLeg[cex.Bear].DepthSeq, "client_order_id": req.ClientOrderID})
+	m.send(r, req)
+}
+
 // --- exit at the line ---
 
 // sendExit sends the pair of reduce-only exit orders of plan; a leg the plan
@@ -330,7 +372,7 @@ func (m *ExecManager) send(r *round, reqs ...cex.OrderRequest) {
 	for _, req := range reqs {
 		m.batch.orders = append(m.batch.orders, req.ClientOrderID)
 	}
-	m.batch.doneAt, m.batch.rejected, m.gapWarned = time.Time{}, false, false
+	m.batch.doneAt, m.batch.rejected = time.Time{}, false
 }
 
 // ids lists the orders' client ids.

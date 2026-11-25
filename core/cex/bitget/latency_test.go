@@ -118,24 +118,18 @@ func TestRunKeepsTheRESTConnectionWarm(t *testing.T) {
 		t.Fatalf("without the keep-warm requests %d connections were used, want 2: the server closes after 300 ms idle", conns)
 	}
 
-	server = newRESTCountingServer(t, 300*time.Millisecond)
+	// With Run: the keep-warm requests hold the connection open past the
+	// server's idle limit. The loop is stopped before the last request, so
+	// that request cannot meet a keep-warm request in flight (HTTP/1.1 would
+	// then open a second connection, which is fine but not what is tested).
+	server = newRESTCountingServer(t, 600*time.Millisecond)
 	warm := testClient(server.URL)
 	warm.rest.keepWarm = 30 * time.Millisecond
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
 	go func() { warm.Run(ctx); close(done) }()
 	waitFor(t, "the connection opened at the start", func() bool { conns, _ := server.seen(); return conns == 1 })
-	time.Sleep(900 * time.Millisecond)
-	if err := warm.call(context.Background(), http.MethodGet, pathInstruments, nil, nil, false, nil); err != nil {
-		t.Fatal(err)
-	}
-	conns, paths := server.seen()
-	if conns != 1 {
-		t.Errorf("%d connections after 900 ms with the keep-warm requests, want the one opened at the start", conns)
-	}
-	if n := len(paths) - 1; n < 10 || paths[0] != "GET "+pathServerTime || paths[len(paths)-1] != "GET "+pathInstruments {
-		t.Errorf("%d keep-warm requests in 900 ms at one per 30 ms, the first %q", n, paths[0])
-	}
+	time.Sleep(1800 * time.Millisecond)
 	if attrs := warm.StatusAttrs(); attrs[4] != "rest_warm_ms" || attrs[5].(float64) <= 0 {
 		t.Errorf("the status values %v do not carry the last keep-warm round trip", attrs)
 	}
@@ -146,9 +140,19 @@ func TestRunKeepsTheRESTConnectionWarm(t *testing.T) {
 		t.Fatal("Run did not stop with its context")
 	}
 	_, before := server.seen()
+	if err := warm.call(context.Background(), http.MethodGet, pathInstruments, nil, nil, false, nil); err != nil {
+		t.Fatal(err)
+	}
+	conns, paths := server.seen()
+	if conns != 1 {
+		t.Errorf("%d connections after 1.8 s with the keep-warm requests, want the one opened at the start", conns)
+	}
+	if n := len(before) - 1; n < 20 || paths[0] != "GET "+pathServerTime || paths[len(paths)-1] != "GET "+pathInstruments {
+		t.Errorf("%d keep-warm requests in 1.8 s at one per 30 ms, the first %q", n, paths[0])
+	}
 	time.Sleep(100 * time.Millisecond)
-	if _, after := server.seen(); len(after) != len(before) {
-		t.Errorf("%d keep-warm requests after Run stopped", len(after)-len(before))
+	if _, after := server.seen(); len(after) != len(before)+1 {
+		t.Errorf("%d keep-warm requests after Run stopped", len(after)-len(before)-1)
 	}
 }
 

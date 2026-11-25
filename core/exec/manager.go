@@ -52,9 +52,8 @@ type ExecManager struct {
 	lastEntry    *strategy.LastEntry // the last built entry batch, for the spacing rule
 	seqCycle     inventory.CycleID   // the cycle the order sequence counts in
 	orderSeq     int                 // the sequence number of that cycle's last order
-	lastReduceAt [2]time.Time        // by leg: when the last forced order was sent
+	lastReduceAt [2]time.Time        // by leg: when the last reducing order of a forced exit or a gap was sent
 	nextCloseTry time.Time           // a cycle whose close failed is not tried again before this
-	gapWarned    bool                // the uneven fill was reported since the last orders were sent
 	forced       string              // the end reason of the forced exit in progress (inventory.End*); empty while none
 	lateLogged   bool                // the forced exit of a cycle of an ended Session was reported
 	atLine       strategy.Reason     // the at_line_blocked reason recorded last; empty when the last entry check did not stop there

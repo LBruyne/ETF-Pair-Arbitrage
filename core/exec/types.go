@@ -100,13 +100,6 @@ type round struct {
 	cycle   *inventory.Cycle  // the open cycle after that booking; nil when flat
 }
 
-// reasonUnevenFills is the idle reason while the cycle's two legs carry a
-// gap that an order could be sent for (strategy.EvaluateGap gives a
-// completion or a trim) and the loop sends none for it: the batch is not
-// settled, no entry and no exit at the line is made, and the forced exit,
-// which closes both legs whatever they hold, is not held up.
-const reasonUnevenFills strategy.Reason = "uneven_fills"
-
 // atLineReasons are the reasons an entry is refused after its signal held
 // (PRD 5.13 steps 6 to 9): each is recorded once as an at_line_blocked
 // decision while it lasts.

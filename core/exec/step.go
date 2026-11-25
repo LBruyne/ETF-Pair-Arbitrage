@@ -48,8 +48,8 @@ func (m *ExecManager) step(now time.Time) (done bool) {
 		if m.forcedDue(c, now) {
 			return m.forcedExit(r)
 		}
-		if reason, wait := m.workGap(r); wait {
-			return m.idle(reason)
+		if m.workGap(r) {
+			return false
 		}
 		m.settle(r)
 		if !m.closeIfFlat(r) {
@@ -177,34 +177,37 @@ func (m *ExecManager) freshDepthSince(r *round) bool {
 
 // --- the gap ---
 
-// workGap asks strategy about the cycle's gap: the two legs' anchored
-// amounts that differ by more than the venue's minimum order. wait is true
-// when the round must not go further: a completion waits for the short
-// leg's new frame, a trim waits for a price, or a completion or a trim
-// would be sent. The loop sends neither; such a gap holds the batch
-// unsettled and leaves the cycle to the forced exit, which closes both legs
-// whatever they hold.
-func (m *ExecManager) workGap(r *round) (reason strategy.Reason, wait bool) {
+// workGap deals with the cycle's gap (PRD 8): the two legs' anchored
+// amounts differing by more than an order the venue takes. strategy chooses
+// one order at a time (PRD 8.8): a completion of the leg that has less
+// inside the entry batch's window, or a trim of the leg that has more. It
+// reports whether the round ends here: an order was sent, or the gap waits
+// - a completion for the short leg's own new frame, a trim for a price or
+// for the resend interval. When it does not, no order can be sent for the
+// gap: what is left is dust, and the batch can be settled.
+func (m *ExecManager) workGap(r *round) (decided bool) {
 	if !r.rulesOK {
-		return strategy.ReasonNotReady, true
+		m.idle(strategy.ReasonNotReady)
+		return true
 	}
 	a := m.strat.EvaluateGap(m.gapInput(r))
 	switch a.Kind {
 	case strategy.GapNone:
-		return "", false
+		return false
 	case strategy.GapWait:
-		return strategy.ReasonAwaitDepth, true
+		m.idle(strategy.ReasonAwaitDepth)
+		return true
 	case strategy.GapBlocked:
-		return strategy.ReasonNoPrice, true
+		m.idle(strategy.ReasonNoPrice)
+		return true
+	case strategy.GapTrim:
+		if r.now.Sub(m.lastReduceAt[a.Leg]) < m.timing.resend {
+			m.idle(strategy.ReasonAwaitOrders) // two reducing orders of one leg are resend apart
+			return true
+		}
 	}
-	if !m.gapWarned {
-		m.gapWarned = true
-		hold := r.cycle.Hold()
-		logger.GlobalLogger.Warn("exec: the legs filled unevenly; no completion or trim is sent and the cycle waits for the forced exit",
-			"cycle", r.cycle.ID, "gap_order", string(a.Kind), "leg", a.Leg.String(), "side", string(a.Side), "qty", a.Qty, "price", a.Price,
-			"hold_bull", hold[cex.Bull], "hold_bear", hold[cex.Bear])
-	}
-	return reasonUnevenFills, true
+	m.sendGap(r, a)
+	return true
 }
 
 // gapInput gathers the facts of one gap decision. The entry batch that is

@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"log/slog"
 	"os"
 	"sync"
 	"testing"
@@ -14,7 +13,6 @@ import (
 
 	"etf-pair-arbitrage/core/cex"
 	"etf-pair-arbitrage/core/inventory"
-	"etf-pair-arbitrage/core/logger"
 	"etf-pair-arbitrage/core/store"
 	"etf-pair-arbitrage/core/strategy"
 )
@@ -116,6 +114,64 @@ func (v *fakeVenue) feed(ev cex.BookEvent) bool {
 	}
 	on(ev)
 	return true
+}
+
+// gateVenue is the paper venue with a gate on its private stream: while a
+// contract is held, the reports and fills of its orders, and the position
+// sets, wait until the test releases them - the venue has the outcome, the
+// process does not know it yet.
+type gateVenue struct {
+	*cex.PaperVenue
+	mu    sync.Mutex
+	held  cex.Symbol
+	queue []cex.PrivateEvent
+	on    func(cex.PrivateEvent)
+}
+
+func (g *gateVenue) SubscribePrivate(ctx context.Context, symbols []cex.Symbol, onEvent func(cex.PrivateEvent), onDown func(error)) error {
+	g.mu.Lock()
+	g.on = onEvent
+	g.mu.Unlock()
+	return g.PaperVenue.SubscribePrivate(ctx, symbols, g.deliver, onDown)
+}
+
+// deliver passes an event on, or keeps it while its contract is held.
+func (g *gateVenue) deliver(ev cex.PrivateEvent) {
+	g.mu.Lock()
+	held := g.held != "" && (ev.Positions != nil || (ev.Order != nil && ev.Order.Request.Symbol == g.held) || (ev.Fill != nil && ev.Fill.Symbol == g.held))
+	if held {
+		g.queue = append(g.queue, ev)
+	}
+	on := g.on
+	g.mu.Unlock()
+	if !held {
+		on(ev)
+	}
+}
+
+// hold starts keeping the events of symbol's orders.
+func (g *gateVenue) hold(symbol cex.Symbol) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.held = symbol
+}
+
+// release delivers what was kept, in order, and opens the gate.
+func (g *gateVenue) release() {
+	g.mu.Lock()
+	queue, on := g.queue, g.on
+	g.queue, g.held = nil, ""
+	g.mu.Unlock()
+	for _, ev := range queue {
+		on(ev)
+	}
+}
+
+// heldEvents is how many events wait.
+func (g *gateVenue) heldEvents() int {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return len(g.queue)
 }
 
 // silentSources stand for Binance, Coinbase and Direxion: cex's own loops
@@ -222,6 +278,7 @@ type rig struct {
 
 	venue   *fakeVenue
 	paper   *cex.PaperVenue
+	gate    *gateVenue // the paper venue as cex sees it
 	cex     *cex.CexManager
 	src     *testCex
 	inv     *inventory.InventoryManager
@@ -259,8 +316,9 @@ func newRig(t *testing.T, now time.Time, opts rigOptions) *rig {
 	cexCfg.Pair, cexCfg.BookConnections = pair, 1
 	r.paper = cex.NewPaperVenue(r.venue, cex.PaperConfig{Pair: pair, Latency: [2]time.Duration{opts.latency, opts.latency}, TakerFeeBps: 0.65, Leverage: 10})
 	r.paper.UseStore(r.sink)
+	r.gate = &gateVenue{PaperVenue: r.paper}
 	var err error
-	if r.cex, err = cex.NewManager(cexCfg, r.paper, silentSources{}, silentSources{}, silentSources{}); err != nil {
+	if r.cex, err = cex.NewManager(cexCfg, r.gate, silentSources{}, silentSources{}, silentSources{}); err != nil {
 		t.Fatal(err)
 	}
 	r.cex.UseStore(r.sink)
@@ -491,46 +549,6 @@ func (r *rig) warmUp() {
 	if !r.m.stats.Ready {
 		r.t.Fatalf("the mean is not ready after the warm-up")
 	}
-}
-
-// warnCapture counts the Warn lines of a message while a test runs.
-type warnCapture struct {
-	mu    sync.Mutex
-	inner slog.Handler
-	count map[string]int
-}
-
-func (c *warnCapture) Enabled(ctx context.Context, l slog.Level) bool { return c.inner.Enabled(ctx, l) }
-func (c *warnCapture) WithAttrs(a []slog.Attr) slog.Handler           { return c }
-func (c *warnCapture) WithGroup(string) slog.Handler                  { return c }
-func (c *warnCapture) Handle(ctx context.Context, r slog.Record) error {
-	if r.Level == slog.LevelWarn {
-		c.mu.Lock()
-		c.count[r.Message]++
-		c.mu.Unlock()
-	}
-	return c.inner.Handle(ctx, r)
-}
-
-// snapshot returns the Warn lines logged so far, counted by message.
-func (c *warnCapture) snapshot() map[string]int {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	out := make(map[string]int, len(c.count))
-	for message, n := range c.count {
-		out[message] = n
-	}
-	return out
-}
-
-// captureWarns routes the process logger through a warnCapture until the
-// test ends.
-func captureWarns(t *testing.T) *warnCapture {
-	old := logger.GlobalLogger
-	c := &warnCapture{inner: old.Handler(), count: map[string]int{}}
-	logger.GlobalLogger = slog.New(c)
-	t.Cleanup(func() { logger.GlobalLogger = old })
-	return c
 }
 
 // legSymbol is the test pair's contract of a leg.
