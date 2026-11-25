@@ -48,8 +48,8 @@ func (noSource) Distributions(context.Context, string) ([]cex.Distribution, erro
 const liveRecording = 60 * time.Second
 
 // Against the real exchange (public, unauthenticated, read-only), gated by
-// BITGET_PUBLIC_TEST=1: a manager on the real client runs for a minute with
-// the example pair. Both legs must get a usable book and keep it, the rules
+// BITGET_PUBLIC_TEST=1: a manager on the real client, inside the paper
+// venue, runs for a minute with the example pair. Both legs must get a usable book and keep it, the rules
 // and the settled funding rates must load. Every raw frame is saved under
 // experiments/core_step2/ in the format of the earlier probe recordings: a
 // JSON header line, then "<arrival unix ms>\t<frame>" per line. The REST
@@ -116,7 +116,9 @@ func TestLiveBitgetPublic(t *testing.T) {
 		}
 	}
 
-	mgr, err := cex.NewManager(cfg, client, noSource{}, noSource{}, noSource{})
+	// The client has no API key, so the manager gets it the way a paper run
+	// does: inside the paper venue, which uses its public side only.
+	mgr, err := cex.NewManager(cfg, cex.NewPaperVenue(client, cex.PaperConfig{Pair: cfg.Pair, Leverage: 10}), noSource{}, noSource{}, noSource{})
 	if err != nil {
 		t.Fatal(err)
 	}

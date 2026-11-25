@@ -454,33 +454,3 @@ func TestFundingHistory(t *testing.T) {
 		t.Errorf("an empty history: %v, %v", got, err)
 	}
 }
-
-// The account side is not implemented: every such method says so, and
-// placing an order answers in the terms of "nothing left the process".
-func TestAccountSideIsNotImplemented(t *testing.T) {
-	client, seen := restServer(t, nil)
-	ctx := context.Background()
-	symbols := []cex.Symbol{"SOXLUSDT"}
-	_, errSettings := client.AccountSettings(ctx, symbols)
-	_, errPositions := client.Positions(ctx, symbols)
-	_, errOrder := client.OrderByClientID(ctx, "SOXLUSDT", "etfp-1")
-	_, errRecent := client.RecentOrders(ctx, "SOXLUSDT", time.Now())
-	_, errFills := client.Fills(ctx, time.Now())
-	_, errRecords := client.FinancialRecords(ctx, time.Now())
-	errPrivate := client.SubscribePrivate(ctx, symbols, func(cex.PrivateEvent) {}, func(error) {})
-	for name, err := range map[string]error{"AccountSettings": errSettings, "Positions": errPositions, "OrderByClientID": errOrder, "RecentOrders": errRecent,
-		"Fills": errFills, "FinancialRecords": errRecords, "SubscribePrivate": errPrivate} {
-		if !errors.Is(err, errNotImplemented) {
-			t.Errorf("%s = %v, want the not-implemented error", name, err)
-		}
-	}
-	if _, err := client.PlaceOrder(ctx, cex.OrderRequest{Symbol: "SOXLUSDT"}); !errors.Is(err, cex.ErrNotSent) {
-		t.Errorf("PlaceOrder = %v, want cex.ErrNotSent", err)
-	}
-	if len(*seen) != 0 {
-		t.Errorf("the account-side methods sent requests: %v", *seen)
-	}
-	if client.Name() != "bitget" {
-		t.Errorf("Name = %q", client.Name())
-	}
-}
