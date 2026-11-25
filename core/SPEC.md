@@ -1,6 +1,6 @@
 # core 架构与设计方案
 
-版本：0.11 · 2026-11-25（UTC+8） · 状态：**设计稿；审计五次批复后分步实施中：第 0–4 步已实现并提交；第 5 步（cex 订单与纸面、Bitget 账户侧）和第 5.3 步（延迟相关的改动、WSS 下单通道）已实现并通过测试，未提交；第 6 步起未开始。** 0.11 落实用户第 56、57 条：取价不再归档（SOXL 第 2 个、SOXS 第 5 个原始价位，5.2 末尾“取价档”），下单默认改用 WSS 并用真实订单验证（5.7 末尾）。0.10 落实第 53–55 条（SOXS 改 `books5`、延迟设计 L1–L4 和 WSS 下单的实现与实测）。规则在 PRD 3.9。0.9 写入第 5 步的做法和延迟研究；0.8、0.7 落实审计第五、四次意见（5.4b、5.4a）。各轮审计原文、检查报告和 0.1–0.10 的副本在 `experiments/decisions_20261123/spec_core_20261124/`。
+版本：0.11 · 2026-11-25（UTC+8） · 状态：**设计稿；审计五次批复后分步实施中：第 0–4 步已实现并提交；第 5 步（cex 订单与纸面、Bitget 账户侧）和第 5.3 步（延迟相关的改动、WSS 下单通道）已实现并通过测试，未提交；第 6 步起未开始。** 0.11 之后的补充（2026-11-25 晚，用户第 61 条）：5.6 新增只供 Live Monitor 显示的三项落库（`funding_rate` 表、`inventory_sample` 的标记价等八列、`signal_sample` 的两腿中价）。0.11 落实用户第 56、57 条：取价不再归档（SOXL 第 2 个、SOXS 第 5 个原始价位，5.2 末尾“取价档”），下单默认改用 WSS 并用真实订单验证（5.7 末尾）。0.10 落实第 53–55 条（SOXS 改 `books5`、延迟设计 L1–L4 和 WSS 下单的实现与实测）。规则在 PRD 3.9。0.9 写入第 5 步的做法和延迟研究；0.8、0.7 落实审计第五、四次意见（5.4b、5.4a）。各轮审计原文、检查报告和 0.1–0.10 的副本在 `experiments/decisions_20261123/spec_core_20261124/`。
 
 core 是 ETF Pair Arbitrage 的交易进程：读 Bitget 上 SOXLUSDT / SOXSUSDT 两个永续合约的盘口，按锚点算出价差、均线和 σ，在非盘中两条腿同时偏离均线足够远时用 IOC 限价单同时买入（或同时卖出）两条腿，价差回到平仓线时平仓，每个美股常规收盘前全部平掉。
 
@@ -265,7 +265,9 @@ type MarketRule struct {
 }
 func (r MarketRule) Sendable(qty, price decimal.Decimal) bool // qty ≥ MinQty and qty × price ≥ MinNotional
 type AccountSettings struct{ OneWay bool; BySymbol map[Symbol]SymbolSetting } // SymbolSetting{Crossed bool; Leverage int}
-type Position struct{ Symbol Symbol; Qty decimal.Decimal; AvgPrice decimal.Decimal; UpdatedAt time.Time } // Qty signed: short is negative
+type Position struct{ Symbol Symbol; Qty decimal.Decimal; AvgPrice decimal.Decimal; UpdatedAt time.Time; MarkPrice, UnrealisedPnL, LiqPrice decimal.NullDecimal } // Qty signed: short is negative; the last three for the board only, not valid when not reported
+type AccountAssets struct{ Equity, MarginRatio decimal.Decimal; ReceivedAt time.Time } // the whole account, for the board only
+type AccountAssetsReader interface{ AccountAssets(ctx context.Context) (AccountAssets, error) } // optional on a Venue: the real exchange has it, the paper venue not
 type PositionSet struct{ BySymbol map[Symbol]Position; ReceivedAt time.Time; Loaded bool }
 type FinancialRecord struct{ ID string; Symbol Symbol; Type string; Amount decimal.Decimal; At time.Time }
 
@@ -352,6 +354,7 @@ func (m *CexManager) ReadPositions(ctx context.Context) (PositionSet, error) // 
 func (m *CexManager) AccountChanged() <-chan struct{}     // closed when positions or financial records are published
 func (m *CexManager) FinancialRecords() []FinancialRecord // funding records of the two legs read so far, oldest first
 func (m *CexManager) FundingRateAt(leg Leg, settlement time.Time) (rate decimal.Decimal, ok bool)
+func (m *CexManager) AccountAssets() (AccountAssets, bool) // last read of the account's equity and margin ratio, for inventory_sample; false before one and on the paper venue
 
 // --- orders ---
 func (m *CexManager) PlaceOrders(reqs ...OrderRequest) error // writes the pending rows, then sends each order on its own goroutine
@@ -547,7 +550,7 @@ NAV                                  Kind = nav，A = NAV            # 之后不
 - **连接**：每条腿一条公共连接（各调一次 `SubscribeBooks`）。增量接不上时重开这条腿的订阅。`Book.Connected` 因此按腿算。断线或增量接不上而丢深度时，最优价不跟着丢：深度的第一档比 `books1` 新就先存成最优价，所以 `HasPrice` 仍按最后一个最优价的到达时刻算，最多再撑 `depth_max_age`（PRD 3.1）。序号与已有深度相等的帧也丢弃。
 - **`Run` 是四个循环**：盘口在 `Run` 自己的 goroutine；F、锚点、参考数据各一个，读取内联、每次最多等 10 秒。
 - **`Venue.FinancialRecords` 只返回资金费结算流水**：流水类型是线上的字符串，留在适配器里，manager 只按合约筛。
-- **读取间隔**（`timings`）：资金费流水首次回看 7 天、之后每分钟读一次并重叠一个间隔；合约规则每小时；账户设置每分钟；结算费率每 5 分钟（每条腿 100 条）；持仓在启动时读到成功一次，之后只在 `ReadPositions` 时读。
+- **读取间隔**（`timings`）：资金费流水首次回看 7 天、之后每分钟读一次并重叠一个间隔；合约规则每小时；账户设置每分钟；结算费率每 5 分钟（每条腿 100 条，新的结算各写一行 `funding_rate`）；持仓在启动时读到成功一次，之后只在 `ReadPositions` 时读；账户权益和保证金率每 10 秒（与 `inventory_sample` 同频，只在交易所适配器实现了 `AccountAssetsReader` 时读，纸面交易所不实现；结果只存在一个原子指针里，不关 `AccountChanged`，不唤醒任何循环）。
 - **`TradingReady`**：规则已读到且两个合约在线；实盘另要求私有流在线（第 5.2 步加上：适配器实现可选接口 `PrivateStreamStatus{PrivateUp() bool}`，纸面交易所不实现）。`Restore` 的 `orders` 参数第 5.1 步起使用。
 - **NAV**：取到分；返回的交易日必须等于所问的日期；在“两条腿这一轮都读到、且都满 `nav_settle_delay` 没变”的那次读取时确认。铃锚点不取整。
 - **分红**：调整后的 `KnownAt` 取锚点得知时刻、T、金额读到时刻三者里最晚的；窗口跨两个 Session，按时刻判断。每天的核对在启动时做一次、之后每 24 小时，只对晚于当前 Session 起始日的除息日报警。Direxion 的密钥缺失或被拒：本次运行不再读，一条 Error 加 `event`。
@@ -1097,14 +1100,16 @@ R = 已结束各轮的已实现净额（含 `void` 的亏损）+ 已入账的资
 - **核对**（PRD 13.4、13.7）：用 REST 读的持仓（`cex.ReadPositions`，两个合约），推送只用来触发。只由 exec 的循环调用（`inv.Reconcile`），每次之前刚 `Sync` 过订单快照：`recover` 的最后一步；每批订单都有了最终状态之后；`closeIfFlat`；没有未出结果的订单时每 10 秒一次。inventory 的 `Run` 自己不核对。比的是两条腿带符号的数量与账本（各仓位的未平数量 + 零头）。差额能由还没查清的订单解释（同一条腿、同一方向、不超过它的未成交数量）不算不符。不符要间隔 1 秒再读一次、仍然不符才置 `Mismatch() = true`，打 Error；置位后不自动清除，人核对后重启。持仓读不到不当作空仓，也不当作不符，只是不开仓（`not_ready`）。
 - **零头**（用户第 47 条：“零头暂时不处理，记录零头仓位和价格即可”）：一轮结束时某条腿剩下发不出单的数量（低于最小数量或最小名义），`CloseCycle` 把它从仓位里取出来记下：一行 `event`（`dust_left`，Warn：腿、带符号的数量、它的开仓均价、`cycle_id`、`lot_id`），并把每条腿的**净零头**（带符号的数量和均价）写进 `inventory_state.dust`，与 `cycle` 行、`r_closed` 同一次 `WriteSync`。零头不产生已实现盈亏：仓位和这一轮的毛额、手续费、净额以及 R 都只算实际平掉的部分。核对持仓时把净零头算上（交易所持仓 = 各仓位的未平数量 + 净零头），所以留着零头不会被当成持仓不符。之后不再对它做任何事——不冲抵、不归属、不专门去平；实盘里出现得多不多，从 `event` 和 `inventory_state` 看，再决定要不要处理。
 - **资金费**（PRD 7.6）：cex 每分钟读一次资金费流水（接口不能按合约过滤，读回后本地取两个合约的资金费类型），inventory 在 `cex.AccountChanged()` 时取新的流水：每条写一行 `funding`、计入 R，按它的结算时刻（流水时间向下取到 8 小时的结算点；实测流水比结算晚 2–6 秒）记给持仓区间包含这个时刻的那一轮。一轮跨过某个结算时刻时：这个时刻两个合约的结算费率（`FundingHistory`）是 0 就按 0 算已知；不是 0 而流水还没读到，`FundingKnown = false`，净额显示“待出账”。
-- **采样**：每 10 秒一行 `inventory_sample`（交易所持仓、账本持仓、R、额度、是否不符）。
+- **采样**：每 10 秒一行 `inventory_sample`（交易所持仓、账本持仓、R、额度、是否不符；另有只供看板显示的标记价、未实现盈亏、强平价和账户权益、保证金率，见 5.6）。
 
 读写接口：
 
 ```go
 type cexSource interface { // what inventory needs from cex; *cex.CexManager satisfies it, tests pass a fake
     ReadPositions(ctx context.Context) (cex.PositionSet, error)
+    Positions() cex.PositionSet                       // for the samples
     AccountChanged() <-chan struct{}
+    AccountAssets() (cex.AccountAssets, bool)         // for the samples only
     FinancialRecords() []cex.FinancialRecord
     FundingRateAt(leg cex.Leg, settlement time.Time) (rate decimal.Decimal, ok bool)
 }
@@ -1635,7 +1640,7 @@ func (s *Store) LoadState(ctx context.Context, sessionID string) (State, error) 
 - store 不引用任何模块的类型：`State` 里是它自己的行结构（`CycleRow`、`LotRow`、`OrderRow`、`MinuteBarRow`、`AnchorFactRow`、`InventoryStateRow`），各模块在自己的 `store.go` 里与领域类型互转。每个模块用 `UseStore(sink)` 接入（与相邻仓库相同），测试用 `store.Fake`。
 - `Record`：有界队列（4,096 行），单个 writer 每 200 毫秒或满 256 行写一批（`pgx.Batch`，一个事务）。写失败：连接类的失败保留这一批、每秒重试、`Healthy() = false`、打 Error（持续失败时每分钟再打一次）；被数据库以数据原因拒绝的行（SQLSTATE 22、23、42 类，比如行结构与表对不上）：这一批改为逐行各一个事务写，被拒的丢掉并计数、打 Error（带表名和 SQLSTATE，不带行的内容），其余的照写；它不算数据库不可用，不影响 `Healthy()`；队列满时新行丢弃并计数（PRD 13.5 接受写不了时的记录缺失：平仓单照发，重启时按编号从交易所认回）。`Healthy()` 为假时 exec 不开仓（`store_error`）。
 - `WriteSync`：发单前的 `cex_order`（`pending`）行，以及开一轮、开一个仓位时的 `cycle`、`lot` 行。它与 `Record` 走同一个队列、由同一个 writer 提交：同步行连同排在它前面的行在一个事务里写完才返回。调用方最多等 1 秒，到点就返回“提交未确认”，不管 writer 取没取走这个请求（writer 照自己的顺序写完，不会被调用方的超时打断；轮到单独写这条同步行时调用方已经超时的，writer 跳过不写）。不另开事务，是因为同一张状态表的行必须按产生的先后落库——否则先 `Record` 的 `cycle(open)` 会在稍后的批里盖掉刚同步写入的 `cycle(closed)`。返回错误的意思是“没有确认写入”，不是“一定没写”：writer 已经取走请求、提交在 1 秒内没回来时，调用方拿到超时，行却可能已经在库里。所以调用方失败之后，要对同一个主键再同步写一行作废的状态，确认写入之前不开仓（见 5.3）。writer 这一侧，写失败时同步行不保留，排在它前面的异步行照常重试。上一次写失败、还在重试期间，`WriteSync` 立即返回错误，不等满 1 秒（数据库不可用时，照发的只减仓单不会每批多等 1 秒）。
-- 写入规则三类：**状态**（`cycle`、`lot`、`cex_order`、`inventory_state`：按主键 upsert，后写覆盖先写——每张表只有一个模块写，行按产生的先后进同一个队列，所以不需要版本号）、**事实**（`cex_fill`、`funding`、`anchor_fact`、`decision`、`event`、`minute_bar`：唯一键去重）、**采样**（`signal_sample`、`inventory_sample`：主键含时间；也用“已存在就跳过”，一批提交结果不明后重发时不会卡在主键冲突上）。`run_id`、`live` 以及 `decision`、`event` 的 `seq` 由 store 在入队时加上（行结构里没有这三个字段；`seq` 每次运行一条序列，两张表共用）；`live` 来自 `store.Config.Live`，由 `config.Load` 从 `exec.live` 抄入。
+- 写入规则三类：**状态**（`cycle`、`lot`、`cex_order`、`inventory_state`：按主键 upsert，后写覆盖先写——每张表只有一个模块写，行按产生的先后进同一个队列，所以不需要版本号）、**事实**（`cex_fill`、`funding`、`funding_rate`、`anchor_fact`、`decision`、`event`、`minute_bar`：唯一键去重）、**采样**（`signal_sample`、`inventory_sample`：主键含时间；也用“已存在就跳过”，一批提交结果不明后重发时不会卡在主键冲突上）。`run_id`、`live` 以及 `decision`、`event` 的 `seq` 由 store 在入队时加上（行结构里没有这三个字段；`seq` 每次运行一条序列，两张表共用）；`live` 来自 `store.Config.Live`，由 `config.Load` 从 `exec.live` 抄入。
 - `schema.sql`（表和索引）嵌入二进制，启动时由写入角色幂等应用，应用期间持一把事务级的 advisory lock。schema `trade` 本身和两个角色的授权不在这个文件里：写入角色没有在库里建 schema 的权限，由安装脚本建（开发库是 `scripts/dev_db.sh`，正式库是 `install.sh` 要加的一段）。以后改表，在文件里追加放在 `DO` 块里、先查是否已存在再执行的语句：`CREATE INDEX IF NOT EXISTS` 和 `ALTER TABLE … IF NOT EXISTS` 即使无事可做也会锁表，纸面和实盘两个进程同时在跑时会与写入的事务互相等待。测试用环境变量 `ETFPAIR_TRADE_TEST_DSN` 指向临时库，没有就跳过并在报告里写明是跳过。
 
 **库与角色**：库 `etfpair`（本机，与看板同一实例），schema `trade`。新角色 `etfpair_trade`（`trade` 的属主；对 `etfpair.perp_second` 只有 `SELECT`）和 `etfpair_trade_reader`（Grafana 用：`trade` 只读、`default_transaction_read_only = on`、`statement_timeout = 15s`、连接上限 10）。库对 PUBLIC 撤了 `CONNECT`，两个新角色要显式授权。
@@ -1649,7 +1654,7 @@ func (s *Store) LoadState(ctx context.Context, sessionID string) (State, error) 
 |---|---|---|---|
 | `process_run` | 状态 / `run_id` | main：启动、停止 | `started_ms`、`stopped_ms`、`host`、`live`、`config` JSONB（生效的配置，不含 `.env`） |
 | `minute_bar` | 事实 / `(live, minute_ms)` | exec：每分钟结束 | 只有原始输入：`session_id`、`mid_bull`、`mid_bear`、`f`、`valid`、`source`（`own` / `perp_second`）。同一分钟不同的运行写出的值相同，可以跨运行复用；价差、均线、σ 随参数而变，不存在这里，各次运行按自己的配置重算，落在带 `run_id` 的 `signal_sample` 里 |
-| `signal_sample` | 采样 / `(ts_ms, run_id)` | exec：每秒 | `session_id`、`session_end_ms`、`phase`（`off_hours` / `regular` / `close_window`）、`anchor_kind`、`anchor_bull`、`anchor_bear`、`f`、`mid_d`、`mu_d`、`sigma_d`、`x_long_d`、`x_short_d`、`stats_ready`、`idle_reason`、`depth_ok_bull`、`depth_ok_bear`、`conflict_bull`、`conflict_bear`、`cycle_id`、`direction`、`hold_bull`、`hold_bear`、`quota_left` |
+| `signal_sample` | 采样 / `(ts_ms, run_id)` | exec：每秒 | `session_id`、`session_end_ms`、`phase`（`off_hours` / `regular` / `close_window`）、`anchor_kind`、`anchor_bull`、`anchor_bear`、`f`、`mid_d`、`mu_d`、`sigma_d`、`x_long_d`、`x_short_d`、`stats_ready`、`idle_reason`、`depth_ok_bull`、`depth_ok_bear`、`conflict_bull`、`conflict_bear`、`cycle_id`、`direction`、`hold_bull`、`hold_bear`、`quota_left`；只供看板：`mid_bull`、`mid_bear`（两腿 bid1/ask1 中价，USDT；没有最优买卖价时为 NULL） |
 | `anchor_fact` | 事实 / `(live, session_id, kind, leg, known_ms)` | cex：每次读到锚点、NAV、分红 | `kind`（`bell_f` / `bell` / `nav_seen` / `nav` / `dividend`）、`value`、`f`、`source`、`detail` JSONB |
 | `cycle` | 状态 / `cycle_id` | inventory：开（同步）、每次记账、结束 | `session_id`、`direction`、`status`（`open` / `closed` / `takeover`）、`funding_awaited` JSONB、`end_reason`（`exit_line` / `close_window` / `stop` / `session_changed` / `no_fill` / `one_leg` / `store_error`）、`pair_anchor_kind`、`pair_anchor_bull`、`pair_anchor_bear`、`opened_ms`、`closed_ms`、`gross`、`fees`、`funding`、`funding_known`、`net`、`dust_bull`、`dust_bear` |
 | `lot` | 状态 / `lot_id` | inventory：开（同步）、每次记账、结清 | `cycle_id`、`seq`、`status`（`building` / `open` / `closed` / `void`）、`void_reason`、`direction`、`x_d`、`mu_d`、`sigma_d`、`fee_d`、`fee_usdt_est`、每条腿的 `entry_qty` / `entry_value` / `entry_fee` / `exit_qty` / `exit_value` / `exit_fee`（列名带 `_bull`、`_bear`）、`opened_ms`、`closed_ms`、`gross`、`fees`、`net` |
@@ -1657,11 +1662,14 @@ func (s *Store) LoadState(ctx context.Context, sessionID string) (State, error) 
 | `cex_fill` | 事实 / `exec_id` | cex：每笔成交推送 | `client_order_id`、`order_id`、`symbol`、`side`、`price`、`qty`、`value`、`fee`、`exec_ms`（交易所）、`received_ms`（本机） |
 | `decision` | 事实 / `(run_id, seq)` | exec：每个决定；纸面交易所：每张纸面单一行 `paper_match` | `ts_ms`、`cycle_id`、`lot_id`、`kind`（`entry` / `exit` / `complete` / `trim` / `forced` / `at_line_blocked` / `paper_match`）、`direction`、`reason`、`detail` JSONB |
 | `funding` | 事实 / `record_id` | inventory：每条资金费流水 | `symbol`、`type`、`amount`、`ts_ms`、`settlement_ms`、`cycle_id` |
-| `inventory_sample` | 采样 / `(ts_ms, run_id)` | inventory：每 10 秒 | `pos_bull`、`pos_bear`（交易所，带符号；持仓还没读到时为 NULL）、`ledger_bull`、`ledger_bear`、`r`、`quota_total`、`quota_used`、`mismatch` |
+| `funding_rate` | 事实 / `(live, symbol, settlement_ms)` | cex：每次读结算费率时新出现的结算（纸面和实盘都读，公开接口） | `leg`、`rate`（交易所公布的结算费率，带符号）。只供看板 |
+| `inventory_sample` | 采样 / `(ts_ms, run_id)` | inventory：每 10 秒 | `pos_bull`、`pos_bear`（交易所，带符号；持仓还没读到时为 NULL）、`ledger_bull`、`ledger_bear`、`r`、`quota_total`、`quota_used`、`mismatch`；只供看板：`mark_bull` / `mark_bear`（标记价）、`upl_bull` / `upl_bear`（交易所给的未实现盈亏，USDT）、`liq_bull` / `liq_bear`（强平价），取自最近一次读到或推送的持仓（Bitget `current-position` 的 `markPrice`、`unrealisedPnl`、`liquidationPrice`，私有流是 `liqPrice`；没有持仓或交易所没给时为 NULL，纸面没有这三项），`equity`（账户权益，USDT，`usdtEquity`）、`margin_ratio`（账户保证金率，按交易所原样，`mgnRatio`），取自 `GET /api/v3/account/assets` 的最近一次读取（每 10 秒读一次；最近一次成功的读取超过 30 秒时写 NULL，不把旧数当现值）；这两项是整个账户的——账户上还有相邻仓库的仓位；纸面模式不读私有接口，恒为 NULL |
 | `inventory_state` | 状态 / `live` | inventory：一轮结束、资金费入账、零头变化时 | `capital`、`r_closed`、`since_ms`（账本的起点）、`dust` JSONB（每条腿的净零头：带符号的数量和均价） |
 | `event` | 事实 / `(run_id, seq)` | 各模块：报警和状态变化 | `ts_ms`、`module`、`level`、`kind`、`message`、`detail` JSONB |
 
 每个事实只由掌握它的模块写一次：订单和成交是 cex 的，仓位和盈亏是 inventory 的，决定和采样是 exec 的。
+
+**只供看板的记录**（用户第 61 条，2026-11-25；Live Monitor 要显示资金费率、保证金率、按中价估的未平仓盈亏）：`funding_rate`、`inventory_sample` 的 `mark_*` / `upl_*` / `liq_*` / `equity` / `margin_ratio`、`signal_sample` 的 `mid_*`。程序只写不读：没有任何决定取自这些值（PRD 6.6、V17 照旧，保证金率不参与任何判断），重启也不读回。列在 `schema.sql` 末尾按“没有才加”的方式追加，表不存在时新建；读看板的 `etfpair_trade_reader` 靠安装时的 `ALTER DEFAULT PRIVILEGES … GRANT SELECT ON TABLES` 自动能读新表，不用重跑安装脚本。字段的出处和一次只读实测：`experiments/decisions_20261123/spec_core_20261124/bitget_facts/account_assets_20261125.md`。
 
 ### 5.7 延迟：测量、结论与设计（2026-11-25）
 
@@ -1803,7 +1811,7 @@ func (s *Store) LoadState(ctx context.Context, sessionID string) (State, error) 
 
 ## 9. 实施步骤与状态
 
-每一步结束时：`go build ./... && go vet ./... && go test -race ./...`（在 `core/` 下）通过，本步的验收项有测试，本文件与实现一致，向用户汇报后再进下一步。V 编号是 PRD 第 17 节的验收条目。每个 manager 的时钟都是注入的（`timings.clock`），测试和回放用假时钟。状态（2026-11-25 晚）：**第 0–6.4 步已实现、经独立审查、测试通过并已提交（6.2–6.4 的合并审查进行中）；第 6.5 步纸面联调实施中：正式库的角色和 schema 已装，2026-11-25 19:53 UTC+8 起在真实行情上跑纸面（先 1 小时，再跨 11-26 05:00 的真实收盘）。之后是第 7 步看板（用户第 61 条）。**
+每一步结束时：`go build ./... && go vet ./... && go test -race ./...`（在 `core/` 下）通过，本步的验收项有测试，本文件与实现一致，向用户汇报后再进下一步。V 编号是 PRD 第 17 节的验收条目。每个 manager 的时钟都是注入的（`timings.clock`），测试和回放用假时钟。状态（2026-11-25 晚）：**第 0–6.4 步已实现、经独立审查、测试通过并已提交（6.2–6.4 的合并审查进行中）；第 6.5 步纸面联调实施中：正式库的角色和 schema 已装，2026-11-25 19:53 UTC+8 起在真实行情上跑纸面（先 1 小时，再跨 11-26 05:00 的真实收盘）。之后是第 7 步看板（用户第 61 条）；看板要的三项落库（5.6 末尾“只供看板的记录”）已加上并通过测试，未提交，正在跑的纸面进程要重启后才写这些列。**
 
 | # | 步骤 | 内容 | 验收 |
 |---|---|---|---|
@@ -1896,5 +1904,7 @@ func (s *Store) LoadState(ctx context.Context, sessionID string) (State, error) 
 **其他**：Binance https://developers.binance.com/en/docs/llms-full.txt（`indexPriceKlines`、`tradingSchedule`）；Coinbase https://docs.cdp.coinbase.com/exchange/websocket-feed/overview 和 Exchange REST 的 `ticker`、`candles`；NYSE https://www.nyse.com/trade/hours-calendars。
 
 **第 5.2 步重读的官方页面（2026-11-25）**：事实文件 `experiments/decisions_20261123/spec_core_20261124/bitget_facts/step52_facts.md` 开头的表逐页列出地址和取得时刻（下单与订单管理、持仓、账户设置、资产流水、私有流的 Order / Fill / Positions / Place-Order 频道、错误码、枚举、最佳实践、快速开始、2026-11 变更日志；官方文档已从 `bitget.com/api-doc` 重定向到 `bitget.com/docs`），页面副本在 `step52/docs/`。延迟研究另读的页面见 5.7 和 `latency_20261125/`。
+
+**看板用的账户资产（2026-11-25 20:34 UTC+8 取得）**：https://www.bitget.com/docs/catalog/account/assets-balance 的 Get Account Assets（`GET /api/v3/account/assets`，20 次/秒/UID，权限 UTA mgt. (read)；`usdtEquity` “Account equity (USDT)”、`mgnRatio` “Margin ratio”），保证金率的定义取 https://www.bitget.com/docs/uta/uta-intro 的 “Margin rate”（全仓：(维持保证金 + 部分强平手续费) ÷ 账户权益）；页面副本和一次签名 GET 的原始应答见 `bitget_facts/account_assets_20261125.md`。
 
 **0.8 及以前写在这里、现已由第 5.2 步核实的**（原文保留备查）：私有 WS 的登录和频道字段、下单请求体的字段、限速数字、错误码。实现到第 5.2 步时按 `carefully-read-app-docs` 重读对应的官方页面，并把读的页面和日期补进本节。

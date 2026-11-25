@@ -68,7 +68,7 @@ BITGET_ORDER_LATENCY_TEST=1 BITGET_ORDER_LATENCY_AUTHORISED=owner-authorised BIT
 
 `TestLiveWSOrderRoundTrip` 在一个合约上（`SOXLUSDT` 默认，或 `SOXSUSDT`）：先确认这个合约 REST 持仓为空、账户是单向持仓、下单连接和私有流在线、买一卖一不到 2 秒，否则什么都不发；开仓是一张 WSS 的 IOC 限价买单，数量刚过最小名义（约 5.5 USDT，超过最小名义 3 倍就不发），价格为卖一上方 0.3%；平仓是一张 WSS 的只减仓 IOC 限价卖单（帧里写 `YES`），数量就是成交量，价格为买一下方 0.3%；交易所拒绝或没有平掉时记下它的答复（代码和信息），依次再试 REST 只减仓、REST 普通卖单（单向持仓下卖出同样数量即平多，只按 REST 读到的持仓和订单记账都还剩的数量发），每次用当时的买一重新定价，平掉为止；最后用 REST 读持仓，不为空就报错并写出剩下多少。一次最多 6 张、间隔 1 秒以上，订单编号以 `lat` 开头。原始记录存到 `../experiments/core_step5/latency/ws_round_trip_<合约>_<UTC 时间>.json`：每张单发出的帧或请求体（不含请求头、登录和签名）、下单连接收到的每一帧、这些订单的 `order` / `fill` 推送和这个合约的 `position` 推送、所有 REST 请求和应答（保温请求除外），都带本机时间；日志写出哪一种平仓成功、每张单发出 → 应答、发出 → 建单、发出 → 最终推送、成交价对发单时的最优价、交易所报的手续费对订单金额的 0.65 bps。`TestWSRoundTripRehearsal` 用同一份代码对着本地模拟的交易所把各种答复（`YES` 被拒、被接受但不当只减仓、回一个不带请求号的错误帧、全部只减仓都被拒、第一张只成交一半、开仓没成交、开始时不空仓等）都跑一遍。
 
-表结构（`store/schema.sql`）改了之后，开发库要删掉重建：已有的表不会自动多出新列，进程会把写不进去的行丢掉并打 Error。开发库里只有测试数据：
+表结构（`store/schema.sql`）里新加的表和列写在文件末尾，按需添加，进程启动时自动加上；改了已有的列（类型、约束）时，开发库要删掉重建，否则进程会把写不进去的行丢掉并打 Error。开发库里只有测试数据：
 
 ```bash
 scripts/dev_db.sh stop && rm -rf ../experiments/core_dev_db && scripts/dev_db.sh start
