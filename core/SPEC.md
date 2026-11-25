@@ -1488,6 +1488,18 @@ func (m *ExecManager) forcedExit(now time.Time, unknown bool) (done bool) {
 - 数据库测试的隔离：根包和 store 包的库测试先取一个会话级 advisory lock（`core/internal/dbtest`），并行的各包轮流使用同一个开发库；启动测试在锁内先清掉 `process_run` 以外的 `trade` 表。`scripts/dev_db.sh` 只在开发库里建 `etfpair.perp_second` 并授予写权限（正式库上交易程序只有 SELECT）。
 - 测试（`exec/restart_test.go`，前 7 个真实落库）：`TestRecoveryReadsBeforeItStops`（旧进程带仓 → 恢复时读取失败 → 收到停止 → 读取恢复 → 减仓并核对后才退出）、`TestRestartAfterTheSend` / `TestRestartBeforeTheSend`（第二条腿的通知被扣住，发单前后各一个崩溃点）、`TestRestartRecognisesAnUnrecordedOrder`、`TestRestartAfterAnUnrecordedExit`（V16 末句）、`TestRestartAfterATakeover`、`TestRestartAcrossTheClose`、`TestMinutesResumedPreferringOwnRows`（V15）；store 包 `TestLoadPerpMinutes`。五处关键改动逐一撤掉过，对应测试都会失败。
 
+#### 第 6.2–6.4 步的合并审查之后（2026-11-25）
+
+审查 `experiments/decisions_20261123/spec_core_20261124/review_code_step62_64.md`：无必须改；4 处应改、8 处小问题都已修，各有回归测试（逐项改回旧逻辑都会失败）。定下的行为：
+
+- 恢复时分钟读不到（录制服务或 F 的分钟收盘价）只记 Warn，补不出的分钟算无效，恢复照常——否则带仓重启可能过了收盘也不平。
+- 结果未知期间按持仓回吐：持仓快照早于这一轮订单里最晚的最终状态时先用 REST 再读一次，仍旧则这一拍等待——避免同一个差额回吐两次。
+- 按持仓强平和回吐都先减去账本记录的零头（带符号）。
+- 一批出结果后的持仓核对放在 `workGap` 不再发单之后、结清之前，不挡补齐 / 回吐的判断。
+- 持仓不符的确认要求两次差额相同，且在 2 × 1 秒之内；价格超限只按 `ErrorKind` 判断（含被撤的 IOC），补齐单也受同价不重发和 200 毫秒间隔约束。
+- 认定“没有到达”之后又报来的成交不入账，记 Error，交给持仓核对报不符；`order_never_arrived` 只在认定生效时记。
+- 恢复和读库重试期间照常每 60 秒报警，报警之后的停止信号算人工接管；恢复出的在建批一张订单都没有的，作废，这一轮以 `no_fill` 结束；超出持有量被丢弃的平仓成交记 Warn。
+
 ### 5.4a 审计第四次意见之后的修改（2026-11-25）
 
 审计在第 2–4 步的代码上复现了六个问题，另提了两处口径；都已修并有回归测试（审计的数字原样用作断言）。上文与这里不同的地方以这里和代码为准。
