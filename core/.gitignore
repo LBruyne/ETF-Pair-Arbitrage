@@ -1,5 +1,6 @@
 # Secrets and the private configuration.
 .env
+.env.reader
 config.yaml
 
 # Logs.
