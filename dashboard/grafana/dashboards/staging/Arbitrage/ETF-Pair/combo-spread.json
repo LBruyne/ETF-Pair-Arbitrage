@@ -38,7 +38,7 @@
      "format": "table",
      "rawQuery": true,
      "editorMode": "code",
-     "rawSql": "WITH v AS MATERIALIZED (SELECT * FROM (SELECT (SELECT CASE m[3] WHEN 'k' THEN 1000 WHEN 'w' THEN 10000 WHEN '万' THEN 10000 ELSE 1 END * (replace(m[1], ',', '') || m[2])::numeric FROM regexp_match(regexp_replace(regexp_replace(lower(normalize('$notional', NFKC)), '[[:space:]_]', '', 'g'), 'u(sdt)?$', ''), '^([0-9]{1,3}(?:,[0-9]{3})+|[0-9]+)((?:[.][0-9]+)?)(k|w|万)?$') m) AS n, (SELECT CASE WHEN m[1]::numeric > 0 THEN m[1]::numeric END FROM regexp_match(regexp_replace(lower(normalize('$d', NFKC)), '[[:space:]_]', '', 'g'), '^([0-9]+(?:[.][0-9]+)?)(?:bps)?$') m) AS d, (SELECT CASE WHEN m[1]::integer > 0 THEN m[1]::integer END FROM regexp_match(regexp_replace(lower(normalize('$ma_minutes', NFKC)), '[[:space:]_]', '', 'g'), '^([0-9]{1,6})(?:min|m)?$') m) AS ma_n) v),\n     l AS MATERIALIZED (SELECT x.* FROM v CROSS JOIN LATERAL etfpair.combo_last('$combo', '$venue', '$ma', v.ma_n, v.n, v.d, (extract(epoch FROM now()) * 1000)::bigint) x)\nSELECT (SELECT phase FROM etfpair.etf_phase WHERE start_ms <= (extract(epoch FROM now()) * 1000)::bigint AND end_ms > (extract(epoch FROM now()) * 1000)::bigint) AS \"Phase\",\n       p.p_bull AS \"Bull Price\",\n       (floor((p.a_bull)::float8 * 1e2::float8 + 0.5) / 1e2::float8) AS \"Bull Anchor\",\n       p.p_bear AS \"Bear Price\",\n       (floor((p.a_bear)::float8 * 1e2::float8 + 0.5) / 1e2::float8) AS \"Bear Anchor\",\n       p.p_ref AS \"Ref Price\",\n       (floor((100 * (p.fx * p.p_ref / p.a_ref - 1))::float8 * 1e2::float8 + 0.5) / 1e2::float8) AS \"Ref Return\",\n       CASE WHEN b.basis IS NULL THEN NULL WHEN b.s_bps IS NOT NULL THEN (floor((b.s_bps)::float8 * 1e2::float8 + 0.5) / 1e2::float8) ELSE -4000000000 END AS \"Spread\",\n       CASE WHEN b.basis IS NULL THEN NULL WHEN b.mu_bps IS NOT NULL THEN (floor((b.mu_bps)::float8 * 1e2::float8 + 0.5) / 1e2::float8) WHEN b.s_bps IS NULL THEN -4000000000 WHEN b.past_t THEN -5000000000 ELSE -6000000000 END AS \"Mean\",\n       CASE WHEN b.basis IS NULL THEN NULL WHEN abs(b.s_bps - b.mu_bps) IS NOT NULL THEN (floor((abs(b.s_bps - b.mu_bps))::float8 * 1e2::float8 + 0.5) / 1e2::float8) WHEN b.s_bps IS NULL THEN -4000000000 WHEN b.past_t THEN -5000000000 ELSE -6000000000 END AS \"Deviation\",\n       b.anchor_status AS \"Anchor Status\",\n       b.fx AS \"USD/USDT\",\n       CASE WHEN b.basis IS NULL THEN NULL WHEN b.s_bps IS NULL THEN -4000000000 WHEN b.past_t THEN -5000000000 WHEN b.s_long_bps < b.mu_bps THEN (floor((abs(b.s_long_bps - b.mu_bps))::float8 * 1e2::float8 + 0.5) / 1e2::float8) WHEN abs(b.s_long_bps - b.mu_bps) IS NOT NULL THEN -10000000000 WHEN b.mu_bps IS NULL THEN -6000000000 WHEN NOT coalesce(v.n > 0, false) THEN -3000000000 ELSE -2000000000 END AS \"Real Long Deviation\",\n       CASE WHEN b.basis IS NULL THEN NULL WHEN b.s_bps IS NULL THEN -4000000000 WHEN b.past_t THEN -5000000000 WHEN b.s_short_bps > b.mu_bps THEN (floor((abs(b.s_short_bps - b.mu_bps))::float8 * 1e2::float8 + 0.5) / 1e2::float8) WHEN abs(b.s_short_bps - b.mu_bps) IS NOT NULL THEN -10000000000 WHEN b.mu_bps IS NULL THEN -6000000000 WHEN NOT coalesce(v.n > 0, false) THEN -3000000000 ELSE -2000000000 END AS \"Real Short Deviation\",\n       CASE WHEN b.basis IS NULL THEN NULL WHEN b.s_bps IS NULL THEN -4000000000 WHEN NOT coalesce(v.n > 0, false) THEN -3000000000 WHEN b.basis <> 'mid' THEN -2000000000 WHEN NOT b.partial_long THEN -8000000000 WHEN b.filled_long IS NOT NULL THEN (floor((b.filled_long)::float8 * 1e0::float8 + 0.5) / 1e0::float8) ELSE -2000000000 END AS \"Long Fill\",\n       CASE WHEN b.basis IS NULL THEN NULL WHEN b.s_bps IS NULL THEN -4000000000 WHEN NOT coalesce(v.n > 0, false) THEN -3000000000 WHEN b.basis <> 'mid' THEN -2000000000 WHEN NOT b.partial_short THEN -8000000000 WHEN b.filled_short IS NOT NULL THEN (floor((b.filled_short)::float8 * 1e0::float8 + 0.5) / 1e0::float8) ELSE -2000000000 END AS \"Short Fill\",\n       b.signal AS \"Signal\",\n       CASE WHEN b.basis IS NULL THEN NULL WHEN b.bid12_bull IS NOT NULL THEN (floor((b.bid12_bull)::float8 * 1e2::float8 + 0.5) / 1e2::float8) WHEN NOT b.book_bull THEN -2000000000 ELSE -7000000000 END AS \"Bid 1+2 Depth · Bull\",\n       CASE WHEN b.basis IS NULL THEN NULL WHEN b.bid12_bear IS NOT NULL THEN (floor((b.bid12_bear)::float8 * 1e2::float8 + 0.5) / 1e2::float8) WHEN NOT b.book_bear THEN -2000000000 ELSE -7000000000 END AS \"Bid 1+2 Depth · Bear\",\n       CASE WHEN b.basis IS NULL THEN NULL WHEN b.ask12_bull IS NOT NULL THEN (floor((b.ask12_bull)::float8 * 1e2::float8 + 0.5) / 1e2::float8) WHEN NOT b.book_bull THEN -2000000000 ELSE -7000000000 END AS \"Ask 1+2 Depth · Bull\",\n       CASE WHEN b.basis IS NULL THEN NULL WHEN b.ask12_bear IS NOT NULL THEN (floor((b.ask12_bear)::float8 * 1e2::float8 + 0.5) / 1e2::float8) WHEN NOT b.book_bear THEN -2000000000 ELSE -7000000000 END AS \"Ask 1+2 Depth · Bear\"\nFROM v LEFT JOIN l p ON p.kind = 'prices' LEFT JOIN l b ON b.kind = 'basis'"
+     "rawSql": "WITH v AS MATERIALIZED (SELECT * FROM (SELECT (SELECT CASE m[3] WHEN 'k' THEN 1000 WHEN 'w' THEN 10000 WHEN '万' THEN 10000 ELSE 1 END * (replace(m[1], ',', '') || m[2])::numeric FROM regexp_match(regexp_replace(regexp_replace(lower(normalize('$notional', NFKC)), '[[:space:]_]', '', 'g'), 'u(sdt)?$', ''), '^([0-9]{1,3}(?:,[0-9]{3})+|[0-9]+)((?:[.][0-9]+)?)(k|w|万)?$') m) AS n, (SELECT CASE WHEN m[1]::numeric > 0 THEN m[1]::numeric END FROM regexp_match(regexp_replace(lower(normalize('$d', NFKC)), '[[:space:]_]', '', 'g'), '^([0-9]+(?:[.][0-9]+)?)(?:bps)?$') m) AS d, (SELECT CASE WHEN m[1]::integer > 0 THEN m[1]::integer END FROM regexp_match(regexp_replace(lower(normalize('$ma_minutes', NFKC)), '[[:space:]_]', '', 'g'), '^([0-9]{1,6})(?:min|m)?$') m) AS ma_n, (SELECT CASE WHEN m[1]::integer > 0 THEN m[1]::integer END FROM regexp_match(regexp_replace(lower(normalize('$sigma_minutes', NFKC)), '[[:space:]_]', '', 'g'), '^([0-9]{1,6})(?:min|m)?$') m) AS sig_n) v),\n     l AS MATERIALIZED (SELECT x.* FROM v CROSS JOIN LATERAL etfpair.combo_last('$combo', '$venue', '$ma', v.ma_n, v.sig_n, v.n, v.d, (extract(epoch FROM now()) * 1000)::bigint) x)\nSELECT CASE WHEN g.i = 1 THEN (SELECT phase FROM etfpair.etf_phase WHERE start_ms <= (extract(epoch FROM now()) * 1000)::bigint AND end_ms > (extract(epoch FROM now()) * 1000)::bigint) END AS \"Phase\",\n       CASE WHEN g.i = 1 THEN p.p_bull END AS \"Bull Price\",\n       CASE WHEN g.i = 1 THEN (floor((p.a_bull)::float8 * 1e2::float8 + 0.5) / 1e2::float8) END AS \"Bull Anchor\",\n       CASE WHEN g.i = 1 THEN p.p_bear END AS \"Bear Price\",\n       CASE WHEN g.i = 1 THEN (floor((p.a_bear)::float8 * 1e2::float8 + 0.5) / 1e2::float8) END AS \"Bear Anchor\",\n       CASE WHEN g.i = 1 THEN p.p_ref END AS \"Ref Price\",\n       CASE WHEN g.i = 1 THEN (floor((100 * (p.fx * p.p_ref / p.a_ref - 1))::float8 * 1e2::float8 + 0.5) / 1e2::float8) END AS \"Ref Return\",\n       CASE WHEN g.i = 1 THEN CASE WHEN b.basis IS NULL THEN NULL WHEN b.s_bps IS NOT NULL THEN (floor((b.s_bps)::float8 * 1e2::float8 + 0.5) / 1e2::float8) ELSE -4000000000 END END AS \"Spread\",\n       CASE WHEN g.i = 1 THEN CASE WHEN b.basis IS NULL THEN NULL WHEN b.mu_bps IS NOT NULL THEN (floor((b.mu_bps)::float8 * 1e2::float8 + 0.5) / 1e2::float8) WHEN b.s_bps IS NULL THEN -4000000000 WHEN b.past_t THEN -5000000000 ELSE -6000000000 END END AS \"Mean\",\n       CASE WHEN g.i = 1 THEN CASE WHEN b.basis IS NULL THEN NULL WHEN b.sigma_bps IS NOT NULL THEN (floor((b.sigma_bps)::float8 * 1e2::float8 + 0.5) / 1e2::float8) WHEN b.s_bps IS NULL THEN -4000000000 WHEN b.past_t THEN -5000000000 ELSE -11000000000 END END AS \"Sigma\",\n       CASE WHEN g.i = 1 THEN CASE WHEN b.basis IS NULL THEN NULL WHEN abs(b.s_bps - b.mu_bps) IS NOT NULL THEN (floor((abs(b.s_bps - b.mu_bps))::float8 * 1e2::float8 + 0.5) / 1e2::float8) WHEN b.s_bps IS NULL THEN -4000000000 WHEN b.past_t THEN -5000000000 ELSE -6000000000 END END AS \"Deviation\",\n       CASE WHEN g.i = 1 THEN b.anchor_status END AS \"Anchor Status\",\n       CASE WHEN g.i = 1 THEN b.fx END AS \"USD/USDT\",\n       CASE WHEN g.i = 1 THEN CASE WHEN b.basis IS NULL THEN NULL WHEN b.s_bps IS NULL THEN -4000000000 WHEN b.past_t THEN -5000000000 WHEN b.s_long_bps < b.mu_bps THEN (floor((abs(b.s_long_bps - b.mu_bps))::float8 * 1e2::float8 + 0.5) / 1e2::float8) WHEN abs(b.s_long_bps - b.mu_bps) IS NOT NULL THEN -10000000000 WHEN b.mu_bps IS NULL THEN -6000000000 WHEN NOT coalesce(v.n > 0, false) THEN -3000000000 WHEN b.basis <> 'mid' THEN -2000000000 ELSE -12000000000 END END AS \"Real Long Deviation\",\n       CASE WHEN g.i = 1 THEN CASE WHEN b.basis IS NULL THEN NULL WHEN b.s_bps IS NULL THEN -4000000000 WHEN b.past_t THEN -5000000000 WHEN b.s_short_bps > b.mu_bps THEN (floor((abs(b.s_short_bps - b.mu_bps))::float8 * 1e2::float8 + 0.5) / 1e2::float8) WHEN abs(b.s_short_bps - b.mu_bps) IS NOT NULL THEN -10000000000 WHEN b.mu_bps IS NULL THEN -6000000000 WHEN NOT coalesce(v.n > 0, false) THEN -3000000000 WHEN b.basis <> 'mid' THEN -2000000000 ELSE -12000000000 END END AS \"Real Short Deviation\",\n       CASE WHEN g.i = 1 THEN CASE WHEN b.basis IS NULL THEN NULL WHEN b.s_bps IS NULL THEN -4000000000 WHEN NOT coalesce(v.n > 0, false) THEN -3000000000 WHEN b.basis <> 'mid' THEN -2000000000 WHEN NOT b.partial_long THEN -8000000000 WHEN b.filled_long IS NOT NULL THEN (floor((b.filled_long)::float8 * 1e0::float8 + 0.5) / 1e0::float8) ELSE -2000000000 END END AS \"Long Fill\",\n       CASE WHEN g.i = 1 THEN CASE WHEN b.basis IS NULL THEN NULL WHEN b.s_bps IS NULL THEN -4000000000 WHEN NOT coalesce(v.n > 0, false) THEN -3000000000 WHEN b.basis <> 'mid' THEN -2000000000 WHEN NOT b.partial_short THEN -8000000000 WHEN b.filled_short IS NOT NULL THEN (floor((b.filled_short)::float8 * 1e0::float8 + 0.5) / 1e0::float8) ELSE -2000000000 END END AS \"Short Fill\",\n       CASE WHEN g.i = 1 THEN b.signal END AS \"Signal\",\n       k.ticker AS \"Leg\",\n       trim_scale(k.tick)::text AS \"Tick\",\n       '1–' || etfpair.pricing_levels(k.tick) AS \"Levels\",\n       CASE g.i WHEN 1 THEN CASE WHEN b.basis IS NULL THEN NULL WHEN b.bid_ct_bull IS NOT NULL THEN (floor((b.bid_ct_bull)::float8 * 1e2::float8 + 0.5) / 1e2::float8) WHEN NOT b.book_bull THEN -2000000000 ELSE -12000000000 END ELSE CASE WHEN b.basis IS NULL THEN NULL WHEN b.bid_ct_bear IS NOT NULL THEN (floor((b.bid_ct_bear)::float8 * 1e2::float8 + 0.5) / 1e2::float8) WHEN NOT b.book_bear THEN -2000000000 ELSE -12000000000 END END AS \"Bid · ct\",\n       CASE g.i WHEN 1 THEN CASE WHEN b.basis IS NULL THEN NULL WHEN b.bid_usdt_bull IS NOT NULL THEN (floor((b.bid_usdt_bull)::float8 * 1e0::float8 + 0.5) / 1e0::float8) WHEN NOT b.book_bull THEN -2000000000 ELSE -12000000000 END ELSE CASE WHEN b.basis IS NULL THEN NULL WHEN b.bid_usdt_bear IS NOT NULL THEN (floor((b.bid_usdt_bear)::float8 * 1e0::float8 + 0.5) / 1e0::float8) WHEN NOT b.book_bear THEN -2000000000 ELSE -12000000000 END END AS \"Bid · USDT\",\n       CASE g.i WHEN 1 THEN CASE WHEN b.basis IS NULL THEN NULL WHEN b.ask_ct_bull IS NOT NULL THEN (floor((b.ask_ct_bull)::float8 * 1e2::float8 + 0.5) / 1e2::float8) WHEN NOT b.book_bull THEN -2000000000 ELSE -12000000000 END ELSE CASE WHEN b.basis IS NULL THEN NULL WHEN b.ask_ct_bear IS NOT NULL THEN (floor((b.ask_ct_bear)::float8 * 1e2::float8 + 0.5) / 1e2::float8) WHEN NOT b.book_bear THEN -2000000000 ELSE -12000000000 END END AS \"Ask · ct\",\n       CASE g.i WHEN 1 THEN CASE WHEN b.basis IS NULL THEN NULL WHEN b.ask_usdt_bull IS NOT NULL THEN (floor((b.ask_usdt_bull)::float8 * 1e0::float8 + 0.5) / 1e0::float8) WHEN NOT b.book_bull THEN -2000000000 ELSE -12000000000 END ELSE CASE WHEN b.basis IS NULL THEN NULL WHEN b.ask_usdt_bear IS NOT NULL THEN (floor((b.ask_usdt_bear)::float8 * 1e0::float8 + 0.5) / 1e0::float8) WHEN NOT b.book_bear THEN -2000000000 ELSE -12000000000 END END AS \"Ask · USDT\"\nFROM v LEFT JOIN l p ON p.kind = 'prices' LEFT JOIN l b ON b.kind = 'basis'\nCROSS JOIN (VALUES (1), (2)) g(i)\nLEFT JOIN LATERAL (SELECT CASE g.i WHEN 1 THEN c.bull_ticker ELSE c.bear_ticker END AS ticker, CASE g.i WHEN 1 THEN m.bull_tick ELSE m.bear_tick END AS tick\n                   FROM etfpair.combo c JOIN etfpair.combo_market m ON m.combo_id = c.combo_id\n                   WHERE c.combo_id = '$combo' AND m.venue = '$venue') k ON true\nORDER BY g.i"
     }
    ],
    "fieldConfig": {
@@ -299,7 +299,7 @@
    "id": 3,
    "type": "stat",
    "title": "Spread · Latest Second",
-   "description": "The newest second at which both legs have a basis price: their books' mids, else their last trades (ten minutes back at most).\n\n- **Spread**: 10⁴ × (F·P_bull ÷ A_bull + F·P_bear ÷ A_bear − 2) · P: both legs' mid prices, (best bid + best ask) ÷ 2 of the recorded book, else both last trades · A: anchor · F: USD/USDT.\n- **Mean**: The same on each leg's ${ma:text} of its minute bars over the ${ma_text} min before, this session only · a bar: both legs' mids at the minute's end, else their trades, else their candle closes · No Mean: not ready, or Mean Scale is not a whole number of minutes.\n- **Deviation**: |Spread − Mean|, absolute: its side is in the Signal.\n- **Anchor Status**: NAV: both legs on the issuer's NAV, the same figure for 1 h · Bell: both legs on F × the perp's index at the close (Binance's; Bitget's before Binance lists it), provisional · Missing: no bell anchor yet, or none.\n- **USD/USDT**: F, Coinbase USDT-USD.",
+   "description": "The newest second at which both legs have a basis price: their books' mids, else their last trades (ten minutes back at most).\n\n- **Spread**: 10⁴ × (F·P_bull ÷ A_bull + F·P_bear ÷ A_bear − 2) · P: both legs' mid prices, (best bid + best ask) ÷ 2 of the recorded book, else both last trades · A: anchor · F: USD/USDT.\n- **Mean**: The same on each leg's ${ma:text} of its minute bars over the ${ma_text} min before, this session only · a bar: both legs' mids at the minute's end, else their trades, else their candle closes · No Mean: not ready, or Mean Scale is not a whole number of minutes.\n- **Sigma**: σ: the population standard deviation of the minute bars' spread over the ${sigma_text} min before, this session only, as the trading program's (PRD 4.4) · No Sigma: not ready, or Sigma Scale is not a whole number of minutes.\n- **Deviation**: |Spread − Mean|, absolute: its side is in the Signal.\n- **Anchor Status**: NAV: both legs on the issuer's NAV, the same figure for 1 h · Bell: both legs on F × the perp's index at the close (Binance's; Bitget's before Binance lists it), provisional · Missing: no bell anchor yet, or none.\n- **USD/USDT**: F, Coinbase USDT-USD.",
    "gridPos": {
     "x": 0,
     "y": 4,
@@ -408,20 +408,25 @@
             "color": "#898781",
             "index": 4
            },
-           "-7000000000": {
-            "text": "Not Recorded",
-            "color": "#898781",
-            "index": 5
-           },
            "-9000000000": {
             "text": "No Entry",
             "color": "#fab219",
-            "index": 6
+            "index": 5
            },
            "-10000000000": {
             "text": "Other Side",
             "color": "#898781",
+            "index": 6
+           },
+           "-11000000000": {
+            "text": "No Sigma",
+            "color": "#898781",
             "index": 7
+           },
+           "-12000000000": {
+            "text": "Few Levels",
+            "color": "#898781",
+            "index": 8
            }
           }
          }
@@ -485,20 +490,107 @@
             "color": "#898781",
             "index": 4
            },
-           "-7000000000": {
-            "text": "Not Recorded",
-            "color": "#898781",
-            "index": 5
-           },
            "-9000000000": {
             "text": "No Entry",
             "color": "#fab219",
-            "index": 6
+            "index": 5
            },
            "-10000000000": {
             "text": "Other Side",
             "color": "#898781",
+            "index": 6
+           },
+           "-11000000000": {
+            "text": "No Sigma",
+            "color": "#898781",
             "index": 7
+           },
+           "-12000000000": {
+            "text": "Few Levels",
+            "color": "#898781",
+            "index": 8
+           }
+          }
+         }
+        ]
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "Sigma"
+      },
+      "properties": [
+       {
+        "id": "unit",
+        "value": "suffix: bps"
+       },
+       {
+        "id": "decimals",
+        "value": 2
+       },
+       {
+        "id": "mappings",
+        "value": [
+         {
+          "type": "special",
+          "options": {
+           "match": "null",
+           "result": {
+            "text": "–",
+            "color": "#898781",
+            "index": 0
+           }
+          }
+         },
+         {
+          "type": "value",
+          "options": {
+           "-2000000000": {
+            "text": "No Book",
+            "color": "#898781",
+            "index": 0
+           },
+           "-3000000000": {
+            "text": "No Notional",
+            "color": "#fab219",
+            "index": 1
+           },
+           "-4000000000": {
+            "text": "No Anchor",
+            "color": "#898781",
+            "index": 2
+           },
+           "-5000000000": {
+            "text": "Past T",
+            "color": "#fab219",
+            "index": 3
+           },
+           "-6000000000": {
+            "text": "No Mean",
+            "color": "#898781",
+            "index": 4
+           },
+           "-9000000000": {
+            "text": "No Entry",
+            "color": "#fab219",
+            "index": 5
+           },
+           "-10000000000": {
+            "text": "Other Side",
+            "color": "#898781",
+            "index": 6
+           },
+           "-11000000000": {
+            "text": "No Sigma",
+            "color": "#898781",
+            "index": 7
+           },
+           "-12000000000": {
+            "text": "Few Levels",
+            "color": "#898781",
+            "index": 8
            }
           }
          }
@@ -562,20 +654,25 @@
             "color": "#898781",
             "index": 4
            },
-           "-7000000000": {
-            "text": "Not Recorded",
-            "color": "#898781",
-            "index": 5
-           },
            "-9000000000": {
             "text": "No Entry",
             "color": "#fab219",
-            "index": 6
+            "index": 5
            },
            "-10000000000": {
             "text": "Other Side",
             "color": "#898781",
+            "index": 6
+           },
+           "-11000000000": {
+            "text": "No Sigma",
+            "color": "#898781",
             "index": 7
+           },
+           "-12000000000": {
+            "text": "Few Levels",
+            "color": "#898781",
+            "index": 8
            }
           }
          }
@@ -659,6 +756,7 @@
        "names": [
         "Spread",
         "Mean",
+        "Sigma",
         "Deviation",
         "Anchor Status",
         "USD/USDT"
@@ -672,7 +770,7 @@
    "id": 4,
    "type": "stat",
    "title": "Signal · Latest Second · Notional ${n_text} USDT",
-   "description": "The same second, at the notional N (USDT, both legs together); the deviations are absolute, each shown on the side of the Mean its real spread can fill on, as the bright lines of Entry Points · Bps (Other Side on the other), and the Signal gives the side.\n\n- **Real Long Deviation**: |Real Long Spread − Mean| while Real Long Spread is below the Mean, the side a Long fills on · Other Side (grey): Real Long Spread at or above the Mean, where a Long cannot come (the tooltips still give |Real Long Spread − Mean| there) · Real Long Spread: the Spread on the average prices of buying both legs for N through their recorded asks (open Long, close Short).\n- **Real Short Deviation**: |Real Short Spread − Mean| while Real Short Spread is above the Mean, the side a Short fills on · Other Side: at or below the Mean · Real Short Spread: selling both legs for N through their recorded bids (open Short, close Long).\n- **Long Fill**: USDT of N the recorded asks of both legs fill, the quantities making q·A equal on both legs · Full: all of N · less where the recorded levels (now 5 a side at a 0.01 tick, 50 at 0.001; fewer earlier, see Data Coverage · Levels) hold less: the real spread is then on what they hold; the exchange's book may hold more.\n- **Short Fill**: The same on the recorded bids.\n- **Signal**: Long: Real Long Spread ≤ Mean − Entry · Short: Real Short Spread ≥ Mean + Entry · Partial: that side filled less than N · None: inside · No Anchor: not ready · No Mean: not ready, or Mean Scale is not a whole number of minutes from 1 to 999,999 · No Book: not on both legs' books (trade prices, as before the recorder) · No Notional: the typed notional is not a positive number (the title shows ? or 0), amber · No Entry: Entry is not a positive number, amber · Past T: a leg's dividend took effect without its amount, amber, no signal until the amount is known.",
+   "description": "The same second, at the notional N (USDT, both legs together); the deviations are absolute, each shown on the side of the Mean its real spread can fill on, as the bright lines of Entry Points · Bps (Other Side on the other), and the Signal gives the side.\n\n- **Real Long Deviation**: |Real Long Spread − Mean| while Real Long Spread is below the Mean, the side a Long fills on · Other Side (grey): Real Long Spread at or above the Mean, where a Long cannot come (the tooltips still give |Real Long Spread − Mean| there) · Real Long Spread: the Spread on the average prices of buying both legs for N through their pricing levels' asks (open Long, close Short).\n- **Real Short Deviation**: |Real Short Spread − Mean| while Real Short Spread is above the Mean, the side a Short fills on · Other Side: at or below the Mean · Real Short Spread: selling both legs for N through their pricing levels' bids (open Short, close Long).\n- **Long Fill**: USDT of N the asks of both legs' pricing levels fill (${bull} 1–${bull_levels}, ${bear} 1–${bear_levels}), the quantities making q·A equal on both legs · Full: all of N · less where those levels hold less (Partial): the real spread is then on their totals, as Book · Latest Second shows them.\n- **Short Fill**: The same on the pricing levels' bids.\n- **Signal**: Long: Real Long Spread ≤ Mean − Entry · Short: Real Short Spread ≥ Mean + Entry · Partial: that side filled less than N (its pricing levels hold less) · None: inside · No Anchor: not ready · No Mean: not ready, or Mean Scale is not a whole number of minutes from 1 to 999,999 · No Book: not on both legs' books (trade prices, as before the recorder) · No Notional: the typed notional is not a positive number (the title shows ? or 0), amber · No Entry: Entry is not a positive number, amber · Past T: a leg's dividend took effect without its amount, amber, no signal until the amount is known.",
    "gridPos": {
     "x": 0,
     "y": 7,
@@ -781,20 +879,25 @@
             "color": "#898781",
             "index": 4
            },
-           "-7000000000": {
-            "text": "Not Recorded",
-            "color": "#898781",
-            "index": 5
-           },
            "-9000000000": {
             "text": "No Entry",
             "color": "#fab219",
-            "index": 6
+            "index": 5
            },
            "-10000000000": {
             "text": "Other Side",
             "color": "#898781",
+            "index": 6
+           },
+           "-11000000000": {
+            "text": "No Sigma",
+            "color": "#898781",
             "index": 7
+           },
+           "-12000000000": {
+            "text": "Few Levels",
+            "color": "#898781",
+            "index": 8
            }
           }
          }
@@ -858,20 +961,25 @@
             "color": "#898781",
             "index": 4
            },
-           "-7000000000": {
-            "text": "Not Recorded",
-            "color": "#898781",
-            "index": 5
-           },
            "-9000000000": {
             "text": "No Entry",
             "color": "#fab219",
-            "index": 6
+            "index": 5
            },
            "-10000000000": {
             "text": "Other Side",
             "color": "#898781",
+            "index": 6
+           },
+           "-11000000000": {
+            "text": "No Sigma",
+            "color": "#898781",
             "index": 7
+           },
+           "-12000000000": {
+            "text": "Few Levels",
+            "color": "#898781",
+            "index": 8
            }
           }
          }
@@ -935,25 +1043,30 @@
             "color": "#898781",
             "index": 4
            },
-           "-7000000000": {
-            "text": "Not Recorded",
-            "color": "#898781",
-            "index": 5
-           },
            "-9000000000": {
             "text": "No Entry",
             "color": "#fab219",
-            "index": 6
+            "index": 5
            },
            "-10000000000": {
             "text": "Other Side",
             "color": "#898781",
+            "index": 6
+           },
+           "-11000000000": {
+            "text": "No Sigma",
+            "color": "#898781",
             "index": 7
+           },
+           "-12000000000": {
+            "text": "Few Levels",
+            "color": "#898781",
+            "index": 8
            },
            "-8000000000": {
             "text": "Full",
             "color": "text",
-            "index": 8
+            "index": 9
            }
           }
          }
@@ -1017,25 +1130,30 @@
             "color": "#898781",
             "index": 4
            },
-           "-7000000000": {
-            "text": "Not Recorded",
-            "color": "#898781",
-            "index": 5
-           },
            "-9000000000": {
             "text": "No Entry",
             "color": "#fab219",
-            "index": 6
+            "index": 5
            },
            "-10000000000": {
             "text": "Other Side",
             "color": "#898781",
+            "index": 6
+           },
+           "-11000000000": {
+            "text": "No Sigma",
+            "color": "#898781",
             "index": 7
+           },
+           "-12000000000": {
+            "text": "Few Levels",
+            "color": "#898781",
+            "index": 8
            },
            "-8000000000": {
             "text": "Full",
             "color": "text",
-            "index": 8
+            "index": 9
            }
           }
          }
@@ -1146,14 +1264,14 @@
   },
   {
    "id": 5,
-   "type": "stat",
-   "title": "Book · Latest Second · Contracts",
-   "description": "The same second: each leg's book, the contracts (ct) at its first two 0.01 price levels.\n\n- **Bid 1+2 Depth · ${bull}**: The size of the leg's first two bid levels at a 0.01 tick, ct: contracts (shares of the ETF), as recorded · Bitget SOXS (a 0.001 tick): its levels merged into 0.01 ones, bids down and asks up, as Bitget's own 0.01 depth · No Book: no usable book of the leg in that second · Not Recorded: its recorded levels end within the second 0.01 level (Binance SOXL, SOXS 11-19 19:15 to 11-20 18:43; Bitget SOXS before 11-22 12:16, at times).\n- **Ask 1+2 Depth · ${bull}**: The same on the asks.",
+   "type": "table",
+   "title": "Book · Latest Second · Pricing Levels",
+   "description": "Depth = the total of a leg's pricing levels on a side: ct (contracts, shares of the ETF) and USDT (Σ price × size)\n\nThe same second as the strips above · Tick: the leg's price tick on this CEX · Levels: its pricing levels, the first levels from the best price on the side a taker takes, as the trading program prices (PRD 3.2): 2 at a 0.01 tick (SOXL), 5 at 0.001 (Bitget SOXS), the levels as recorded, never merged into 0.01 ones · the Real spreads, the fills and the Signal take N through these levels only · the total, not the program's takeable half · No Book: no usable book of the leg in that second · Few Levels: that side holds fewer levels than its pricing levels (no pricing level).",
    "gridPos": {
     "x": 0,
     "y": 10,
     "w": 24,
-    "h": 3
+    "h": 5
    },
    "datasource": {
     "type": "datasource",
@@ -1173,51 +1291,84 @@
    "fieldConfig": {
     "defaults": {
      "color": {
-      "mode": "thresholds"
+      "mode": "fixed",
+      "fixedColor": "text"
      },
-     "custom": {},
-     "mappings": [
-      {
-       "type": "special",
-       "options": {
-        "match": "null",
-        "result": {
-         "text": "–",
-         "color": "#898781",
-         "index": 0
-        }
-       }
-      }
-     ],
-     "noValue": "–",
-     "thresholds": {
-      "mode": "absolute",
-      "steps": [
-       {
-        "color": "text",
-        "value": null
-       }
-      ]
-     }
+     "custom": {
+      "align": "auto",
+      "cellOptions": {
+       "type": "auto"
+      },
+      "filterable": false,
+      "inspect": false,
+      "minWidth": 60,
+      "wrapHeaderText": true
+     },
+     "mappings": [],
+     "noValue": "–"
     },
     "overrides": [
      {
       "matcher": {
        "id": "byName",
-       "options": "Bid 1+2 Depth · Bull"
+       "options": "Leg"
       },
       "properties": [
        {
+        "id": "custom.width",
+        "value": 80
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "Tick"
+      },
+      "properties": [
+       {
+        "id": "custom.align",
+        "value": "right"
+       },
+       {
+        "id": "custom.width",
+        "value": 80
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "Levels"
+      },
+      "properties": [
+       {
+        "id": "custom.align",
+        "value": "right"
+       },
+       {
+        "id": "custom.width",
+        "value": 80
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "Bid · ct"
+      },
+      "properties": [
+       {
+        "id": "custom.align",
+        "value": "right"
+       },
+       {
         "id": "unit",
-        "value": "suffix: ct"
+        "value": "locale"
        },
        {
         "id": "decimals",
         "value": 2
-       },
-       {
-        "id": "displayName",
-        "value": "Bid 1+2 Depth · ${bull}"
        },
        {
         "id": "mappings",
@@ -1261,20 +1412,25 @@
             "color": "#898781",
             "index": 4
            },
-           "-7000000000": {
-            "text": "Not Recorded",
-            "color": "#898781",
-            "index": 5
-           },
            "-9000000000": {
             "text": "No Entry",
             "color": "#fab219",
-            "index": 6
+            "index": 5
            },
            "-10000000000": {
             "text": "Other Side",
             "color": "#898781",
+            "index": 6
+           },
+           "-11000000000": {
+            "text": "No Sigma",
+            "color": "#898781",
             "index": 7
+           },
+           "-12000000000": {
+            "text": "Few Levels",
+            "color": "#898781",
+            "index": 8
            }
           }
          }
@@ -1285,20 +1441,20 @@
      {
       "matcher": {
        "id": "byName",
-       "options": "Bid 1+2 Depth · Bear"
+       "options": "Bid · USDT"
       },
       "properties": [
        {
+        "id": "custom.align",
+        "value": "right"
+       },
+       {
         "id": "unit",
-        "value": "suffix: ct"
+        "value": "locale"
        },
        {
         "id": "decimals",
-        "value": 2
-       },
-       {
-        "id": "displayName",
-        "value": "Bid 1+2 Depth · ${bear}"
+        "value": 0
        },
        {
         "id": "mappings",
@@ -1342,20 +1498,25 @@
             "color": "#898781",
             "index": 4
            },
-           "-7000000000": {
-            "text": "Not Recorded",
-            "color": "#898781",
-            "index": 5
-           },
            "-9000000000": {
             "text": "No Entry",
             "color": "#fab219",
-            "index": 6
+            "index": 5
            },
            "-10000000000": {
             "text": "Other Side",
             "color": "#898781",
+            "index": 6
+           },
+           "-11000000000": {
+            "text": "No Sigma",
+            "color": "#898781",
             "index": 7
+           },
+           "-12000000000": {
+            "text": "Few Levels",
+            "color": "#898781",
+            "index": 8
            }
           }
          }
@@ -1366,20 +1527,20 @@
      {
       "matcher": {
        "id": "byName",
-       "options": "Ask 1+2 Depth · Bull"
+       "options": "Ask · ct"
       },
       "properties": [
        {
+        "id": "custom.align",
+        "value": "right"
+       },
+       {
         "id": "unit",
-        "value": "suffix: ct"
+        "value": "locale"
        },
        {
         "id": "decimals",
         "value": 2
-       },
-       {
-        "id": "displayName",
-        "value": "Ask 1+2 Depth · ${bull}"
        },
        {
         "id": "mappings",
@@ -1423,20 +1584,25 @@
             "color": "#898781",
             "index": 4
            },
-           "-7000000000": {
-            "text": "Not Recorded",
-            "color": "#898781",
-            "index": 5
-           },
            "-9000000000": {
             "text": "No Entry",
             "color": "#fab219",
-            "index": 6
+            "index": 5
            },
            "-10000000000": {
             "text": "Other Side",
             "color": "#898781",
+            "index": 6
+           },
+           "-11000000000": {
+            "text": "No Sigma",
+            "color": "#898781",
             "index": 7
+           },
+           "-12000000000": {
+            "text": "Few Levels",
+            "color": "#898781",
+            "index": 8
            }
           }
          }
@@ -1447,20 +1613,20 @@
      {
       "matcher": {
        "id": "byName",
-       "options": "Ask 1+2 Depth · Bear"
+       "options": "Ask · USDT"
       },
       "properties": [
        {
+        "id": "custom.align",
+        "value": "right"
+       },
+       {
         "id": "unit",
-        "value": "suffix: ct"
+        "value": "locale"
        },
        {
         "id": "decimals",
-        "value": 2
-       },
-       {
-        "id": "displayName",
-        "value": "Ask 1+2 Depth · ${bear}"
+        "value": 0
        },
        {
         "id": "mappings",
@@ -1504,20 +1670,25 @@
             "color": "#898781",
             "index": 4
            },
-           "-7000000000": {
-            "text": "Not Recorded",
-            "color": "#898781",
-            "index": 5
-           },
            "-9000000000": {
             "text": "No Entry",
             "color": "#fab219",
-            "index": 6
+            "index": 5
            },
            "-10000000000": {
             "text": "Other Side",
             "color": "#898781",
+            "index": 6
+           },
+           "-11000000000": {
+            "text": "No Sigma",
+            "color": "#898781",
             "index": 7
+           },
+           "-12000000000": {
+            "text": "Few Levels",
+            "color": "#898781",
+            "index": 8
            }
           }
          }
@@ -1528,24 +1699,11 @@
     ]
    },
    "options": {
-    "reduceOptions": {
-     "calcs": [
-      "lastNotNull"
-     ],
-     "fields": "/.*/",
-     "values": false
-    },
-    "colorMode": "value",
-    "graphMode": "none",
-    "textMode": "value_and_name",
-    "justifyMode": "center",
-    "wideLayout": false,
-    "text": {
-     "titleSize": 13,
-     "valueSize": 20
-    },
-    "showPercentChange": false,
-    "orientation": "vertical"
+    "showHeader": true,
+    "cellHeight": "sm",
+    "footer": {
+     "show": false
+    }
    },
    "transformations": [
     {
@@ -1553,12 +1711,31 @@
      "options": {
       "include": {
        "names": [
-        "Bid 1+2 Depth · Bull",
-        "Bid 1+2 Depth · Bear",
-        "Ask 1+2 Depth · Bull",
-        "Ask 1+2 Depth · Bear"
+        "Leg",
+        "Tick",
+        "Levels",
+        "Bid · ct",
+        "Bid · USDT",
+        "Ask · ct",
+        "Ask · USDT"
        ]
       }
+     }
+    },
+    {
+     "id": "filterByValue",
+     "options": {
+      "filters": [
+       {
+        "fieldName": "Leg",
+        "config": {
+         "id": "isNotNull",
+         "options": {}
+        }
+       }
+      ],
+      "type": "include",
+      "match": "any"
      }
     }
    ]
@@ -1570,7 +1747,7 @@
    "description": "Key to the bands behind every chart: each phase's current or next hours · no band while closed.\n\n- **Pre-Market**: 04:00 – 09:30 New York.\n- **Regular**: 09:30 – 16:00 New York, 13:00 on an early close.\n- **After-Hours**: Four hours from the close.\n- **Overnight**: 20:00 – 04:00 New York before a trading day.\n- **Next Close**: The next regular close, the flatten deadline: 16:00 New York, 13:00 on an early close, as the calendar has it with its overrides.\n- **Calendar**: The calendar against Binance's schedule, checked hourly: OK to the last day the schedule covers (New York date) · Differ: the first date whose trading day or close differs, without an override, and +n more · Not compared: the schedule could not be read or compared · amber unless OK · detail and check time in Calendar Check; extended hours are not compared here.",
    "gridPos": {
     "x": 0,
-    "y": 13,
+    "y": 15,
     "w": 24,
     "h": 3
    },
@@ -1735,7 +1912,7 @@
    "description": "Each ETF's coming dividend or split, from the dates known ahead\n\nEx-Date: New York · Action: ex D (USD per share as declared, ? until a source gives it) or split r:1 · Takes Effect: a dividend at 20:00 New York of the day before the ex-date, the anchor then less D; a split at each CEX's first trade after its halt · Status: Scheduled (date only), Known, None (no distribution); Past T: it has taken effect, its amount still unknown, amber · Source: where the newest reading came from · it stays until the ex-date has passed.",
    "gridPos": {
     "x": 0,
-    "y": 16,
+    "y": 18,
     "w": 14,
     "h": 6
    },
@@ -1886,7 +2063,7 @@
    "description": "The latest hourly check of the calendar against Binance's schedule\n\nChecked: when · Binance Through: the last day its schedule covers, New York · Result: OK, Differ (a trading day or close differs on a date without an override), Not compared (the schedule could not be read or compared), amber unless OK · Detail: the differences (here UTC+8 against Binance) or the reason.",
    "gridPos": {
     "x": 14,
-    "y": 16,
+    "y": 18,
     "w": 10,
     "h": 6
    },
@@ -2017,11 +2194,11 @@
   {
    "id": 9,
    "type": "row",
-   "title": "Spread · ${ma:text} ${ma_text} min · Entry ${d_text} bps · Notional ${n_text} USDT (Both Legs)",
+   "title": "Spread · ${ma:text} ${ma_text} min · σ ${sigma_text} min · Entry ${d_text} bps · Notional ${n_text} USDT (Both Legs)",
    "collapsed": false,
    "gridPos": {
     "x": 0,
-    "y": 22,
+    "y": 24,
     "w": 24,
     "h": 1
    },
@@ -2031,10 +2208,10 @@
    "id": 10,
    "type": "timeseries",
    "title": "Spread · Bps",
-   "description": "Spread = 10⁴ × (F·P_bull ÷ A_bull + F·P_bear ÷ A_bear − 2) · P: both legs' mid prices, else both last trades · Real Long, Real Short Spread: the same on the average prices of buying, selling both legs for the notional N through their recorded asks, bids · Long: Real Long Spread ≤ Mean − Entry · Short: Real Short Spread ≥ Mean + Entry\n\nDrawn: Spread, Mean and the band Mean ± Entry (not drawn when Entry is not a positive number: the Signal reads No Entry); the drawn Spread crossing the band is not a signal (see Deviation · Bps and Entry Points · Bps) · tooltip, in this order: Spread, Real Long Spread, Real Short Spread, Mean, Deviation, Real Long Deviation, Real Short Deviation, Signal, each leg's Bid 1+2 Depth and Ask 1+2 Depth (ct: contracts); each row is that second's value or the reason it has none (No Anchor, Past T, No Mean, No Notional, No Book, Not Recorded; No Mean also when Mean Scale is not a whole number of minutes from 1 to 999,999) · P: (best bid + best ask) ÷ 2 of both legs' recorded books in that second, else both legs' last trades before it (before the recorder: trades only, No Book) · Real Long Spread, Real Short Spread: what opening or closing a basket of N USDT (both legs together) as a taker gives in that second, the quantities making q·A equal on both legs; where the recorded levels (now 5 a side at a 0.01 tick, 50 at 0.001; fewer earlier, see Data Coverage · Levels) hold less than N, on what they hold, and the Signal reads Partial · Deviation, Real Long Deviation, Real Short Deviation: |Spread − Mean|, |Real Long Spread − Mean|, |Real Short Spread − Mean|, absolute (with their signs on Deviation · Bps) · Signal: as in Signal · Latest Second · 1+2 Depth: the contracts at a leg's first two 0.01 levels, as in Book · Latest Second · A: session anchor, less a dividend or over a split's ratio from the instant it takes effect (a mark there, with the expected and measured step; the mean restarts, also when a leg's dividend takes effect without its amount: A stays, the spread steps, Past T until the amount is known) · F: USD/USDT · Mean: the same on each leg's mean of its minute bars (both legs' mids at the minute's end, else their trades, else their candle closes) · each session is drawn on its own · points: the recorder's per-second rows, every second to about 83 min, 5 s to about 7 h, 10 s to about 14 h, 30 s to about 41 h, then every minute or more; a second without both legs' prices is a gap.",
+   "description": "Spread = 10⁴ × (F·P_bull ÷ A_bull + F·P_bear ÷ A_bear − 2) · P: both legs' mid prices, else both last trades · Real Long, Real Short Spread: the same on the average prices of buying, selling both legs for the notional N through their pricing levels' asks, bids · σ: the population standard deviation of the minute bars' spread over the Sigma Scale · Long: Real Long Spread ≤ Mean − Entry · Short: Real Short Spread ≥ Mean + Entry\n\nDrawn: Spread, Mean, the band Mean ± Entry (teal, dashed; not drawn when Entry is not a positive number: the Signal reads No Entry) and Mean ± 1, 1.5, 2, 2.5, 3 σ (grey: whole σ dashed, half σ dotted; none until sigma is ready); the drawn Spread crossing a line is not a signal (see Deviation · Bps and Entry Points · Bps) · legend Sigma: σ's last, lowest and highest · tooltip, in this order: Spread, Real Long Spread, Real Short Spread, Mean, Sigma, Deviation, Real Long Deviation, Real Short Deviation, Signal, each leg's bid and ask depth of its pricing levels in ct (contracts) and USDT; each row is that second's value or the reason it has none (No Anchor, Past T, No Mean, No Sigma, No Notional, No Book, Few Levels) · P: (best bid + best ask) ÷ 2 of both legs' recorded books in that second, else both legs' last trades before it (before the recorder: trades only, No Book) · Real Long Spread, Real Short Spread: what opening or closing a basket of N USDT (both legs together) as a taker gives in that second, the quantities making q·A equal on both legs, through each leg's pricing levels only (${bull} 1–${bull_levels}, ${bear} 1–${bear_levels}: 2 at a 0.01 tick, 5 at 0.001, the trading program's, PRD 3.2); where those levels hold less than N, on their totals, and the Signal reads Partial · Deviation, Real Long Deviation, Real Short Deviation: |Spread − Mean|, |Real Long Spread − Mean|, |Real Short Spread − Mean|, absolute (with their signs on Deviation · Bps) · Signal: as in Signal · Latest Second · depth: as in Book · Latest Second · A: session anchor, less a dividend or over a split's ratio from the instant it takes effect (a mark there, with the expected and measured step; the mean and σ restart, also when a leg's dividend takes effect without its amount: A stays, the spread steps, Past T until the amount is known) · F: USD/USDT · Mean: the same on each leg's mean of its minute bars (both legs' mids at the minute's end, else their trades, else their candle closes) · each session is drawn on its own · points: the recorder's per-second rows, every second to about 83 min, 5 s to about 7 h, 10 s to about 14 h, 30 s to about 41 h, then every minute or more; a second without both legs' prices is a gap.",
    "gridPos": {
     "x": 0,
-    "y": 23,
+    "y": 25,
     "w": 24,
     "h": 13
    },
@@ -2052,7 +2229,7 @@
      "format": "table",
      "rawQuery": true,
      "editorMode": "code",
-     "rawSql": "WITH v AS MATERIALIZED (SELECT * FROM (SELECT (SELECT CASE m[3] WHEN 'k' THEN 1000 WHEN 'w' THEN 10000 WHEN '万' THEN 10000 ELSE 1 END * (replace(m[1], ',', '') || m[2])::numeric FROM regexp_match(regexp_replace(regexp_replace(lower(normalize('$notional', NFKC)), '[[:space:]_]', '', 'g'), 'u(sdt)?$', ''), '^([0-9]{1,3}(?:,[0-9]{3})+|[0-9]+)((?:[.][0-9]+)?)(k|w|万)?$') m) AS n, (SELECT CASE WHEN m[1]::numeric > 0 THEN m[1]::numeric END FROM regexp_match(regexp_replace(lower(normalize('$d', NFKC)), '[[:space:]_]', '', 'g'), '^([0-9]+(?:[.][0-9]+)?)(?:bps)?$') m) AS d, (SELECT CASE WHEN m[1]::integer > 0 THEN m[1]::integer END FROM regexp_match(regexp_replace(lower(normalize('$ma_minutes', NFKC)), '[[:space:]_]', '', 'g'), '^([0-9]{1,6})(?:min|m)?$') m) AS ma_n) v)\nSELECT to_timestamp(r.ts_ms / 1000.0) AS time,\n       (floor((r.s_bps)::float8 * 1e1::float8 + 0.5) / 1e1::float8) AS \"Spread\",\n       (floor((r.mu_bps)::float8 * 1e1::float8 + 0.5) / 1e1::float8) AS \"Mean\",\n       (floor((r.mu_bps + v.d)::float8 * 1e1::float8 + 0.5) / 1e1::float8) AS \"Mean + Entry\",\n       (floor((r.mu_bps - v.d)::float8 * 1e1::float8 + 0.5) / 1e1::float8) AS \"Mean − Entry\",\n       CASE WHEN r.basis IS NULL THEN NULL WHEN r.s_bps IS NOT NULL THEN (floor((r.s_bps)::float8 * 1e1::float8 + 0.5) / 1e1::float8) ELSE -4000000000 END AS \"Spread · Tooltip\",\n       CASE WHEN r.basis IS NULL THEN NULL WHEN r.s_long_bps IS NOT NULL THEN (floor((r.s_long_bps)::float8 * 1e1::float8 + 0.5) / 1e1::float8) WHEN r.s_bps IS NULL THEN -4000000000 WHEN NOT coalesce(v.n > 0, false) THEN -3000000000 ELSE -2000000000 END AS \"Real Long Spread\",\n       CASE WHEN r.basis IS NULL THEN NULL WHEN r.s_short_bps IS NOT NULL THEN (floor((r.s_short_bps)::float8 * 1e1::float8 + 0.5) / 1e1::float8) WHEN r.s_bps IS NULL THEN -4000000000 WHEN NOT coalesce(v.n > 0, false) THEN -3000000000 ELSE -2000000000 END AS \"Real Short Spread\",\n       CASE WHEN r.basis IS NULL THEN NULL WHEN r.mu_bps IS NOT NULL THEN (floor((r.mu_bps)::float8 * 1e1::float8 + 0.5) / 1e1::float8) WHEN r.s_bps IS NULL THEN -4000000000 WHEN r.past_t THEN -5000000000 ELSE -6000000000 END AS \"Mean · Tooltip\",\n       CASE WHEN r.basis IS NULL THEN NULL WHEN abs(r.s_bps - r.mu_bps) IS NOT NULL THEN (floor((abs(r.s_bps - r.mu_bps))::float8 * 1e1::float8 + 0.5) / 1e1::float8) WHEN r.s_bps IS NULL THEN -4000000000 WHEN r.past_t THEN -5000000000 ELSE -6000000000 END AS \"Deviation · Tooltip\",\n       CASE WHEN r.basis IS NULL THEN NULL WHEN r.s_bps IS NULL THEN -4000000000 WHEN r.past_t THEN -5000000000 WHEN abs(r.s_long_bps - r.mu_bps) IS NOT NULL THEN (floor((abs(r.s_long_bps - r.mu_bps))::float8 * 1e1::float8 + 0.5) / 1e1::float8) WHEN r.mu_bps IS NULL THEN -6000000000 WHEN NOT coalesce(v.n > 0, false) THEN -3000000000 ELSE -2000000000 END AS \"Real Long Deviation · Tooltip\",\n       CASE WHEN r.basis IS NULL THEN NULL WHEN r.s_bps IS NULL THEN -4000000000 WHEN r.past_t THEN -5000000000 WHEN abs(r.s_short_bps - r.mu_bps) IS NOT NULL THEN (floor((abs(r.s_short_bps - r.mu_bps))::float8 * 1e1::float8 + 0.5) / 1e1::float8) WHEN r.mu_bps IS NULL THEN -6000000000 WHEN NOT coalesce(v.n > 0, false) THEN -3000000000 ELSE -2000000000 END AS \"Real Short Deviation · Tooltip\",\n       CASE WHEN r.basis IS NOT NULL THEN CASE r.signal WHEN 'None' THEN 0 WHEN 'Long' THEN 1 WHEN 'Short' THEN 2 WHEN 'Long · Partial' THEN 3 WHEN 'Short · Partial' THEN 4 WHEN 'No Book' THEN -2000000000 WHEN 'No Notional' THEN -3000000000 WHEN 'No Anchor' THEN -4000000000 WHEN 'Past T' THEN -5000000000 WHEN 'No Mean' THEN -6000000000 WHEN 'No Entry' THEN -9000000000 END END AS \"Signal\",\n       CASE WHEN r.basis IS NULL THEN NULL WHEN r.bid12_bull IS NOT NULL THEN (floor((r.bid12_bull)::float8 * 1e2::float8 + 0.5) / 1e2::float8) WHEN NOT r.book_bull THEN -2000000000 ELSE -7000000000 END AS \"Bid 1+2 Depth · Bull\",\n       CASE WHEN r.basis IS NULL THEN NULL WHEN r.bid12_bear IS NOT NULL THEN (floor((r.bid12_bear)::float8 * 1e2::float8 + 0.5) / 1e2::float8) WHEN NOT r.book_bear THEN -2000000000 ELSE -7000000000 END AS \"Bid 1+2 Depth · Bear\",\n       CASE WHEN r.basis IS NULL THEN NULL WHEN r.ask12_bull IS NOT NULL THEN (floor((r.ask12_bull)::float8 * 1e2::float8 + 0.5) / 1e2::float8) WHEN NOT r.book_bull THEN -2000000000 ELSE -7000000000 END AS \"Ask 1+2 Depth · Bull\",\n       CASE WHEN r.basis IS NULL THEN NULL WHEN r.ask12_bear IS NOT NULL THEN (floor((r.ask12_bear)::float8 * 1e2::float8 + 0.5) / 1e2::float8) WHEN NOT r.book_bear THEN -2000000000 ELSE -7000000000 END AS \"Ask 1+2 Depth · Bear\",\n       CASE WHEN NOT r.past_t THEN (floor((r.s_bps - r.mu_bps)::float8 * 1e1::float8 + 0.5) / 1e1::float8) END AS \"Signed Deviation\",\n       CASE WHEN NOT r.past_t THEN (floor((r.s_long_bps - r.mu_bps)::float8 * 1e1::float8 + 0.5) / 1e1::float8) END AS \"Signed Real Long Deviation\",\n       CASE WHEN NOT r.past_t THEN (floor((r.s_short_bps - r.mu_bps)::float8 * 1e1::float8 + 0.5) / 1e1::float8) END AS \"Signed Real Short Deviation\",\n       CASE WHEN r.past_t THEN (floor((r.s_bps - r.mu_bps)::float8 * 1e1::float8 + 0.5) / 1e1::float8) END AS \"Signed Past T\",\n       -v.d AS \"−Entry\",\n       CASE WHEN r.basis IS NULL THEN NULL WHEN r.s_bps - r.mu_bps IS NOT NULL THEN (floor((r.s_bps - r.mu_bps)::float8 * 1e1::float8 + 0.5) / 1e1::float8) WHEN r.s_bps IS NULL THEN -4000000000 WHEN r.past_t THEN -5000000000 ELSE -6000000000 END AS \"Signed Deviation · Tooltip\",\n       CASE WHEN r.basis IS NULL THEN NULL WHEN r.s_bps IS NULL THEN -4000000000 WHEN r.past_t THEN -5000000000 WHEN r.s_long_bps - r.mu_bps IS NOT NULL THEN (floor((r.s_long_bps - r.mu_bps)::float8 * 1e1::float8 + 0.5) / 1e1::float8) WHEN r.mu_bps IS NULL THEN -6000000000 WHEN NOT coalesce(v.n > 0, false) THEN -3000000000 ELSE -2000000000 END AS \"Signed Real Long Deviation · Tooltip\",\n       CASE WHEN r.basis IS NULL THEN NULL WHEN r.s_bps IS NULL THEN -4000000000 WHEN r.past_t THEN -5000000000 WHEN r.s_short_bps - r.mu_bps IS NOT NULL THEN (floor((r.s_short_bps - r.mu_bps)::float8 * 1e1::float8 + 0.5) / 1e1::float8) WHEN r.mu_bps IS NULL THEN -6000000000 WHEN NOT coalesce(v.n > 0, false) THEN -3000000000 ELSE -2000000000 END AS \"Signed Real Short Deviation · Tooltip\",\n       count(*) FILTER (WHERE r.signal LIKE 'Long%') OVER w AS \"Long Points\",\n       count(*) FILTER (WHERE r.signal LIKE 'Short%') OVER w AS \"Short Points\",\n       CASE WHEN NOT r.past_t THEN (floor((abs(r.s_bps - r.mu_bps))::float8 * 1e1::float8 + 0.5) / 1e1::float8) END AS \"Deviation · Line\",\n       CASE WHEN NOT r.past_t THEN (floor((abs(r.s_long_bps - r.mu_bps))::float8 * 1e1::float8 + 0.5) / 1e1::float8) END AS \"Real Long Deviation · Faded\",\n       CASE WHEN NOT r.past_t THEN (floor((abs(r.s_short_bps - r.mu_bps))::float8 * 1e1::float8 + 0.5) / 1e1::float8) END AS \"Real Short Deviation · Faded\",\n       CASE WHEN NOT r.past_t AND r.s_long_bps < r.mu_bps THEN (floor((abs(r.s_long_bps - r.mu_bps))::float8 * 1e1::float8 + 0.5) / 1e1::float8) END AS \"Real Long Deviation\",\n       CASE WHEN NOT r.past_t AND r.s_short_bps > r.mu_bps THEN (floor((abs(r.s_short_bps - r.mu_bps))::float8 * 1e1::float8 + 0.5) / 1e1::float8) END AS \"Real Short Deviation\",\n       CASE WHEN r.past_t THEN (floor((abs(r.s_bps - r.mu_bps))::float8 * 1e1::float8 + 0.5) / 1e1::float8) END AS \"Past T\",\n       v.d AS \"+Entry\",\n       CASE WHEN r.signal LIKE 'Long%' THEN (floor((abs(r.s_long_bps - r.mu_bps))::float8 * 1e1::float8 + 0.5) / 1e1::float8) END AS \"Long Dots\",\n       CASE WHEN r.signal LIKE 'Short%' THEN (floor((abs(r.s_short_bps - r.mu_bps))::float8 * 1e1::float8 + 0.5) / 1e1::float8) END AS \"Short Dots\",\n       r.phase_sort AS \"Phase\",\n       CASE WHEN r.phase IS NOT NULL THEN (r.signal LIKE 'Long%')::integer END AS \"Long Point\",\n       CASE WHEN r.phase IS NOT NULL THEN (r.signal LIKE 'Short%')::integer END AS \"Short Point\",\n       CASE WHEN r.phase IS NOT NULL THEN (r.signal LIKE '% · Partial')::integer END AS \"Partial Point\",\n       CASE WHEN r.phase IS NOT NULL THEN (r.signal = 'Past T')::integer END AS \"Past T Point\",\n       CASE WHEN r.phase IS NOT NULL THEN (r.signal = 'No Book')::integer END AS \"No Book Point\",\n       CASE WHEN r.phase IS NOT NULL AND NOT r.past_t AND r.s_long_bps < r.mu_bps THEN (floor((r.mu_bps - r.s_long_bps)::float8 * 1e1::float8 + 0.5) / 1e1::float8) END AS \"Best Long\",\n       CASE WHEN r.phase IS NOT NULL AND NOT r.past_t AND r.s_short_bps > r.mu_bps THEN (floor((r.s_short_bps - r.mu_bps)::float8 * 1e1::float8 + 0.5) / 1e1::float8) END AS \"Best Short\"\nFROM v CROSS JOIN LATERAL etfpair.combo_range('$combo', '$venue', '$ma', v.ma_n, $__from, $__to, (SELECT CASE WHEN r <= 1000 THEN 1000 WHEN r <= 5000 THEN 5000 WHEN r <= 10000 THEN 10000 WHEN r <= 30000 THEN 30000 ELSE ceil(r / 60000) * 60000 END::bigint FROM (SELECT ($__to - $__from) / 5000.0 AS r) x), v.n, v.d) r\nWINDOW w AS (ORDER BY r.ts_ms)\nORDER BY r.ts_ms"
+     "rawSql": "WITH v AS MATERIALIZED (SELECT * FROM (SELECT (SELECT CASE m[3] WHEN 'k' THEN 1000 WHEN 'w' THEN 10000 WHEN '万' THEN 10000 ELSE 1 END * (replace(m[1], ',', '') || m[2])::numeric FROM regexp_match(regexp_replace(regexp_replace(lower(normalize('$notional', NFKC)), '[[:space:]_]', '', 'g'), 'u(sdt)?$', ''), '^([0-9]{1,3}(?:,[0-9]{3})+|[0-9]+)((?:[.][0-9]+)?)(k|w|万)?$') m) AS n, (SELECT CASE WHEN m[1]::numeric > 0 THEN m[1]::numeric END FROM regexp_match(regexp_replace(lower(normalize('$d', NFKC)), '[[:space:]_]', '', 'g'), '^([0-9]+(?:[.][0-9]+)?)(?:bps)?$') m) AS d, (SELECT CASE WHEN m[1]::integer > 0 THEN m[1]::integer END FROM regexp_match(regexp_replace(lower(normalize('$ma_minutes', NFKC)), '[[:space:]_]', '', 'g'), '^([0-9]{1,6})(?:min|m)?$') m) AS ma_n, (SELECT CASE WHEN m[1]::integer > 0 THEN m[1]::integer END FROM regexp_match(regexp_replace(lower(normalize('$sigma_minutes', NFKC)), '[[:space:]_]', '', 'g'), '^([0-9]{1,6})(?:min|m)?$') m) AS sig_n) v)\nSELECT to_timestamp(r.ts_ms / 1000.0) AS time,\n       (floor((r.s_bps)::float8 * 1e1::float8 + 0.5) / 1e1::float8) AS \"Spread\",\n       (floor((r.mu_bps)::float8 * 1e1::float8 + 0.5) / 1e1::float8) AS \"Mean\",\n       (floor((r.mu_bps + v.d)::float8 * 1e1::float8 + 0.5) / 1e1::float8) AS \"Mean + Entry\",\n       (floor((r.mu_bps - v.d)::float8 * 1e1::float8 + 0.5) / 1e1::float8) AS \"Mean − Entry\",\n       (floor((r.sigma_bps)::float8 * 1e2::float8 + 0.5) / 1e2::float8) AS \"Sigma\",\n       CASE WHEN r.basis IS NULL THEN NULL WHEN r.s_bps IS NOT NULL THEN (floor((r.s_bps)::float8 * 1e1::float8 + 0.5) / 1e1::float8) ELSE -4000000000 END AS \"Spread · Tooltip\",\n       CASE WHEN r.basis IS NULL THEN NULL WHEN r.s_long_bps IS NOT NULL THEN (floor((r.s_long_bps)::float8 * 1e1::float8 + 0.5) / 1e1::float8) WHEN r.s_bps IS NULL THEN -4000000000 WHEN NOT coalesce(v.n > 0, false) THEN -3000000000 WHEN r.basis <> 'mid' THEN -2000000000 ELSE -12000000000 END AS \"Real Long Spread\",\n       CASE WHEN r.basis IS NULL THEN NULL WHEN r.s_short_bps IS NOT NULL THEN (floor((r.s_short_bps)::float8 * 1e1::float8 + 0.5) / 1e1::float8) WHEN r.s_bps IS NULL THEN -4000000000 WHEN NOT coalesce(v.n > 0, false) THEN -3000000000 WHEN r.basis <> 'mid' THEN -2000000000 ELSE -12000000000 END AS \"Real Short Spread\",\n       CASE WHEN r.basis IS NULL THEN NULL WHEN r.mu_bps IS NOT NULL THEN (floor((r.mu_bps)::float8 * 1e1::float8 + 0.5) / 1e1::float8) WHEN r.s_bps IS NULL THEN -4000000000 WHEN r.past_t THEN -5000000000 ELSE -6000000000 END AS \"Mean · Tooltip\",\n       CASE WHEN r.basis IS NULL THEN NULL WHEN r.sigma_bps IS NOT NULL THEN (floor((r.sigma_bps)::float8 * 1e2::float8 + 0.5) / 1e2::float8) WHEN r.s_bps IS NULL THEN -4000000000 WHEN r.past_t THEN -5000000000 ELSE -11000000000 END AS \"Sigma · Tooltip\",\n       CASE WHEN r.basis IS NULL THEN NULL WHEN abs(r.s_bps - r.mu_bps) IS NOT NULL THEN (floor((abs(r.s_bps - r.mu_bps))::float8 * 1e1::float8 + 0.5) / 1e1::float8) WHEN r.s_bps IS NULL THEN -4000000000 WHEN r.past_t THEN -5000000000 ELSE -6000000000 END AS \"Deviation · Tooltip\",\n       CASE WHEN r.basis IS NULL THEN NULL WHEN r.s_bps IS NULL THEN -4000000000 WHEN r.past_t THEN -5000000000 WHEN abs(r.s_long_bps - r.mu_bps) IS NOT NULL THEN (floor((abs(r.s_long_bps - r.mu_bps))::float8 * 1e1::float8 + 0.5) / 1e1::float8) WHEN r.mu_bps IS NULL THEN -6000000000 WHEN NOT coalesce(v.n > 0, false) THEN -3000000000 WHEN r.basis <> 'mid' THEN -2000000000 ELSE -12000000000 END AS \"Real Long Deviation · Tooltip\",\n       CASE WHEN r.basis IS NULL THEN NULL WHEN r.s_bps IS NULL THEN -4000000000 WHEN r.past_t THEN -5000000000 WHEN abs(r.s_short_bps - r.mu_bps) IS NOT NULL THEN (floor((abs(r.s_short_bps - r.mu_bps))::float8 * 1e1::float8 + 0.5) / 1e1::float8) WHEN r.mu_bps IS NULL THEN -6000000000 WHEN NOT coalesce(v.n > 0, false) THEN -3000000000 WHEN r.basis <> 'mid' THEN -2000000000 ELSE -12000000000 END AS \"Real Short Deviation · Tooltip\",\n       CASE WHEN r.basis IS NOT NULL THEN CASE r.signal WHEN 'None' THEN 0 WHEN 'Long' THEN 1 WHEN 'Short' THEN 2 WHEN 'Long · Partial' THEN 3 WHEN 'Short · Partial' THEN 4 WHEN 'No Book' THEN -2000000000 WHEN 'No Notional' THEN -3000000000 WHEN 'No Anchor' THEN -4000000000 WHEN 'Past T' THEN -5000000000 WHEN 'No Mean' THEN -6000000000 WHEN 'No Entry' THEN -9000000000 END END AS \"Signal\",\n       CASE WHEN r.basis IS NULL THEN NULL WHEN r.bid_ct_bull IS NOT NULL THEN (floor((r.bid_ct_bull)::float8 * 1e2::float8 + 0.5) / 1e2::float8) WHEN NOT r.book_bull THEN -2000000000 ELSE -12000000000 END AS \"Bid Bull ct\",\n       CASE WHEN r.basis IS NULL THEN NULL WHEN r.bid_ct_bear IS NOT NULL THEN (floor((r.bid_ct_bear)::float8 * 1e2::float8 + 0.5) / 1e2::float8) WHEN NOT r.book_bear THEN -2000000000 ELSE -12000000000 END AS \"Bid Bear ct\",\n       CASE WHEN r.basis IS NULL THEN NULL WHEN r.ask_ct_bull IS NOT NULL THEN (floor((r.ask_ct_bull)::float8 * 1e2::float8 + 0.5) / 1e2::float8) WHEN NOT r.book_bull THEN -2000000000 ELSE -12000000000 END AS \"Ask Bull ct\",\n       CASE WHEN r.basis IS NULL THEN NULL WHEN r.ask_ct_bear IS NOT NULL THEN (floor((r.ask_ct_bear)::float8 * 1e2::float8 + 0.5) / 1e2::float8) WHEN NOT r.book_bear THEN -2000000000 ELSE -12000000000 END AS \"Ask Bear ct\",\n       CASE WHEN r.basis IS NULL THEN NULL WHEN r.bid_usdt_bull IS NOT NULL THEN (floor((r.bid_usdt_bull)::float8 * 1e0::float8 + 0.5) / 1e0::float8) WHEN NOT r.book_bull THEN -2000000000 ELSE -12000000000 END AS \"Bid Bull USDT\",\n       CASE WHEN r.basis IS NULL THEN NULL WHEN r.bid_usdt_bear IS NOT NULL THEN (floor((r.bid_usdt_bear)::float8 * 1e0::float8 + 0.5) / 1e0::float8) WHEN NOT r.book_bear THEN -2000000000 ELSE -12000000000 END AS \"Bid Bear USDT\",\n       CASE WHEN r.basis IS NULL THEN NULL WHEN r.ask_usdt_bull IS NOT NULL THEN (floor((r.ask_usdt_bull)::float8 * 1e0::float8 + 0.5) / 1e0::float8) WHEN NOT r.book_bull THEN -2000000000 ELSE -12000000000 END AS \"Ask Bull USDT\",\n       CASE WHEN r.basis IS NULL THEN NULL WHEN r.ask_usdt_bear IS NOT NULL THEN (floor((r.ask_usdt_bear)::float8 * 1e0::float8 + 0.5) / 1e0::float8) WHEN NOT r.book_bear THEN -2000000000 ELSE -12000000000 END AS \"Ask Bear USDT\",\n       CASE WHEN NOT r.past_t THEN (floor((r.s_bps - r.mu_bps)::float8 * 1e1::float8 + 0.5) / 1e1::float8) END AS \"Signed Deviation\",\n       CASE WHEN NOT r.past_t THEN (floor((r.s_long_bps - r.mu_bps)::float8 * 1e1::float8 + 0.5) / 1e1::float8) END AS \"Signed Real Long Deviation\",\n       CASE WHEN NOT r.past_t THEN (floor((r.s_short_bps - r.mu_bps)::float8 * 1e1::float8 + 0.5) / 1e1::float8) END AS \"Signed Real Short Deviation\",\n       CASE WHEN r.past_t THEN (floor((r.s_bps - r.mu_bps)::float8 * 1e1::float8 + 0.5) / 1e1::float8) END AS \"Signed Past T\",\n       -v.d AS \"−Entry\",\n       CASE WHEN r.basis IS NULL THEN NULL WHEN r.s_bps - r.mu_bps IS NOT NULL THEN (floor((r.s_bps - r.mu_bps)::float8 * 1e1::float8 + 0.5) / 1e1::float8) WHEN r.s_bps IS NULL THEN -4000000000 WHEN r.past_t THEN -5000000000 ELSE -6000000000 END AS \"Signed Deviation · Tooltip\",\n       CASE WHEN r.basis IS NULL THEN NULL WHEN r.s_bps IS NULL THEN -4000000000 WHEN r.past_t THEN -5000000000 WHEN r.s_long_bps - r.mu_bps IS NOT NULL THEN (floor((r.s_long_bps - r.mu_bps)::float8 * 1e1::float8 + 0.5) / 1e1::float8) WHEN r.mu_bps IS NULL THEN -6000000000 WHEN NOT coalesce(v.n > 0, false) THEN -3000000000 WHEN r.basis <> 'mid' THEN -2000000000 ELSE -12000000000 END AS \"Signed Real Long Deviation · Tooltip\",\n       CASE WHEN r.basis IS NULL THEN NULL WHEN r.s_bps IS NULL THEN -4000000000 WHEN r.past_t THEN -5000000000 WHEN r.s_short_bps - r.mu_bps IS NOT NULL THEN (floor((r.s_short_bps - r.mu_bps)::float8 * 1e1::float8 + 0.5) / 1e1::float8) WHEN r.mu_bps IS NULL THEN -6000000000 WHEN NOT coalesce(v.n > 0, false) THEN -3000000000 WHEN r.basis <> 'mid' THEN -2000000000 ELSE -12000000000 END AS \"Signed Real Short Deviation · Tooltip\",\n       count(*) FILTER (WHERE r.signal LIKE 'Long%') OVER w AS \"Long Points\",\n       count(*) FILTER (WHERE r.signal LIKE 'Short%') OVER w AS \"Short Points\",\n       CASE WHEN NOT r.past_t THEN (floor((abs(r.s_bps - r.mu_bps))::float8 * 1e1::float8 + 0.5) / 1e1::float8) END AS \"Deviation · Line\",\n       CASE WHEN NOT r.past_t THEN (floor((abs(r.s_long_bps - r.mu_bps))::float8 * 1e1::float8 + 0.5) / 1e1::float8) END AS \"Real Long Deviation · Faded\",\n       CASE WHEN NOT r.past_t THEN (floor((abs(r.s_short_bps - r.mu_bps))::float8 * 1e1::float8 + 0.5) / 1e1::float8) END AS \"Real Short Deviation · Faded\",\n       CASE WHEN NOT r.past_t AND r.s_long_bps < r.mu_bps THEN (floor((abs(r.s_long_bps - r.mu_bps))::float8 * 1e1::float8 + 0.5) / 1e1::float8) END AS \"Real Long Deviation\",\n       CASE WHEN NOT r.past_t AND r.s_short_bps > r.mu_bps THEN (floor((abs(r.s_short_bps - r.mu_bps))::float8 * 1e1::float8 + 0.5) / 1e1::float8) END AS \"Real Short Deviation\",\n       CASE WHEN r.past_t THEN (floor((abs(r.s_bps - r.mu_bps))::float8 * 1e1::float8 + 0.5) / 1e1::float8) END AS \"Past T\",\n       v.d AS \"+Entry\",\n       CASE WHEN r.signal LIKE 'Long%' THEN (floor((abs(r.s_long_bps - r.mu_bps))::float8 * 1e1::float8 + 0.5) / 1e1::float8) END AS \"Long Dots\",\n       CASE WHEN r.signal LIKE 'Short%' THEN (floor((abs(r.s_short_bps - r.mu_bps))::float8 * 1e1::float8 + 0.5) / 1e1::float8) END AS \"Short Dots\",\n       r.phase_sort AS \"Phase\",\n       CASE WHEN r.phase IS NOT NULL THEN (r.signal LIKE 'Long%')::integer END AS \"Long Point\",\n       CASE WHEN r.phase IS NOT NULL THEN (r.signal LIKE 'Short%')::integer END AS \"Short Point\",\n       CASE WHEN r.phase IS NOT NULL THEN (r.signal LIKE '% · Partial')::integer END AS \"Partial Point\",\n       CASE WHEN r.phase IS NOT NULL THEN (r.signal = 'Past T')::integer END AS \"Past T Point\",\n       CASE WHEN r.phase IS NOT NULL THEN (r.signal = 'No Book')::integer END AS \"No Book Point\",\n       CASE WHEN r.phase IS NOT NULL AND NOT r.past_t AND r.s_long_bps < r.mu_bps THEN (floor((r.mu_bps - r.s_long_bps)::float8 * 1e1::float8 + 0.5) / 1e1::float8) END AS \"Best Long\",\n       CASE WHEN r.phase IS NOT NULL AND NOT r.past_t AND r.s_short_bps > r.mu_bps THEN (floor((r.s_short_bps - r.mu_bps)::float8 * 1e1::float8 + 0.5) / 1e1::float8) END AS \"Best Short\"\nFROM v CROSS JOIN LATERAL etfpair.combo_range('$combo', '$venue', '$ma', v.ma_n, v.sig_n, $__from, $__to, (SELECT CASE WHEN r <= 1000 THEN 1000 WHEN r <= 5000 THEN 5000 WHEN r <= 10000 THEN 10000 WHEN r <= 30000 THEN 30000 ELSE ceil(r / 60000) * 60000 END::bigint FROM (SELECT ($__to - $__from) / 5000.0 AS r) x), v.n, v.d) r\nWINDOW w AS (ORDER BY r.ts_ms)\nORDER BY r.ts_ms"
     }
    ],
    "fieldConfig": {
@@ -2086,6 +2263,415 @@
      "decimals": 1
     },
     "overrides": [
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "Sigma"
+      },
+      "properties": [
+       {
+        "id": "color",
+        "value": {
+         "mode": "fixed",
+         "fixedColor": "#a8a69e"
+        }
+       },
+       {
+        "id": "custom.lineWidth",
+        "value": 0
+       },
+       {
+        "id": "custom.axisPlacement",
+        "value": "hidden"
+       },
+       {
+        "id": "decimals",
+        "value": 2
+       },
+       {
+        "id": "custom.hideFrom",
+        "value": {
+         "legend": false,
+         "tooltip": true,
+         "viz": false
+        }
+       },
+       {
+        "id": "noValue",
+        "value": "–"
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "Mean + 1σ"
+      },
+      "properties": [
+       {
+        "id": "color",
+        "value": {
+         "mode": "fixed",
+         "fixedColor": "#898781C0"
+        }
+       },
+       {
+        "id": "custom.lineWidth",
+        "value": 1
+       },
+       {
+        "id": "custom.lineStyle",
+        "value": {
+         "fill": "dash",
+         "dash": [
+          6,
+          4
+         ]
+        }
+       },
+       {
+        "id": "custom.hideFrom",
+        "value": {
+         "legend": true,
+         "tooltip": true,
+         "viz": false
+        }
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "Mean − 1σ"
+      },
+      "properties": [
+       {
+        "id": "color",
+        "value": {
+         "mode": "fixed",
+         "fixedColor": "#898781C0"
+        }
+       },
+       {
+        "id": "custom.lineWidth",
+        "value": 1
+       },
+       {
+        "id": "custom.lineStyle",
+        "value": {
+         "fill": "dash",
+         "dash": [
+          6,
+          4
+         ]
+        }
+       },
+       {
+        "id": "custom.hideFrom",
+        "value": {
+         "legend": true,
+         "tooltip": true,
+         "viz": false
+        }
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "Mean + 1.5σ"
+      },
+      "properties": [
+       {
+        "id": "color",
+        "value": {
+         "mode": "fixed",
+         "fixedColor": "#89878190"
+        }
+       },
+       {
+        "id": "custom.lineWidth",
+        "value": 1
+       },
+       {
+        "id": "custom.lineStyle",
+        "value": {
+         "fill": "dash",
+         "dash": [
+          2,
+          3
+         ]
+        }
+       },
+       {
+        "id": "custom.hideFrom",
+        "value": {
+         "legend": true,
+         "tooltip": true,
+         "viz": false
+        }
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "Mean − 1.5σ"
+      },
+      "properties": [
+       {
+        "id": "color",
+        "value": {
+         "mode": "fixed",
+         "fixedColor": "#89878190"
+        }
+       },
+       {
+        "id": "custom.lineWidth",
+        "value": 1
+       },
+       {
+        "id": "custom.lineStyle",
+        "value": {
+         "fill": "dash",
+         "dash": [
+          2,
+          3
+         ]
+        }
+       },
+       {
+        "id": "custom.hideFrom",
+        "value": {
+         "legend": true,
+         "tooltip": true,
+         "viz": false
+        }
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "Mean + 2σ"
+      },
+      "properties": [
+       {
+        "id": "color",
+        "value": {
+         "mode": "fixed",
+         "fixedColor": "#898781C0"
+        }
+       },
+       {
+        "id": "custom.lineWidth",
+        "value": 1
+       },
+       {
+        "id": "custom.lineStyle",
+        "value": {
+         "fill": "dash",
+         "dash": [
+          6,
+          4
+         ]
+        }
+       },
+       {
+        "id": "custom.hideFrom",
+        "value": {
+         "legend": true,
+         "tooltip": true,
+         "viz": false
+        }
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "Mean − 2σ"
+      },
+      "properties": [
+       {
+        "id": "color",
+        "value": {
+         "mode": "fixed",
+         "fixedColor": "#898781C0"
+        }
+       },
+       {
+        "id": "custom.lineWidth",
+        "value": 1
+       },
+       {
+        "id": "custom.lineStyle",
+        "value": {
+         "fill": "dash",
+         "dash": [
+          6,
+          4
+         ]
+        }
+       },
+       {
+        "id": "custom.hideFrom",
+        "value": {
+         "legend": true,
+         "tooltip": true,
+         "viz": false
+        }
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "Mean + 2.5σ"
+      },
+      "properties": [
+       {
+        "id": "color",
+        "value": {
+         "mode": "fixed",
+         "fixedColor": "#89878190"
+        }
+       },
+       {
+        "id": "custom.lineWidth",
+        "value": 1
+       },
+       {
+        "id": "custom.lineStyle",
+        "value": {
+         "fill": "dash",
+         "dash": [
+          2,
+          3
+         ]
+        }
+       },
+       {
+        "id": "custom.hideFrom",
+        "value": {
+         "legend": true,
+         "tooltip": true,
+         "viz": false
+        }
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "Mean − 2.5σ"
+      },
+      "properties": [
+       {
+        "id": "color",
+        "value": {
+         "mode": "fixed",
+         "fixedColor": "#89878190"
+        }
+       },
+       {
+        "id": "custom.lineWidth",
+        "value": 1
+       },
+       {
+        "id": "custom.lineStyle",
+        "value": {
+         "fill": "dash",
+         "dash": [
+          2,
+          3
+         ]
+        }
+       },
+       {
+        "id": "custom.hideFrom",
+        "value": {
+         "legend": true,
+         "tooltip": true,
+         "viz": false
+        }
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "Mean + 3σ"
+      },
+      "properties": [
+       {
+        "id": "color",
+        "value": {
+         "mode": "fixed",
+         "fixedColor": "#898781C0"
+        }
+       },
+       {
+        "id": "custom.lineWidth",
+        "value": 1
+       },
+       {
+        "id": "custom.lineStyle",
+        "value": {
+         "fill": "dash",
+         "dash": [
+          6,
+          4
+         ]
+        }
+       },
+       {
+        "id": "custom.hideFrom",
+        "value": {
+         "legend": true,
+         "tooltip": true,
+         "viz": false
+        }
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "Mean − 3σ"
+      },
+      "properties": [
+       {
+        "id": "color",
+        "value": {
+         "mode": "fixed",
+         "fixedColor": "#898781C0"
+        }
+       },
+       {
+        "id": "custom.lineWidth",
+        "value": 1
+       },
+       {
+        "id": "custom.lineStyle",
+        "value": {
+         "fill": "dash",
+         "dash": [
+          6,
+          4
+         ]
+        }
+       },
+       {
+        "id": "custom.hideFrom",
+        "value": {
+         "legend": true,
+         "tooltip": true,
+         "viz": false
+        }
+       }
+      ]
+     },
      {
       "matcher": {
        "id": "byName",
@@ -2286,20 +2872,25 @@
             "color": "#898781",
             "index": 4
            },
-           "-7000000000": {
-            "text": "Not Recorded",
-            "color": "#898781",
-            "index": 5
-           },
            "-9000000000": {
             "text": "No Entry",
             "color": "#898781",
-            "index": 6
+            "index": 5
            },
            "-10000000000": {
             "text": "Other Side",
             "color": "#898781",
+            "index": 6
+           },
+           "-11000000000": {
+            "text": "No Sigma",
+            "color": "#898781",
             "index": 7
+           },
+           "-12000000000": {
+            "text": "Few Levels",
+            "color": "#898781",
+            "index": 8
            }
           }
          }
@@ -2363,20 +2954,25 @@
             "color": "#898781",
             "index": 4
            },
-           "-7000000000": {
-            "text": "Not Recorded",
-            "color": "#898781",
-            "index": 5
-           },
            "-9000000000": {
             "text": "No Entry",
             "color": "#898781",
-            "index": 6
+            "index": 5
            },
            "-10000000000": {
             "text": "Other Side",
             "color": "#898781",
+            "index": 6
+           },
+           "-11000000000": {
+            "text": "No Sigma",
+            "color": "#898781",
             "index": 7
+           },
+           "-12000000000": {
+            "text": "Few Levels",
+            "color": "#898781",
+            "index": 8
            }
           }
          }
@@ -2436,20 +3032,25 @@
             "color": "#898781",
             "index": 4
            },
-           "-7000000000": {
-            "text": "Not Recorded",
-            "color": "#898781",
-            "index": 5
-           },
            "-9000000000": {
             "text": "No Entry",
             "color": "#898781",
-            "index": 6
+            "index": 5
            },
            "-10000000000": {
             "text": "Other Side",
             "color": "#898781",
+            "index": 6
+           },
+           "-11000000000": {
+            "text": "No Sigma",
+            "color": "#898781",
             "index": 7
+           },
+           "-12000000000": {
+            "text": "Few Levels",
+            "color": "#898781",
+            "index": 8
            }
           }
          }
@@ -2509,20 +3110,25 @@
             "color": "#898781",
             "index": 4
            },
-           "-7000000000": {
-            "text": "Not Recorded",
-            "color": "#898781",
-            "index": 5
-           },
            "-9000000000": {
             "text": "No Entry",
             "color": "#898781",
-            "index": 6
+            "index": 5
            },
            "-10000000000": {
             "text": "Other Side",
             "color": "#898781",
+            "index": 6
+           },
+           "-11000000000": {
+            "text": "No Sigma",
+            "color": "#898781",
             "index": 7
+           },
+           "-12000000000": {
+            "text": "Few Levels",
+            "color": "#898781",
+            "index": 8
            }
           }
          }
@@ -2531,6 +3137,92 @@
        {
         "id": "displayName",
         "value": "Mean​"
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "Sigma · Tooltip"
+      },
+      "properties": [
+       {
+        "id": "decimals",
+        "value": 2
+       },
+       {
+        "id": "color",
+        "value": {
+         "mode": "fixed",
+         "fixedColor": "#a8a69e"
+        }
+       },
+       {
+        "id": "custom.hideFrom",
+        "value": {
+         "legend": true,
+         "tooltip": false,
+         "viz": true
+        }
+       },
+       {
+        "id": "mappings",
+        "value": [
+         {
+          "type": "value",
+          "options": {
+           "-2000000000": {
+            "text": "No Book",
+            "color": "#898781",
+            "index": 0
+           },
+           "-3000000000": {
+            "text": "No Notional",
+            "color": "#898781",
+            "index": 1
+           },
+           "-4000000000": {
+            "text": "No Anchor",
+            "color": "#898781",
+            "index": 2
+           },
+           "-5000000000": {
+            "text": "Past T",
+            "color": "#898781",
+            "index": 3
+           },
+           "-6000000000": {
+            "text": "No Mean",
+            "color": "#898781",
+            "index": 4
+           },
+           "-9000000000": {
+            "text": "No Entry",
+            "color": "#898781",
+            "index": 5
+           },
+           "-10000000000": {
+            "text": "Other Side",
+            "color": "#898781",
+            "index": 6
+           },
+           "-11000000000": {
+            "text": "No Sigma",
+            "color": "#898781",
+            "index": 7
+           },
+           "-12000000000": {
+            "text": "Few Levels",
+            "color": "#898781",
+            "index": 8
+           }
+          }
+         }
+        ]
+       },
+       {
+        "id": "displayName",
+        "value": "Sigma​"
        }
       ]
      },
@@ -2586,20 +3278,25 @@
             "color": "#898781",
             "index": 4
            },
-           "-7000000000": {
-            "text": "Not Recorded",
-            "color": "#898781",
-            "index": 5
-           },
            "-9000000000": {
             "text": "No Entry",
             "color": "#898781",
-            "index": 6
+            "index": 5
            },
            "-10000000000": {
             "text": "Other Side",
             "color": "#898781",
+            "index": 6
+           },
+           "-11000000000": {
+            "text": "No Sigma",
+            "color": "#898781",
             "index": 7
+           },
+           "-12000000000": {
+            "text": "Few Levels",
+            "color": "#898781",
+            "index": 8
            }
           }
          }
@@ -2663,20 +3360,25 @@
             "color": "#898781",
             "index": 4
            },
-           "-7000000000": {
-            "text": "Not Recorded",
-            "color": "#898781",
-            "index": 5
-           },
            "-9000000000": {
             "text": "No Entry",
             "color": "#898781",
-            "index": 6
+            "index": 5
            },
            "-10000000000": {
             "text": "Other Side",
             "color": "#898781",
+            "index": 6
+           },
+           "-11000000000": {
+            "text": "No Sigma",
+            "color": "#898781",
             "index": 7
+           },
+           "-12000000000": {
+            "text": "Few Levels",
+            "color": "#898781",
+            "index": 8
            }
           }
          }
@@ -2740,20 +3442,25 @@
             "color": "#898781",
             "index": 4
            },
-           "-7000000000": {
-            "text": "Not Recorded",
-            "color": "#898781",
-            "index": 5
-           },
            "-9000000000": {
             "text": "No Entry",
             "color": "#898781",
-            "index": 6
+            "index": 5
            },
            "-10000000000": {
             "text": "Other Side",
             "color": "#898781",
+            "index": 6
+           },
+           "-11000000000": {
+            "text": "No Sigma",
+            "color": "#898781",
             "index": 7
+           },
+           "-12000000000": {
+            "text": "Few Levels",
+            "color": "#898781",
+            "index": 8
            }
           }
          }
@@ -2856,12 +3563,12 @@
      {
       "matcher": {
        "id": "byName",
-       "options": "Bid 1+2 Depth · Bull"
+       "options": "Bid Bull ct"
       },
       "properties": [
        {
         "id": "unit",
-        "value": "suffix: ct"
+        "value": "locale"
        },
        {
         "id": "decimals",
@@ -2913,20 +3620,25 @@
             "color": "#898781",
             "index": 4
            },
-           "-7000000000": {
-            "text": "Not Recorded",
-            "color": "#898781",
-            "index": 5
-           },
            "-9000000000": {
             "text": "No Entry",
             "color": "#898781",
-            "index": 6
+            "index": 5
            },
            "-10000000000": {
             "text": "Other Side",
             "color": "#898781",
+            "index": 6
+           },
+           "-11000000000": {
+            "text": "No Sigma",
+            "color": "#898781",
             "index": 7
+           },
+           "-12000000000": {
+            "text": "Few Levels",
+            "color": "#898781",
+            "index": 8
            }
           }
          }
@@ -2934,19 +3646,19 @@
        },
        {
         "id": "displayName",
-        "value": "Bid 1+2 Depth · ${bull}"
+        "value": "Bid 1–${bull_levels} · ${bull} · ct"
        }
       ]
      },
      {
       "matcher": {
        "id": "byName",
-       "options": "Bid 1+2 Depth · Bear"
+       "options": "Bid Bear ct"
       },
       "properties": [
        {
         "id": "unit",
-        "value": "suffix: ct"
+        "value": "locale"
        },
        {
         "id": "decimals",
@@ -2998,20 +3710,25 @@
             "color": "#898781",
             "index": 4
            },
-           "-7000000000": {
-            "text": "Not Recorded",
-            "color": "#898781",
-            "index": 5
-           },
            "-9000000000": {
             "text": "No Entry",
             "color": "#898781",
-            "index": 6
+            "index": 5
            },
            "-10000000000": {
             "text": "Other Side",
             "color": "#898781",
+            "index": 6
+           },
+           "-11000000000": {
+            "text": "No Sigma",
+            "color": "#898781",
             "index": 7
+           },
+           "-12000000000": {
+            "text": "Few Levels",
+            "color": "#898781",
+            "index": 8
            }
           }
          }
@@ -3019,19 +3736,19 @@
        },
        {
         "id": "displayName",
-        "value": "Bid 1+2 Depth · ${bear}"
+        "value": "Bid 1–${bear_levels} · ${bear} · ct"
        }
       ]
      },
      {
       "matcher": {
        "id": "byName",
-       "options": "Ask 1+2 Depth · Bull"
+       "options": "Ask Bull ct"
       },
       "properties": [
        {
         "id": "unit",
-        "value": "suffix: ct"
+        "value": "locale"
        },
        {
         "id": "decimals",
@@ -3083,20 +3800,25 @@
             "color": "#898781",
             "index": 4
            },
-           "-7000000000": {
-            "text": "Not Recorded",
-            "color": "#898781",
-            "index": 5
-           },
            "-9000000000": {
             "text": "No Entry",
             "color": "#898781",
-            "index": 6
+            "index": 5
            },
            "-10000000000": {
             "text": "Other Side",
             "color": "#898781",
+            "index": 6
+           },
+           "-11000000000": {
+            "text": "No Sigma",
+            "color": "#898781",
             "index": 7
+           },
+           "-12000000000": {
+            "text": "Few Levels",
+            "color": "#898781",
+            "index": 8
            }
           }
          }
@@ -3104,19 +3826,19 @@
        },
        {
         "id": "displayName",
-        "value": "Ask 1+2 Depth · ${bull}"
+        "value": "Ask 1–${bull_levels} · ${bull} · ct"
        }
       ]
      },
      {
       "matcher": {
        "id": "byName",
-       "options": "Ask 1+2 Depth · Bear"
+       "options": "Ask Bear ct"
       },
       "properties": [
        {
         "id": "unit",
-        "value": "suffix: ct"
+        "value": "locale"
        },
        {
         "id": "decimals",
@@ -3168,20 +3890,25 @@
             "color": "#898781",
             "index": 4
            },
-           "-7000000000": {
-            "text": "Not Recorded",
-            "color": "#898781",
-            "index": 5
-           },
            "-9000000000": {
             "text": "No Entry",
             "color": "#898781",
-            "index": 6
+            "index": 5
            },
            "-10000000000": {
             "text": "Other Side",
             "color": "#898781",
+            "index": 6
+           },
+           "-11000000000": {
+            "text": "No Sigma",
+            "color": "#898781",
             "index": 7
+           },
+           "-12000000000": {
+            "text": "Few Levels",
+            "color": "#898781",
+            "index": 8
            }
           }
          }
@@ -3189,7 +3916,367 @@
        },
        {
         "id": "displayName",
-        "value": "Ask 1+2 Depth · ${bear}"
+        "value": "Ask 1–${bear_levels} · ${bear} · ct"
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "Bid Bull USDT"
+      },
+      "properties": [
+       {
+        "id": "unit",
+        "value": "locale"
+       },
+       {
+        "id": "decimals",
+        "value": 0
+       },
+       {
+        "id": "color",
+        "value": {
+         "mode": "fixed",
+         "fixedColor": "#d95926"
+        }
+       },
+       {
+        "id": "custom.hideFrom",
+        "value": {
+         "legend": true,
+         "tooltip": false,
+         "viz": true
+        }
+       },
+       {
+        "id": "mappings",
+        "value": [
+         {
+          "type": "value",
+          "options": {
+           "-2000000000": {
+            "text": "No Book",
+            "color": "#898781",
+            "index": 0
+           },
+           "-3000000000": {
+            "text": "No Notional",
+            "color": "#898781",
+            "index": 1
+           },
+           "-4000000000": {
+            "text": "No Anchor",
+            "color": "#898781",
+            "index": 2
+           },
+           "-5000000000": {
+            "text": "Past T",
+            "color": "#898781",
+            "index": 3
+           },
+           "-6000000000": {
+            "text": "No Mean",
+            "color": "#898781",
+            "index": 4
+           },
+           "-9000000000": {
+            "text": "No Entry",
+            "color": "#898781",
+            "index": 5
+           },
+           "-10000000000": {
+            "text": "Other Side",
+            "color": "#898781",
+            "index": 6
+           },
+           "-11000000000": {
+            "text": "No Sigma",
+            "color": "#898781",
+            "index": 7
+           },
+           "-12000000000": {
+            "text": "Few Levels",
+            "color": "#898781",
+            "index": 8
+           }
+          }
+         }
+        ]
+       },
+       {
+        "id": "displayName",
+        "value": "Bid 1–${bull_levels} · ${bull} · USDT"
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "Bid Bear USDT"
+      },
+      "properties": [
+       {
+        "id": "unit",
+        "value": "locale"
+       },
+       {
+        "id": "decimals",
+        "value": 0
+       },
+       {
+        "id": "color",
+        "value": {
+         "mode": "fixed",
+         "fixedColor": "#d95926"
+        }
+       },
+       {
+        "id": "custom.hideFrom",
+        "value": {
+         "legend": true,
+         "tooltip": false,
+         "viz": true
+        }
+       },
+       {
+        "id": "mappings",
+        "value": [
+         {
+          "type": "value",
+          "options": {
+           "-2000000000": {
+            "text": "No Book",
+            "color": "#898781",
+            "index": 0
+           },
+           "-3000000000": {
+            "text": "No Notional",
+            "color": "#898781",
+            "index": 1
+           },
+           "-4000000000": {
+            "text": "No Anchor",
+            "color": "#898781",
+            "index": 2
+           },
+           "-5000000000": {
+            "text": "Past T",
+            "color": "#898781",
+            "index": 3
+           },
+           "-6000000000": {
+            "text": "No Mean",
+            "color": "#898781",
+            "index": 4
+           },
+           "-9000000000": {
+            "text": "No Entry",
+            "color": "#898781",
+            "index": 5
+           },
+           "-10000000000": {
+            "text": "Other Side",
+            "color": "#898781",
+            "index": 6
+           },
+           "-11000000000": {
+            "text": "No Sigma",
+            "color": "#898781",
+            "index": 7
+           },
+           "-12000000000": {
+            "text": "Few Levels",
+            "color": "#898781",
+            "index": 8
+           }
+          }
+         }
+        ]
+       },
+       {
+        "id": "displayName",
+        "value": "Bid 1–${bear_levels} · ${bear} · USDT"
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "Ask Bull USDT"
+      },
+      "properties": [
+       {
+        "id": "unit",
+        "value": "locale"
+       },
+       {
+        "id": "decimals",
+        "value": 0
+       },
+       {
+        "id": "color",
+        "value": {
+         "mode": "fixed",
+         "fixedColor": "#2a78d6"
+        }
+       },
+       {
+        "id": "custom.hideFrom",
+        "value": {
+         "legend": true,
+         "tooltip": false,
+         "viz": true
+        }
+       },
+       {
+        "id": "mappings",
+        "value": [
+         {
+          "type": "value",
+          "options": {
+           "-2000000000": {
+            "text": "No Book",
+            "color": "#898781",
+            "index": 0
+           },
+           "-3000000000": {
+            "text": "No Notional",
+            "color": "#898781",
+            "index": 1
+           },
+           "-4000000000": {
+            "text": "No Anchor",
+            "color": "#898781",
+            "index": 2
+           },
+           "-5000000000": {
+            "text": "Past T",
+            "color": "#898781",
+            "index": 3
+           },
+           "-6000000000": {
+            "text": "No Mean",
+            "color": "#898781",
+            "index": 4
+           },
+           "-9000000000": {
+            "text": "No Entry",
+            "color": "#898781",
+            "index": 5
+           },
+           "-10000000000": {
+            "text": "Other Side",
+            "color": "#898781",
+            "index": 6
+           },
+           "-11000000000": {
+            "text": "No Sigma",
+            "color": "#898781",
+            "index": 7
+           },
+           "-12000000000": {
+            "text": "Few Levels",
+            "color": "#898781",
+            "index": 8
+           }
+          }
+         }
+        ]
+       },
+       {
+        "id": "displayName",
+        "value": "Ask 1–${bull_levels} · ${bull} · USDT"
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "Ask Bear USDT"
+      },
+      "properties": [
+       {
+        "id": "unit",
+        "value": "locale"
+       },
+       {
+        "id": "decimals",
+        "value": 0
+       },
+       {
+        "id": "color",
+        "value": {
+         "mode": "fixed",
+         "fixedColor": "#2a78d6"
+        }
+       },
+       {
+        "id": "custom.hideFrom",
+        "value": {
+         "legend": true,
+         "tooltip": false,
+         "viz": true
+        }
+       },
+       {
+        "id": "mappings",
+        "value": [
+         {
+          "type": "value",
+          "options": {
+           "-2000000000": {
+            "text": "No Book",
+            "color": "#898781",
+            "index": 0
+           },
+           "-3000000000": {
+            "text": "No Notional",
+            "color": "#898781",
+            "index": 1
+           },
+           "-4000000000": {
+            "text": "No Anchor",
+            "color": "#898781",
+            "index": 2
+           },
+           "-5000000000": {
+            "text": "Past T",
+            "color": "#898781",
+            "index": 3
+           },
+           "-6000000000": {
+            "text": "No Mean",
+            "color": "#898781",
+            "index": 4
+           },
+           "-9000000000": {
+            "text": "No Entry",
+            "color": "#898781",
+            "index": 5
+           },
+           "-10000000000": {
+            "text": "Other Side",
+            "color": "#898781",
+            "index": 6
+           },
+           "-11000000000": {
+            "text": "No Sigma",
+            "color": "#898781",
+            "index": 7
+           },
+           "-12000000000": {
+            "text": "Few Levels",
+            "color": "#898781",
+            "index": 8
+           }
+          }
+         }
+        ]
+       },
+       {
+        "id": "displayName",
+        "value": "Ask 1–${bear_levels} · ${bear} · USDT"
        }
       ]
      }
@@ -3224,19 +4311,382 @@
         "Mean",
         "Mean + Entry",
         "Mean − Entry",
+        "Sigma",
         "Spread · Tooltip",
         "Real Long Spread",
         "Real Short Spread",
         "Mean · Tooltip",
+        "Sigma · Tooltip",
         "Deviation · Tooltip",
         "Real Long Deviation · Tooltip",
         "Real Short Deviation · Tooltip",
         "Signal",
-        "Bid 1+2 Depth · Bull",
-        "Bid 1+2 Depth · Bear",
-        "Ask 1+2 Depth · Bull",
-        "Ask 1+2 Depth · Bear"
+        "Bid Bull ct",
+        "Bid Bear ct",
+        "Ask Bull ct",
+        "Ask Bear ct",
+        "Bid Bull USDT",
+        "Bid Bear USDT",
+        "Ask Bull USDT",
+        "Ask Bear USDT"
        ]
+      }
+     }
+    },
+    {
+     "id": "calculateField",
+     "options": {
+      "mode": "binary",
+      "binary": {
+       "left": {
+        "matcher": {
+         "id": "byName",
+         "options": "Sigma"
+        }
+       },
+       "operator": "*",
+       "right": {
+        "fixed": "1.5"
+       }
+      },
+      "alias": "1.5σ · Step",
+      "replaceFields": false
+     }
+    },
+    {
+     "id": "calculateField",
+     "options": {
+      "mode": "binary",
+      "binary": {
+       "left": {
+        "matcher": {
+         "id": "byName",
+         "options": "Sigma"
+        }
+       },
+       "operator": "*",
+       "right": {
+        "fixed": "2"
+       }
+      },
+      "alias": "2σ · Step",
+      "replaceFields": false
+     }
+    },
+    {
+     "id": "calculateField",
+     "options": {
+      "mode": "binary",
+      "binary": {
+       "left": {
+        "matcher": {
+         "id": "byName",
+         "options": "Sigma"
+        }
+       },
+       "operator": "*",
+       "right": {
+        "fixed": "2.5"
+       }
+      },
+      "alias": "2.5σ · Step",
+      "replaceFields": false
+     }
+    },
+    {
+     "id": "calculateField",
+     "options": {
+      "mode": "binary",
+      "binary": {
+       "left": {
+        "matcher": {
+         "id": "byName",
+         "options": "Sigma"
+        }
+       },
+       "operator": "*",
+       "right": {
+        "fixed": "3"
+       }
+      },
+      "alias": "3σ · Step",
+      "replaceFields": false
+     }
+    },
+    {
+     "id": "calculateField",
+     "options": {
+      "mode": "binary",
+      "binary": {
+       "left": {
+        "matcher": {
+         "id": "byName",
+         "options": "Mean"
+        }
+       },
+       "operator": "+",
+       "right": {
+        "matcher": {
+         "id": "byName",
+         "options": "Sigma"
+        }
+       }
+      },
+      "alias": "Mean + 1σ",
+      "replaceFields": false
+     }
+    },
+    {
+     "id": "calculateField",
+     "options": {
+      "mode": "binary",
+      "binary": {
+       "left": {
+        "matcher": {
+         "id": "byName",
+         "options": "Mean"
+        }
+       },
+       "operator": "-",
+       "right": {
+        "matcher": {
+         "id": "byName",
+         "options": "Sigma"
+        }
+       }
+      },
+      "alias": "Mean − 1σ",
+      "replaceFields": false
+     }
+    },
+    {
+     "id": "calculateField",
+     "options": {
+      "mode": "binary",
+      "binary": {
+       "left": {
+        "matcher": {
+         "id": "byName",
+         "options": "Mean"
+        }
+       },
+       "operator": "+",
+       "right": {
+        "matcher": {
+         "id": "byName",
+         "options": "1.5σ · Step"
+        }
+       }
+      },
+      "alias": "Mean + 1.5σ",
+      "replaceFields": false
+     }
+    },
+    {
+     "id": "calculateField",
+     "options": {
+      "mode": "binary",
+      "binary": {
+       "left": {
+        "matcher": {
+         "id": "byName",
+         "options": "Mean"
+        }
+       },
+       "operator": "-",
+       "right": {
+        "matcher": {
+         "id": "byName",
+         "options": "1.5σ · Step"
+        }
+       }
+      },
+      "alias": "Mean − 1.5σ",
+      "replaceFields": false
+     }
+    },
+    {
+     "id": "calculateField",
+     "options": {
+      "mode": "binary",
+      "binary": {
+       "left": {
+        "matcher": {
+         "id": "byName",
+         "options": "Mean"
+        }
+       },
+       "operator": "+",
+       "right": {
+        "matcher": {
+         "id": "byName",
+         "options": "2σ · Step"
+        }
+       }
+      },
+      "alias": "Mean + 2σ",
+      "replaceFields": false
+     }
+    },
+    {
+     "id": "calculateField",
+     "options": {
+      "mode": "binary",
+      "binary": {
+       "left": {
+        "matcher": {
+         "id": "byName",
+         "options": "Mean"
+        }
+       },
+       "operator": "-",
+       "right": {
+        "matcher": {
+         "id": "byName",
+         "options": "2σ · Step"
+        }
+       }
+      },
+      "alias": "Mean − 2σ",
+      "replaceFields": false
+     }
+    },
+    {
+     "id": "calculateField",
+     "options": {
+      "mode": "binary",
+      "binary": {
+       "left": {
+        "matcher": {
+         "id": "byName",
+         "options": "Mean"
+        }
+       },
+       "operator": "+",
+       "right": {
+        "matcher": {
+         "id": "byName",
+         "options": "2.5σ · Step"
+        }
+       }
+      },
+      "alias": "Mean + 2.5σ",
+      "replaceFields": false
+     }
+    },
+    {
+     "id": "calculateField",
+     "options": {
+      "mode": "binary",
+      "binary": {
+       "left": {
+        "matcher": {
+         "id": "byName",
+         "options": "Mean"
+        }
+       },
+       "operator": "-",
+       "right": {
+        "matcher": {
+         "id": "byName",
+         "options": "2.5σ · Step"
+        }
+       }
+      },
+      "alias": "Mean − 2.5σ",
+      "replaceFields": false
+     }
+    },
+    {
+     "id": "calculateField",
+     "options": {
+      "mode": "binary",
+      "binary": {
+       "left": {
+        "matcher": {
+         "id": "byName",
+         "options": "Mean"
+        }
+       },
+       "operator": "+",
+       "right": {
+        "matcher": {
+         "id": "byName",
+         "options": "3σ · Step"
+        }
+       }
+      },
+      "alias": "Mean + 3σ",
+      "replaceFields": false
+     }
+    },
+    {
+     "id": "calculateField",
+     "options": {
+      "mode": "binary",
+      "binary": {
+       "left": {
+        "matcher": {
+         "id": "byName",
+         "options": "Mean"
+        }
+       },
+       "operator": "-",
+       "right": {
+        "matcher": {
+         "id": "byName",
+         "options": "3σ · Step"
+        }
+       }
+      },
+      "alias": "Mean − 3σ",
+      "replaceFields": false
+     }
+    },
+    {
+     "id": "organize",
+     "options": {
+      "indexByName": {
+       "time": 0,
+       "Mean + 1σ": 1,
+       "Mean − 1σ": 2,
+       "Mean + 1.5σ": 3,
+       "Mean − 1.5σ": 4,
+       "Mean + 2σ": 5,
+       "Mean − 2σ": 6,
+       "Mean + 2.5σ": 7,
+       "Mean − 2.5σ": 8,
+       "Mean + 3σ": 9,
+       "Mean − 3σ": 10,
+       "Spread": 11,
+       "Mean": 12,
+       "Mean + Entry": 13,
+       "Mean − Entry": 14,
+       "Sigma": 15,
+       "Spread · Tooltip": 16,
+       "Real Long Spread": 17,
+       "Real Short Spread": 18,
+       "Mean · Tooltip": 19,
+       "Sigma · Tooltip": 20,
+       "Deviation · Tooltip": 21,
+       "Real Long Deviation · Tooltip": 22,
+       "Real Short Deviation · Tooltip": 23,
+       "Signal": 24,
+       "Bid Bull ct": 25,
+       "Bid Bear ct": 26,
+       "Ask Bull ct": 27,
+       "Ask Bear ct": 28,
+       "Bid Bull USDT": 29,
+       "Bid Bear USDT": 30,
+       "Ask Bull USDT": 31,
+       "Ask Bear USDT": 32
+      },
+      "renameByName": {},
+      "excludeByName": {
+       "1.5σ · Step": true,
+       "2σ · Step": true,
+       "2.5σ · Step": true,
+       "3σ · Step": true
       }
      }
     }
@@ -3246,10 +4696,10 @@
    "id": 11,
    "type": "timeseries",
    "title": "Deviation · Bps",
-   "description": "Deviation = Spread − Mean · Real Long / Short Deviation = Real Long / Short Spread − Mean · Long: Real Long Deviation ≤ −Entry · Short: Real Short Deviation ≥ +Entry\n\nThe Spread chart with its Mean at zero, with signs · purple: Deviation on the mids (trades where there is no book; the only line before the recorder) · blue: Real Long Deviation, buying both legs for N through their recorded asks, never below purple · orange: Real Short Deviation, selling through the bids, never above it · a Long needs blue at or under −Entry (blue dashed), a Short orange at or over +Entry (orange dashed), Partial included; blue over +Entry or orange under −Entry is no signal · legend Min of blue, Max of orange: how far each side came toward or past its Entry (Entry Points' Best) · tooltip: each second's value or why it has none, and the Signal · Past T (amber): no signal until the dividend's amount is known · no band with No Entry · absolute values and signal dots: Entry Points · Bps.",
+   "description": "Deviation = Spread − Mean · Real Long / Short Deviation = Real Long / Short Spread − Mean · Long: Real Long Deviation ≤ −Entry · Short: Real Short Deviation ≥ +Entry · ±k σ: k times sigma, k = 1, 1.5, 2, 2.5, 3\n\nThe Spread chart with its Mean at zero, with signs · purple: Deviation on the mids (trades where there is no book; the only line before the recorder) · blue: Real Long Deviation, buying both legs for N through their pricing levels' asks, never below purple · orange: Real Short Deviation, selling through the bids, never above it · a Long needs blue at or under −Entry (blue dashed), a Short orange at or over +Entry (orange dashed), Partial included; blue over +Entry or orange under −Entry is no signal · grey: ±1, 1.5, 2, 2.5, 3 σ (whole σ dashed, half σ dotted), the trading program's lines are d_in·σ: where blue reaches −2σ, x ≤ −2σ · legend Min of blue, Max of orange: how far each side came toward or past its Entry (Entry Points' Best); Sigma: σ's last, lowest and highest, k σ is k times it · tooltip: each second's value or why it has none, σ, and the Signal · Past T (amber): no signal until the dividend's amount is known · no band with No Entry, no σ lines with No Sigma · absolute values and signal dots: Entry Points · Bps.",
    "gridPos": {
     "x": 0,
-    "y": 36,
+    "y": 38,
     "w": 24,
     "h": 13
    },
@@ -3367,6 +4817,376 @@
        {
         "id": "custom.lineWidth",
         "value": 0
+       },
+       {
+        "id": "custom.hideFrom",
+        "value": {
+         "legend": true,
+         "tooltip": true,
+         "viz": false
+        }
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "+1σ"
+      },
+      "properties": [
+       {
+        "id": "color",
+        "value": {
+         "mode": "fixed",
+         "fixedColor": "#898781C0"
+        }
+       },
+       {
+        "id": "custom.lineWidth",
+        "value": 1
+       },
+       {
+        "id": "custom.lineStyle",
+        "value": {
+         "fill": "dash",
+         "dash": [
+          6,
+          4
+         ]
+        }
+       },
+       {
+        "id": "custom.hideFrom",
+        "value": {
+         "legend": true,
+         "tooltip": true,
+         "viz": false
+        }
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "−1σ"
+      },
+      "properties": [
+       {
+        "id": "color",
+        "value": {
+         "mode": "fixed",
+         "fixedColor": "#898781C0"
+        }
+       },
+       {
+        "id": "custom.lineWidth",
+        "value": 1
+       },
+       {
+        "id": "custom.lineStyle",
+        "value": {
+         "fill": "dash",
+         "dash": [
+          6,
+          4
+         ]
+        }
+       },
+       {
+        "id": "custom.hideFrom",
+        "value": {
+         "legend": true,
+         "tooltip": true,
+         "viz": false
+        }
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "+1.5σ"
+      },
+      "properties": [
+       {
+        "id": "color",
+        "value": {
+         "mode": "fixed",
+         "fixedColor": "#89878190"
+        }
+       },
+       {
+        "id": "custom.lineWidth",
+        "value": 1
+       },
+       {
+        "id": "custom.lineStyle",
+        "value": {
+         "fill": "dash",
+         "dash": [
+          2,
+          3
+         ]
+        }
+       },
+       {
+        "id": "custom.hideFrom",
+        "value": {
+         "legend": true,
+         "tooltip": true,
+         "viz": false
+        }
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "−1.5σ"
+      },
+      "properties": [
+       {
+        "id": "color",
+        "value": {
+         "mode": "fixed",
+         "fixedColor": "#89878190"
+        }
+       },
+       {
+        "id": "custom.lineWidth",
+        "value": 1
+       },
+       {
+        "id": "custom.lineStyle",
+        "value": {
+         "fill": "dash",
+         "dash": [
+          2,
+          3
+         ]
+        }
+       },
+       {
+        "id": "custom.hideFrom",
+        "value": {
+         "legend": true,
+         "tooltip": true,
+         "viz": false
+        }
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "+2σ"
+      },
+      "properties": [
+       {
+        "id": "color",
+        "value": {
+         "mode": "fixed",
+         "fixedColor": "#898781C0"
+        }
+       },
+       {
+        "id": "custom.lineWidth",
+        "value": 1
+       },
+       {
+        "id": "custom.lineStyle",
+        "value": {
+         "fill": "dash",
+         "dash": [
+          6,
+          4
+         ]
+        }
+       },
+       {
+        "id": "custom.hideFrom",
+        "value": {
+         "legend": true,
+         "tooltip": true,
+         "viz": false
+        }
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "−2σ"
+      },
+      "properties": [
+       {
+        "id": "color",
+        "value": {
+         "mode": "fixed",
+         "fixedColor": "#898781C0"
+        }
+       },
+       {
+        "id": "custom.lineWidth",
+        "value": 1
+       },
+       {
+        "id": "custom.lineStyle",
+        "value": {
+         "fill": "dash",
+         "dash": [
+          6,
+          4
+         ]
+        }
+       },
+       {
+        "id": "custom.hideFrom",
+        "value": {
+         "legend": true,
+         "tooltip": true,
+         "viz": false
+        }
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "+2.5σ"
+      },
+      "properties": [
+       {
+        "id": "color",
+        "value": {
+         "mode": "fixed",
+         "fixedColor": "#89878190"
+        }
+       },
+       {
+        "id": "custom.lineWidth",
+        "value": 1
+       },
+       {
+        "id": "custom.lineStyle",
+        "value": {
+         "fill": "dash",
+         "dash": [
+          2,
+          3
+         ]
+        }
+       },
+       {
+        "id": "custom.hideFrom",
+        "value": {
+         "legend": true,
+         "tooltip": true,
+         "viz": false
+        }
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "−2.5σ"
+      },
+      "properties": [
+       {
+        "id": "color",
+        "value": {
+         "mode": "fixed",
+         "fixedColor": "#89878190"
+        }
+       },
+       {
+        "id": "custom.lineWidth",
+        "value": 1
+       },
+       {
+        "id": "custom.lineStyle",
+        "value": {
+         "fill": "dash",
+         "dash": [
+          2,
+          3
+         ]
+        }
+       },
+       {
+        "id": "custom.hideFrom",
+        "value": {
+         "legend": true,
+         "tooltip": true,
+         "viz": false
+        }
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "+3σ"
+      },
+      "properties": [
+       {
+        "id": "color",
+        "value": {
+         "mode": "fixed",
+         "fixedColor": "#898781C0"
+        }
+       },
+       {
+        "id": "custom.lineWidth",
+        "value": 1
+       },
+       {
+        "id": "custom.lineStyle",
+        "value": {
+         "fill": "dash",
+         "dash": [
+          6,
+          4
+         ]
+        }
+       },
+       {
+        "id": "custom.hideFrom",
+        "value": {
+         "legend": true,
+         "tooltip": true,
+         "viz": false
+        }
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "−3σ"
+      },
+      "properties": [
+       {
+        "id": "color",
+        "value": {
+         "mode": "fixed",
+         "fixedColor": "#898781C0"
+        }
+       },
+       {
+        "id": "custom.lineWidth",
+        "value": 1
+       },
+       {
+        "id": "custom.lineStyle",
+        "value": {
+         "fill": "dash",
+         "dash": [
+          6,
+          4
+         ]
+        }
        },
        {
         "id": "custom.hideFrom",
@@ -3575,6 +5395,45 @@
      {
       "matcher": {
        "id": "byName",
+       "options": "Sigma"
+      },
+      "properties": [
+       {
+        "id": "color",
+        "value": {
+         "mode": "fixed",
+         "fixedColor": "#a8a69e"
+        }
+       },
+       {
+        "id": "custom.lineWidth",
+        "value": 0
+       },
+       {
+        "id": "custom.axisPlacement",
+        "value": "hidden"
+       },
+       {
+        "id": "decimals",
+        "value": 2
+       },
+       {
+        "id": "custom.hideFrom",
+        "value": {
+         "legend": false,
+         "tooltip": true,
+         "viz": false
+        }
+       },
+       {
+        "id": "noValue",
+        "value": "–"
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
        "options": "Signed Deviation · Tooltip"
       },
       "properties": [
@@ -3624,20 +5483,25 @@
             "color": "#898781",
             "index": 4
            },
-           "-7000000000": {
-            "text": "Not Recorded",
-            "color": "#898781",
-            "index": 5
-           },
            "-9000000000": {
             "text": "No Entry",
             "color": "#898781",
-            "index": 6
+            "index": 5
            },
            "-10000000000": {
             "text": "Other Side",
             "color": "#898781",
+            "index": 6
+           },
+           "-11000000000": {
+            "text": "No Sigma",
+            "color": "#898781",
             "index": 7
+           },
+           "-12000000000": {
+            "text": "Few Levels",
+            "color": "#898781",
+            "index": 8
            }
           }
          }
@@ -3701,20 +5565,25 @@
             "color": "#898781",
             "index": 4
            },
-           "-7000000000": {
-            "text": "Not Recorded",
-            "color": "#898781",
-            "index": 5
-           },
            "-9000000000": {
             "text": "No Entry",
             "color": "#898781",
-            "index": 6
+            "index": 5
            },
            "-10000000000": {
             "text": "Other Side",
             "color": "#898781",
+            "index": 6
+           },
+           "-11000000000": {
+            "text": "No Sigma",
+            "color": "#898781",
             "index": 7
+           },
+           "-12000000000": {
+            "text": "Few Levels",
+            "color": "#898781",
+            "index": 8
            }
           }
          }
@@ -3778,20 +5647,25 @@
             "color": "#898781",
             "index": 4
            },
-           "-7000000000": {
-            "text": "Not Recorded",
-            "color": "#898781",
-            "index": 5
-           },
            "-9000000000": {
             "text": "No Entry",
             "color": "#898781",
-            "index": 6
+            "index": 5
            },
            "-10000000000": {
             "text": "Other Side",
             "color": "#898781",
+            "index": 6
+           },
+           "-11000000000": {
+            "text": "No Sigma",
+            "color": "#898781",
             "index": 7
+           },
+           "-12000000000": {
+            "text": "Few Levels",
+            "color": "#898781",
+            "index": 8
            }
           }
          }
@@ -3800,6 +5674,92 @@
        {
         "id": "displayName",
         "value": "Real Short Deviation​"
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "Sigma · Tooltip"
+      },
+      "properties": [
+       {
+        "id": "decimals",
+        "value": 2
+       },
+       {
+        "id": "color",
+        "value": {
+         "mode": "fixed",
+         "fixedColor": "#a8a69e"
+        }
+       },
+       {
+        "id": "custom.hideFrom",
+        "value": {
+         "legend": true,
+         "tooltip": false,
+         "viz": true
+        }
+       },
+       {
+        "id": "mappings",
+        "value": [
+         {
+          "type": "value",
+          "options": {
+           "-2000000000": {
+            "text": "No Book",
+            "color": "#898781",
+            "index": 0
+           },
+           "-3000000000": {
+            "text": "No Notional",
+            "color": "#898781",
+            "index": 1
+           },
+           "-4000000000": {
+            "text": "No Anchor",
+            "color": "#898781",
+            "index": 2
+           },
+           "-5000000000": {
+            "text": "Past T",
+            "color": "#898781",
+            "index": 3
+           },
+           "-6000000000": {
+            "text": "No Mean",
+            "color": "#898781",
+            "index": 4
+           },
+           "-9000000000": {
+            "text": "No Entry",
+            "color": "#898781",
+            "index": 5
+           },
+           "-10000000000": {
+            "text": "Other Side",
+            "color": "#898781",
+            "index": 6
+           },
+           "-11000000000": {
+            "text": "No Sigma",
+            "color": "#898781",
+            "index": 7
+           },
+           "-12000000000": {
+            "text": "Few Levels",
+            "color": "#898781",
+            "index": 8
+           }
+          }
+         }
+        ]
+       },
+       {
+        "id": "displayName",
+        "value": "Sigma​"
        }
       ]
      },
@@ -3924,9 +5884,11 @@
         "+Entry",
         "−Entry",
         "Signed Past T",
+        "Sigma",
         "Signed Deviation · Tooltip",
         "Signed Real Long Deviation · Tooltip",
         "Signed Real Short Deviation · Tooltip",
+        "Sigma · Tooltip",
         "Signal"
        ]
       }
@@ -3961,22 +5923,234 @@
      }
     },
     {
+     "id": "calculateField",
+     "options": {
+      "mode": "binary",
+      "binary": {
+       "left": {
+        "matcher": {
+         "id": "byName",
+         "options": "Sigma"
+        }
+       },
+       "operator": "*",
+       "right": {
+        "fixed": "1"
+       }
+      },
+      "alias": "+1σ",
+      "replaceFields": false
+     }
+    },
+    {
+     "id": "calculateField",
+     "options": {
+      "mode": "binary",
+      "binary": {
+       "left": {
+        "matcher": {
+         "id": "byName",
+         "options": "Sigma"
+        }
+       },
+       "operator": "*",
+       "right": {
+        "fixed": "-1"
+       }
+      },
+      "alias": "−1σ",
+      "replaceFields": false
+     }
+    },
+    {
+     "id": "calculateField",
+     "options": {
+      "mode": "binary",
+      "binary": {
+       "left": {
+        "matcher": {
+         "id": "byName",
+         "options": "Sigma"
+        }
+       },
+       "operator": "*",
+       "right": {
+        "fixed": "1.5"
+       }
+      },
+      "alias": "+1.5σ",
+      "replaceFields": false
+     }
+    },
+    {
+     "id": "calculateField",
+     "options": {
+      "mode": "binary",
+      "binary": {
+       "left": {
+        "matcher": {
+         "id": "byName",
+         "options": "Sigma"
+        }
+       },
+       "operator": "*",
+       "right": {
+        "fixed": "-1.5"
+       }
+      },
+      "alias": "−1.5σ",
+      "replaceFields": false
+     }
+    },
+    {
+     "id": "calculateField",
+     "options": {
+      "mode": "binary",
+      "binary": {
+       "left": {
+        "matcher": {
+         "id": "byName",
+         "options": "Sigma"
+        }
+       },
+       "operator": "*",
+       "right": {
+        "fixed": "2"
+       }
+      },
+      "alias": "+2σ",
+      "replaceFields": false
+     }
+    },
+    {
+     "id": "calculateField",
+     "options": {
+      "mode": "binary",
+      "binary": {
+       "left": {
+        "matcher": {
+         "id": "byName",
+         "options": "Sigma"
+        }
+       },
+       "operator": "*",
+       "right": {
+        "fixed": "-2"
+       }
+      },
+      "alias": "−2σ",
+      "replaceFields": false
+     }
+    },
+    {
+     "id": "calculateField",
+     "options": {
+      "mode": "binary",
+      "binary": {
+       "left": {
+        "matcher": {
+         "id": "byName",
+         "options": "Sigma"
+        }
+       },
+       "operator": "*",
+       "right": {
+        "fixed": "2.5"
+       }
+      },
+      "alias": "+2.5σ",
+      "replaceFields": false
+     }
+    },
+    {
+     "id": "calculateField",
+     "options": {
+      "mode": "binary",
+      "binary": {
+       "left": {
+        "matcher": {
+         "id": "byName",
+         "options": "Sigma"
+        }
+       },
+       "operator": "*",
+       "right": {
+        "fixed": "-2.5"
+       }
+      },
+      "alias": "−2.5σ",
+      "replaceFields": false
+     }
+    },
+    {
+     "id": "calculateField",
+     "options": {
+      "mode": "binary",
+      "binary": {
+       "left": {
+        "matcher": {
+         "id": "byName",
+         "options": "Sigma"
+        }
+       },
+       "operator": "*",
+       "right": {
+        "fixed": "3"
+       }
+      },
+      "alias": "+3σ",
+      "replaceFields": false
+     }
+    },
+    {
+     "id": "calculateField",
+     "options": {
+      "mode": "binary",
+      "binary": {
+       "left": {
+        "matcher": {
+         "id": "byName",
+         "options": "Sigma"
+        }
+       },
+       "operator": "*",
+       "right": {
+        "fixed": "-3"
+       }
+      },
+      "alias": "−3σ",
+      "replaceFields": false
+     }
+    },
+    {
      "id": "organize",
      "options": {
       "indexByName": {
        "time": 0,
        "Band Top": 1,
        "Band Bottom": 2,
-       "Signed Deviation": 3,
-       "Signed Real Long Deviation": 4,
-       "Signed Real Short Deviation": 5,
-       "+Entry": 6,
-       "−Entry": 7,
-       "Signed Past T": 8,
-       "Signed Deviation · Tooltip": 9,
-       "Signed Real Long Deviation · Tooltip": 10,
-       "Signed Real Short Deviation · Tooltip": 11,
-       "Signal": 12
+       "+1σ": 3,
+       "−1σ": 4,
+       "+1.5σ": 5,
+       "−1.5σ": 6,
+       "+2σ": 7,
+       "−2σ": 8,
+       "+2.5σ": 9,
+       "−2.5σ": 10,
+       "+3σ": 11,
+       "−3σ": 12,
+       "Signed Deviation": 13,
+       "Signed Real Long Deviation": 14,
+       "Signed Real Short Deviation": 15,
+       "+Entry": 16,
+       "−Entry": 17,
+       "Signed Past T": 18,
+       "Sigma": 19,
+       "Signed Deviation · Tooltip": 20,
+       "Signed Real Long Deviation · Tooltip": 21,
+       "Signed Real Short Deviation · Tooltip": 22,
+       "Sigma · Tooltip": 23,
+       "Signal": 24
       },
       "renameByName": {
        "Signed Deviation": "Deviation",
@@ -3993,10 +6167,10 @@
    "id": 12,
    "type": "timeseries",
    "title": "Entry Points · Bps",
-   "description": "Deviation = |Spread − Mean| · Real Long Deviation = |Real Long Spread − Mean| · Real Short Deviation = |Real Short Spread − Mean| · Long: Real Long Spread ≤ Mean − Entry · Short: Real Short Spread ≥ Mean + Entry\n\nAll three are absolute (with their signs: Deviation · Bps); each real line is bright on the side of the Mean its real spread can fill on and faded on the other: Real Long Deviation (blue) bright while Real Long Spread is below the Mean, Real Short Deviation (orange) bright while Real Short Spread is above it, so a bright line above Entry (dashed) is a signal of its side and a faded one is none (Signal · Latest Second shows a faded side as Other Side) · Long Points, Short Points: a dot on the blue, orange line at each drawn second whose Signal is Long, Short (Partial included), counted in the legend · Real Long, Real Short Deviation: buying, selling both legs for the notional through their recorded levels, the Signal's spreads; none without both legs' books · Deviation (grey): on the basis prices, the only line before the recorder · legend Last, Max: the newest and the largest value of each bright line (Max: Entry Points' Best of the range), the counts in the range · tooltip: each row is that second's value, absolute whatever its side, or the reason it has none (No Anchor, Past T, No Mean, No Notional, No Book), and the Signal · No Entry (Entry not a positive number): no Entry line, no dots · empty until the session's mean is ready, and with no valid Mean Scale · Past T, amber: the deviation from the instant a leg's dividend takes effect without its amount until it is known, no signal and not counted · points are coarser on longer ranges, so counts do not compare across ranges.",
+   "description": "Deviation = |Spread − Mean| · Real Long Deviation = |Real Long Spread − Mean| · Real Short Deviation = |Real Short Spread − Mean| · Long: Real Long Spread ≤ Mean − Entry · Short: Real Short Spread ≥ Mean + Entry\n\nAll three are absolute (with their signs: Deviation · Bps); each real line is bright on the side of the Mean its real spread can fill on and faded on the other: Real Long Deviation (blue) bright while Real Long Spread is below the Mean, Real Short Deviation (orange) bright while Real Short Spread is above it, so a bright line above Entry (teal dashed) is a signal of its side and a faded one is none (Signal · Latest Second shows a faded side as Other Side) · grey: 1, 1.5, 2, 2.5, 3 σ (whole σ dashed, half σ dotted) · Long Points, Short Points: a dot on the blue, orange line at each drawn second whose Signal is Long, Short (Partial included), counted in the legend · Real Long, Real Short Deviation: buying, selling both legs for the notional through their pricing levels, the Signal's spreads; none without both legs' books · Deviation (grey): on the basis prices, the only line before the recorder · legend Max: the largest value of each bright line (Entry Points' Best of the range), the counts in the range · tooltip: each row is that second's value, absolute whatever its side, or the reason it has none (No Anchor, Past T, No Mean, No Notional, No Book, Few Levels), and the Signal · No Entry (Entry not a positive number): no Entry line, no dots · empty until the session's mean is ready, and with no valid Mean Scale · Past T, amber: the deviation from the instant a leg's dividend takes effect without its amount until it is known, no signal and not counted · points are coarser on longer ranges, so counts do not compare across ranges.",
    "gridPos": {
     "x": 0,
-    "y": 49,
+    "y": 51,
     "w": 24,
     "h": 13
    },
@@ -4158,6 +6332,191 @@
        {
         "id": "noValue",
         "value": "–"
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "+1σ"
+      },
+      "properties": [
+       {
+        "id": "color",
+        "value": {
+         "mode": "fixed",
+         "fixedColor": "#898781C0"
+        }
+       },
+       {
+        "id": "custom.lineWidth",
+        "value": 1
+       },
+       {
+        "id": "custom.lineStyle",
+        "value": {
+         "fill": "dash",
+         "dash": [
+          6,
+          4
+         ]
+        }
+       },
+       {
+        "id": "custom.hideFrom",
+        "value": {
+         "legend": true,
+         "tooltip": true,
+         "viz": false
+        }
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "+1.5σ"
+      },
+      "properties": [
+       {
+        "id": "color",
+        "value": {
+         "mode": "fixed",
+         "fixedColor": "#89878190"
+        }
+       },
+       {
+        "id": "custom.lineWidth",
+        "value": 1
+       },
+       {
+        "id": "custom.lineStyle",
+        "value": {
+         "fill": "dash",
+         "dash": [
+          2,
+          3
+         ]
+        }
+       },
+       {
+        "id": "custom.hideFrom",
+        "value": {
+         "legend": true,
+         "tooltip": true,
+         "viz": false
+        }
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "+2σ"
+      },
+      "properties": [
+       {
+        "id": "color",
+        "value": {
+         "mode": "fixed",
+         "fixedColor": "#898781C0"
+        }
+       },
+       {
+        "id": "custom.lineWidth",
+        "value": 1
+       },
+       {
+        "id": "custom.lineStyle",
+        "value": {
+         "fill": "dash",
+         "dash": [
+          6,
+          4
+         ]
+        }
+       },
+       {
+        "id": "custom.hideFrom",
+        "value": {
+         "legend": true,
+         "tooltip": true,
+         "viz": false
+        }
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "+2.5σ"
+      },
+      "properties": [
+       {
+        "id": "color",
+        "value": {
+         "mode": "fixed",
+         "fixedColor": "#89878190"
+        }
+       },
+       {
+        "id": "custom.lineWidth",
+        "value": 1
+       },
+       {
+        "id": "custom.lineStyle",
+        "value": {
+         "fill": "dash",
+         "dash": [
+          2,
+          3
+         ]
+        }
+       },
+       {
+        "id": "custom.hideFrom",
+        "value": {
+         "legend": true,
+         "tooltip": true,
+         "viz": false
+        }
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "+3σ"
+      },
+      "properties": [
+       {
+        "id": "color",
+        "value": {
+         "mode": "fixed",
+         "fixedColor": "#898781C0"
+        }
+       },
+       {
+        "id": "custom.lineWidth",
+        "value": 1
+       },
+       {
+        "id": "custom.lineStyle",
+        "value": {
+         "fill": "dash",
+         "dash": [
+          6,
+          4
+         ]
+        }
+       },
+       {
+        "id": "custom.hideFrom",
+        "value": {
+         "legend": true,
+         "tooltip": true,
+         "viz": false
+        }
        }
       ]
      },
@@ -4350,7 +6709,7 @@
        },
        {
         "id": "custom.lineWidth",
-        "value": 1
+        "value": 1.5
        },
        {
         "id": "custom.lineStyle",
@@ -4486,20 +6845,25 @@
             "color": "#898781",
             "index": 4
            },
-           "-7000000000": {
-            "text": "Not Recorded",
-            "color": "#898781",
-            "index": 5
-           },
            "-9000000000": {
             "text": "No Entry",
             "color": "#898781",
-            "index": 6
+            "index": 5
            },
            "-10000000000": {
             "text": "Other Side",
             "color": "#898781",
+            "index": 6
+           },
+           "-11000000000": {
+            "text": "No Sigma",
+            "color": "#898781",
             "index": 7
+           },
+           "-12000000000": {
+            "text": "Few Levels",
+            "color": "#898781",
+            "index": 8
            }
           }
          }
@@ -4563,20 +6927,25 @@
             "color": "#898781",
             "index": 4
            },
-           "-7000000000": {
-            "text": "Not Recorded",
-            "color": "#898781",
-            "index": 5
-           },
            "-9000000000": {
             "text": "No Entry",
             "color": "#898781",
-            "index": 6
+            "index": 5
            },
            "-10000000000": {
             "text": "Other Side",
             "color": "#898781",
+            "index": 6
+           },
+           "-11000000000": {
+            "text": "No Sigma",
+            "color": "#898781",
             "index": 7
+           },
+           "-12000000000": {
+            "text": "Few Levels",
+            "color": "#898781",
+            "index": 8
            }
           }
          }
@@ -4640,20 +7009,25 @@
             "color": "#898781",
             "index": 4
            },
-           "-7000000000": {
-            "text": "Not Recorded",
-            "color": "#898781",
-            "index": 5
-           },
            "-9000000000": {
             "text": "No Entry",
             "color": "#898781",
-            "index": 6
+            "index": 5
            },
            "-10000000000": {
             "text": "Other Side",
             "color": "#898781",
+            "index": 6
+           },
+           "-11000000000": {
+            "text": "No Sigma",
+            "color": "#898781",
             "index": 7
+           },
+           "-12000000000": {
+            "text": "Few Levels",
+            "color": "#898781",
+            "index": 8
            }
           }
          }
@@ -4789,6 +7163,7 @@
         "+Entry",
         "Long Dots",
         "Short Dots",
+        "Sigma",
         "Deviation · Tooltip",
         "Real Long Deviation · Tooltip",
         "Real Short Deviation · Tooltip",
@@ -4798,30 +7173,138 @@
      }
     },
     {
+     "id": "calculateField",
+     "options": {
+      "mode": "binary",
+      "binary": {
+       "left": {
+        "matcher": {
+         "id": "byName",
+         "options": "Sigma"
+        }
+       },
+       "operator": "*",
+       "right": {
+        "fixed": "1"
+       }
+      },
+      "alias": "+1σ",
+      "replaceFields": false
+     }
+    },
+    {
+     "id": "calculateField",
+     "options": {
+      "mode": "binary",
+      "binary": {
+       "left": {
+        "matcher": {
+         "id": "byName",
+         "options": "Sigma"
+        }
+       },
+       "operator": "*",
+       "right": {
+        "fixed": "1.5"
+       }
+      },
+      "alias": "+1.5σ",
+      "replaceFields": false
+     }
+    },
+    {
+     "id": "calculateField",
+     "options": {
+      "mode": "binary",
+      "binary": {
+       "left": {
+        "matcher": {
+         "id": "byName",
+         "options": "Sigma"
+        }
+       },
+       "operator": "*",
+       "right": {
+        "fixed": "2"
+       }
+      },
+      "alias": "+2σ",
+      "replaceFields": false
+     }
+    },
+    {
+     "id": "calculateField",
+     "options": {
+      "mode": "binary",
+      "binary": {
+       "left": {
+        "matcher": {
+         "id": "byName",
+         "options": "Sigma"
+        }
+       },
+       "operator": "*",
+       "right": {
+        "fixed": "2.5"
+       }
+      },
+      "alias": "+2.5σ",
+      "replaceFields": false
+     }
+    },
+    {
+     "id": "calculateField",
+     "options": {
+      "mode": "binary",
+      "binary": {
+       "left": {
+        "matcher": {
+         "id": "byName",
+         "options": "Sigma"
+        }
+       },
+       "operator": "*",
+       "right": {
+        "fixed": "3"
+       }
+      },
+      "alias": "+3σ",
+      "replaceFields": false
+     }
+    },
+    {
      "id": "organize",
      "options": {
       "indexByName": {
        "time": 0,
        "Long Points": 1,
        "Short Points": 2,
-       "Deviation · Line": 3,
-       "Real Long Deviation · Faded": 4,
-       "Real Short Deviation · Faded": 5,
-       "Real Long Deviation": 6,
-       "Real Short Deviation": 7,
-       "Past T": 8,
-       "+Entry": 9,
-       "Long Dots": 10,
-       "Short Dots": 11,
-       "Deviation · Tooltip": 12,
-       "Real Long Deviation · Tooltip": 13,
-       "Real Short Deviation · Tooltip": 14,
-       "Signal": 15
+       "+1σ": 3,
+       "+1.5σ": 4,
+       "+2σ": 5,
+       "+2.5σ": 6,
+       "+3σ": 7,
+       "Deviation · Line": 8,
+       "Real Long Deviation · Faded": 9,
+       "Real Short Deviation · Faded": 10,
+       "Real Long Deviation": 11,
+       "Real Short Deviation": 12,
+       "Past T": 13,
+       "+Entry": 14,
+       "Long Dots": 15,
+       "Short Dots": 16,
+       "Sigma": 17,
+       "Deviation · Tooltip": 18,
+       "Real Long Deviation · Tooltip": 19,
+       "Real Short Deviation · Tooltip": 20,
+       "Signal": 21
       },
       "renameByName": {
        "Deviation · Line": "Deviation"
       },
-      "excludeByName": {}
+      "excludeByName": {
+       "Sigma": true
+      }
      }
     }
    ]
@@ -4833,7 +7316,7 @@
    "description": "Long Points: Real Long Spread ≤ Mean − Entry · Short Points: Real Short Spread ≥ Mean + Entry · Best: the largest absolute deviation on the favourable side\n\nThe drawn points of the time range with a deviation, by the US market phase they fall in, counted as the Signal reads them, at the notional (none Long, Short or No Book with No Entry or No Notional) · Partial Points: Long and Short points whose side the recorded levels filled less than N, already in Long Points and Short Points · Best Long: the largest Real Long Deviation of the points whose Real Long Spread is below the Mean, Best Short: the largest Real Short Deviation of those whose Real Short Spread is above it (the legend Max of the bright lines on Entry Points · Bps); how far each side came toward or past its Entry (not past T; – where none) · Past T Points: points past the instant a leg's dividend took effect without its amount, amber · No Book Points: points without both legs' books (on trade prices) · these two are in neither Long nor Short Points · Points: every point with a deviation, these included · counts depend on the range, as in the chart.",
    "gridPos": {
     "x": 0,
-    "y": 62,
+    "y": 64,
     "w": 24,
     "h": 8
    },
@@ -5273,7 +7756,7 @@
    "collapsed": false,
    "gridPos": {
     "x": 0,
-    "y": 70,
+    "y": 72,
     "w": 24,
     "h": 1
    },
@@ -5286,7 +7769,7 @@
    "description": "Return = Price ÷ Anchor (USDT) − 1 · Anchor (USDT) = Anchor (USD) ÷ F\n\nPrice: perp last trade as of each point's time, at the seconds both legs have one, none during a split's halt · Anchor (USD): the session's anchor, the bell, F × Binance's index of the perp at the close (Bitget's before Binance lists the perp), replaced for the whole session by the issuer's NAV once stable; less a dividend, or over a split's ratio, from the instant it takes effect; legend and tooltip only · Anchor (USDT): the price where Return is 0, moves slightly with F · F: USD/USDT · Return: right axis, %.",
    "gridPos": {
     "x": 0,
-    "y": 71,
+    "y": 73,
     "w": 24,
     "h": 10
    },
@@ -5519,7 +8002,7 @@
    "description": "Return = Price ÷ Anchor (USDT) − 1 · Anchor (USDT) = Anchor (USD) ÷ F\n\nPrice: perp last trade as of each point's time, at the seconds both legs have one, none during a split's halt · Anchor (USD): the session's anchor, the bell, F × Binance's index of the perp at the close (Bitget's before Binance lists the perp), replaced for the whole session by the issuer's NAV once stable; less a dividend, or over a split's ratio, from the instant it takes effect; legend and tooltip only · Anchor (USDT): the price where Return is 0, moves slightly with F · F: USD/USDT · Return: right axis, %.",
    "gridPos": {
     "x": 0,
-    "y": 81,
+    "y": 83,
     "w": 24,
     "h": 10
    },
@@ -5750,7 +8233,7 @@
    "description": "Return = Price ÷ Anchor (USDT) − 1 · Anchor (USDT) = Anchor (USD) ÷ F\n\nPrice: perp last trade as of each point's time, at the seconds both legs have one, none during a split's halt · Anchor (USD): the session's anchor, the bell, F × Binance's index of the perp at the close (Bitget's before Binance lists the perp); less a dividend, or over a split's ratio, from the instant it takes effect; legend and tooltip only · Anchor (USDT): the price where Return is 0, moves slightly with F · F: USD/USDT · Return: right axis, % · ${ref}: the unleveraged ETF of the same index.",
    "gridPos": {
     "x": 0,
-    "y": 91,
+    "y": 93,
     "w": 24,
     "h": 10
    },
@@ -5981,7 +8464,7 @@
    "description": "Bull Leg = (F·p_bull ÷ A_bull − 1) ÷ 3 · Bear Leg = (F·p_bear ÷ A_bear − 1) ÷ 3 · Sum = Bull Leg + Bear Leg\n\nThe index return each leg implies since the close, on the perps' last trades · Sum: the spread on those trades ÷ 3 in % (0.01 % = 1 bps), right axis; the drawn Spread is on mid prices, apart from it by the trades against the mids · Reference: ${ref}'s own return · each on its anchor less a dividend, or over a split's ratio, from the instant it takes effect.",
    "gridPos": {
     "x": 0,
-    "y": 101,
+    "y": 103,
     "w": 24,
     "h": 10
    },
@@ -6229,7 +8712,7 @@
    "collapsed": false,
    "gridPos": {
     "x": 0,
-    "y": 111,
+    "y": 113,
     "w": 24,
     "h": 1
    },
@@ -6242,7 +8725,7 @@
    "description": "Breakeven Entry = 2 × Taker · Net at Entry = Entry − Breakeven Entry\n\nOne round trip across the band, bps of both legs' notional: four taker fills; the Signal is on the real spreads of the notional, so crossing the spread and going down the levels are inside it · Half Spreads: both legs' half spreads in the newest second with a book of both, what crossing the best levels costs now · Net at Entry: – when Entry is not a positive number · funding not included.",
    "gridPos": {
     "x": 0,
-    "y": 112,
+    "y": 114,
     "w": 24,
     "h": 5
    },
@@ -6452,7 +8935,7 @@
    "collapsed": false,
    "gridPos": {
     "x": 0,
-    "y": 117,
+    "y": 119,
     "w": 24,
     "h": 1
    },
@@ -6465,7 +8948,7 @@
    "description": "Anchor = both legs' NAV once the issuer has given the same figure for 1 h, else both legs' Bell = F × the perp's index at the close\n\nSession: the New York day whose close starts it · Bell: F × the close of the perp's one-minute index kline that ends at the close, Binance's, or Bitget's before Binance lists the perp, USD · NAV: the issuer's current figure · Known Time: when the anchor in use became known (a bell filled in later: close + 2 min; a NAV loaded from the issuer's history: its load time) · Missing: no bell anchor yet, or none · Actions: the session's dividends (ex, USD as declared) and splits, when each takes effect on this CEX and its status: Scheduled, Known, None (no instant), then Applied, Verified, Mismatch, and known MM-DD HH:MM when the amount came after that instant; amber: Mismatch, or Past T without an amount · anchors shown are the session's start, before an action; coming actions: Next Actions · times UTC+8.",
    "gridPos": {
     "x": 0,
-    "y": 118,
+    "y": 120,
     "w": 24,
     "h": 11
    },
@@ -6716,7 +9199,7 @@
    "description": "Missing Minutes = minutes of the range without a candle close · Book Age = seconds since the newest second with a book\n\nSeconds: the recorder's per-second rows with a last price, which give the points and the mean's minute bars · Book Seconds: those with a best bid and a best ask · Levels: the fewest levels the thinner side and the most the deeper side of those books held, the depth the real spreads can take (Bitget SOXS: 5 until 11-20 18:43, 10 until 11-22 12:16, 50 since; Binance SOXL, SOXS: 1 from 11-19 19:15 to 11-20 18:43) · Candle Minutes: the exchanges' one-minute candles, the mean's bar only where a minute's end has neither both legs' books nor both legs' trades; a minute without any bar restarts the mean · Book Age amber from 60 s, red from 300 s.",
    "gridPos": {
     "x": 0,
-    "y": 129,
+    "y": 131,
     "w": 24,
     "h": 6
    },
@@ -7038,6 +9521,25 @@
     "hide": 0
    },
    {
+    "name": "sigma_minutes",
+    "label": "Sigma Scale (min)",
+    "description": "Minutes sigma covers: the population standard deviation of the minute bars' spread over that many minutes, a whole number from 1 to 999,999 (60, 60min); it restarts with the mean · anything else: no sigma lines, Sigma reads No Sigma.",
+    "type": "textbox",
+    "query": "60",
+    "current": {
+     "text": "60",
+     "value": "60"
+    },
+    "options": [
+     {
+      "selected": true,
+      "text": "60",
+      "value": "60"
+     }
+    ],
+    "hide": 0
+   },
+   {
     "name": "d",
     "label": "Entry (bps)",
     "description": "Long: Real Long Spread ≤ Mean − Entry · Short: Real Short Spread ≥ Mean + Entry · a positive number (10, 7.5, 10bps); anything else: the Signal reads No Entry and Mean ± Entry is not drawn.",
@@ -7059,38 +9561,48 @@
    {
     "name": "notional",
     "label": "Notional (USDT)",
-    "description": "N, both legs together: the Real spreads and the Signal fill N through both legs' recorded levels, on what they hold where they hold less · pick one or type another and press Enter: 20000, 20,000, 20k, 2万, 20000U · Enter picks the first listed size whose text contains what is typed, so 0, 1, 5, 10, 50 and 100 need a U (100U) · the titles show the N in use.",
+    "description": "N, both legs together: the Real spreads and the Signal fill N through both legs' pricing levels (2 at a 0.01 tick, 5 at 0.001), on their totals where they hold less (Partial) · pick one or type any amount and press Enter: 2000, 20,000, 20k, 2万, 20000U · the options are written 1k to 100k, so a typed number of four digits or more never picks one; only 1 to 99 (contained in 100 or 500) need a U (50U) · the titles show the N in use.",
     "type": "custom",
-    "query": "1\\,000 : 1000,5\\,000 : 5000,10\\,000 : 10000,50\\,000 : 50000,100\\,000 : 100000",
+    "query": "100 : 100,500 : 500,1k : 1000,5k : 5000,10k : 10000,50k : 50000,100k : 100000",
     "options": [
      {
-      "text": "1,000",
+      "text": "100",
+      "value": "100",
+      "selected": false
+     },
+     {
+      "text": "500",
+      "value": "500",
+      "selected": false
+     },
+     {
+      "text": "1k",
       "value": "1000",
       "selected": false
      },
      {
-      "text": "5,000",
+      "text": "5k",
       "value": "5000",
       "selected": false
      },
      {
-      "text": "10,000",
+      "text": "10k",
       "value": "10000",
       "selected": true
      },
      {
-      "text": "50,000",
+      "text": "50k",
       "value": "50000",
       "selected": false
      },
      {
-      "text": "100,000",
+      "text": "100k",
       "value": "100000",
       "selected": false
      }
     ],
     "current": {
-     "text": "10,000",
+     "text": "10k",
      "value": "10000",
      "selected": true
     },
@@ -7210,6 +9722,66 @@
     },
     "definition": "SELECT coalesce(((SELECT CASE WHEN m[1]::integer > 0 THEN m[1]::integer END FROM regexp_match(regexp_replace(lower(normalize('$ma_minutes', NFKC)), '[[:space:]_]', '', 'g'), '^([0-9]{1,6})(?:min|m)?$') m))::text, '?')",
     "query": "SELECT coalesce(((SELECT CASE WHEN m[1]::integer > 0 THEN m[1]::integer END FROM regexp_match(regexp_replace(lower(normalize('$ma_minutes', NFKC)), '[[:space:]_]', '', 'g'), '^([0-9]{1,6})(?:min|m)?$') m))::text, '?')",
+    "refresh": 1,
+    "sort": 0,
+    "multi": false,
+    "includeAll": false,
+    "current": {},
+    "options": [],
+    "hide": 2,
+    "allowCustomValue": false
+   },
+   {
+    "name": "sigma_text",
+    "label": "Sigma Scale in Use",
+    "description": "",
+    "type": "query",
+    "datasource": {
+     "type": "grafana-postgresql-datasource",
+     "uid": "etfpair"
+    },
+    "definition": "SELECT coalesce(((SELECT CASE WHEN m[1]::integer > 0 THEN m[1]::integer END FROM regexp_match(regexp_replace(lower(normalize('$sigma_minutes', NFKC)), '[[:space:]_]', '', 'g'), '^([0-9]{1,6})(?:min|m)?$') m))::text, '?')",
+    "query": "SELECT coalesce(((SELECT CASE WHEN m[1]::integer > 0 THEN m[1]::integer END FROM regexp_match(regexp_replace(lower(normalize('$sigma_minutes', NFKC)), '[[:space:]_]', '', 'g'), '^([0-9]{1,6})(?:min|m)?$') m))::text, '?')",
+    "refresh": 1,
+    "sort": 0,
+    "multi": false,
+    "includeAll": false,
+    "current": {},
+    "options": [],
+    "hide": 2,
+    "allowCustomValue": false
+   },
+   {
+    "name": "bull_levels",
+    "label": "Bull Pricing Levels",
+    "description": "",
+    "type": "query",
+    "datasource": {
+     "type": "grafana-postgresql-datasource",
+     "uid": "etfpair"
+    },
+    "definition": "SELECT etfpair.pricing_levels(bull_tick) FROM etfpair.combo_market WHERE combo_id = '$combo' AND venue = '$venue'",
+    "query": "SELECT etfpair.pricing_levels(bull_tick) FROM etfpair.combo_market WHERE combo_id = '$combo' AND venue = '$venue'",
+    "refresh": 1,
+    "sort": 0,
+    "multi": false,
+    "includeAll": false,
+    "current": {},
+    "options": [],
+    "hide": 2,
+    "allowCustomValue": false
+   },
+   {
+    "name": "bear_levels",
+    "label": "Bear Pricing Levels",
+    "description": "",
+    "type": "query",
+    "datasource": {
+     "type": "grafana-postgresql-datasource",
+     "uid": "etfpair"
+    },
+    "definition": "SELECT etfpair.pricing_levels(bear_tick) FROM etfpair.combo_market WHERE combo_id = '$combo' AND venue = '$venue'",
+    "query": "SELECT etfpair.pricing_levels(bear_tick) FROM etfpair.combo_market WHERE combo_id = '$combo' AND venue = '$venue'",
     "refresh": 1,
     "sort": 0,
     "multi": false,
@@ -7362,7 +9934,7 @@
    "title": "Reset",
    "type": "link",
    "icon": "bolt",
-   "url": "/d/arb-etf-pair-combo-spread/combo-spread?orgId=1&from=now-6h&to=now&refresh=30s&var-combo=${combo}&var-venue=${venue}&var-ma=sma&var-ma_minutes=60&var-d=10&var-notional=10000",
+   "url": "/d/arb-etf-pair-combo-spread/combo-spread?orgId=1&from=now-6h&to=now&refresh=30s&var-combo=${combo}&var-venue=${venue}&var-ma=sma&var-ma_minutes=60&var-sigma_minutes=60&var-d=10&var-notional=10000",
    "tooltip": "Settings, time range and refresh back to defaults; Combo and CEX stay.",
    "targetBlank": false,
    "keepTime": false,

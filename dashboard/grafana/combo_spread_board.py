@@ -19,7 +19,7 @@ every figure is rounded once in SQL to the decimals it is shown with
 (shown()). The typed settings (Notional, Entry, Mean Scale) reach SQL only
 as quoted text, parsed once per query (SETTINGS); one that is not a number
 gives a reason (No Notional, No Entry, No Mean), never a query error."""
-from boardkit import (BAD, BLUE, BPS, GREY, LIGHT_GREY, NO_FIGURE, ORANGE, PHASES, PURPLE, SIGNED, TEAL, TEXT, WARN, bands, code_texts, col,
+from boardkit import (BAD, BLUE, BPS, GREY, LIGHT_GREY, NO_FIGURE, ORANGE, PHASES, PURPLE, SIGNED, TEAL, TEXT, WARN, bands, calc, code_texts, col,
                       copy_field, custom_var, group_by, keep_fields, marks, named, organize, query_var, reset_ids, reset_link, row, rows_with, series, sort_by, sql,
                       stat_strip, table, textbox_var, timeseries, tooltip_only)
 
@@ -54,20 +54,26 @@ MEAN_SCALE = "(SELECT CASE WHEN m[1]::integer > 0 THEN m[1]::integer END FROM re
 # Entry and Mean Scale as the titles show them, whatever was typed (10bps, 30min): the value in use, ? when there is none.
 D_TEXT = "SELECT coalesce(rtrim(rtrim(to_char(%s, 'FM999,999,990.999999'), '0'), '.'), '?')" % ENTRY
 MA_TEXT = "SELECT coalesce((%s)::text, '?')" % MEAN_SCALE
-# The typed settings, read once per query (one row v): N, Entry and Mean Scale; every figure of a query takes them from it.
-SETTINGS = "(SELECT %s AS n, %s AS d, %s AS ma_n) v" % (NOTIONAL, ENTRY, MEAN_SCALE)
+# Sigma Scale, sigma's minutes, as typed: as Mean Scale; NULL for anything else, for which the board has no sigma (No Sigma).
+SIGMA_SCALE = "(SELECT CASE WHEN m[1]::integer > 0 THEN m[1]::integer END FROM regexp_match(%s, '^([0-9]{1,6})(?:min|m)?$') m)" % typed("sigma_minutes")
+SIGMA_TEXT = "SELECT coalesce((%s)::text, '?')" % SIGMA_SCALE
+# The typed settings, read once per query (one row v): N, Entry, Mean Scale and Sigma Scale; every figure of a query takes them
+# from it.
+SETTINGS = "(SELECT %s AS n, %s AS d, %s AS ma_n, %s AS sig_n) v" % (NOTIONAL, ENTRY, MEAN_SCALE, SIGMA_SCALE)
+# The sigma multiples drawn around the Mean (Spread chart) and zero (Deviation chart, + only on Entry Points), owner item 61.
+SIGMAS = (1, 1.5, 2, 2.5, 3)
 # The end of the range, or now when the range runs into the future.
 END_MS = "least($__to, (extract(epoch FROM now()) * 1000)::bigint)"
 NOW_MS = "(extract(epoch FROM now()) * 1000)::bigint"
 # What the Spread row draws (etfpair.combo_range, LATERAL to v): each point at the time its value was known, and a row with
 # only its time where the lines break: at missing data and at the start of a session.
-RANGE = "etfpair.combo_range('$combo', '$venue', '$ma', v.ma_n, $__from, $__to, %s, v.n, v.d) r" % STEP_MS
+RANGE = "etfpair.combo_range('$combo', '$venue', '$ma', v.ma_n, v.sig_n, $__from, $__to, %s, v.n, v.d) r" % STEP_MS
 # What the Prices row draws (etfpair.combo_prices): trade prices only, no mean and no book.
 PRICES = "etfpair.combo_prices('$combo', '$venue', $__from, $__to, %s) p" % STEP_MS
 # The snapshot strips' two newest seconds, whatever the time range (etfpair.combo_last, LATERAL to v, ten minutes back at
 # most): kind 'prices', the newest second at which both legs and the reference have a trade price; kind 'basis', the newest at
 # which both legs have a basis price, the point combo_range would draw there.
-LAST = "etfpair.combo_last('$combo', '$venue', '$ma', v.ma_n, v.n, v.d, %s) x" % NOW_MS
+LAST = "etfpair.combo_last('$combo', '$venue', '$ma', v.ma_n, v.sig_n, v.n, v.d, %s) x" % NOW_MS
 
 
 def shown(x, decimals):
@@ -81,7 +87,7 @@ def shown(x, decimals):
 # stay NULL. FULL is a fill that took the whole notional. No Entry is a Signal only (Entry is not a positive number); Other
 # Side is a real deviation in the Signal strip on the side of the mean its real spread cannot fill on.
 NO_VALUE = {-2000000000: "No Book", -3000000000: "No Notional", -4000000000: "No Anchor", -5000000000: "Past T", -6000000000: "No Mean",
-            -7000000000: "Not Recorded", -9000000000: "No Entry", -10000000000: "Other Side"}
+            -9000000000: "No Entry", -10000000000: "Other Side", -11000000000: "No Sigma", -12000000000: "Few Levels"}
 CODE = {text: code for code, text in NO_VALUE.items()}
 FULL = -8000000000
 
@@ -90,9 +96,11 @@ def reason(text, x, leg=None):
     """When a point of x (a row of combo_range or combo_last) has a reason: no anchor or F (no spread); past T of a leg's
     dividend without its amount; no mean (not ready, or no valid Mean Scale typed); no valid notional typed (v.n, the
     query's settings); not on both legs' books (No Book; with leg, that leg has no usable book); leg's recorded levels end
-    within its second 0.01 level (Not Recorded, the last resort of a depth)."""
+    query's settings); not on both legs' books (No Book; with leg, that leg has no usable book); no sigma (not ready, or no
+    valid Sigma Scale typed); a side with fewer levels than the leg's pricing levels (Few Levels, the last resort of a real
+    spread or a depth)."""
     return {"No Anchor": "{x}.s_bps IS NULL", "Past T": "{x}.past_t", "No Mean": "{x}.mu_bps IS NULL", "No Notional": "NOT coalesce(v.n > 0, false)",
-            "No Book": "NOT {x}.book_%s" % leg if leg else "{x}.basis <> 'mid'", "Not Recorded": "true"}[text].format(x=x)
+            "No Book": "NOT {x}.book_%s" % leg if leg else "{x}.basis <> 'mid'", "No Sigma": "true", "Few Levels": "true"}[text].format(x=x)
 
 
 def coded(x, value, decimals, before=(), after=(), leg=None, side=None):
@@ -111,13 +119,14 @@ def coded(x, value, decimals, before=(), after=(), leg=None, side=None):
 
 # The reasons each figure can lack a value, in order (DESIGN 1.9).
 SPREAD_WHY = dict(after=("No Anchor",))
-REAL_WHY = dict(after=("No Anchor", "No Notional", "No Book"))
+REAL_WHY = dict(after=("No Anchor", "No Notional", "No Book", "Few Levels"))
 MEAN_WHY = dict(after=("No Anchor", "Past T", "No Mean"))
-REAL_DEV_WHY = dict(before=("No Anchor", "Past T"), after=("No Mean", "No Notional", "No Book"))
+SIGMA_WHY = dict(after=("No Anchor", "Past T", "No Sigma"))
+REAL_DEV_WHY = dict(before=("No Anchor", "Past T"), after=("No Mean", "No Notional", "No Book", "Few Levels"))
 
 
 def depth_why(leg):
-    return dict(after=("No Book", "Not Recorded"), leg=leg)
+    return dict(after=("No Book", "Few Levels"), leg=leg)
 
 
 # The Signal of each point as a number, for the charts' tooltips, and its text and colour there (those of the Signal figure).
@@ -143,33 +152,45 @@ def fill(x, side):
 # The alpha of a faded line's #rrggbbaa colour: a quarter of the opacity.
 FADED = "40"
 LEGS = (("Bid", "bid", "Bull", "bull"), ("Bid", "bid", "Bear", "bear"), ("Ask", "ask", "Bull", "bull"), ("Ask", "ask", "Bear", "bear"))
-# Each leg's book in the newest second and in the tooltip: the contracts of its first two 0.01 levels on a side, shown with
-# their unit (ct).
-DEPTHS = [("%s 1+2 Depth · %s" % (side, leg), "%s 1+2 Depth · ${%s}" % (side, low_leg), "%s12_%s" % (low_side, low_leg), low_leg)
-          for side, low_side, leg, low_leg in LEGS]
+# Each leg's depth on a side in the tooltip: the total of its pricing levels (1 to ${bull_levels}: 2 at a 0.01 tick, 5 at
+# 0.001), in contracts (ct) and in USDT. (frame column, shown name, combo_range column, leg).
+DEPTHS = [("%s %s %s" % (side, leg, unit), "%s 1–${%s_levels} · ${%s} · %s" % (side, low_leg, low_leg, unit), "%s_%s_%s" % (low_side, unit.lower(), low_leg), low_leg)
+          for unit in ("ct", "USDT") for side, low_side, leg, low_leg in LEGS]
 CONTRACTS = "suffix: ct"
 
-# The newest seconds (combo_last, called once; p its prices second, b its basis second): the US market phase now; the trade
-# prices with their anchors and the reference's return; the basis second's spread, mean, deviation, anchor status and USD/USDT;
-# its real deviations, each shown on the side of the mean its real spread can fill on (Real Long Spread below the Mean, Real
-# Short Spread above it) and Other Side on the other, fills and Signal; both legs' 1+2 depths. One row: each strip shows its
-# columns of it.
+# The newest seconds (combo_last, called once; p its prices second, b its basis second), in two rows. Row 1 holds the strips'
+# figures: the US market phase now; the trade prices with their anchors and the reference's return; the basis second's
+# spread, mean, sigma, deviation, anchor status and USD/USDT; its real deviations, each shown on the side of the mean its real
+# spread can fill on (Real Long Spread below the Mean, Real Short Spread above it) and Other Side on the other, fills and
+# Signal. Both rows hold the Book table, one leg each: its ticker, price tick, pricing levels and the depth of those levels on
+# each side in contracts and USDT. A strip reduces each field to its last value, the table keeps the rows with a Leg.
 LAST_COLUMNS = [
     ("Phase", "(SELECT phase FROM etfpair.etf_phase WHERE start_ms <= %s AND end_ms > %s)" % (NOW_MS, NOW_MS)),
     ("Bull Price", "p.p_bull"), ("Bull Anchor", shown("p.a_bull", 2)), ("Bear Price", "p.p_bear"), ("Bear Anchor", shown("p.a_bear", 2)),
     ("Ref Price", "p.p_ref"), ("Ref Return", shown("100 * (p.fx * p.p_ref / p.a_ref - 1)", 2)),
     ("Spread", coded("b", "b.s_bps", 2, **SPREAD_WHY)), ("Mean", coded("b", "b.mu_bps", 2, **MEAN_WHY)),
+    ("Sigma", coded("b", "b.sigma_bps", 2, **SIGMA_WHY)),
     ("Deviation", coded("b", "abs(b.s_bps - b.mu_bps)", 2, **MEAN_WHY)), ("Anchor Status", "b.anchor_status"), ("USD/USDT", "b.fx"),
     ("Real Long Deviation", coded("b", "abs(b.s_long_bps - b.mu_bps)", 2, side="b.s_long_bps < b.mu_bps", **REAL_DEV_WHY)),
     ("Real Short Deviation", coded("b", "abs(b.s_short_bps - b.mu_bps)", 2, side="b.s_short_bps > b.mu_bps", **REAL_DEV_WHY)),
-    ("Long Fill", fill("b", "long")), ("Short Fill", fill("b", "short")), ("Signal", "b.signal")] + [
-    (name, coded("b", "b." + c, 2, **depth_why(leg))) for name, _, c, leg in DEPTHS]
+    ("Long Fill", fill("b", "long")), ("Short Fill", fill("b", "short")), ("Signal", "b.signal")]
+BOOK_COLUMNS = [("Leg", "k.ticker"), ("Tick", "trim_scale(k.tick)::text"), ("Levels", "'1–' || etfpair.pricing_levels(k.tick)")] + [
+    ("%s · %s" % (side, unit), "CASE g.i WHEN 1 THEN %s ELSE %s END" % (
+        coded("b", "b.%s_%s_bull" % (low_side, unit.lower()), 2 if unit == "ct" else 0, **depth_why("bull")),
+        coded("b", "b.%s_%s_bear" % (low_side, unit.lower()), 2 if unit == "ct" else 0, **depth_why("bear"))))
+    for side, low_side in (("Bid", "bid"), ("Ask", "ask")) for unit in ("ct", "USDT")]
 Q_LAST = sql("""
 WITH v AS MATERIALIZED (SELECT * FROM @SETTINGS@),
      l AS MATERIALIZED (SELECT x.* FROM v CROSS JOIN LATERAL @LAST@)
 SELECT @COLUMNS@
-FROM v LEFT JOIN l p ON p.kind = 'prices' LEFT JOIN l b ON b.kind = 'basis'""", SETTINGS=SETTINGS, LAST=LAST,
-             COLUMNS=",\n       ".join('%s AS "%s"' % (q, name) for name, q in LAST_COLUMNS))
+FROM v LEFT JOIN l p ON p.kind = 'prices' LEFT JOIN l b ON b.kind = 'basis'
+CROSS JOIN (VALUES (1), (2)) g(i)
+LEFT JOIN LATERAL (SELECT CASE g.i WHEN 1 THEN c.bull_ticker ELSE c.bear_ticker END AS ticker, CASE g.i WHEN 1 THEN m.bull_tick ELSE m.bear_tick END AS tick
+                   FROM etfpair.combo c JOIN etfpair.combo_market m ON m.combo_id = c.combo_id
+                   WHERE c.combo_id = '$combo' AND m.venue = '$venue') k ON true
+ORDER BY g.i""", SETTINGS=SETTINGS, LAST=LAST,
+             COLUMNS=",\n       ".join(['CASE WHEN g.i = 1 THEN %s END AS "%s"' % (q, name) for name, q in LAST_COLUMNS] +
+                                        ['%s AS "%s"' % (q, name) for name, q in BOOK_COLUMNS]))
 
 
 def phase_hours(name):
@@ -254,13 +275,15 @@ def phase_marks(name):
 #   its name (a number in the frame is a fifth of the bytes of the name); 0 or 1 per kind of point; the absolute real deviation of
 #   a point on the favourable side of the mean (not past T), whose largest is the phase's Best.
 SPREAD_CHART = [("Spread", shown("r.s_bps", 1)), ("Mean", shown("r.mu_bps", 1)), ("Mean + Entry", shown("r.mu_bps + v.d", 1)),
-                ("Mean − Entry", shown("r.mu_bps - v.d", 1)),
+                ("Mean − Entry", shown("r.mu_bps - v.d", 1)), ("Sigma", shown("r.sigma_bps", 2)),
                 ("Spread · Tooltip", coded("r", "r.s_bps", 1, **SPREAD_WHY)), ("Real Long Spread", coded("r", "r.s_long_bps", 1, **REAL_WHY)),
                 ("Real Short Spread", coded("r", "r.s_short_bps", 1, **REAL_WHY)), ("Mean · Tooltip", coded("r", "r.mu_bps", 1, **MEAN_WHY)),
+                ("Sigma · Tooltip", coded("r", "r.sigma_bps", 2, **SIGMA_WHY)),
                 ("Deviation · Tooltip", coded("r", "abs(r.s_bps - r.mu_bps)", 1, **MEAN_WHY)),
                 ("Real Long Deviation · Tooltip", coded("r", "abs(r.s_long_bps - r.mu_bps)", 1, **REAL_DEV_WHY)),
                 ("Real Short Deviation · Tooltip", coded("r", "abs(r.s_short_bps - r.mu_bps)", 1, **REAL_DEV_WHY)),
-                ("Signal", signal_code("r"))] + [(name, coded("r", "r." + c, 2, **depth_why(leg))) for name, _, c, leg in DEPTHS]
+                ("Signal", signal_code("r"))] + [(name, coded("r", "r." + c, 2 if c.split("_")[1] == "ct" else 0, **depth_why(leg)))
+                                                  for name, _, c, leg in DEPTHS]
 DEVIATION_CHART = [("Signed Deviation", "CASE WHEN NOT r.past_t THEN %s END" % shown("r.s_bps - r.mu_bps", 1)),
                    ("Signed Real Long Deviation", "CASE WHEN NOT r.past_t THEN %s END" % shown("r.s_long_bps - r.mu_bps", 1)),
                    ("Signed Real Short Deviation", "CASE WHEN NOT r.past_t THEN %s END" % shown("r.s_short_bps - r.mu_bps", 1)),
@@ -429,15 +452,48 @@ FILLED = code_texts({**NO_VALUE, FULL: "Full"}, {"Full": "text", "Past T": WARN,
 # and over it the two real lines (their inner edges decide a signal: UI review r1 S1), the band's edges and Past T; the tooltip's
 # twins, in its order, and the Signal last.
 DEVIATION_FIELDS = ["time", "Signed Deviation", "Signed Real Long Deviation", "Signed Real Short Deviation", "+Entry", "−Entry", "Signed Past T",
-                    "Signed Deviation · Tooltip", "Signed Real Long Deviation · Tooltip", "Signed Real Short Deviation · Tooltip", "Signal"]
+                    "Sigma", "Signed Deviation · Tooltip", "Signed Real Long Deviation · Tooltip", "Signed Real Short Deviation · Tooltip",
+                    "Sigma · Tooltip", "Signal"]
 DEVIATION_BAND = [copy_field("+Entry", "Band Top"), copy_field("−Entry", "Band Bottom")]
-DEVIATION_ORDER = DEVIATION_FIELDS[:1] + ["Band Top", "Band Bottom"] + DEVIATION_FIELDS[1:]
+
+
+def sigma_text(k):
+    return "%gσ" % k
+
+
+# The sigma lines (owner item 61), made in the browser from the frame's Sigma (and Mean) so that the frame carries one column for
+# them, not ten: on the Spread chart Mean ± k σ, on the Deviation chart ± k σ, on Entry Points + k σ. Each is drawn behind the
+# data, grey and thin, whole multiples dashed and halves dotted, none in the legend (its Sigma row gives σ itself) nor the tooltip.
+def sigma_line(name, legend=False):
+    k = float(name.split(" ")[-1].lstrip("+−±").rstrip("σ"))
+    whole = k == int(k)
+    return series(name, GREY + ("C0" if whole else "90"), width=1, dash=[6, 4] if whole else [2, 3], legend=legend, tooltip=False)
+
+
+SIGMA_STEPS = ["%s · Step" % sigma_text(k) for k in SIGMAS if k != 1]   # k σ, to add to the Mean; not shown
+
+
+def sigma_of(k):
+    return "Sigma" if k == 1 else "%s · Step" % sigma_text(k)
+
+
+SPREAD_SIGMAS = [("Mean %s %s" % (sign, sigma_text(k)), k) for k in SIGMAS for sign in ("+", "−")]
+SPREAD_SIGMA_CALCS = [calc("%s · Step" % sigma_text(k), "Sigma", "*", k) for k in SIGMAS if k != 1] + [
+    calc(name, "Mean", "+" if "+" in name else "-", sigma_of(k)) for name, k in SPREAD_SIGMAS]
+DEVIATION_SIGMAS = [("%s%s" % (sign, sigma_text(k)), k) for k in SIGMAS for sign in ("+", "−")]
+DEVIATION_SIGMA_CALCS = [calc(name, "Sigma", "*", k if name.startswith("+") else -k) for name, k in DEVIATION_SIGMAS]
+DEVIATION_ORDER = (DEVIATION_FIELDS[:1] + ["Band Top", "Band Bottom"] + [name for name, _ in DEVIATION_SIGMAS] + DEVIATION_FIELDS[1:7] +
+                   ["Sigma"] + DEVIATION_FIELDS[8:])
+ENTRY_SIGMAS = [("+" + sigma_text(k), k) for k in SIGMAS]
+ENTRY_SIGMA_CALCS = [calc(name, "Sigma", "*", k) for name, k in ENTRY_SIGMAS]
 DEVIATION_NAMES = {"Signed Deviation": "Deviation", "Signed Real Long Deviation": "Real Long Deviation",
                    "Signed Real Short Deviation": "Real Short Deviation", "Signed Past T": "Past T"}
 # The Entry Points chart: the faded real lines come before the bright ones, which Grafana then draws over them.
 ENTRY_FIELDS = ["time", "Long Points", "Short Points", "Deviation · Line", "Real Long Deviation · Faded", "Real Short Deviation · Faded",
-                    "Real Long Deviation", "Real Short Deviation", "Past T", "+Entry", "Long Dots", "Short Dots", "Deviation · Tooltip",
-                    "Real Long Deviation · Tooltip", "Real Short Deviation · Tooltip", "Signal"]
+                "Real Long Deviation", "Real Short Deviation", "Past T", "+Entry", "Long Dots", "Short Dots", "Sigma", "Deviation · Tooltip",
+                "Real Long Deviation · Tooltip", "Real Short Deviation · Tooltip", "Signal"]
+ENTRY_ORDER = ENTRY_FIELDS[:3] + [name for name, _ in ENTRY_SIGMAS] + ENTRY_FIELDS[3:]
+SPREAD_ORDER = ["time"] + [name for name, _ in SPREAD_SIGMAS] + [name for name, _ in SPREAD_CHART]
 ENTRY_SUMS = ["Long Point", "Short Point", "Partial Point", "Past T Point", "No Book Point"]
 ENTRY_TABLE = [("Phase", "Phase"), ("Long Point (sum)", "Long Points"), ("Short Point (sum)", "Short Points"), ("Partial Point (sum)", "Partial Points"),
                ("Best Long (max)", "Best Long"), ("Best Short (max)", "Best Short"), ("Past T Point (sum)", "Past T Points"),
@@ -455,6 +511,13 @@ def price_fields(name):
     return [keep_fields(["time"] + columns), organize(["time"] + columns, rename={c: c[len(name) + 1:] for c in columns})]
 
 
+# The Notional's options, fixed sizes from 100 U (item 61) to 100k: written in k from 1,000 on, so that a typed amount (Grafana
+# picks the first option whose text contains what is typed, on Enter) never picks one unless it is 1 to 99.
+NOTIONAL_OPTIONS = [("100", "100"), ("500", "500")] + [("%dk" % (v // 1000), str(v)) for v in (1000, 5000, 10000, 50000, 100000)]
+# A leg's pricing levels (etfpair.pricing_levels of its tick), for the names of its depths.
+LEVELS = "SELECT etfpair.pricing_levels(%s_tick) FROM etfpair.combo_market WHERE combo_id = '$combo' AND venue = '$venue'"
+
+
 def build():
     reset_ids()
     templating = [
@@ -465,13 +528,16 @@ def build():
         custom_var("ma", "EMA/SMA", [("EMA", "ema"), ("SMA", "sma")], "sma", "SMA: plain average · EMA: alpha = 2 ÷ (Mean Scale + 1)."),
         textbox_var("ma_minutes", "Mean Scale (min)", "60", "Minutes the mean covers, a whole number from 1 to 999,999 (60, 60min); it restarts at each "
                     "close · anything else: no mean, the Mean, the deviations and the Signal read No Mean."),
+        textbox_var("sigma_minutes", "Sigma Scale (min)", "60", "Minutes sigma covers: the population standard deviation of the "
+                    "minute bars' spread over that many minutes, a whole number from 1 to 999,999 (60, 60min); it restarts with the mean · "
+                    "anything else: no sigma lines, Sigma reads No Sigma."),
         textbox_var("d", "Entry (bps)", "10", "Long: Real Long Spread ≤ Mean − Entry · Short: Real Short Spread ≥ Mean + Entry · a positive "
                     "number (10, 7.5, 10bps); anything else: the Signal reads No Entry and Mean ± Entry is not drawn."),
-        custom_var("notional", "Notional (USDT)", [("{:,}".format(v), str(v)) for v in (1000, 5000, 10000, 50000, 100000)], "10000",
-                   "N, both legs together: the Real spreads and the Signal fill N through both legs' recorded levels, on what they hold "
-                   "where they hold less · pick one or type another and press Enter: 20000, 20,000, 20k, 2万, 20000U · Enter picks the "
-                   "first listed size whose text contains what is typed, so 0, 1, 5, 10, 50 and 100 need a U (100U) · the titles show the "
-                   "N in use.",
+        custom_var("notional", "Notional (USDT)", NOTIONAL_OPTIONS, "10000",
+                   "N, both legs together: the Real spreads and the Signal fill N through both legs' pricing levels (2 at a 0.01 tick, 5 "
+                   "at 0.001), on their totals where they hold less (Partial) · pick one or type any amount and press Enter: 2000, "
+                   "20,000, 20k, 2万, 20000U · the options are written 1k to 100k, so a typed number of four digits or more never "
+                   "picks one; only 1 to 99 (contained in 100 or 500) need a U (50U) · the titles show the N in use.",
                    allow_custom=True),
         query_var("bull", "Bull", "SELECT bull_ticker FROM etfpair.combo WHERE combo_id = '$combo'", "", hide=2),
         query_var("bear", "Bear", "SELECT bear_ticker FROM etfpair.combo WHERE combo_id = '$combo'", "", hide=2),
@@ -479,6 +545,9 @@ def build():
         query_var("n_text", "Notional in Use", N_TEXT, "", hide=2),
         query_var("d_text", "Entry in Use", D_TEXT, "", hide=2),
         query_var("ma_text", "Mean Scale in Use", MA_TEXT, "", hide=2),
+        query_var("sigma_text", "Sigma Scale in Use", SIGMA_TEXT, "", hide=2),
+        query_var("bull_levels", "Bull Pricing Levels", LEVELS % "bull", "", hide=2),
+        query_var("bear_levels", "Bear Pricing Levels", LEVELS % "bear", "", hide=2),
     ]
     panels, y = [], 0
     bps2 = {"unit": BPS, "decimals": 2}
@@ -509,6 +578,8 @@ def build():
         ("Mean", "The same on each leg's ${ma:text} of its minute bars over the ${ma_text} min before, this session only · a bar: both "
          "legs' mids at the minute's end, else their trades, else their candle closes · No Mean: not ready, or Mean Scale is not a whole "
          "number of minutes.", dict(bps2, **why)),
+        ("Sigma", "σ: the population standard deviation of the minute bars' spread over the ${sigma_text} min before, this session "
+         "only, as the trading program's (PRD 4.4) · No Sigma: not ready, or Sigma Scale is not a whole number of minutes.", dict(bps2, **why)),
         ("Deviation", "|Spread − Mean|, absolute: its side is in the Signal.", dict(bps2, **why)),
         ("Anchor Status", "NAV: both legs on the issuer's NAV, the same figure for 1 h · Bell: both legs on F × the perp's index at the close "
          "(Binance's; Bitget's before Binance lists it), provisional · Missing: no bell anchor yet, or none.", {"mappings": [STATUS]}),
@@ -519,17 +590,17 @@ def build():
     panels.append(stat_strip("Signal · Latest Second · Notional ${n_text} USDT", None, [
         ("Real Long Deviation", "|Real Long Spread − Mean| while Real Long Spread is below the Mean, the side a Long fills on · Other "
          "Side (grey): Real Long Spread at or above the Mean, where a Long cannot come (the tooltips still give |Real Long Spread − "
-         "Mean| there) · Real Long Spread: the Spread on the average prices of buying both legs for N through their recorded asks "
+         "Mean| there) · Real Long Spread: the Spread on the average prices of buying both legs for N through their pricing levels' asks "
          "(open Long, close Short).", dict(bps2, **why)),
         ("Real Short Deviation", "|Real Short Spread − Mean| while Real Short Spread is above the Mean, the side a Short fills on · "
-         "Other Side: at or below the Mean · Real Short Spread: selling both legs for N through their recorded bids (open Short, close "
-         "Long).", dict(bps2, **why)),
-        ("Long Fill", "USDT of N the recorded asks of both legs fill, the quantities making q·A equal on both legs · Full: all of N · "
-         "less where the recorded levels (now 5 a side at a 0.01 tick, 50 at 0.001; fewer earlier, see Data Coverage · Levels) hold "
-         "less: the real spread is then on what they hold; the exchange's book may hold more.", dict(usdt, mappings=[NO_FIGURE, FILLED])),
-        ("Short Fill", "The same on the recorded bids.", dict(usdt, mappings=[NO_FIGURE, FILLED])),
+         "Other Side: at or below the Mean · Real Short Spread: selling both legs for N through their pricing levels' bids (open "
+         "Short, close Long).", dict(bps2, **why)),
+        ("Long Fill", "USDT of N the asks of both legs' pricing levels fill (${bull} 1–${bull_levels}, ${bear} 1–${bear_levels}), the "
+         "quantities making q·A equal on both legs · Full: all of N · less where those levels hold less (Partial): the real spread is "
+         "then on their totals, as Book · Latest Second shows them.", dict(usdt, mappings=[NO_FIGURE, FILLED])),
+        ("Short Fill", "The same on the pricing levels' bids.", dict(usdt, mappings=[NO_FIGURE, FILLED])),
         ("Signal", "Long: Real Long Spread ≤ Mean − Entry · Short: Real Short Spread ≥ Mean + Entry · Partial: that side filled less "
-         "than N · None: inside · No Anchor: not ready · No Mean: not ready, or Mean Scale is not a whole number of minutes from 1 to 999,999 · No Book: "
+         "than N (its pricing levels hold less) · None: inside · No Anchor: not ready · No Mean: not ready, or Mean Scale is not a whole number of minutes from 1 to 999,999 · No Book: "
          "not on both legs' books (trade prices, as before the recorder) · No Notional: the typed notional is not a positive number "
          "(the title shows ? or 0), amber · No Entry: Entry is not a positive number, amber · Past T: a leg's dividend took effect "
          "without its amount, amber, no signal until the amount is known.", {"mappings": [SIGNAL]}),
@@ -537,15 +608,21 @@ def build():
                           "the side of the Mean its real spread can fill on, as the bright lines of Entry Points · Bps (Other Side on the "
                           "other), and the Signal gives the side.",
         source=prices)); y += 3
-    # Contracts, as the tooltips show them: the unit's suffix leaves out the separators of thousands that locale gives.
-    contracts = {"unit": CONTRACTS, "decimals": 2}
-    panels.append(stat_strip("Book · Latest Second · Contracts", None, [
-        (name, about, dict(contracts, displayName=display, mappings=[NO_FIGURE, WHY])) for (name, display, _, _), about in zip(DEPTHS, (
-            "The size of the leg's first two bid levels at a 0.01 tick, ct: contracts (shares of the ETF), as recorded · Bitget SOXS (a "
-            "0.001 tick): its levels merged into 0.01 ones, bids down and asks up, as Bitget's own 0.01 depth · No Book: no usable book "
-            "of the leg in that second · Not Recorded: its recorded levels end within the second 0.01 level (Binance SOXL, SOXS 11-19 "
-            "19:15 to 11-20 18:43; Bitget SOXS before 11-22 12:16, at times).", "", "The same on the asks.", ""))],
-        0, y, 24, 3, intro="The same second: each leg's book, the contracts (ct) at its first two 0.01 price levels.", source=prices)); y += 3
+    # The book of each leg in the same second, a row a leg (Q_LAST's two rows): its price tick on this CEX, its pricing levels
+    # and their depth on each side, in contracts and USDT (owner item 61, point 4).
+    depth_ct = dict(custom_align="right", unit="locale", decimals=2, mappings=[NO_FIGURE, WHY])
+    depth_usdt = dict(custom_align="right", unit="locale", decimals=0, mappings=[NO_FIGURE, WHY])
+    book_fields = [name for name, _ in BOOK_COLUMNS]
+    panels.append(table("Book · Latest Second · Pricing Levels", None, 0, y, 24, 5, source=prices,
+                        transformations=[keep_fields(book_fields), rows_with("Leg")], description=(
+        "Depth = the total of a leg's pricing levels on a side: ct (contracts, shares of the ETF) and USDT (Σ price × size)\n\n"
+        "The same second as the strips above · Tick: the leg's price tick on this CEX · Levels: its pricing levels, the first levels "
+        "from the best price on the side a taker takes, as the trading program prices (PRD 3.2): 2 at a 0.01 tick (SOXL), 5 at 0.001 "
+        "(Bitget SOXS), the levels as recorded, never merged into 0.01 ones · the Real spreads, the fills and the Signal take N "
+        "through these levels only · the total, not the program's takeable half · No Book: no usable book of the leg in that second "
+        "· Few Levels: that side holds fewer levels than its pricing levels (no pricing level)."), overrides=[
+        col("Leg", 80), col("Tick", 80, custom_align="right"), col("Levels", 80, custom_align="right"),
+        col("Bid · ct", **depth_ct), col("Bid · USDT", **depth_usdt), col("Ask · ct", **depth_ct), col("Ask · USDT", **depth_usdt)])); y += 5
     panels.append(stat_strip("Trading Phases · UTC+8", Q_PHASES, [
         (name, about, {"color": {"mode": "fixed", "fixedColor": color}}) for (name, color), about in zip(PHASE_TEXT.items(), (
             "04:00 – 09:30 New York.", "09:30 – 16:00 New York, 13:00 on an early close.", "Four hours from the close.",
@@ -575,77 +652,87 @@ def build():
         col("Result", 104, custom_cellOptions={"type": "color-text"}, mappings=[CALENDAR]),
         col("Detail", custom_minWidth=120, custom_wrapText=True)])); y += 6
 
-    panels.append(row("Spread · ${ma:text} ${ma_text} min · Entry ${d_text} bps · Notional ${n_text} USDT (Both Legs)", y)); y += 1
+    panels.append(row("Spread · ${ma:text} ${ma_text} min · σ ${sigma_text} min · Entry ${d_text} bps · Notional ${n_text} USDT (Both Legs)", y)); y += 1
     # The tooltips show only twins, each point's value or the reason it has none (tooltip_only), as Grafana would show a nearby
     # point's value in place of a NULL: the drawn lines and the legend's figures are kept out of them.
     no_value = code_texts(NO_VALUE)
     signal = code_texts({code: text for text, code in SIGNALS.items()}, {text: o["color"] for text, o in SIGNAL["options"].items()})
-    depth = {"unit": CONTRACTS, "decimals": 2}
 
-    def twin(name, color, shown_as=None):
-        return tooltip_only(name, color, no_value, shown=shown_as)
-    band = [series("Spread", PURPLE, width=2, tooltip=False), series("Mean", TEXT, width=1, tooltip=False),
+    def twin(name, color, shown_as=None, props=None):
+        return tooltip_only(name, color, no_value, props, shown=shown_as)
+    # Sigma: a figure for the legend (Last, Min, Max) without a line, on a hidden axis of its own; the sigma lines are drawn from it.
+    sigma = named("Sigma", {"color": {"mode": "fixed", "fixedColor": LIGHT_GREY}, "custom.lineWidth": 0, "custom.axisPlacement": "hidden",
+                            "decimals": 2, "custom.hideFrom": {"legend": False, "tooltip": True, "viz": False}})
+    band = [sigma] + [sigma_line(name) for name, _ in SPREAD_SIGMAS] + [
+            series("Spread", PURPLE, width=2, tooltip=False), series("Mean", TEXT, width=1, tooltip=False),
             series("Mean + Entry", TEAL, dash=[6, 4], fill_to="Mean − Entry", fill=8, tooltip=False),
             series("Mean − Entry", TEAL, dash=[6, 4], legend=False, tooltip=False),
             twin("Spread · Tooltip", PURPLE, "Spread​"), twin("Real Long Spread", BLUE), twin("Real Short Spread", ORANGE),
-            twin("Mean · Tooltip", TEXT, "Mean​"), twin("Deviation · Tooltip", GREY, "Deviation"),
+            twin("Mean · Tooltip", TEXT, "Mean​"), twin("Sigma · Tooltip", LIGHT_GREY, "Sigma​", {"decimals": 2}),
+            twin("Deviation · Tooltip", GREY, "Deviation"),
             twin("Real Long Deviation · Tooltip", BLUE, "Real Long Deviation"), twin("Real Short Deviation · Tooltip", ORANGE, "Real Short Deviation"),
             tooltip_only("Signal", TEXT, signal)] + [
-        tooltip_only(name, ORANGE if name.startswith("Bid") else BLUE, no_value, depth, shown=display) for name, display, _, _ in DEPTHS]
-    spread = timeseries("Spread · Bps", Q_SPREAD, 0, y, 24, 13, band, transformations=[keep_fields(["time"] + [name for name, _ in SPREAD_CHART])],
-                        description=(
+        twin(name, ORANGE if name.startswith("Bid") else BLUE, display,
+             {"unit": "locale", "decimals": 2 if name.endswith("ct") else 0}) for name, display, _, _ in DEPTHS]
+    spread = timeseries("Spread · Bps", Q_SPREAD, 0, y, 24, 13, band, transformations=[keep_fields(["time"] + [name for name, _ in SPREAD_CHART])] +
+                        SPREAD_SIGMA_CALCS + [organize(SPREAD_ORDER, exclude=SIGMA_STEPS)], description=(
         "Spread = 10⁴ × (F·P_bull ÷ A_bull + F·P_bear ÷ A_bear − 2) · P: both legs' mid prices, else both last trades · Real Long, Real "
-        "Short Spread: the same on the average prices of buying, selling both legs for the notional N through their recorded asks, bids · "
-        "Long: Real Long Spread ≤ Mean − Entry · Short: Real Short Spread ≥ Mean + Entry\n\n"
-        "Drawn: Spread, Mean and the band Mean ± Entry (not drawn when Entry is not a positive number: the Signal reads No Entry); the "
-        "drawn Spread crossing the band is not a signal (see Deviation · Bps and Entry Points · Bps) · "
-        "tooltip, in this order: Spread, Real Long Spread, Real Short Spread, Mean, Deviation, Real Long Deviation, Real Short Deviation, "
-        "Signal, each leg's Bid 1+2 Depth and Ask 1+2 Depth (ct: contracts); each row is that second's value or the reason it has none "
-        "(No Anchor, Past T, No Mean, No Notional, No Book, Not Recorded; No Mean also when Mean Scale is not a whole number of minutes from 1 to 999,999) · "
-        "P: (best bid + best ask) ÷ 2 of both legs' recorded books in that second, else "
-        "both legs' last trades before it (before the recorder: trades only, No Book) · Real Long Spread, Real Short Spread: what "
-        "opening or closing a basket of N USDT (both legs together) as a taker gives in that second, the quantities making q·A equal on "
-        "both legs; where the recorded levels (now 5 a side at a 0.01 tick, 50 at 0.001; fewer earlier, see Data Coverage · Levels) hold "
-        "less than N, on what they hold, and the Signal reads Partial · Deviation, Real Long Deviation, Real Short Deviation: |Spread − "
-        "Mean|, |Real Long Spread − Mean|, |Real Short Spread − Mean|, absolute (with their signs on Deviation · Bps) · Signal: as in "
-        "Signal · Latest Second · 1+2 Depth: the "
-        "contracts at a leg's first two 0.01 levels, as in Book · Latest Second · A: session anchor, less a dividend or over a split's "
-        "ratio from the instant it takes effect (a mark there, with the expected and measured step; the mean restarts, also when a leg's "
-        "dividend takes effect without its amount: A stays, the spread steps, Past T until the amount is known) · F: USD/USDT · Mean: the "
-        "same on each leg's mean of its minute bars (both legs' mids at the minute's end, else their trades, else their candle closes) · "
-        "each session is drawn on its own · points: the recorder's per-second rows, every second to about 83 min, 5 s to about 7 h, 10 s "
-        "to about 14 h, 30 s to about 41 h, then every minute or more; a second without both legs' prices is a gap."))
+        "Short Spread: the same on the average prices of buying, selling both legs for the notional N through their pricing levels' "
+        "asks, bids · σ: the population standard deviation of the minute bars' spread over the Sigma Scale · Long: Real Long Spread ≤ "
+        "Mean − Entry · Short: Real Short Spread ≥ Mean + Entry\n\n"
+        "Drawn: Spread, Mean, the band Mean ± Entry (teal, dashed; not drawn when Entry is not a positive number: the Signal reads No "
+        "Entry) and Mean ± 1, 1.5, 2, 2.5, 3 σ (grey: whole σ dashed, half σ dotted; none until sigma is ready); the drawn Spread "
+        "crossing a line is not a signal (see Deviation · Bps and Entry Points · Bps) · legend Sigma: σ's last, lowest and highest · "
+        "tooltip, in this order: Spread, Real Long Spread, Real Short Spread, Mean, Sigma, Deviation, Real Long Deviation, Real Short "
+        "Deviation, Signal, each leg's bid and ask depth of its pricing levels in ct (contracts) and USDT; each row is that second's "
+        "value or the reason it has none (No Anchor, Past T, No Mean, No Sigma, No Notional, No Book, Few Levels) · P: (best bid + best "
+        "ask) ÷ 2 of both legs' recorded books in that second, else both legs' last trades before it (before the recorder: trades "
+        "only, No Book) · Real Long Spread, Real Short Spread: what opening or closing a basket of N USDT (both legs together) as a "
+        "taker gives in that second, the quantities making q·A equal on both legs, through each leg's pricing levels only (${bull} 1–"
+        "${bull_levels}, ${bear} 1–${bear_levels}: 2 at a 0.01 tick, 5 at 0.001, the trading program's, PRD 3.2); where those levels "
+        "hold less than N, on their totals, and the Signal reads Partial · Deviation, Real Long Deviation, Real Short Deviation: |Spread "
+        "− Mean|, |Real Long Spread − Mean|, |Real Short Spread − Mean|, absolute (with their signs on Deviation · Bps) · Signal: as in "
+        "Signal · Latest Second · depth: as in Book · Latest Second · A: session anchor, less a dividend or over a split's ratio from "
+        "the instant it takes effect (a mark there, with the expected and measured step; the mean and σ restart, also when a leg's "
+        "dividend takes effect without its amount: A stays, the spread steps, Past T until the amount is known) · F: USD/USDT · Mean: "
+        "the same on each leg's mean of its minute bars (both legs' mids at the minute's end, else their trades, else their candle "
+        "closes) · each session is drawn on its own · points: the recorder's per-second rows, every second to about 83 min, 5 s to "
+        "about 7 h, 10 s to about 14 h, 30 s to about 41 h, then every minute or more; a second without both legs' prices is a gap."))
     panels.append(spread); y += 13
     # The Deviation chart (OWNER.md item 22): the Spread chart with its Mean moved to zero, the zero in the middle of the axis,
-    # every figure with its sign. Deviation purple and 2 px as the Spread, drawn first; the real deviations over it, curves at
-    # every second in their sides' colours. The band ±Entry filled as the Spread chart's Mean ± Entry (on browser copies, Grafana
-    # filling a band in its upper line's colour) and each edge dashed in the colour of the line it triggers: −Entry blue, where a
-    # Long needs Real Long Deviation; +Entry orange, where a Short needs Real Short Deviation (UI review r1 M1). Neither the band
-    # nor Past T (amber) is in the legend, as on Entry Points (item 17); the row's title has Entry.
+    # every figure with its sign. The sigma lines ±k σ behind everything but the band (item 61). Deviation purple and 2 px as the
+    # Spread, drawn first; the real deviations over it, curves at every second in their sides' colours. The band ±Entry filled as
+    # the Spread chart's Mean ± Entry (on browser copies, Grafana filling a band in its upper line's colour) and each edge dashed in
+    # the colour of the line it triggers: −Entry blue, where a Long needs Real Long Deviation; +Entry orange, where a Short needs
+    # Real Short Deviation (UI review r1 M1). Neither the band nor Past T (amber) is in the legend, as on Entry Points (item 17);
+    # the row's title has Entry.
     hidden = {"legend": True, "tooltip": True, "viz": False}
     signed = [named("Band Top", {"color": {"mode": "fixed", "fixedColor": TEAL}, "custom.lineWidth": 0, "custom.fillBelowTo": "Band Bottom",
                                  "custom.fillOpacity": 8, "custom.hideFrom": hidden}),
-              named("Band Bottom", {"color": {"mode": "fixed", "fixedColor": TEAL}, "custom.lineWidth": 0, "custom.hideFrom": hidden}),
+              named("Band Bottom", {"color": {"mode": "fixed", "fixedColor": TEAL}, "custom.lineWidth": 0, "custom.hideFrom": hidden})] + [
+              sigma_line(name) for name, _ in DEVIATION_SIGMAS] + [
               series("Deviation", PURPLE, width=2, tooltip=False), series("Real Long Deviation", BLUE, width=1, tooltip=False),
               series("Real Short Deviation", ORANGE, width=1, tooltip=False),
               series("+Entry", ORANGE, width=1.5, dash=[6, 4], legend=False, tooltip=False),
               series("−Entry", BLUE, width=1.5, dash=[6, 4], legend=False, tooltip=False),
-              series("Past T", WARN, width=2, legend=False, tooltip=False),
-              twin("Signed Deviation · Tooltip", PURPLE, "Deviation\u200b"), twin("Signed Real Long Deviation · Tooltip", BLUE, "Real Long Deviation\u200b"),
-              twin("Signed Real Short Deviation · Tooltip", ORANGE, "Real Short Deviation\u200b"), tooltip_only("Signal", TEXT, signal)]
+              series("Past T", WARN, width=2, legend=False, tooltip=False), sigma,
+              twin("Signed Deviation · Tooltip", PURPLE, "Deviation​"), twin("Signed Real Long Deviation · Tooltip", BLUE, "Real Long Deviation​"),
+              twin("Signed Real Short Deviation · Tooltip", ORANGE, "Real Short Deviation​"),
+              twin("Sigma · Tooltip", LIGHT_GREY, "Sigma​", {"decimals": 2}), tooltip_only("Signal", TEXT, signal)]
     # Thirteen rows high, as the Spread chart: the same plot height, so their shapes compare (UI review r1 N2).
     deviation = timeseries("Deviation · Bps", None, 0, y, 24, 13, signed, zero_line=True, source=spread,
-                           transformations=[keep_fields(DEVIATION_FIELDS)] + DEVIATION_BAND + [organize(DEVIATION_ORDER, rename=DEVIATION_NAMES)],
-                           description=(
+                           transformations=[keep_fields(DEVIATION_FIELDS)] + DEVIATION_BAND + DEVIATION_SIGMA_CALCS +
+                           [organize(DEVIATION_ORDER, rename=DEVIATION_NAMES)], description=(
         "Deviation = Spread − Mean · Real Long / Short Deviation = Real Long / Short Spread − Mean · Long: Real Long Deviation ≤ −Entry "
-        "· Short: Real Short Deviation ≥ +Entry\n\n"
+        "· Short: Real Short Deviation ≥ +Entry · ±k σ: k times sigma, k = 1, 1.5, 2, 2.5, 3\n\n"
         "The Spread chart with its Mean at zero, with signs · purple: Deviation on the mids (trades where there is no book; the only line "
-        "before the recorder) · blue: Real Long Deviation, buying both legs for N through their recorded asks, never below purple · "
-        "orange: Real Short Deviation, selling through the bids, never above it · a Long needs blue at or under −Entry (blue dashed), a "
-        "Short orange at or over +Entry (orange dashed), Partial included; blue over +Entry or orange under −Entry is no signal · legend "
-        "Min of blue, Max of orange: how far each side came toward or past its Entry (Entry Points' Best) · tooltip: each second's value or why it has none, and the Signal · "
-        "Past T (amber): no signal until the dividend's amount is known · no band with No Entry · absolute values and signal dots: Entry "
-        "Points · Bps."))
+        "before the recorder) · blue: Real Long Deviation, buying both legs for N through their pricing levels' asks, never below purple "
+        "· orange: Real Short Deviation, selling through the bids, never above it · a Long needs blue at or under −Entry (blue dashed), a "
+        "Short orange at or over +Entry (orange dashed), Partial included; blue over +Entry or orange under −Entry is no signal · grey: "
+        "±1, 1.5, 2, 2.5, 3 σ (whole σ dashed, half σ dotted), the trading program's lines are d_in·σ: where blue reaches −2σ, x ≤ "
+        "−2σ · legend Min of blue, Max of orange: how far each side came toward or past its Entry (Entry Points' Best); Sigma: σ's last, "
+        "lowest and highest, k σ is k times it · tooltip: each second's value or why it has none, σ, and the Signal · Past T (amber): no signal until the "
+        "dividend's amount is known · no band with No Entry, no σ lines with No Sigma · absolute values and signal dots: Entry Points · Bps."))
     deviation["fieldConfig"]["defaults"]["custom"]["axisCenteredZero"] = True
     panels.append(deviation); y += 13
     # The two counts are for the legend, first so that a narrow window's legend under the plot shows them: no line, a hidden
@@ -663,29 +750,32 @@ def build():
     # can fill on: neither in the legend nor in the tooltip.
     def faded(name, color):
         return series(name, color + FADED, width=1.5, legend=False, tooltip=False)
-    lines_x = [count_of("Long Points", BLUE), count_of("Short Points", ORANGE), series("Deviation", GREY, width=1, tooltip=False),
+    lines_x = [count_of("Long Points", BLUE), count_of("Short Points", ORANGE)] + [sigma_line(name) for name, _ in ENTRY_SIGMAS] + [
+               series("Deviation", GREY, width=1, tooltip=False),
                faded("Real Long Deviation · Faded", BLUE), faded("Real Short Deviation · Faded", ORANGE),
                series("Real Long Deviation", BLUE, width=1.5, tooltip=False), series("Real Short Deviation", ORANGE, width=1.5, tooltip=False),
-               series("Past T", WARN, width=2, legend=False, tooltip=False), series("+Entry", TEAL, dash=[6, 4], legend=False, tooltip=False),
+               series("Past T", WARN, width=2, legend=False, tooltip=False),
+               series("+Entry", TEAL, width=1.5, dash=[6, 4], legend=False, tooltip=False),
                dots("Long Dots", BLUE), dots("Short Dots", ORANGE),
                twin("Deviation · Tooltip", GREY, "Deviation​"), twin("Real Long Deviation · Tooltip", BLUE, "Real Long Deviation​"),
                twin("Real Short Deviation · Tooltip", ORANGE, "Real Short Deviation​"), tooltip_only("Signal", TEXT, signal)]
     # Thirteen rows high: at 880 px the legend under the plot shows its last row whole (twelve leaves it 4 px short).
     panels.append(timeseries("Entry Points · Bps", None, 0, y, 24, 13, lines_x, zero_line=True, soft_min=0, source=spread, calcs=["max"],
-                             transformations=[keep_fields(ENTRY_FIELDS), organize(ENTRY_FIELDS, rename={"Deviation · Line": "Deviation"})],
+                             transformations=[keep_fields(ENTRY_FIELDS)] + ENTRY_SIGMA_CALCS +
+                             [organize(ENTRY_ORDER, rename={"Deviation · Line": "Deviation"}, exclude=["Sigma"])],
                              description=(
         "Deviation = |Spread − Mean| · Real Long Deviation = |Real Long Spread − Mean| · Real Short Deviation = |Real Short Spread − Mean| · "
         "Long: Real Long Spread ≤ Mean − Entry · Short: Real Short Spread ≥ Mean + Entry\n\n"
         "All three are absolute (with their signs: Deviation · Bps); each real line is bright on the side of the Mean its real spread can fill on and faded on the other: "
         "Real Long Deviation (blue) bright while Real Long Spread is below the Mean, Real Short Deviation (orange) bright while Real "
-        "Short Spread is above it, so a bright line above Entry (dashed) is a signal of its side and a faded one is none (Signal · "
-        "Latest Second shows a faded side as Other Side) · Long Points, "
+        "Short Spread is above it, so a bright line above Entry (teal dashed) is a signal of its side and a faded one is none (Signal · "
+        "Latest Second shows a faded side as Other Side) · grey: 1, 1.5, 2, 2.5, 3 σ (whole σ dashed, half σ dotted) · Long Points, "
         "Short Points: a dot on the blue, orange line at each drawn second whose Signal is Long, Short (Partial included), counted in "
-        "the legend · Real Long, Real Short Deviation: buying, selling both legs for the notional through their recorded levels, the "
+        "the legend · Real Long, Real Short Deviation: buying, selling both legs for the notional through their pricing levels, the "
         "Signal's spreads; none without both legs' books · Deviation (grey): on the basis prices, the only line before the recorder · "
-        "legend Last, Max: the newest and the largest value of each bright line (Max: Entry Points' Best of the range), the counts in "
+        "legend Max: the largest value of each bright line (Entry Points' Best of the range), the counts in "
         "the range · tooltip: each row is that second's value, absolute whatever its side, or the reason it has none (No Anchor, Past "
-        "T, No Mean, No Notional, No Book), and the Signal · No Entry (Entry not a positive number): no Entry line, no dots · empty "
+        "T, No Mean, No Notional, No Book, Few Levels), and the Signal · No Entry (Entry not a positive number): no Entry line, no dots · empty "
         "until the session's mean is ready, and with no valid Mean Scale · Past T, amber: the deviation from the instant a leg's "
         "dividend takes effect without its amount until it is known, no signal and not counted · points are coarser on longer ranges, "
         "so counts do not compare across ranges."))); y += 13

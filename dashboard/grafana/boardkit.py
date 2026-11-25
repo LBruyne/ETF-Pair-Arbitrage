@@ -103,6 +103,15 @@ def copy_field(name, alias):
                                                  "replaceFields": False}}
 
 
+def calc(alias, left, operator, right):
+    """Transformation: a field alias = left operator right, made in the browser row by row (Grafana's binary operation);
+    left and right are field names or numbers. A NULL operand gives NULL, so the result breaks where its operands do."""
+    def operand(x):
+        return {"fixed": str(x)} if isinstance(x, (int, float)) else {"matcher": {"id": "byName", "options": x}}
+    return {"id": "calculateField", "options": {"mode": "binary", "binary": {"left": operand(left), "operator": operator, "right": operand(right)},
+                                                 "alias": alias, "replaceFields": False}}
+
+
 def rows_with(field):
     """Transformation: only the rows at which field has a value."""
     return {"id": "filterByValue", "options": {"filters": [{"fieldName": field, "config": {"id": "isNotNull", "options": {}}}], "type": "include",

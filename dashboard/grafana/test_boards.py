@@ -24,26 +24,28 @@ SPEC = os.path.join(os.path.dirname(os.path.abspath(__file__)), os.pardir, "SPEC
 SOXL = {"combo": "SOXL-SOXS", "bull": "SOXL", "bear": "SOXS", "ref": "SOXX"}
 TQQQ = {"combo": "TQQQ-SQQQ", "bull": "TQQQ", "bear": "SQQQ", "ref": "QQQ"}
 SELECTIONS = [
-    dict(SOXL, venue="binance", ma="sma", ma_minutes="60", d="10", notional="10000", hours=6),
-    dict(SOXL, venue="bitget", ma="ema", ma_minutes="240", d="7.5", notional="100000", hours=168),
-    dict(SOXL, venue="bitget", ma="sma", ma_minutes="10", d="5", notional="1000", hours=1),
-    dict(TQQQ, venue="binance", ma="ema", ma_minutes="30", d="8", notional="20,000", hours=24),
-    dict(TQQQ, venue="bitget", ma="sma", ma_minutes="120", d="6", notional=" 50000 ", hours=48),
+    dict(SOXL, venue="binance", ma="sma", ma_minutes="60", sigma_minutes="60", d="10", notional="10000", hours=6),
+    dict(SOXL, venue="bitget", ma="ema", ma_minutes="240", sigma_minutes="30", d="7.5", notional="100000", hours=168),
+    dict(SOXL, venue="bitget", ma="sma", ma_minutes="10", sigma_minutes="120", d="5", notional="500", hours=1),
+    dict(TQQQ, venue="binance", ma="ema", ma_minutes="30", sigma_minutes="30min", d="8", notional="20,000", hours=24),
+    dict(TQQQ, venue="bitget", ma="sma", ma_minutes="120", sigma_minutes="5", d="6", notional=" 50000 ", hours=48),
 ]
 TEXT = {"venue": {"binance": "Binance", "bitget": "Bitget"}, "ma": {"sma": "SMA", "ema": "EMA"}}
 ZWSP = "\u200b"
 # What each panel that shows another's result takes it from.
 SHARED = {"Spread · Latest Second": "Prices · Latest Second", "Signal · Latest Second · Notional ${n_text} USDT": "Prices · Latest Second",
-          "Book · Latest Second · Contracts": "Prices · Latest Second", "Deviation · Bps": "Spread · Bps", "Entry Points · Bps": "Spread · Bps",
+          "Book · Latest Second · Pricing Levels": "Prices · Latest Second", "Deviation · Bps": "Spread · Bps", "Entry Points · Bps": "Spread · Bps",
           "Entry Points by Phase · Bps": "Spread · Bps",
           "${bear} Price · USDT": "${bull} Price · USDT", "${ref} Price · USDT": "${bull} Price · USDT", "Implied Return · %": "${bull} Price · USDT"}
 # The Spread chart's tooltip rows in order (DESIGN 1.9) and the Deviation and Entry Points charts', as shown (the zero-width
 # space left out).
-SPREAD_TOOLTIP = ["Spread", "Real Long Spread", "Real Short Spread", "Mean", "Deviation", "Real Long Deviation", "Real Short Deviation", "Signal",
-                  "Bid 1+2 Depth · ${bull}", "Bid 1+2 Depth · ${bear}", "Ask 1+2 Depth · ${bull}", "Ask 1+2 Depth · ${bear}"]
+SPREAD_TOOLTIP = ["Spread", "Real Long Spread", "Real Short Spread", "Mean", "Sigma", "Deviation", "Real Long Deviation", "Real Short Deviation",
+                  "Signal"] + ["%s 1–${%s_levels} · ${%s} · %s" % (side, leg, leg, unit) for unit in ("ct", "USDT") for side, leg in
+                               (("Bid", "bull"), ("Bid", "bear"), ("Ask", "bull"), ("Ask", "bear"))]
 DEVIATION_TOOLTIP = ["Deviation", "Real Long Deviation", "Real Short Deviation", "Signal"]
-LEGENDS = {"Spread · Bps": ["Spread", "Mean", "Mean + Entry"],
-           "Deviation · Bps": ["Deviation", "Real Long Deviation", "Real Short Deviation"],
+SIGNED_TOOLTIP = ["Deviation", "Real Long Deviation", "Real Short Deviation", "Sigma", "Signal"]
+LEGENDS = {"Spread · Bps": ["Spread", "Mean", "Mean + Entry", "Sigma"],
+           "Deviation · Bps": ["Deviation", "Real Long Deviation", "Real Short Deviation", "Sigma"],
            "Entry Points · Bps": ["Long Points", "Short Points", "Deviation", "Real Long Deviation", "Real Short Deviation"]}
 # The Deviation chart's columns of the Spread row's frame (OWNER.md item 22): the signed deviations, drawn and for the tooltip.
 SIGNED = ["Signed Deviation", "Signed Real Long Deviation", "Signed Real Short Deviation", "Signed Past T", "−Entry", "Signed Deviation · Tooltip",
@@ -56,7 +58,7 @@ def substitute(q, sel, now_ms, end_ms=None):
     escaping of a single-value variable for an SQL data source); the range ending at end_ms (now_ms by default, moved ahead
     hours later by sel["ahead"]) and now() read as now_ms where the board takes now in milliseconds."""
     to_ms = (end_ms if end_ms is not None else now_ms) + sel.get("ahead", 0) * 3600_000
-    values = dict(sel, __from=str(int(to_ms - sel["hours"] * 3600_000)), __to=str(int(to_ms)))
+    values = dict(dict(sigma_minutes="60"), **sel, __from=str(int(to_ms - sel["hours"] * 3600_000)), __to=str(int(to_ms)))
     q = q.replace(board.NOW_MS, "%d::bigint" % now_ms)
 
     def fill(m):
@@ -122,6 +124,12 @@ def fields(b, p):
         elif t["id"] == "calculateField" and o["mode"] == "reduceRow" and len(o["reduce"]["include"]) == 1 and not o["replaceFields"]:
             assert o["reduce"]["include"][0] in names, o
             names = names + [o["alias"]]
+        elif t["id"] == "calculateField" and o["mode"] == "binary" and not o["replaceFields"]:
+            for side in ("left", "right"):
+                assert "fixed" in o["binary"][side] or o["binary"][side]["matcher"]["options"] in names, o
+            names = names + [o["alias"]]
+        elif t["id"] == "filterByValue":
+            pass  # rows only
         elif t["id"] == "organize":
             names = sorted((n for n in names if not o["excludeByName"].get(n)), key=lambda n: o["indexByName"].get(n, len(names)))
             names = [o["renameByName"].get(n, n) for n in names]
@@ -192,13 +200,13 @@ class Boards(unittest.TestCase):
         ids = [p["id"] for p in b["panels"]]
         self.assertEqual(len(ids), len(set(ids)))
         names = [v["name"] for v in b["templating"]["list"]]
-        self.assertEqual(names[:6], ["combo", "venue", "ma", "ma_minutes", "d", "notional"])
+        self.assertEqual(names[:7], ["combo", "venue", "ma", "ma_minutes", "sigma_minutes", "d", "notional"])
         for title, q in queries(b):
             # Every variable a query uses is one the board defines; the typed settings only as a whole quoted literal (the text
             # parsed in SQL, never pasted into it).
             for var in re.findall(r"\$\{?(\w+)", q):
                 self.assertIn(var, names + ["__from", "__to"], title)
-            for var in ("notional", "d", "ma_minutes"):
+            for var in ("notional", "d", "ma_minutes", "sigma_minutes"):
                 self.assertEqual(len(re.findall(r"\$\{?%s\b" % var, q)), q.count("'$%s'" % var), (title, var))
         # No panel overlaps another on the grid.
         cells = set()
@@ -271,7 +279,7 @@ class Boards(unittest.TestCase):
         self.assertEqual(board.SIGNAL["options"]["No Entry"]["color"], boardkit.WARN)
         self.assertEqual(board.WHY["options"][str(board.CODE["Other Side"])], {"text": "Other Side", "color": boardkit.GREY,
                                                                               "index": list(board.NO_VALUE).index(board.CODE["Other Side"])})
-        for title, tooltip in (("Spread · Bps", SPREAD_TOOLTIP), ("Deviation · Bps", DEVIATION_TOOLTIP), ("Entry Points · Bps", DEVIATION_TOOLTIP)):
+        for title, tooltip in (("Spread · Bps", SPREAD_TOOLTIP), ("Deviation · Bps", SIGNED_TOOLTIP), ("Entry Points · Bps", DEVIATION_TOOLTIP)):
             chart = by_title(b, title)
             props, names = props_of(chart), fields(b, chart)
             self.assertEqual(sorted(props), sorted(n for n in names if n != "time"), title)
@@ -295,8 +303,9 @@ class Boards(unittest.TestCase):
         # in the frame's order; every figure with its sign, the real lines on both sides of the Mean.
         chart = by_title(b, "Deviation · Bps")
         props, names = props_of(chart), fields(b, chart)
-        self.assertEqual([n for n in names if n != "time"][:8], ["Band Top", "Band Bottom", "Deviation", "Real Long Deviation", "Real Short Deviation",
-                                                                 "+Entry", "−Entry", "Past T"])
+        sigma_lines = [name for name, _ in board.DEVIATION_SIGMAS]
+        self.assertEqual([n for n in names if n != "time"][:18], ["Band Top", "Band Bottom"] + sigma_lines + [
+            "Deviation", "Real Long Deviation", "Real Short Deviation", "+Entry", "−Entry", "Past T"])
         self.assertNotIn("sortBy", chart["options"]["legend"])
         for name, color, width in (("Deviation", boardkit.PURPLE, 2), ("Real Long Deviation", boardkit.BLUE, 1), ("Real Short Deviation", boardkit.ORANGE, 1),
                                    ("Past T", boardkit.WARN, 2), ("Band Top", boardkit.TEAL, 0), ("Band Bottom", boardkit.TEAL, 0)):
@@ -309,7 +318,7 @@ class Boards(unittest.TestCase):
             self.assertNotIn("custom.fillBelowTo", props[name], name)
         for name in ("Band Top", "Band Bottom", "+Entry", "−Entry", "Past T"):
             self.assertEqual(props[name]["custom.hideFrom"], {"legend": True, "tooltip": True, "viz": False}, name)
-        copies = [t["options"] for t in chart["transformations"] if t["id"] == "calculateField"]
+        copies = [t["options"] for t in chart["transformations"] if t["id"] == "calculateField" and t["options"]["mode"] == "reduceRow"]
         self.assertEqual([(c["reduce"]["include"], c["alias"]) for c in copies], [(["+Entry"], "Band Top"), (["−Entry"], "Band Bottom")])
         defaults = chart["fieldConfig"]["defaults"]["custom"]
         self.assertEqual((defaults["thresholdsStyle"], defaults["axisCenteredZero"]), ({"mode": "dashed"}, True))
@@ -320,6 +329,26 @@ class Boards(unittest.TestCase):
             self.assertNotIn("< r.mu_bps", q, name)
             self.assertNotIn("> r.mu_bps", q, name)
         self.assertEqual([name for name, _ in board.DEVIATION_CHART], SIGNED)
+        # 3.4 (owner item 61): the sigma lines ±1, 1.5, 2, 2.5, 3 σ (Mean ± k σ on the Spread chart, + k σ on Entry Points), made
+        # in the browser from the frame's one Sigma column (k σ = Sigma × k, Mean ± it), grey, whole σ dashed and half σ dotted,
+        # drawn before the data (behind it), in neither the legend nor the tooltip; Sigma itself a legend row without a line.
+        for title, expected in (("Spread · Bps", [name for name, _ in board.SPREAD_SIGMAS]), ("Deviation · Bps", sigma_lines),
+                                ("Entry Points · Bps", [name for name, _ in board.ENTRY_SIGMAS])):
+            chart_s = by_title(b, title)
+            props_s, names_s = props_of(chart_s), fields(b, chart_s)
+            self.assertEqual([n for n in names_s if "σ" in n and "Step" not in n], expected, title)
+            self.assertEqual(len(expected), 10 if title != "Entry Points · Bps" else 5)
+            first_data = min(names_s.index(n) for n in ("Spread", "Deviation") if n in names_s)
+            for name in expected:
+                k = float(name.split(" ")[-1].lstrip("+−").rstrip("σ"))
+                self.assertLess(names_s.index(name), first_data, name)
+                self.assertEqual(props_s[name]["custom.hideFrom"], {"legend": True, "tooltip": True, "viz": False}, name)
+                self.assertEqual(props_s[name]["custom.lineStyle"]["dash"], [6, 4] if k == int(k) else [2, 3], name)
+                calcs = [t["options"]["binary"] for t in chart_s["transformations"] if t["id"] == "calculateField" and t["options"].get("alias") == name]
+                self.assertEqual(len(calcs), 1, name)
+            if "Sigma" in props_s and title != "Entry Points · Bps":
+                self.assertEqual((props_s["Sigma"]["custom.lineWidth"], props_s["Sigma"]["custom.axisPlacement"]), (0, "hidden"))
+        self.assertEqual(dict(board.SPREAD_CHART)["Sigma"], board.shown("r.sigma_bps", 2))
         # The Entry Points chart (the Deviation chart until OWNER.md item 22): two real lines without a fill and a 1 px grey
         # Deviation line; each real line bright (in the legend)
         # on the side of the mean its real spread can fill on and faded (a quarter of the opacity, neither in the legend nor in the
@@ -373,15 +402,21 @@ class Boards(unittest.TestCase):
         sizes = {p["title"]: p["options"]["text"] for p in b["panels"] if p["type"] == "stat"}
         self.assertEqual(sizes, {"Prices · Latest Second": {"titleSize": 12, "valueSize": 20}, "Spread · Latest Second": {"titleSize": 13, "valueSize": 20},
                                  "Signal · Latest Second · Notional ${n_text} USDT": {"titleSize": 13, "valueSize": 20},
-                                 "Book · Latest Second · Contracts": {"titleSize": 13, "valueSize": 20},
                                  "Trading Phases · UTC+8": {"titleSize": 13, "valueSize": 18}})
-        book, spread = props_of(by_title(b, "Book · Latest Second · Contracts")), props_of(by_title(b, "Spread · Bps"))
+        # 3.4: the Book table, a row a leg (Q_LAST's two rows): tick, levels, each side's depth in ct (two decimals) and USDT
+        # (none), separators of thousands; the tooltip's depth rows likewise, the unit in their names.
+        book_panel = by_title(b, "Book · Latest Second · Pricing Levels")
+        self.assertEqual(fields(b, book_panel), ["Leg", "Tick", "Levels", "Bid · ct", "Bid · USDT", "Ask · ct", "Ask · USDT"])
+        book, spread = props_of(book_panel), props_of(by_title(b, "Spread · Bps"))
+        for name in ("Bid · ct", "Ask · ct", "Bid · USDT", "Ask · USDT"):
+            self.assertEqual((book[name]["unit"], book[name]["decimals"]), ("locale", 2 if name.endswith("ct") else 0), name)
+        self.assertNotIn("unit", book["Tick"])
         for name, display, _, _ in board.DEPTHS:
-            self.assertEqual((book[name]["unit"], book[name]["decimals"], book[name]["displayName"]), ("suffix: ct", 2, display), name)
-            self.assertEqual((spread[name]["unit"], spread[name]["decimals"]), ("suffix: ct", 2), name)
+            self.assertEqual((spread[name]["unit"], spread[name]["decimals"], spread[name]["displayName"]),
+                             ("locale", 2 if name.endswith("ct") else 0, display), name)
         heights = {p["title"]: p["gridPos"]["h"] for p in b["panels"]}
-        self.assertEqual([heights[t] for t in ("Next Actions · UTC+8", "Calendar Check · UTC+8", "Deviation · Bps", "Entry Points · Bps",
-                                               "Entry Points by Phase · Bps")], [6, 6, 13, 13, 8])
+        self.assertEqual([heights[t] for t in ("Book · Latest Second · Pricing Levels", "Next Actions · UTC+8", "Calendar Check · UTC+8", "Deviation · Bps",
+                                               "Entry Points · Bps", "Entry Points by Phase · Bps")], [5, 6, 6, 13, 13, 8])
         tops = {p["title"]: p["gridPos"]["y"] for p in b["panels"]}
         order = ["Spread · Bps", "Deviation · Bps", "Entry Points · Bps", "Entry Points by Phase · Bps"]
         self.assertEqual([tops[t] for t in order[1:]], [tops[t] + heights[t] for t in order[:-1]])
@@ -434,17 +469,18 @@ class Boards(unittest.TestCase):
         b = board.build()
         var = next(v for v in b["templating"]["list"] if v["name"] == "notional")
         self.assertEqual((var["label"], var["type"], var["current"]["value"], var["allowCustomValue"]), ("Notional (USDT)", "custom", "10000", True))
-        self.assertEqual([o["value"] for o in var["options"]], ["1000", "5000", "10000", "50000", "100000"])
+        self.assertEqual([(o["text"], o["value"]) for o in var["options"]], [("100", "100"), ("500", "500"), ("1k", "1000"), ("5k", "5000"),
+                                                                             ("10k", "10000"), ("50k", "50000"), ("100k", "100000")])
         self.assertIn("var-notional=10000", b["links"][0]["url"])
         # The typed settings are parsed once per query (SETTINGS, one materialized row v, not a parse per row or per use) and
         # passed from it.
         for q in (board.Q_SPREAD, board.Q_LAST):
             self.assertEqual(q.count(board.SETTINGS), 1)
             self.assertIn("WITH v AS MATERIALIZED (SELECT * FROM %s)" % board.SETTINGS, q)
-            self.assertEqual((q.count(board.NOTIONAL), q.count(board.ENTRY), q.count(board.MEAN_SCALE)), (1, 1, 1))
+            self.assertEqual((q.count(board.NOTIONAL), q.count(board.ENTRY), q.count(board.MEAN_SCALE), q.count(board.SIGMA_SCALE)), (1, 1, 1, 1))
         self.assertEqual((board.Q_FEES.count(board.ENTRY), board.Q_FEES.count(board.NOTIONAL)), (1, 0))
-        self.assertIn("v.ma_n, $__from, $__to, %s, v.n, v.d) r" % board.STEP_MS, board.RANGE)
-        self.assertIn("v.ma_n, v.n, v.d, %s) x" % board.NOW_MS, board.LAST)
+        self.assertIn("v.ma_n, v.sig_n, $__from, $__to, %s, v.n, v.d) r" % board.STEP_MS, board.RANGE)
+        self.assertIn("v.ma_n, v.sig_n, v.n, v.d, %s) x" % board.NOW_MS, board.LAST)
         self.assertNotIn(board.NOTIONAL, board.Q_PRICES)
 
     @unittest.skipUnless(PSQL, "set ETFPAIR_BOARD_PSQL to run the queries")
@@ -475,6 +511,9 @@ class Boards(unittest.TestCase):
         self.assertEqual(got, entries)
         got = {t: psql("SELECT coalesce((%s)::text, '')" % typed(board.MEAN_SCALE, "ma_minutes", t), "-At").strip() for t in scales}
         self.assertEqual(got, scales)
+        # Sigma Scale (3.4) reads as Mean Scale.
+        got = {t: psql("SELECT coalesce((%s)::text, '')" % typed(board.SIGMA_SCALE, "sigma_minutes", t), "-At").strip() for t in scales}
+        self.assertEqual(got, scales)
 
     @unittest.skipUnless(PSQL, "set ETFPAIR_BOARD_PSQL to run the queries")
     def test_queries_with_entry_and_mean_scale_not_numbers(self):
@@ -503,7 +542,8 @@ class Boards(unittest.TestCase):
                               for r in csv.DictReader(io.StringIO(result.stdout))]
             return out
         for key, value in [("d", v) for v in ("10", "10bps", "abc", "", "0", "-5", "1'; SELECT 1; --")] + \
-                          [("ma_minutes", v) for v in ("30", "abc", "", "0", "30.5", "30min")]:
+                          [("ma_minutes", v) for v in ("30", "abc", "", "0", "30.5", "30min")] + \
+                          [("sigma_minutes", v) for v in ("60", "60min", "abc", "", "0", "30.5")]:
             runs[key, value] = run_all(dict(base, **{key: value}))
         ok, codes = runs["d", "10"], {v: k for k, v in board.SIGNALS.items()}
         spread, last, fees = "Spread · Bps", "Prices · Latest Second", "Fee Levels · ${venue:text} · Bps"
@@ -552,9 +592,25 @@ class Boards(unittest.TestCase):
             row = got[last][0]
             self.assertEqual((row["Mean"], row["Deviation"], row["Real Long Deviation"], row["Real Short Deviation"], row["Signal"]),
                              (no_mean, no_mean, no_mean, no_mean, "No Mean"), value)
-            self.assertEqual((row["Spread"], row["Long Fill"], row["Bid 1+2 Depth · Bull"]), (mean[last][0]["Spread"], mean[last][0]["Long Fill"],
-                                                                                              mean[last][0]["Bid 1+2 Depth · Bull"]), value)
+            self.assertEqual((row["Spread"], row["Long Fill"], row["Bid · ct"]), (mean[last][0]["Spread"], mean[last][0]["Long Fill"],
+                                                                                              mean[last][0]["Bid · ct"]), value)
             self.assertEqual(got[fees], mean[fees], value)
+
+        # Sigma Scale (3.4): "60min" is 60; anything else no sigma (Sigma empty, its tooltip and strip No Sigma where there is a
+        # spread and no Past T), every other figure as with a valid one.
+        sig = runs["sigma_minutes", "60"]
+        self.assertEqual(runs["sigma_minutes", "60min"], sig)
+        self.assertTrue(any(r["Sigma"] for r in sig[spread]))
+        no_sigma = str(board.CODE["No Sigma"])
+        for value in ("abc", "", "0", "30.5"):
+            got = runs["sigma_minutes", value]
+            self.assertEqual({r["Sigma"] for r in got[spread]}, {""}, value)
+            self.assertEqual({r["Sigma · Tooltip"] for r in got[spread]} - {"", no_sigma, no_anchor, str(board.CODE["Past T"])}, set(), value)
+            for a, w in zip(got[spread], sig[spread]):
+                self.assertEqual({k: v for k, v in a.items() if k not in ("Sigma", "Sigma · Tooltip")},
+                                 {k: v for k, v in w.items() if k not in ("Sigma", "Sigma · Tooltip")}, value)
+            self.assertEqual(got[last][0]["Sigma"], no_sigma, value)
+            self.assertEqual({k: v for k, v in got[last][0].items() if k != "Sigma"}, {k: v for k, v in sig[last][0].items() if k != "Sigma"}, value)
 
     def test_staging_is_generated(self):
         # The staged board is the generator's output, byte for byte (python3 dashboard/grafana/gen_dashboard.py writes it).
@@ -691,24 +747,25 @@ class Boards(unittest.TestCase):
         # none, in DESIGN 1.9's order; the Deviation chart's lines leave Past T to the amber line and dot the Long and Short
         # seconds; the counts run; Entry Points' columns mark the points with a phase. A break row stays NULL but for the counts
         # and Entry.
-        cols = ("ts_ms, session_date, phase, phase_sort, basis, past_t, s_bps, mu_bps, s_long_bps, s_short_bps, partial_long, partial_short, "
-                "book_bull, book_bear, bid12_bull, bid12_bear, ask12_bull, ask12_bear, a_ok, signal")
-        book = "true, true, 100.5, 20.25, 90.0, 30.0"
+        cols = ("ts_ms, session_date, phase, phase_sort, basis, past_t, s_bps, mu_bps, sigma_bps, s_long_bps, s_short_bps, partial_long, "
+                "partial_short, book_bull, book_bear, bid_ct_bull, bid_ct_bear, ask_ct_bull, ask_ct_bear, bid_usdt_bull, bid_usdt_bear, ask_usdt_bull, "
+                "ask_usdt_bear, a_ok, signal")
+        book = "true, true, 100.5, 20.25, 90.0, 30.0, 4040.1, 1210.5, 3600.4, 1800.0"
         points = [
-            "(1000::bigint, NULL::date, 'Overnight', 4, 'mid', true, -120.04, -53.0, -119.0, -121.0, false, false, %s, true, 'Past T')" % book,
-            "(2000, NULL, 'Overnight', 4, 'mid', false, -120.04, -53.0, -119.0, -121.0, false, false, %s, true, 'Long')" % book,
-            "(3000, NULL, NULL, NULL, 'mid', true, 5.0, NULL, 6.0, 4.0, false, false, %s, true, 'Past T')" % book,
-            "(4000, NULL, NULL, NULL, 'mid', false, 5.0, NULL, 6.0, 4.0, false, false, %s, true, 'No Mean')" % book,
-            "(5000, NULL, 'Regular', 2, 'trade', false, -130.0, -60.0, NULL, NULL, NULL, NULL, true, false, 50.0, NULL, NULL, NULL, true, 'No Book')",
-            "(6000, NULL, 'Regular', 2, 'mid', false, -70.0, -55.0, -66.0, -75.0, true, false, %s, true, 'Long · Partial')" % book,
-            "(7000, NULL, 'Regular', 2, 'mid', false, 20.0, 0.0, 25.0, 12.0, false, true, %s, true, 'Short · Partial')" % book,
-            "(8000, NULL, 'Regular', 2, 'mid', false, 15.0, 0.0, 16.0, 11.0, false, false, %s, true, 'Short')" % book,
-            "(9000, NULL, 'Regular', 2, 'mid', false, 10.0, 0.0, 12.0, 8.0, false, false, %s, true, 'None')" % book,
-            "(10000, NULL, NULL, NULL, 'mid', false, NULL, NULL, NULL, NULL, NULL, NULL, %s, false, 'No Anchor')" % book,
-            "(11000, NULL, 'Regular', 2, 'mid', false, 1.0, 0.0, 3.0, -2.0, false, false, true, true, 7.0, NULL, 8.0, NULL, true, 'None')",
-            "(11001, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL)",
-            "(12000, NULL, 'Regular', 2, 'mid', false, -5.0, 0.0, -3.0, -8.0, false, false, %s, true, 'None')" % book,
-            "(13000, NULL, 'Regular', 2, 'mid', false, 2.0, 0.0, 4.0, -1.0, false, false, %s, true, 'No Entry')" % book]
+            "(1000::bigint, NULL::date, 'Overnight', 4, 'mid', true, -120.04, -53.0, 2.5, -119.0, -121.0, false, false, %s, true, 'Past T')" % book,
+            "(2000, NULL, 'Overnight', 4, 'mid', false, -120.04, -53.0, 2.5, -119.0, -121.0, false, false, %s, true, 'Long')" % book,
+            "(3000, NULL, NULL, NULL, 'mid', true, 5.0, NULL, NULL, 6.0, 4.0, false, false, %s, true, 'Past T')" % book,
+            "(4000, NULL, NULL, NULL, 'mid', false, 5.0, NULL, NULL, 6.0, 4.0, false, false, %s, true, 'No Mean')" % book,
+            "(5000, NULL, 'Regular', 2, 'trade', false, -130.0, -60.0, 2.5, NULL, NULL, NULL, NULL, true, false, 50.0, NULL, NULL, NULL, 2010.0, NULL, NULL, NULL, true, 'No Book')",
+            "(6000, NULL, 'Regular', 2, 'mid', false, -70.0, -55.0, 2.5, -66.0, -75.0, true, false, %s, true, 'Long · Partial')" % book,
+            "(7000, NULL, 'Regular', 2, 'mid', false, 20.0, 0.0, 2.5, 25.0, 12.0, false, true, %s, true, 'Short · Partial')" % book,
+            "(8000, NULL, 'Regular', 2, 'mid', false, 15.0, 0.0, 2.5, 16.0, 11.0, false, false, %s, true, 'Short')" % book,
+            "(9000, NULL, 'Regular', 2, 'mid', false, 10.0, 0.0, 2.5, 12.0, 8.0, false, false, %s, true, 'None')" % book,
+            "(10000, NULL, NULL, NULL, 'mid', false, NULL, NULL, NULL, NULL, NULL, NULL, NULL, %s, false, 'No Anchor')" % book,
+            "(11000, NULL, 'Regular', 2, 'mid', false, 1.0, 0.0, 2.5, 3.0, -2.0, false, false, true, true, 7.0, NULL, 8.0, NULL, 280.0, NULL, 320.0, NULL, true, 'None')",
+            "(11001, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL)",
+            "(12000, NULL, 'Regular', 2, 'mid', false, -5.0, 0.0, 2.5, -3.0, -8.0, false, false, %s, true, 'None')" % book,
+            "(13000, NULL, 'Regular', 2, 'mid', false, 2.0, 0.0, 2.5, 4.0, -1.0, false, false, %s, true, 'No Entry')" % book]
         made_up = "(VALUES %s) r(%s)" % (", ".join(points), cols)
         self.assertIn(board.RANGE, board.Q_SPREAD)
         sel = dict(SOXL, venue="binance", ma="sma", ma_minutes="60", d="10", notional="10000", hours=1)
@@ -717,27 +774,29 @@ class Boards(unittest.TestCase):
         header = got[0]
         self.assertEqual(header, columns(board.Q_SPREAD))
         table = {int(r[0]): dict(zip(header, r)) for r in got[1:]}
-        nb, nn, na, pt, nm, nr, ne = (str(board.CODE[t]) for t in ("No Book", "No Notional", "No Anchor", "Past T", "No Mean", "Not Recorded",
-                                                                     "No Entry"))
+        nb, nn, na, pt, nm, nr, ne, ns = (str(board.CODE[t]) for t in ("No Book", "No Notional", "No Anchor", "Past T", "No Mean", "Few Levels",
+                                                                         "No Entry", "No Sigma"))
         spread_rows = ["Spread · Tooltip", "Real Long Spread", "Real Short Spread", "Mean · Tooltip", "Deviation · Tooltip",
-                       "Real Long Deviation · Tooltip", "Real Short Deviation · Tooltip", "Signal", "Bid 1+2 Depth · Bull", "Bid 1+2 Depth · Bear",
-                       "Ask 1+2 Depth · Bull", "Ask 1+2 Depth · Bear"]
-        depths = ["100.5", "20.25", "90", "30"]
+                       "Real Long Deviation · Tooltip", "Real Short Deviation · Tooltip", "Signal"] + [name for name, _, _, _ in board.DEPTHS]
+        depths = ["100.5", "20.25", "90", "30", "4040", "1211", "3600", "1800"]
         want = {
             1000: ["-120", "-119", "-121", "-53", "67", pt, pt, pt] + depths,
             2000: ["-120", "-119", "-121", "-53", "67", "66", "68", "1"] + depths,
             3000: ["5", "6", "4", pt, pt, pt, pt, pt] + depths,
             4000: ["5", "6", "4", nm, nm, nm, nm, nm] + depths,
-            5000: ["-130", nb, nb, "-60", "70", nb, nb, nb, "50", nb, nr, nb],
+            5000: ["-130", nb, nb, "-60", "70", nb, nb, nb, "50", nb, nr, nb, "2010", nb, nr, nb],
             6000: ["-70", "-66", "-75", "-55", "15", "11", "20", "3"] + depths,
             7000: ["20", "25", "12", "0", "20", "25", "12", "4"] + depths,
             8000: ["15", "16", "11", "0", "15", "16", "11", "2"] + depths,
             9000: ["10", "12", "8", "0", "10", "12", "8", "0"] + depths,
             10000: [na, na, na, na, na, na, na, na] + depths,
-            11000: ["1", "3", "-2", "0", "1", "3", "2", "0", "7", nr, "8", nr],
+            11000: ["1", "3", "-2", "0", "1", "3", "2", "0", "7", nr, "8", nr, "280", nr, "320", nr],
             12000: ["-5", "-3", "-8", "0", "5", "3", "8", "0"] + depths,
             13000: ["2", "4", "-1", "0", "2", "4", "1", ne] + depths}
         self.assertEqual({t: [table[t][c] for c in spread_rows] for t in want}, want)
+        # 3.4: Sigma, the drawn column and the tooltip's (its value, else No Anchor, Past T, No Sigma).
+        self.assertEqual({t: (table[t]["Sigma"], table[t]["Sigma · Tooltip"]) for t in (1000, 3000, 4000, 5000, 10000, 11001)},
+                         {1000: ("2.5", "2.5"), 3000: ("", pt), 4000: ("", ns), 5000: ("2.5", "2.5"), 10000: ("", na), 11001: ("", "")})
         # Rounded once to the tooltip's decimals: -120.04 shows as -120.0, 67.04 as 67.0.
         self.assertEqual((table[2000]["Spread"], table[2000]["Deviation · Line"], table[2000]["Signed Deviation"]), ("-120", "67", "-67"))
         # Each real line faded at every point but past T, bright only where its real spread lies on the side it fills on (Real Long
@@ -804,35 +863,43 @@ class Boards(unittest.TestCase):
         # rounded once; the basis second's absolute deviations, a real one only on the side its real spread can fill on (Real
         # Short Spread here below the Mean: Other Side), a capped side's fill in USDT and Full for the other, the Signal's text and
         # each leg's depths or their reasons. Without those seconds every figure is empty (–) but the Phase.
-        last_cols = ("kind, ts_ms, session_date, basis, past_t, fx, a_bull, a_bear, a_ref, p_bull, p_bear, p_ref, s_bps, mu_bps, s_long_bps, "
-                     "s_short_bps, partial_long, partial_short, filled_long, filled_short, book_bull, book_bear, bid12_bull, bid12_bear, ask12_bull, "
-                     "ask12_bear, anchor_status, signal")
+        last_cols = ("kind, ts_ms, session_date, basis, past_t, fx, a_bull, a_bear, a_ref, p_bull, p_bear, p_ref, s_bps, mu_bps, sigma_bps, s_long_bps, "
+                     "s_short_bps, partial_long, partial_short, filled_long, filled_short, book_bull, book_bear, bid_ct_bull, bid_ct_bear, ask_ct_bull, "
+                     "ask_ct_bear, bid_usdt_bull, bid_usdt_bear, ask_usdt_bull, ask_usdt_bear, anchor_status, signal")
         last = ("(VALUES ('prices'::text, 1000::bigint, NULL::date, NULL::text, NULL::boolean, 1.0::numeric, 30.756, 83.5051, 123.18, 33.74, 75.599, "
-                "127.56, NULL::numeric, NULL::numeric, NULL::numeric, NULL::numeric, NULL::boolean, NULL::boolean, NULL::numeric, NULL::numeric, "
-                "NULL::boolean, NULL::boolean, NULL::numeric, NULL::numeric, NULL::numeric, NULL::numeric, NULL::text, NULL::text), "
-                "('basis', 2000, NULL, 'mid', false, 0.998525, 30.756, 83.505, 123.18, 33.735, 75.604, NULL, -7.364, -2.408, -12.0, -9.9, true, false, "
-                "6234.4, 10000.0000000000000002, true, true, 2415.33, NULL, 2094.72, 54.93, 'Bell', 'Long · Partial')) "
+                "127.56, NULL::numeric, NULL::numeric, NULL::numeric, NULL::numeric, NULL::numeric, NULL::boolean, NULL::boolean, NULL::numeric, "
+                "NULL::numeric, NULL::boolean, NULL::boolean, NULL::numeric, NULL::numeric, NULL::numeric, NULL::numeric, NULL::numeric, NULL::numeric, "
+                "NULL::numeric, NULL::numeric, NULL::text, NULL::text), "
+                "('basis', 2000, NULL, 'mid', false, 0.998525, 30.756, 83.505, 123.18, 33.735, 75.604, NULL, -7.364, -2.408, 3.4567, -12.0, -9.9, true, "
+                "false, 6234.4, 10000.0000000000000002, true, true, 2415.33, NULL, 2094.72, 54.93, 81481.7, NULL, 70653.6, 4152.65, 'Bell', "
+                "'Long · Partial')) "
                 "x(%s)") % last_cols
         self.assertIn("CROSS JOIN LATERAL " + board.LAST, board.Q_LAST)
-        row = rows_of(substitute(board.Q_LAST.replace(board.LAST, last), sel, 20_000))[0]
+        rows = rows_of(substitute(board.Q_LAST.replace(board.LAST, last), sel, 20_000))
+        row = rows[0]
         other = str(board.CODE["Other Side"])
-        self.assertEqual(row, {"Phase": "", "Bull Price": "33.74", "Bull Anchor": "30.76", "Bear Price": "75.599", "Bear Anchor": "83.51",
-                               "Ref Price": "127.56", "Ref Return": "3.56", "Spread": "-7.36", "Mean": "-2.41", "Deviation": "4.96",
-                               "Anchor Status": "Bell", "USD/USDT": "0.998525", "Real Long Deviation": "9.59", "Real Short Deviation": other,
-                               "Long Fill": "6234", "Short Fill": str(board.FULL), "Signal": "Long · Partial", "Bid 1+2 Depth · Bull": "2415.33",
-                               "Bid 1+2 Depth · Bear": nr, "Ask 1+2 Depth · Bull": "2094.72", "Ask 1+2 Depth · Bear": "54.93"})
+        book = ("Leg", "Tick", "Levels", "Bid · ct", "Bid · USDT", "Ask · ct", "Ask · USDT")
+        self.assertEqual({k: v for k, v in row.items() if k not in book},
+                         {"Phase": "", "Bull Price": "33.74", "Bull Anchor": "30.76", "Bear Price": "75.599", "Bear Anchor": "83.51",
+                          "Ref Price": "127.56", "Ref Return": "3.56", "Spread": "-7.36", "Mean": "-2.41", "Sigma": "3.46", "Deviation": "4.96",
+                          "Anchor Status": "Bell", "USD/USDT": "0.998525", "Real Long Deviation": "9.59", "Real Short Deviation": other,
+                          "Long Fill": "6234", "Short Fill": str(board.FULL), "Signal": "Long · Partial"})
+        # The Book table's two rows (sel is Binance SOXL / SOXS: both ticks 0.01, levels 1-2); the strips' figures only in row 1.
+        self.assertEqual([[r[c] for c in book] for r in rows], [["SOXL", "0.01", "1–2", "2415.33", "81482", "2094.72", "70654"],
+                                                                 ["SOXS", "0.01", "1–2", nr, nr, "54.93", "4153"]])
+        self.assertEqual({k: v for k, v in rows[1].items() if v and k not in book}, {})
         # The basis second's past_t, Spread, Real Long Spread and Real Short Spread changed (the Mean stays -2.408): both real
         # spreads above the Mean (Real Long Deviation on the other side, Real Short Deviation |3.1 + 2.408|); both at the Mean
         # (neither side); both below it; past T (Past T on both, whatever the side).
-        basis = "'mid', false, 0.998525, 30.756, 83.505, 123.18, 33.735, 75.604, NULL, -7.364, -2.408, -12.0, -9.9,"
+        basis = "'mid', false, 0.998525, 30.756, 83.505, 123.18, 33.735, 75.604, NULL, -7.364, -2.408, 3.4567, -12.0, -9.9,"
         self.assertIn(basis, last)
         for past_t, s, s_long, s_short, want in (("false", 1.6, 5.0, 3.1, (other, "5.51")), ("false", -2.408, -2.408, -2.408, (other, other)),
                                                  ("false", -12.0, -12.0, -12.0, ("9.59", other)), ("true", -7.364, -12.0, -9.9, (pt, pt))):
-            changed = "'mid', %s, 0.998525, 30.756, 83.505, 123.18, 33.735, 75.604, NULL, %s, -2.408, %s, %s," % (past_t, s, s_long, s_short)
+            changed = "'mid', %s, 0.998525, 30.756, 83.505, 123.18, 33.735, 75.604, NULL, %s, -2.408, 3.4567, %s, %s," % (past_t, s, s_long, s_short)
             row = rows_of(substitute(board.Q_LAST.replace(board.LAST, last.replace(basis, changed)), sel, 20_000))[0]
             self.assertEqual((row["Real Long Deviation"], row["Real Short Deviation"]), want, changed)
         row = rows_of(substitute(board.Q_LAST.replace(board.LAST, "(SELECT * FROM %s WHERE false) x" % last.replace(") x(", ") l(")), sel, 20_000))[0]
-        self.assertEqual({k: v for k, v in row.items() if v}, {})
+        self.assertEqual({k: v for k, v in row.items() if v and k not in ("Leg", "Tick", "Levels")}, {})
 
     @unittest.skipUnless(PSQL, "set ETFPAIR_BOARD_PSQL to run the queries")
     def test_steps(self):
