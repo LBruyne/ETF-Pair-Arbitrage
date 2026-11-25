@@ -3,7 +3,7 @@
 ETF Pair Arbitrage 的交易进程（Go）：读 Bitget 上 SOXLUSDT / SOXSUSDT 两个永续合约的盘口，按锚点算价差、均线和 σ，非盘中两条腿同时偏离足够远时用 IOC 限价单同时开仓，回到平仓线时平仓，每个美股常规收盘前全部平掉。
 
 - 规则在 [../PRD.md](../PRD.md)，设计在 [SPEC.md](SPEC.md)（模块、接口、表、实施步骤）。
-- **现状：SPEC 第 9 节的第 0–5 步已实现**（第 0–4 步已提交；第 5 步经独立审查和修订、通过测试，未提交）。执行循环（第 6 步）还没有。先说脚手架、`store` 和 `cex` 的行情与参考数据：
+- **现状：SPEC 第 9 节的第 0–6.4 步已实现并提交**（各步都经独立审查；第 6.5 步纸面联调进行中）。下面按模块说明：
   - 两条腿的盘口：每条腿 `cex.book_connections` 条 Bitget 公共连接（默认 3），各订阅深度（两条腿都是 `books5`）和 `books1`，按撮合序号合并，判冲突和有效期（`Books()` 一次读出两条腿，`DepthUsable`、`DepthOK`、`HasPrice` 都在这同一份上回答）；
   - 汇率 F（Coinbase，每 5 秒一次）、美股日历与 Session、与 Binance 时段表的每小时核对；
   - 锚点：铃锚点（Binance 指数 × F）→ NAV 稳定 1 小时后换成 NAV（Direxion），分红窗口与 A − Div，拆股条目的不开仓窗口；每个事实写一行 `anchor_fact`，重启时读回接着用；
@@ -20,7 +20,7 @@ ETF Pair Arbitrage 的交易进程（Go）：读 Bitget 上 SOXLUSDT / SOXSUSDT 
   - 订单表（`cex/orders.go`）：`PlaceOrders` 先把 `cex_order` 行同步写库再发单（写不了时，含非只减仓单的一组整组不发，只减仓的照发）；回报、推送、查询按“累计成交量只增不减、最终状态之后只补成交量和手续费”合并；受理后 1 秒没有结果、超时或断线的单是“结果未知”，每秒按编号查询、不重发；交易所答“没有这张单”满 30 秒且成交记录里也没有，才标 `NotFound`；每次变化写 `cex_order`，成交照到达的写 `cex_fill`（重复的由表的主键 `exec_id` 去掉）；手续费只对报它时的那个成交量算“已知”，成交量变大而新的手续费还没到时回到“未知”继续查；拒单和因价格超限被撤的单在记录上带错误种类（`ErrorKind`，只在内存里，`cex_order` 没有这一列）；重启时读回的订单进表，没有最终状态的变成未知继续查；`RecoverOrders(cycleID)` 只在有未结束的一轮时调用，从交易所认回这一轮里本地没记下的单（两个合约都读到才开始认；别的轮次的单一律不动，它们在库里的行是完整的），`SetOrderLot` 把账本定下的仓位号存进 `cex_order.lot_id`。
   - 纸面交易所（`cex/paper.go`）：纸面模式（`exec.live: false`）下 `main` 用它包住 Bitget 客户端。行情、合约规则、结算费率照常读真实的公开接口；账户侧全在本地——订单过了这条腿的 `sim_order_latency` 后，在那一刻这条腿的盘口上按限价逐档成交（IOC，只减仓单不超过纸面持仓），手续费 = 成交额 × `taker_fee_bps`；纸面持仓、纸面资金费流水；每次撮合写一行 `decision`（`kind = paper_match`，带这一轮和仓位的编号、发单时和成交时的两份盘口；不进 `event`，那里只放报警）；两张单同时撮合时事件按撮合的先后逐张送出；纸面资金费流水在真实交易所公布结算费率之后入账，读取时不按时间过滤。**真实交易所收不到任何订单和账户请求。**
 - **第 3 步 `strategy` 也已实现**：纯计算，不联网、不读时钟、不持有状态、不打日志。有效档位（`EffectiveLevels`）、价差（`Spread`）、按每条腿美元价存的均线和 σ（`ComputeStats`、`Stats.Mu` / `Sigma`，同一份数据可按任意一组锚点表达）、开仓的检查顺序与数量（`EvaluateEntry`，不开仓的原因是成组的 `Reason` 常量）、平仓线与数量（`EvaluateExit`）、成交不齐时补齐还是回吐（`EvaluateGap`）、强制平仓的限价（`ForcedOrders`）。测试用 PRD 附录 A 的四个算例和手算的数逐数核对。它现在还没有调用方：等 `inventory`（第 4 步）和 `exec`（第 6 步）。
-- 进程现在能启动、连上行情、读出当前 Session 的铃锚点、读回上次的账本和订单、每 30 秒打一行 `cex: status`、收到停止信号后退出。**执行循环（第 6 步）还没有实现，所以没有任何代码会调用 `PlaceOrders`**：任何模式下都不发订单，纸面的也不发。
+- 进程能启动、连上行情、读出锚点、读回上次的账本和订单并恢复未结束的一轮，按 PRD 开仓、平仓、补齐 / 回吐、收盘前强制平仓，处理结果未知、持仓不符、停止信号和人工接管。纸面模式（`exec.live: false`）只撮合在本地；实盘模式（`exec.live: true`）还没有运行过，需要用户另行授权。
 
 ## 构建与检查
 
@@ -115,3 +115,11 @@ go run . -config config.yaml -env .env
 | `inventory/` | 库存：`ledger.go`（由订单重算的账本）、`quota.go`、`reconcile.go`、`manager.go`（恢复、资金费、关轮）、`store.go` |
 | `exec/` | 执行循环：`manager.go`（Run、信号、状态行）、`step.go`（每一拍的判断顺序、开仓阻挡）、`bars.go`（分钟 bar、均线重新开始、换锚）、`orders.go`（开仓、按线平仓、强制平仓、结清、关轮）、`store.go`（落库行）。6.1 已实现；补齐 / 回吐（6.2）、结果未知与停止的其余部分（6.3）、重启恢复（6.4）待做 |
 | `scripts/dev_db.sh` | 开发和测试用的私有数据库：`start` / `stop` / `status` |
+
+## 纸面长跑（第 6.5 步）
+
+- 正式库的角色和 schema：`core/scripts/install_trade_db.sh`（幂等；密码写进 `core/.env` 的 `store.dsn` 和 `core/.env.reader`，不打印）。
+- 配置：`core/config.yaml`（不提交），`exec.live: false`。
+- 启动（在仓库根目录）：`cd core && go build -buildvcs=false -o ../experiments/core_paper/etf_core . && cd ../experiments/core_paper && (setsid nohup ./etf_core -config ../../core/config.yaml -env ../../core/.env > stdout.log 2>&1 < /dev/null & echo $! > etf_core.pid)`。日志在 `experiments/core_paper/logs/etf_core_<UTC+8 启动时刻>.log`。
+- 停止：`kill -TERM $(cat experiments/core_paper/etf_core.pid)`——停止信号会先减仓、结清再退出（SPEC 5.4）。
+- 纸面模式只连公共行情，不连私有流和下单连接，交易所收不到任何订单。

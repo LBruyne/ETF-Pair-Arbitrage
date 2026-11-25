@@ -1629,7 +1629,7 @@ func (s *Store) LoadState(ctx context.Context, sessionID string) (State, error) 
 **库与角色**：库 `etfpair`（本机，与看板同一实例），schema `trade`。新角色 `etfpair_trade`（`trade` 的属主；对 `etfpair.perp_second` 只有 `SELECT`）和 `etfpair_trade_reader`（Grafana 用：`trade` 只读、`default_transaction_read_only = on`、`statement_timeout = 15s`、连接上限 10）。库对 PUBLIC 撤了 `CONNECT`，两个新角色要显式授权。
 
 - 开发和测试：`core/scripts/dev_db.sh` 在 `experiments/core_dev_db/` 下起一个私有的 PostgreSQL（端口 5441，不碰正式库），建库 `etfpair`、这两个角色和 schema `trade`（第 1 步）。它没有录制服务在写，`perp_second` 的补分钟测试（第 6.4 步）用装进去的样本行。
-- 正式库：在 `dashboard/deploy/install.sh` 里加一段建角色和授权（现在没有）；执行它属于发布，要用户授权，排在第 6.5 步纸面联调之前。
+- 正式库：`core/scripts/install_trade_db.sh`（幂等；不放进 `dashboard/deploy/install.sh`，那个脚本会一并重编、重启采集器和录制服务）。用户第 60 条授权，2026-11-25 19:4x UTC+8 已执行：两个角色、schema `trade` 和授权与开发库相同，`etfpair_trade` 对 `etfpair.perp_second` 只有 SELECT；生成的密码只写进 `core/.env` 的 `store.dsn` 和 `core/.env.reader`（JSON，600，看板第 7 步用），不打印、不进日志；DSN 带 `sslmode=disable`（本机回环，与看板一致）。
 
 **表**（账务量 `NUMERIC`，时间 `*_ms` 为 Unix 毫秒 `BIGINT`，统计量和分钟 bar 的中价、F `DOUBLE PRECISION`（Go 里是 `float64`，不是有限值的写 NULL），明细 `JSONB`；另有两个索引 `lot_cycle_idx`、`cex_order_cycle_idx`；每张表都有 `run_id` 和 `live BOOLEAN`，纸面和实盘的行永不合并：`live` 是每张表业务主键的一部分（`process_run` 和带 `run_id` 的采样表除外），两种模式即使用了相同的 `cycle_id`、`lot_id`、订单号也互不覆盖，各自重启只读回自己的）：
 
@@ -1791,7 +1791,7 @@ func (s *Store) LoadState(ctx context.Context, sessionID string) (State, error) 
 
 ## 9. 实施步骤与状态
 
-每一步结束时：`go build ./... && go vet ./... && go test -race ./...`（在 `core/` 下）通过，本步的验收项有测试，本文件与实现一致，向用户汇报后再进下一步。V 编号是 PRD 第 17 节的验收条目。每个 manager 的时钟都是注入的（`timings.clock`），测试和回放用假时钟。状态（2026-11-25）：**第 0–4 步已实现、测试通过并已提交；第 5.1、5.2、5.3 步和 SOXS 的 `books5` 取价档已实现（5.1 经独立代码审查并修订），连私有开发库 241 个顶层测试通过、0 失败、无 race，10 个门控测试默认跳过（其中 `TestLiveOrderLatency` 发真实订单，只在用户授权时运行）；未提交。第 6 步起未开始，等用户说做。**
+每一步结束时：`go build ./... && go vet ./... && go test -race ./...`（在 `core/` 下）通过，本步的验收项有测试，本文件与实现一致，向用户汇报后再进下一步。V 编号是 PRD 第 17 节的验收条目。每个 manager 的时钟都是注入的（`timings.clock`），测试和回放用假时钟。状态（2026-11-25 晚）：**第 0–6.4 步已实现、经独立审查、测试通过并已提交（6.2–6.4 的合并审查进行中）；第 6.5 步纸面联调实施中：正式库的角色和 schema 已装，2026-11-25 19:53 UTC+8 起在真实行情上跑纸面（先 1 小时，再跨 11-26 05:00 的真实收盘）。之后是第 7 步看板（用户第 61 条）。**
 
 | # | 步骤 | 内容 | 验收 |
 |---|---|---|---|
@@ -1810,7 +1810,7 @@ func (s *Store) LoadState(ctx context.Context, sessionID string) (State, error) 
 | 6.2（已实现，2026-11-25；见 5.4 末尾“第 6.2 步实现时定下的”） | exec 成交不齐 | `gapInput`、补齐 / 回吐的发单、等新帧、`void`、零头 | V9 全部；V7 的“补齐不超过额度”；**两条腿都已有最终状态、第二条腿的通知被扣住时，额外的订单为零；放行后持仓和金额只记一次**；订单在第 0 秒发出并成交、订单的最终状态在第 4 秒才到、另一条腿第 6 秒才恢复时不发补齐单；附录 A 例三、例四走完整流程 |
 | 6.3（已实现，2026-11-25；见 5.4 末尾“第 6.3 步实现时定下的”） | exec 例外与停止 | 结果未知的 30 秒和三样证据；持仓不符；停止信号、60 秒报警、人工接管 | **停止时先读到零持仓、随后那张结果未知的开仓单成交：程序继续减仓、结清后才退出，全程不开新仓**；同一盘口下两种拒单：价格超限的同价不重发、价格变了才发；临时限频解除后同价可以再发；V14 其余、V16（末句“平仓单已成交、本地还没记下就重启”在 6.4）、V17 |
 | 6.4（已实现，2026-11-25；见 5.4 末尾“第 6.4 步实现时定下的”） | exec 恢复 | `main` 的读回顺序、`recover.go`；纸面持仓回填 | **旧进程带仓 → 恢复时读取失败 → 收到停止 → 读取恢复 → 减仓并核对后才退出**；V15、V16 末句；“第二条腿的通知被扣住”在重启时再跑一次：发单前后各一个崩溃点；按 `ClientOrderID` 认回本地没记下的单；补分钟优先用自己的；接管后重启接回仓位 |
-| 6.5 | 纸面联调 | 正式库上建角色和 schema（`install.sh` 的新段；用户第 60 条已授权：“两个都同意，不用等我，直接进行测试和调试”）；对真实行情跑纸面：先 1 小时，再跨一个真实收盘 | 1 小时内状态行、`signal_sample`、`minute_bar` 连续；跨收盘那次收盘前确实持有仓位并在收盘前结清（PRD 第 17 节末段）；从 `cex_order` 重算的每轮合计与 `cycle` 一致（PRD 14.3） |
+| 6.5（实施中：角色和 schema 已装，5 分钟试跑通过，2026-11-25 19:53 UTC+8 起长跑） | 纸面联调 | 正式库上建角色和 schema（`install.sh` 的新段；用户第 60 条已授权：“两个都同意，不用等我，直接进行测试和调试”）；对真实行情跑纸面：先 1 小时，再跨一个真实收盘 | 1 小时内状态行、`signal_sample`、`minute_bar` 连续；跨收盘那次收盘前确实持有仓位并在收盘前结清（PRD 第 17 节末段）；从 `cex_order` 重算的每轮合计与 `cycle` 一致（PRD 14.3） |
 | 7 | Live Monitor 看板 | `dashboard/grafana/live_monitor_board.py`、`boardkit`（数据源改为传入、`BOARDS` 加一项）、`gen_dashboard.py`、数据源的 provisioning；`dashboard/SPEC.md` 第 7 节、`dashboard/README.md` | V19：`test_boards.py` 的结构检查；私有 Grafana 上截图几轮审阅；页面数字与表逐项对照。发布另行授权 |
 | 8 | 回放与选参 | `cmd/replay`：自己读录制服务的原始帧文件（`experiments/book_tape`，格式见 dashboard/SPEC.md 附录 A；不引用 `dashboard/` 的 Go 包），按接收时间回放，驱动同一套盘口合并、strategy、inventory、exec 和 `PaperVenue`（每条腿各自的下单延迟）；历史的锚点（按得知时刻）、F 和日历从看板库读，只读。输出 PRD 16.5 的分项。选参：模型、X、Y、d_in、d_out 的网格在前一段完整 Session 上跑，参数冻结后在之后的 Session 上验证（PRD 16.2） | 固定原始帧、接收顺序和注入的时钟，回放两次的订单序列和账本相同；一个 Session 的回放与同期纸面运行的成交一致；回测方案和结果写成报告交用户定参数；**延迟敏感性**（5.7 的 L5）：每条腿 5 / 15 / 25 / 50 / 100 ms 各跑一遍，报成交率、只成交一条腿的比例和净额 |
 | 9 | 实盘前 | 用户定交易账户（第 7 节末项），在那个账户上重新确认权限、持仓模式、杠杆和两个合约的实际费率（0.65 bps 是所查账户当时的读数）；下单应答与订单最终状态分开验收；交易程序自己读到的指数、NAV、分红、日历与看板库逐项对照；参数由用户确认；**小额实盘要用户明确授权、有人值守**：核对第 7 节各项（零成交 IOC 的状态、资金费流水、下单延迟），账本与交易所流水逐笔对上 | PRD 第 17 节末段的三项；**延迟核对**（5.7 的 L6，下真实订单，另行授权）：REST 热连接对 ping 选出的 WebSocket 连接各发几张，比发出到建单的时间，并量 `order` 推送比建单晚多少 |
