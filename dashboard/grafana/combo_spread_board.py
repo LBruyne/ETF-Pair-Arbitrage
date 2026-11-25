@@ -19,7 +19,7 @@ every figure is rounded once in SQL to the decimals it is shown with
 (shown()). The typed settings (Notional, Entry, Mean Scale) reach SQL only
 as quoted text, parsed once per query (SETTINGS); one that is not a number
 gives a reason (No Notional, No Entry, No Mean), never a query error."""
-from boardkit import (BAD, BLUE, BPS, GREY, LIGHT_GREY, NO_FIGURE, ORANGE, PHASES, PURPLE, SIGNED, TEAL, TEXT, WARN, bands, calc, code_texts, col,
+from boardkit import (BAD, BLUE, BPS, GREY, LIGHT_GREY, NO_FIGURE, ORANGE, PHASES, PURPLE, SIGNED, TEAL, TEXT, WARN, bands, code_texts, col,
                       copy_field, custom_var, group_by, keep_fields, marks, named, organize, query_var, reset_ids, reset_link, row, rows_with, series, sort_by, sql,
                       stat_strip, table, textbox_var, timeseries, tooltip_only)
 
@@ -329,6 +329,27 @@ ENTRY_COLUMNS = [("Phase", "r.phase_sort")] + [
         ("Past T Point", "r.sig = 'Past T'"), ("No Book Point", "r.sig = 'No Book'"))] + [
     ("Best Long", "CASE WHEN r.phase IS NOT NULL AND NOT r.past_t AND r.s_long_bps < r.mu_bps THEN %s END" % shown("r.mu_bps - r.s_long_bps", 1)),
     ("Best Short", "CASE WHEN r.phase IS NOT NULL AND NOT r.past_t AND r.s_short_bps > r.mu_bps THEN %s END" % shown("r.s_short_bps - r.mu_bps", 1))]
+def sigma_text(k):
+    return "%gσ" % k
+
+
+# The sigma lines (owner item 61): on the Spread chart Mean ± k σ, on the Deviation chart ± k σ, on Entry Points + k σ (the
+# Deviation chart's columns). Made here, from the Mean and Sigma as shown, NULL where either is (3.5.1: made in the browser
+# before, where Grafana's binary calculation reads a NULL operand as 0 and drew the lines at 0 through each session's warm-up,
+# the gaps and the break rows, with spikes into them); one decimal, as the Mean: the lines are drawn only (neither legend nor
+# tooltip), and a second decimal would add a fifth to the page's bytes.
+SPREAD_SIGMAS = [("Mean %s %s" % (sign, sigma_text(k)), k) for k in SIGMAS for sign in ("+", "−")]
+DEVIATION_SIGMAS = [("%s%s" % (sign, sigma_text(k)), k) for k in SIGMAS for sign in ("+", "−")]
+ENTRY_SIGMAS = [("+" + sigma_text(k), k) for k in SIGMAS]
+
+
+def k_sigma(k):
+    return shown("%g * %s" % (k, shown("r.sigma_bps", 2)), 1)
+
+
+SIGMA_COLUMNS = ([(name, shown("%s %s %g * %s" % (shown("r.mu_bps", 1), "+" if "+" in name else "-", k, shown("r.sigma_bps", 2)), 1))
+                  for name, k in SPREAD_SIGMAS] +
+                 [(name, ("" if name.startswith("+") else "-") + k_sigma(k)) for name, k in DEVIATION_SIGMAS])
 Q_SPREAD = sql("""
 WITH v AS MATERIALIZED (SELECT * FROM @SETTINGS@)
 SELECT to_timestamp(r.ts_ms / 1000.0) AS time,
@@ -336,7 +357,7 @@ SELECT to_timestamp(r.ts_ms / 1000.0) AS time,
 FROM v CROSS JOIN LATERAL @RANGE@
 WINDOW w AS (ORDER BY r.ts_ms)
 ORDER BY r.ts_ms""", SETTINGS=SETTINGS, RANGE=RANGE,
-               COLUMNS=",\n       ".join('%s AS "%s"' % (q, name) for name, q in SPREAD_CHART + DEVIATION_CHART + ENTRY_CHART + ENTRY_COLUMNS))
+               COLUMNS=",\n       ".join('%s AS "%s"' % (q, name) for name, q in SPREAD_CHART + DEVIATION_CHART + ENTRY_CHART + ENTRY_COLUMNS + SIGMA_COLUMNS))
 
 
 # The Prices row's one query: each leg's price; the session's anchor in USDT at the point's USD/USDT, the price at which the
@@ -547,35 +568,16 @@ DEVIATION_FIELDS = ["time", "Signed Deviation", "Signed Real Long Deviation", "S
 DEVIATION_BAND = [copy_field("+Entry", "Band Top"), copy_field("−Entry", "Band Bottom")]
 
 
-def sigma_text(k):
-    return "%gσ" % k
-
-
-# The sigma lines (owner item 61), made in the browser from the frame's Sigma (and Mean) so that the frame carries one column for
-# them, not ten: on the Spread chart Mean ± k σ, on the Deviation chart ± k σ, on Entry Points + k σ. Each is drawn behind the
-# data, grey and thin, whole multiples dashed and halves dotted, none in the legend (its Sigma row gives σ itself) nor the tooltip.
+# The sigma lines (owner item 61) are drawn behind the data, grey and thin, whole multiples dashed and halves dotted, none in the
+# legend (its Sigma row gives σ itself) nor the tooltip.
 def sigma_line(name, legend=False):
     k = float(name.split(" ")[-1].lstrip("+−±").rstrip("σ"))
     whole = k == int(k)
     return series(name, GREY + ("C0" if whole else "90"), width=1, dash=[6, 4] if whole else [2, 3], legend=legend, tooltip=False)
 
 
-SIGMA_STEPS = ["%s · Step" % sigma_text(k) for k in SIGMAS if k != 1]   # k σ, to add to the Mean; not shown
-
-
-def sigma_of(k):
-    return "Sigma" if k == 1 else "%s · Step" % sigma_text(k)
-
-
-SPREAD_SIGMAS = [("Mean %s %s" % (sign, sigma_text(k)), k) for k in SIGMAS for sign in ("+", "−")]
-SPREAD_SIGMA_CALCS = [calc("%s · Step" % sigma_text(k), "Sigma", "*", k) for k in SIGMAS if k != 1] + [
-    calc(name, "Mean", "+" if "+" in name else "-", sigma_of(k)) for name, k in SPREAD_SIGMAS]
-DEVIATION_SIGMAS = [("%s%s" % (sign, sigma_text(k)), k) for k in SIGMAS for sign in ("+", "−")]
-DEVIATION_SIGMA_CALCS = [calc(name, "Sigma", "*", k if name.startswith("+") else -k) for name, k in DEVIATION_SIGMAS]
 DEVIATION_ORDER = (DEVIATION_FIELDS[:1] + ["Band Top", "Band Bottom"] + [name for name, _ in DEVIATION_SIGMAS] + DEVIATION_FIELDS[1:7] +
                    ["Sigma"] + DEVIATION_FIELDS[8:])
-ENTRY_SIGMAS = [("+" + sigma_text(k), k) for k in SIGMAS]
-ENTRY_SIGMA_CALCS = [calc(name, "Sigma", "*", k) for name, k in ENTRY_SIGMAS]
 DEVIATION_NAMES = {"Signed Deviation": "Deviation", "Signed Real Long Deviation": "Real Long Deviation",
                    "Signed Real Short Deviation": "Real Short Deviation", "Signed Past T": "Past T"}
 # The Entry Points chart: the faded real lines come before the bright ones, which Grafana then draws over them.
@@ -603,8 +605,10 @@ def price_fields(name):
 
 # Entry's options (3.5, owner item 64): multiples of sigma; a typed number is bps. The halves are written ½ in the picker (their
 # values, the URL and the titles keep 0.5σ, 1.5σ, 2.5σ): Enter picks the first option whose text contains what is typed, so a
-# typed 5, 0.5, 1.5 or 2.5 would otherwise pick a sigma option instead of bps; only 1, 2 and 3 still do.
-ENTRY_OPTIONS = [(t, v + "σ") for t, v in (("½σ", "0.5"), ("1σ", "1"), ("1½σ", "1.5"), ("2σ", "2"), ("2½σ", "2.5"), ("3σ", "3"))]
+# typed 5, 0.5, 1.5 or 2.5 would otherwise pick a sigma option instead of bps; only 1, 2 and 3 still do. The default, 10 bps, is
+# an option too: Grafana replaces a default that is not one by the first option (3.5 opened on 0.5σ; 3.5.1).
+ENTRY_OPTIONS = [("10 bps", "10")] + [(t, v + "σ") for t, v in (("½σ", "0.5"), ("1σ", "1"), ("1½σ", "1.5"), ("2σ", "2"), ("2½σ", "2.5"),
+                                                                ("3σ", "3"))]
 # The Notional's options, fixed sizes from 100 U (item 61) to 100k: written in k from 1,000 on, so that a typed amount (Grafana
 # picks the first option whose text contains what is typed, on Enter) never picks one unless it is 1 to 99.
 NOTIONAL_OPTIONS = [("100", "100"), ("500", "500")] + [("%dk" % (v // 1000), str(v)) for v in (1000, 5000, 10000, 50000, 100000)]
@@ -626,7 +630,7 @@ def build():
                     "minute bars' spread over that many minutes, a whole number from 1 to 999,999 (60, 60min); it restarts with the mean · "
                     "anything else: no sigma lines, Sigma reads No Sigma."),
         custom_var("d", "Entry", ENTRY_OPTIONS, "10",
-                   "Long: Real Long Spread ≤ Mean − Entry · Short: Real Short Spread ≥ Mean + Entry · pick a multiple of sigma (0.5σ to 3σ: "
+                   "Long: Real Long Spread ≤ Mean − Entry · Short: Real Short Spread ≥ Mean + Entry · pick 10 bps or a multiple of sigma (½σ to 3σ: "
                    "each point's Entry is k × its sigma, the Sigma Scale's, as the sigma lines; none until sigma is ready: No Sigma) or type a "
                    "number of bps and press Enter (10, 7.5, 10bps) · Enter picks the first option whose text contains what is typed, so 1, 2 "
                    "and 3 need bps after them (2bps) · anything else: No Entry, no Entry lines.", allow_custom=True),
@@ -758,7 +762,7 @@ def build():
 
     def twin(name, color, shown_as=None, props=None):
         return tooltip_only(name, color, no_value, props, shown=shown_as)
-    # Sigma: a figure for the legend (Last, Min, Max) without a line, on a hidden axis of its own; the sigma lines are drawn from it.
+    # Sigma: a figure for the legend (Last, Min, Max) without a line, on a hidden axis of its own (the sigma lines are columns of the query).
     sigma = named("Sigma", {"color": {"mode": "fixed", "fixedColor": LIGHT_GREY}, "custom.lineWidth": 0, "custom.axisPlacement": "hidden",
                             "decimals": 2, "custom.hideFrom": {"legend": False, "tooltip": True, "viz": False}})
     band = [sigma] + [sigma_line(name) for name, _ in SPREAD_SIGMAS] + [
@@ -772,8 +776,7 @@ def build():
             tooltip_only("Signal", TEXT, signal)] + [
         twin(name, ORANGE if name.startswith("Bid") else BLUE, display,
              {"unit": "locale", "decimals": 2 if name.endswith("ct") else 0}) for name, display, _, _ in DEPTHS]
-    spread = timeseries("Spread · Bps", Q_SPREAD, 0, y, 24, 13, band, transformations=[keep_fields(["time"] + [name for name, _ in SPREAD_CHART])] +
-                        SPREAD_SIGMA_CALCS + [organize(SPREAD_ORDER, exclude=SIGMA_STEPS)], description=(
+    spread = timeseries("Spread · Bps", Q_SPREAD, 0, y, 24, 13, band, transformations=[keep_fields(SPREAD_ORDER), organize(SPREAD_ORDER)], description=(
         "Spread = 10⁴ × (F·P_bull ÷ A_bull + F·P_bear ÷ A_bear − 2) · P: both legs' mid prices, else both last trades · Real Long, Real "
         "Short Spread: the same on the average prices of buying, selling both legs for the notional N through their pricing levels' "
         "asks, bids · σ: the population standard deviation of the minute bars' spread over the Sigma Scale · Long: Real Long Spread ≤ "
@@ -794,8 +797,9 @@ def build():
         "the instant it takes effect (a mark there, with the expected and measured step; the mean and σ restart, also when a leg's "
         "dividend takes effect without its amount: A stays, the spread steps, Past T until the amount is known) · F: USD/USDT · Mean: "
         "the same on each leg's mean of its minute bars (both legs' mids at the minute's end, else their trades, else their candle "
-        "closes) · each session is drawn on its own · points: the recorder's per-second rows, every second to about 83 min, 5 s to "
-        "about 7 h, 10 s to about 14 h, 30 s to about 41 h, then every minute or more; a second without both legs' prices is a gap."))
+        "closes) · each session is drawn on its own · points: the recorder's per-second rows, at most about 2,000 a line: every second "
+        "to about 33 min, 5 s to about 2.8 h, 10 s to about 5.6 h, 30 s to about 16.7 h, then every minute or more; a second without "
+        "both legs' prices is a gap."))
     panels.append(spread); y += 13
     # The Deviation chart (OWNER.md item 22): the Spread chart with its Mean moved to zero, the zero in the middle of the axis,
     # every figure with its sign. The sigma lines ±k σ behind everything but the band (item 61). Deviation purple and 2 px as the
@@ -819,7 +823,7 @@ def build():
               twin("Sigma · Tooltip", LIGHT_GREY, "Sigma​", {"decimals": 2}), tooltip_only("Signal", TEXT, signal)]
     # Thirteen rows high, as the Spread chart: the same plot height, so their shapes compare (UI review r1 N2).
     deviation = timeseries("Deviation · Bps", None, 0, y, 24, 13, signed, zero_line=True, source=spread,
-                           transformations=[keep_fields(DEVIATION_FIELDS)] + DEVIATION_BAND + DEVIATION_SIGMA_CALCS +
+                           transformations=[keep_fields(DEVIATION_FIELDS + [name for name, _ in DEVIATION_SIGMAS])] + DEVIATION_BAND +
                            [organize(DEVIATION_ORDER, rename=DEVIATION_NAMES)], description=(
         "Deviation = Spread − Mean · Real Long / Short Deviation = Real Long / Short Spread − Mean · Long: Real Long Deviation ≤ −Entry "
         "· Short: Real Short Deviation ≥ +Entry · ±k σ: k times sigma, k = 1, 1.5, 2, 2.5, 3\n\n"
@@ -859,7 +863,7 @@ def build():
                twin("Real Short Deviation · Tooltip", ORANGE, "Real Short Deviation​"), tooltip_only("Signal", TEXT, signal)]
     # Thirteen rows high: at 880 px the legend under the plot shows its last row whole (twelve leaves it 4 px short).
     panels.append(timeseries("Entry Points · Bps", None, 0, y, 24, 13, lines_x, zero_line=True, soft_min=0, source=spread, calcs=["max"],
-                             transformations=[keep_fields(ENTRY_FIELDS)] + ENTRY_SIGMA_CALCS +
+                             transformations=[keep_fields(ENTRY_FIELDS + [name for name, _ in ENTRY_SIGMAS])] +
                              [organize(ENTRY_ORDER, rename={"Deviation · Line": "Deviation"}, exclude=["Sigma"])],
                              description=(
         "Deviation = |Spread − Mean| · Real Long Deviation = |Real Long Spread − Mean| · Real Short Deviation = |Real Short Spread − Mean| · "

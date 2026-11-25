@@ -107,16 +107,6 @@ def copy_field(name, alias):
                                                  "replaceFields": False}}
 
 
-def calc(alias, left, operator, right):
-    """Transformation: a field alias = left operator right, made in the browser row by row (Grafana's binary operation);
-    left and right are field names or numbers. Grafana 13 reads a NULL operand as 0 (Live Monitor round 2: the lines of a
-    break row, all NULL, came out 0), so a result over rows that break the lines must be computed in SQL instead."""
-    def operand(x):
-        return {"fixed": str(x)} if isinstance(x, (int, float)) else {"matcher": {"id": "byName", "options": x}}
-    return {"id": "calculateField", "options": {"mode": "binary", "binary": {"left": operand(left), "operator": operator, "right": operand(right)},
-                                                 "alias": alias, "replaceFields": False}}
-
-
 def rows_with(field):
     """Transformation: only the rows at which field has a value."""
     return {"id": "filterByValue", "options": {"filters": [{"fieldName": field, "config": {"id": "isNotNull", "options": {}}}], "type": "include",
@@ -290,10 +280,9 @@ def query_var(name, label, q, description, hide=0):
 
 def custom_var(name, label, values, default, description, allow_custom=False):
     """values is a list of (text, value); a comma in a text is escaped in the query. allow_custom lets the viewer type a
-    value that is not in the list; the default may then be one that is not."""
+    value that is not in the list. The default must be one of them: Grafana replaces one that is not by the first option."""
     opts = [{"text": t, "value": v, "selected": v == default} for t, v in values]
-    text = next((t for t, v in values if v == default), default)
-    assert allow_custom or text != default or any(v == default for _, v in values), default
+    text = next(t for t, v in values if v == default)
     return {"name": name, "label": label, "description": description, "type": "custom",
             "query": ",".join("%s : %s" % (t.replace(",", "\\,"), v) for t, v in values),
             "options": opts, "current": {"text": text, "value": default, "selected": True}, "multi": False, "includeAll": False, "hide": 0,

@@ -2212,7 +2212,7 @@
    "id": 10,
    "type": "timeseries",
    "title": "Spread · Bps",
-   "description": "Spread = 10⁴ × (F·P_bull ÷ A_bull + F·P_bear ÷ A_bear − 2) · P: both legs' mid prices, else both last trades · Real Long, Real Short Spread: the same on the average prices of buying, selling both legs for the notional N through their pricing levels' asks, bids · σ: the population standard deviation of the minute bars' spread over the Sigma Scale · Long: Real Long Spread ≤ Mean − Entry · Short: Real Short Spread ≥ Mean + Entry · Entry: the bps typed, or k × σ (0.5σ … 3σ) at each point\n\nDrawn: Spread, Mean, the band Mean ± Entry (teal, dashed; not drawn when Entry is not a positive number: the Signal reads No Entry) and Mean ± 1, 1.5, 2, 2.5, 3 σ (grey: whole σ dashed, half σ dotted; none until sigma is ready); the drawn Spread crossing a line is not a signal (see Deviation · Bps and Entry Points · Bps) · legend Sigma: σ's last, lowest and highest · tooltip, in this order: Spread, Real Long Spread, Real Short Spread, Mean, Sigma, Deviation, Real Long Deviation, Real Short Deviation, Signal, each leg's bid and ask depth of its pricing levels in ct (contracts) and USDT; each row is that second's value or the reason it has none (No Anchor, Past T, No Mean, No Sigma, No Notional, No Book, Few Levels) · P: (best bid + best ask) ÷ 2 of both legs' recorded books in that second, else both legs' last trades before it (before the recorder: trades only, No Book) · Real Long Spread, Real Short Spread: what opening or closing a basket of N USDT (both legs together) as a taker gives in that second, the quantities making q·A equal on both legs, through each leg's pricing levels only (${bull} 1–${bull_levels}, ${bear} 1–${bear_levels}: 2 at a 0.01 tick, 5 at 0.001, the trading program's, PRD 3.2); where those levels hold less than N, on their totals, and the Signal reads Partial · Deviation, Real Long Deviation, Real Short Deviation: |Spread − Mean|, |Real Long Spread − Mean|, |Real Short Spread − Mean|, absolute (with their signs on Deviation · Bps) · Signal: as in Signal · Latest Second · depth: as in Book · Latest Second · A: session anchor, less a dividend or over a split's ratio from the instant it takes effect (a mark there, with the expected and measured step; the mean and σ restart, also when a leg's dividend takes effect without its amount: A stays, the spread steps, Past T until the amount is known) · F: USD/USDT · Mean: the same on each leg's mean of its minute bars (both legs' mids at the minute's end, else their trades, else their candle closes) · each session is drawn on its own · points: the recorder's per-second rows, every second to about 83 min, 5 s to about 7 h, 10 s to about 14 h, 30 s to about 41 h, then every minute or more; a second without both legs' prices is a gap.",
+   "description": "Spread = 10⁴ × (F·P_bull ÷ A_bull + F·P_bear ÷ A_bear − 2) · P: both legs' mid prices, else both last trades · Real Long, Real Short Spread: the same on the average prices of buying, selling both legs for the notional N through their pricing levels' asks, bids · σ: the population standard deviation of the minute bars' spread over the Sigma Scale · Long: Real Long Spread ≤ Mean − Entry · Short: Real Short Spread ≥ Mean + Entry · Entry: the bps typed, or k × σ (0.5σ … 3σ) at each point\n\nDrawn: Spread, Mean, the band Mean ± Entry (teal, dashed; not drawn when Entry is not a positive number: the Signal reads No Entry) and Mean ± 1, 1.5, 2, 2.5, 3 σ (grey: whole σ dashed, half σ dotted; none until sigma is ready); the drawn Spread crossing a line is not a signal (see Deviation · Bps and Entry Points · Bps) · legend Sigma: σ's last, lowest and highest · tooltip, in this order: Spread, Real Long Spread, Real Short Spread, Mean, Sigma, Deviation, Real Long Deviation, Real Short Deviation, Signal, each leg's bid and ask depth of its pricing levels in ct (contracts) and USDT; each row is that second's value or the reason it has none (No Anchor, Past T, No Mean, No Sigma, No Notional, No Book, Few Levels) · P: (best bid + best ask) ÷ 2 of both legs' recorded books in that second, else both legs' last trades before it (before the recorder: trades only, No Book) · Real Long Spread, Real Short Spread: what opening or closing a basket of N USDT (both legs together) as a taker gives in that second, the quantities making q·A equal on both legs, through each leg's pricing levels only (${bull} 1–${bull_levels}, ${bear} 1–${bear_levels}: 2 at a 0.01 tick, 5 at 0.001, the trading program's, PRD 3.2); where those levels hold less than N, on their totals, and the Signal reads Partial · Deviation, Real Long Deviation, Real Short Deviation: |Spread − Mean|, |Real Long Spread − Mean|, |Real Short Spread − Mean|, absolute (with their signs on Deviation · Bps) · Signal: as in Signal · Latest Second · depth: as in Book · Latest Second · A: session anchor, less a dividend or over a split's ratio from the instant it takes effect (a mark there, with the expected and measured step; the mean and σ restart, also when a leg's dividend takes effect without its amount: A stays, the spread steps, Past T until the amount is known) · F: USD/USDT · Mean: the same on each leg's mean of its minute bars (both legs' mids at the minute's end, else their trades, else their candle closes) · each session is drawn on its own · points: the recorder's per-second rows, at most about 2,000 a line: every second to about 33 min, 5 s to about 2.8 h, 10 s to about 5.6 h, 30 s to about 16.7 h, then every minute or more; a second without both legs' prices is a gap.",
    "gridPos": {
     "x": 0,
     "y": 25,
@@ -2233,7 +2233,7 @@
      "format": "table",
      "rawQuery": true,
      "editorMode": "code",
-     "rawSql": "WITH v AS MATERIALIZED (SELECT * FROM (SELECT (SELECT CASE m[3] WHEN 'k' THEN 1000 WHEN 'w' THEN 10000 WHEN '万' THEN 10000 ELSE 1 END * (replace(m[1], ',', '') || m[2])::numeric FROM regexp_match(regexp_replace(regexp_replace(lower(normalize('$notional', NFKC)), '[[:space:]_]', '', 'g'), 'u(sdt)?$', ''), '^([0-9]{1,3}(?:,[0-9]{3})+|[0-9]+)((?:[.][0-9]+)?)(k|w|万)?$') m) AS n, (SELECT CASE WHEN m[1]::numeric > 0 THEN m[1]::numeric END FROM regexp_match(regexp_replace(lower(normalize('$d', NFKC)), '[[:space:]_]', '', 'g'), '^([0-9]+(?:[.][0-9]+)?)(?:bps)?$') m) AS d, (SELECT CASE WHEN m[1]::numeric > 0 THEN m[1]::numeric END FROM regexp_match(regexp_replace(lower(normalize('$d', NFKC)), '[[:space:]_]', '', 'g'), '^([0-9]+(?:[.][0-9]+)?)(?:σ|sigma)$') m) AS k, (SELECT CASE WHEN m[1]::integer > 0 THEN m[1]::integer END FROM regexp_match(regexp_replace(lower(normalize('$ma_minutes', NFKC)), '[[:space:]_]', '', 'g'), '^([0-9]{1,6})(?:min|m)?$') m) AS ma_n, (SELECT CASE WHEN m[1]::integer > 0 THEN m[1]::integer END FROM regexp_match(regexp_replace(lower(normalize('$sigma_minutes', NFKC)), '[[:space:]_]', '', 'g'), '^([0-9]{1,6})(?:min|m)?$') m) AS sig_n) v)\nSELECT to_timestamp(r.ts_ms / 1000.0) AS time,\n       (floor((r.s_bps)::float8 * 1e1::float8 + 0.5) / 1e1::float8) AS \"Spread\",\n       (floor((r.mu_bps)::float8 * 1e1::float8 + 0.5) / 1e1::float8) AS \"Mean\",\n       (floor((r.mu_bps + r.entry)::float8 * 1e1::float8 + 0.5) / 1e1::float8) AS \"Mean + Entry\",\n       (floor((r.mu_bps - r.entry)::float8 * 1e1::float8 + 0.5) / 1e1::float8) AS \"Mean − Entry\",\n       (floor((r.sigma_bps)::float8 * 1e2::float8 + 0.5) / 1e2::float8) AS \"Sigma\",\n       CASE WHEN r.basis IS NULL THEN NULL WHEN r.s_bps IS NOT NULL THEN (floor((r.s_bps)::float8 * 1e1::float8 + 0.5) / 1e1::float8) ELSE -4000000000 END AS \"Spread · Tooltip\",\n       CASE WHEN r.basis IS NULL THEN NULL WHEN r.s_long_bps IS NOT NULL THEN (floor((r.s_long_bps)::float8 * 1e1::float8 + 0.5) / 1e1::float8) WHEN r.s_bps IS NULL THEN -4000000000 WHEN NOT coalesce(v.n > 0, false) THEN -3000000000 WHEN r.basis <> 'mid' THEN -2000000000 ELSE -12000000000 END AS \"Real Long Spread\",\n       CASE WHEN r.basis IS NULL THEN NULL WHEN r.s_short_bps IS NOT NULL THEN (floor((r.s_short_bps)::float8 * 1e1::float8 + 0.5) / 1e1::float8) WHEN r.s_bps IS NULL THEN -4000000000 WHEN NOT coalesce(v.n > 0, false) THEN -3000000000 WHEN r.basis <> 'mid' THEN -2000000000 ELSE -12000000000 END AS \"Real Short Spread\",\n       CASE WHEN r.basis IS NULL THEN NULL WHEN r.mu_bps IS NOT NULL THEN (floor((r.mu_bps)::float8 * 1e1::float8 + 0.5) / 1e1::float8) WHEN r.s_bps IS NULL THEN -4000000000 WHEN r.past_t THEN -5000000000 ELSE -6000000000 END AS \"Mean · Tooltip\",\n       CASE WHEN r.basis IS NULL THEN NULL WHEN r.sigma_bps IS NOT NULL THEN (floor((r.sigma_bps)::float8 * 1e2::float8 + 0.5) / 1e2::float8) WHEN r.s_bps IS NULL THEN -4000000000 WHEN r.past_t THEN -5000000000 ELSE -11000000000 END AS \"Sigma · Tooltip\",\n       CASE WHEN r.basis IS NULL THEN NULL WHEN abs(r.s_bps - r.mu_bps) IS NOT NULL THEN (floor((abs(r.s_bps - r.mu_bps))::float8 * 1e1::float8 + 0.5) / 1e1::float8) WHEN r.s_bps IS NULL THEN -4000000000 WHEN r.past_t THEN -5000000000 ELSE -6000000000 END AS \"Deviation · Tooltip\",\n       CASE WHEN r.basis IS NULL THEN NULL WHEN r.s_bps IS NULL THEN -4000000000 WHEN r.past_t THEN -5000000000 WHEN abs(r.s_long_bps - r.mu_bps) IS NOT NULL THEN (floor((abs(r.s_long_bps - r.mu_bps))::float8 * 1e1::float8 + 0.5) / 1e1::float8) WHEN r.mu_bps IS NULL THEN -6000000000 WHEN NOT coalesce(v.n > 0, false) THEN -3000000000 WHEN r.basis <> 'mid' THEN -2000000000 ELSE -12000000000 END AS \"Real Long Deviation · Tooltip\",\n       CASE WHEN r.basis IS NULL THEN NULL WHEN r.s_bps IS NULL THEN -4000000000 WHEN r.past_t THEN -5000000000 WHEN abs(r.s_short_bps - r.mu_bps) IS NOT NULL THEN (floor((abs(r.s_short_bps - r.mu_bps))::float8 * 1e1::float8 + 0.5) / 1e1::float8) WHEN r.mu_bps IS NULL THEN -6000000000 WHEN NOT coalesce(v.n > 0, false) THEN -3000000000 WHEN r.basis <> 'mid' THEN -2000000000 ELSE -12000000000 END AS \"Real Short Deviation · Tooltip\",\n       CASE WHEN r.basis IS NOT NULL THEN CASE r.sig WHEN 'None' THEN 0 WHEN 'Long' THEN 1 WHEN 'Short' THEN 2 WHEN 'Long · Partial' THEN 3 WHEN 'Short · Partial' THEN 4 WHEN 'No Book' THEN -2000000000 WHEN 'No Notional' THEN -3000000000 WHEN 'No Anchor' THEN -4000000000 WHEN 'Past T' THEN -5000000000 WHEN 'No Mean' THEN -6000000000 WHEN 'No Entry' THEN -9000000000 WHEN 'No Sigma' THEN -11000000000 END END AS \"Signal\",\n       CASE WHEN r.basis IS NULL THEN NULL WHEN r.bid_ct_bull IS NOT NULL THEN (floor((r.bid_ct_bull)::float8 * 1e2::float8 + 0.5) / 1e2::float8) WHEN NOT r.book_bull THEN -2000000000 ELSE -12000000000 END AS \"Bid Bull ct\",\n       CASE WHEN r.basis IS NULL THEN NULL WHEN r.bid_ct_bear IS NOT NULL THEN (floor((r.bid_ct_bear)::float8 * 1e2::float8 + 0.5) / 1e2::float8) WHEN NOT r.book_bear THEN -2000000000 ELSE -12000000000 END AS \"Bid Bear ct\",\n       CASE WHEN r.basis IS NULL THEN NULL WHEN r.ask_ct_bull IS NOT NULL THEN (floor((r.ask_ct_bull)::float8 * 1e2::float8 + 0.5) / 1e2::float8) WHEN NOT r.book_bull THEN -2000000000 ELSE -12000000000 END AS \"Ask Bull ct\",\n       CASE WHEN r.basis IS NULL THEN NULL WHEN r.ask_ct_bear IS NOT NULL THEN (floor((r.ask_ct_bear)::float8 * 1e2::float8 + 0.5) / 1e2::float8) WHEN NOT r.book_bear THEN -2000000000 ELSE -12000000000 END AS \"Ask Bear ct\",\n       CASE WHEN r.basis IS NULL THEN NULL WHEN r.bid_usdt_bull IS NOT NULL THEN (floor((r.bid_usdt_bull)::float8 * 1e0::float8 + 0.5) / 1e0::float8) WHEN NOT r.book_bull THEN -2000000000 ELSE -12000000000 END AS \"Bid Bull USDT\",\n       CASE WHEN r.basis IS NULL THEN NULL WHEN r.bid_usdt_bear IS NOT NULL THEN (floor((r.bid_usdt_bear)::float8 * 1e0::float8 + 0.5) / 1e0::float8) WHEN NOT r.book_bear THEN -2000000000 ELSE -12000000000 END AS \"Bid Bear USDT\",\n       CASE WHEN r.basis IS NULL THEN NULL WHEN r.ask_usdt_bull IS NOT NULL THEN (floor((r.ask_usdt_bull)::float8 * 1e0::float8 + 0.5) / 1e0::float8) WHEN NOT r.book_bull THEN -2000000000 ELSE -12000000000 END AS \"Ask Bull USDT\",\n       CASE WHEN r.basis IS NULL THEN NULL WHEN r.ask_usdt_bear IS NOT NULL THEN (floor((r.ask_usdt_bear)::float8 * 1e0::float8 + 0.5) / 1e0::float8) WHEN NOT r.book_bear THEN -2000000000 ELSE -12000000000 END AS \"Ask Bear USDT\",\n       CASE WHEN NOT r.past_t THEN (floor((r.s_bps - r.mu_bps)::float8 * 1e1::float8 + 0.5) / 1e1::float8) END AS \"Signed Deviation\",\n       CASE WHEN NOT r.past_t THEN (floor((r.s_long_bps - r.mu_bps)::float8 * 1e1::float8 + 0.5) / 1e1::float8) END AS \"Signed Real Long Deviation\",\n       CASE WHEN NOT r.past_t THEN (floor((r.s_short_bps - r.mu_bps)::float8 * 1e1::float8 + 0.5) / 1e1::float8) END AS \"Signed Real Short Deviation\",\n       CASE WHEN r.past_t THEN (floor((r.s_bps - r.mu_bps)::float8 * 1e1::float8 + 0.5) / 1e1::float8) END AS \"Signed Past T\",\n       -trim_scale(round(r.entry, 6)) AS \"−Entry\",\n       CASE WHEN r.basis IS NULL THEN NULL WHEN r.s_bps - r.mu_bps IS NOT NULL THEN (floor((r.s_bps - r.mu_bps)::float8 * 1e1::float8 + 0.5) / 1e1::float8) WHEN r.s_bps IS NULL THEN -4000000000 WHEN r.past_t THEN -5000000000 ELSE -6000000000 END AS \"Signed Deviation · Tooltip\",\n       CASE WHEN r.basis IS NULL THEN NULL WHEN r.s_bps IS NULL THEN -4000000000 WHEN r.past_t THEN -5000000000 WHEN r.s_long_bps - r.mu_bps IS NOT NULL THEN (floor((r.s_long_bps - r.mu_bps)::float8 * 1e1::float8 + 0.5) / 1e1::float8) WHEN r.mu_bps IS NULL THEN -6000000000 WHEN NOT coalesce(v.n > 0, false) THEN -3000000000 WHEN r.basis <> 'mid' THEN -2000000000 ELSE -12000000000 END AS \"Signed Real Long Deviation · Tooltip\",\n       CASE WHEN r.basis IS NULL THEN NULL WHEN r.s_bps IS NULL THEN -4000000000 WHEN r.past_t THEN -5000000000 WHEN r.s_short_bps - r.mu_bps IS NOT NULL THEN (floor((r.s_short_bps - r.mu_bps)::float8 * 1e1::float8 + 0.5) / 1e1::float8) WHEN r.mu_bps IS NULL THEN -6000000000 WHEN NOT coalesce(v.n > 0, false) THEN -3000000000 WHEN r.basis <> 'mid' THEN -2000000000 ELSE -12000000000 END AS \"Signed Real Short Deviation · Tooltip\",\n       count(*) FILTER (WHERE r.sig LIKE 'Long%') OVER w AS \"Long Points\",\n       count(*) FILTER (WHERE r.sig LIKE 'Short%') OVER w AS \"Short Points\",\n       CASE WHEN NOT r.past_t THEN (floor((abs(r.s_bps - r.mu_bps))::float8 * 1e1::float8 + 0.5) / 1e1::float8) END AS \"Deviation · Line\",\n       CASE WHEN NOT r.past_t THEN (floor((abs(r.s_long_bps - r.mu_bps))::float8 * 1e1::float8 + 0.5) / 1e1::float8) END AS \"Real Long Deviation · Faded\",\n       CASE WHEN NOT r.past_t THEN (floor((abs(r.s_short_bps - r.mu_bps))::float8 * 1e1::float8 + 0.5) / 1e1::float8) END AS \"Real Short Deviation · Faded\",\n       CASE WHEN NOT r.past_t AND r.s_long_bps < r.mu_bps THEN (floor((abs(r.s_long_bps - r.mu_bps))::float8 * 1e1::float8 + 0.5) / 1e1::float8) END AS \"Real Long Deviation\",\n       CASE WHEN NOT r.past_t AND r.s_short_bps > r.mu_bps THEN (floor((abs(r.s_short_bps - r.mu_bps))::float8 * 1e1::float8 + 0.5) / 1e1::float8) END AS \"Real Short Deviation\",\n       CASE WHEN r.past_t THEN (floor((abs(r.s_bps - r.mu_bps))::float8 * 1e1::float8 + 0.5) / 1e1::float8) END AS \"Past T\",\n       trim_scale(round(r.entry, 6)) AS \"+Entry\",\n       CASE WHEN r.sig LIKE 'Long%' THEN (floor((abs(r.s_long_bps - r.mu_bps))::float8 * 1e1::float8 + 0.5) / 1e1::float8) END AS \"Long Dots\",\n       CASE WHEN r.sig LIKE 'Short%' THEN (floor((abs(r.s_short_bps - r.mu_bps))::float8 * 1e1::float8 + 0.5) / 1e1::float8) END AS \"Short Dots\",\n       r.phase_sort AS \"Phase\",\n       CASE WHEN r.phase IS NOT NULL THEN (r.sig LIKE 'Long%')::integer END AS \"Long Point\",\n       CASE WHEN r.phase IS NOT NULL THEN (r.sig LIKE 'Short%')::integer END AS \"Short Point\",\n       CASE WHEN r.phase IS NOT NULL THEN (r.sig LIKE '% · Partial')::integer END AS \"Partial Point\",\n       CASE WHEN r.phase IS NOT NULL THEN (r.sig = 'Past T')::integer END AS \"Past T Point\",\n       CASE WHEN r.phase IS NOT NULL THEN (r.sig = 'No Book')::integer END AS \"No Book Point\",\n       CASE WHEN r.phase IS NOT NULL AND NOT r.past_t AND r.s_long_bps < r.mu_bps THEN (floor((r.mu_bps - r.s_long_bps)::float8 * 1e1::float8 + 0.5) / 1e1::float8) END AS \"Best Long\",\n       CASE WHEN r.phase IS NOT NULL AND NOT r.past_t AND r.s_short_bps > r.mu_bps THEN (floor((r.s_short_bps - r.mu_bps)::float8 * 1e1::float8 + 0.5) / 1e1::float8) END AS \"Best Short\"\nFROM v CROSS JOIN LATERAL (SELECT x.*, coalesce(v.d, v.k * x.sigma_bps) AS entry, CASE WHEN v.d IS NULL AND v.k IS NOT NULL AND x.sigma_bps IS NULL AND x.s_bps IS NOT NULL AND NOT x.past_t AND x.mu_bps IS NOT NULL AND coalesce(v.n > 0, false) THEN 'No Sigma' ELSE etfpair.combo_signal(x.s_bps, x.past_t, x.mu_bps, v.n, x.basis = 'mid', x.s_long_bps, x.s_short_bps, x.partial_long, x.partial_short, coalesce(v.d, v.k * x.sigma_bps)) END AS sig FROM etfpair.combo_range('$combo', '$venue', '$ma', v.ma_n, v.sig_n, $__from, $__to, (SELECT CASE WHEN r <= 1000 THEN 1000 WHEN r <= 5000 THEN 5000 WHEN r <= 10000 THEN 10000 WHEN r <= 30000 THEN 30000 ELSE ceil(r / 60000) * 60000 END::bigint FROM (SELECT ($__to - $__from) / 2000.0 AS r) x), v.n, v.d) x) r\nWINDOW w AS (ORDER BY r.ts_ms)\nORDER BY r.ts_ms"
+     "rawSql": "WITH v AS MATERIALIZED (SELECT * FROM (SELECT (SELECT CASE m[3] WHEN 'k' THEN 1000 WHEN 'w' THEN 10000 WHEN '万' THEN 10000 ELSE 1 END * (replace(m[1], ',', '') || m[2])::numeric FROM regexp_match(regexp_replace(regexp_replace(lower(normalize('$notional', NFKC)), '[[:space:]_]', '', 'g'), 'u(sdt)?$', ''), '^([0-9]{1,3}(?:,[0-9]{3})+|[0-9]+)((?:[.][0-9]+)?)(k|w|万)?$') m) AS n, (SELECT CASE WHEN m[1]::numeric > 0 THEN m[1]::numeric END FROM regexp_match(regexp_replace(lower(normalize('$d', NFKC)), '[[:space:]_]', '', 'g'), '^([0-9]+(?:[.][0-9]+)?)(?:bps)?$') m) AS d, (SELECT CASE WHEN m[1]::numeric > 0 THEN m[1]::numeric END FROM regexp_match(regexp_replace(lower(normalize('$d', NFKC)), '[[:space:]_]', '', 'g'), '^([0-9]+(?:[.][0-9]+)?)(?:σ|sigma)$') m) AS k, (SELECT CASE WHEN m[1]::integer > 0 THEN m[1]::integer END FROM regexp_match(regexp_replace(lower(normalize('$ma_minutes', NFKC)), '[[:space:]_]', '', 'g'), '^([0-9]{1,6})(?:min|m)?$') m) AS ma_n, (SELECT CASE WHEN m[1]::integer > 0 THEN m[1]::integer END FROM regexp_match(regexp_replace(lower(normalize('$sigma_minutes', NFKC)), '[[:space:]_]', '', 'g'), '^([0-9]{1,6})(?:min|m)?$') m) AS sig_n) v)\nSELECT to_timestamp(r.ts_ms / 1000.0) AS time,\n       (floor((r.s_bps)::float8 * 1e1::float8 + 0.5) / 1e1::float8) AS \"Spread\",\n       (floor((r.mu_bps)::float8 * 1e1::float8 + 0.5) / 1e1::float8) AS \"Mean\",\n       (floor((r.mu_bps + r.entry)::float8 * 1e1::float8 + 0.5) / 1e1::float8) AS \"Mean + Entry\",\n       (floor((r.mu_bps - r.entry)::float8 * 1e1::float8 + 0.5) / 1e1::float8) AS \"Mean − Entry\",\n       (floor((r.sigma_bps)::float8 * 1e2::float8 + 0.5) / 1e2::float8) AS \"Sigma\",\n       CASE WHEN r.basis IS NULL THEN NULL WHEN r.s_bps IS NOT NULL THEN (floor((r.s_bps)::float8 * 1e1::float8 + 0.5) / 1e1::float8) ELSE -4000000000 END AS \"Spread · Tooltip\",\n       CASE WHEN r.basis IS NULL THEN NULL WHEN r.s_long_bps IS NOT NULL THEN (floor((r.s_long_bps)::float8 * 1e1::float8 + 0.5) / 1e1::float8) WHEN r.s_bps IS NULL THEN -4000000000 WHEN NOT coalesce(v.n > 0, false) THEN -3000000000 WHEN r.basis <> 'mid' THEN -2000000000 ELSE -12000000000 END AS \"Real Long Spread\",\n       CASE WHEN r.basis IS NULL THEN NULL WHEN r.s_short_bps IS NOT NULL THEN (floor((r.s_short_bps)::float8 * 1e1::float8 + 0.5) / 1e1::float8) WHEN r.s_bps IS NULL THEN -4000000000 WHEN NOT coalesce(v.n > 0, false) THEN -3000000000 WHEN r.basis <> 'mid' THEN -2000000000 ELSE -12000000000 END AS \"Real Short Spread\",\n       CASE WHEN r.basis IS NULL THEN NULL WHEN r.mu_bps IS NOT NULL THEN (floor((r.mu_bps)::float8 * 1e1::float8 + 0.5) / 1e1::float8) WHEN r.s_bps IS NULL THEN -4000000000 WHEN r.past_t THEN -5000000000 ELSE -6000000000 END AS \"Mean · Tooltip\",\n       CASE WHEN r.basis IS NULL THEN NULL WHEN r.sigma_bps IS NOT NULL THEN (floor((r.sigma_bps)::float8 * 1e2::float8 + 0.5) / 1e2::float8) WHEN r.s_bps IS NULL THEN -4000000000 WHEN r.past_t THEN -5000000000 ELSE -11000000000 END AS \"Sigma · Tooltip\",\n       CASE WHEN r.basis IS NULL THEN NULL WHEN abs(r.s_bps - r.mu_bps) IS NOT NULL THEN (floor((abs(r.s_bps - r.mu_bps))::float8 * 1e1::float8 + 0.5) / 1e1::float8) WHEN r.s_bps IS NULL THEN -4000000000 WHEN r.past_t THEN -5000000000 ELSE -6000000000 END AS \"Deviation · Tooltip\",\n       CASE WHEN r.basis IS NULL THEN NULL WHEN r.s_bps IS NULL THEN -4000000000 WHEN r.past_t THEN -5000000000 WHEN abs(r.s_long_bps - r.mu_bps) IS NOT NULL THEN (floor((abs(r.s_long_bps - r.mu_bps))::float8 * 1e1::float8 + 0.5) / 1e1::float8) WHEN r.mu_bps IS NULL THEN -6000000000 WHEN NOT coalesce(v.n > 0, false) THEN -3000000000 WHEN r.basis <> 'mid' THEN -2000000000 ELSE -12000000000 END AS \"Real Long Deviation · Tooltip\",\n       CASE WHEN r.basis IS NULL THEN NULL WHEN r.s_bps IS NULL THEN -4000000000 WHEN r.past_t THEN -5000000000 WHEN abs(r.s_short_bps - r.mu_bps) IS NOT NULL THEN (floor((abs(r.s_short_bps - r.mu_bps))::float8 * 1e1::float8 + 0.5) / 1e1::float8) WHEN r.mu_bps IS NULL THEN -6000000000 WHEN NOT coalesce(v.n > 0, false) THEN -3000000000 WHEN r.basis <> 'mid' THEN -2000000000 ELSE -12000000000 END AS \"Real Short Deviation · Tooltip\",\n       CASE WHEN r.basis IS NOT NULL THEN CASE r.sig WHEN 'None' THEN 0 WHEN 'Long' THEN 1 WHEN 'Short' THEN 2 WHEN 'Long · Partial' THEN 3 WHEN 'Short · Partial' THEN 4 WHEN 'No Book' THEN -2000000000 WHEN 'No Notional' THEN -3000000000 WHEN 'No Anchor' THEN -4000000000 WHEN 'Past T' THEN -5000000000 WHEN 'No Mean' THEN -6000000000 WHEN 'No Entry' THEN -9000000000 WHEN 'No Sigma' THEN -11000000000 END END AS \"Signal\",\n       CASE WHEN r.basis IS NULL THEN NULL WHEN r.bid_ct_bull IS NOT NULL THEN (floor((r.bid_ct_bull)::float8 * 1e2::float8 + 0.5) / 1e2::float8) WHEN NOT r.book_bull THEN -2000000000 ELSE -12000000000 END AS \"Bid Bull ct\",\n       CASE WHEN r.basis IS NULL THEN NULL WHEN r.bid_ct_bear IS NOT NULL THEN (floor((r.bid_ct_bear)::float8 * 1e2::float8 + 0.5) / 1e2::float8) WHEN NOT r.book_bear THEN -2000000000 ELSE -12000000000 END AS \"Bid Bear ct\",\n       CASE WHEN r.basis IS NULL THEN NULL WHEN r.ask_ct_bull IS NOT NULL THEN (floor((r.ask_ct_bull)::float8 * 1e2::float8 + 0.5) / 1e2::float8) WHEN NOT r.book_bull THEN -2000000000 ELSE -12000000000 END AS \"Ask Bull ct\",\n       CASE WHEN r.basis IS NULL THEN NULL WHEN r.ask_ct_bear IS NOT NULL THEN (floor((r.ask_ct_bear)::float8 * 1e2::float8 + 0.5) / 1e2::float8) WHEN NOT r.book_bear THEN -2000000000 ELSE -12000000000 END AS \"Ask Bear ct\",\n       CASE WHEN r.basis IS NULL THEN NULL WHEN r.bid_usdt_bull IS NOT NULL THEN (floor((r.bid_usdt_bull)::float8 * 1e0::float8 + 0.5) / 1e0::float8) WHEN NOT r.book_bull THEN -2000000000 ELSE -12000000000 END AS \"Bid Bull USDT\",\n       CASE WHEN r.basis IS NULL THEN NULL WHEN r.bid_usdt_bear IS NOT NULL THEN (floor((r.bid_usdt_bear)::float8 * 1e0::float8 + 0.5) / 1e0::float8) WHEN NOT r.book_bear THEN -2000000000 ELSE -12000000000 END AS \"Bid Bear USDT\",\n       CASE WHEN r.basis IS NULL THEN NULL WHEN r.ask_usdt_bull IS NOT NULL THEN (floor((r.ask_usdt_bull)::float8 * 1e0::float8 + 0.5) / 1e0::float8) WHEN NOT r.book_bull THEN -2000000000 ELSE -12000000000 END AS \"Ask Bull USDT\",\n       CASE WHEN r.basis IS NULL THEN NULL WHEN r.ask_usdt_bear IS NOT NULL THEN (floor((r.ask_usdt_bear)::float8 * 1e0::float8 + 0.5) / 1e0::float8) WHEN NOT r.book_bear THEN -2000000000 ELSE -12000000000 END AS \"Ask Bear USDT\",\n       CASE WHEN NOT r.past_t THEN (floor((r.s_bps - r.mu_bps)::float8 * 1e1::float8 + 0.5) / 1e1::float8) END AS \"Signed Deviation\",\n       CASE WHEN NOT r.past_t THEN (floor((r.s_long_bps - r.mu_bps)::float8 * 1e1::float8 + 0.5) / 1e1::float8) END AS \"Signed Real Long Deviation\",\n       CASE WHEN NOT r.past_t THEN (floor((r.s_short_bps - r.mu_bps)::float8 * 1e1::float8 + 0.5) / 1e1::float8) END AS \"Signed Real Short Deviation\",\n       CASE WHEN r.past_t THEN (floor((r.s_bps - r.mu_bps)::float8 * 1e1::float8 + 0.5) / 1e1::float8) END AS \"Signed Past T\",\n       -trim_scale(round(r.entry, 6)) AS \"−Entry\",\n       CASE WHEN r.basis IS NULL THEN NULL WHEN r.s_bps - r.mu_bps IS NOT NULL THEN (floor((r.s_bps - r.mu_bps)::float8 * 1e1::float8 + 0.5) / 1e1::float8) WHEN r.s_bps IS NULL THEN -4000000000 WHEN r.past_t THEN -5000000000 ELSE -6000000000 END AS \"Signed Deviation · Tooltip\",\n       CASE WHEN r.basis IS NULL THEN NULL WHEN r.s_bps IS NULL THEN -4000000000 WHEN r.past_t THEN -5000000000 WHEN r.s_long_bps - r.mu_bps IS NOT NULL THEN (floor((r.s_long_bps - r.mu_bps)::float8 * 1e1::float8 + 0.5) / 1e1::float8) WHEN r.mu_bps IS NULL THEN -6000000000 WHEN NOT coalesce(v.n > 0, false) THEN -3000000000 WHEN r.basis <> 'mid' THEN -2000000000 ELSE -12000000000 END AS \"Signed Real Long Deviation · Tooltip\",\n       CASE WHEN r.basis IS NULL THEN NULL WHEN r.s_bps IS NULL THEN -4000000000 WHEN r.past_t THEN -5000000000 WHEN r.s_short_bps - r.mu_bps IS NOT NULL THEN (floor((r.s_short_bps - r.mu_bps)::float8 * 1e1::float8 + 0.5) / 1e1::float8) WHEN r.mu_bps IS NULL THEN -6000000000 WHEN NOT coalesce(v.n > 0, false) THEN -3000000000 WHEN r.basis <> 'mid' THEN -2000000000 ELSE -12000000000 END AS \"Signed Real Short Deviation · Tooltip\",\n       count(*) FILTER (WHERE r.sig LIKE 'Long%') OVER w AS \"Long Points\",\n       count(*) FILTER (WHERE r.sig LIKE 'Short%') OVER w AS \"Short Points\",\n       CASE WHEN NOT r.past_t THEN (floor((abs(r.s_bps - r.mu_bps))::float8 * 1e1::float8 + 0.5) / 1e1::float8) END AS \"Deviation · Line\",\n       CASE WHEN NOT r.past_t THEN (floor((abs(r.s_long_bps - r.mu_bps))::float8 * 1e1::float8 + 0.5) / 1e1::float8) END AS \"Real Long Deviation · Faded\",\n       CASE WHEN NOT r.past_t THEN (floor((abs(r.s_short_bps - r.mu_bps))::float8 * 1e1::float8 + 0.5) / 1e1::float8) END AS \"Real Short Deviation · Faded\",\n       CASE WHEN NOT r.past_t AND r.s_long_bps < r.mu_bps THEN (floor((abs(r.s_long_bps - r.mu_bps))::float8 * 1e1::float8 + 0.5) / 1e1::float8) END AS \"Real Long Deviation\",\n       CASE WHEN NOT r.past_t AND r.s_short_bps > r.mu_bps THEN (floor((abs(r.s_short_bps - r.mu_bps))::float8 * 1e1::float8 + 0.5) / 1e1::float8) END AS \"Real Short Deviation\",\n       CASE WHEN r.past_t THEN (floor((abs(r.s_bps - r.mu_bps))::float8 * 1e1::float8 + 0.5) / 1e1::float8) END AS \"Past T\",\n       trim_scale(round(r.entry, 6)) AS \"+Entry\",\n       CASE WHEN r.sig LIKE 'Long%' THEN (floor((abs(r.s_long_bps - r.mu_bps))::float8 * 1e1::float8 + 0.5) / 1e1::float8) END AS \"Long Dots\",\n       CASE WHEN r.sig LIKE 'Short%' THEN (floor((abs(r.s_short_bps - r.mu_bps))::float8 * 1e1::float8 + 0.5) / 1e1::float8) END AS \"Short Dots\",\n       r.phase_sort AS \"Phase\",\n       CASE WHEN r.phase IS NOT NULL THEN (r.sig LIKE 'Long%')::integer END AS \"Long Point\",\n       CASE WHEN r.phase IS NOT NULL THEN (r.sig LIKE 'Short%')::integer END AS \"Short Point\",\n       CASE WHEN r.phase IS NOT NULL THEN (r.sig LIKE '% · Partial')::integer END AS \"Partial Point\",\n       CASE WHEN r.phase IS NOT NULL THEN (r.sig = 'Past T')::integer END AS \"Past T Point\",\n       CASE WHEN r.phase IS NOT NULL THEN (r.sig = 'No Book')::integer END AS \"No Book Point\",\n       CASE WHEN r.phase IS NOT NULL AND NOT r.past_t AND r.s_long_bps < r.mu_bps THEN (floor((r.mu_bps - r.s_long_bps)::float8 * 1e1::float8 + 0.5) / 1e1::float8) END AS \"Best Long\",\n       CASE WHEN r.phase IS NOT NULL AND NOT r.past_t AND r.s_short_bps > r.mu_bps THEN (floor((r.s_short_bps - r.mu_bps)::float8 * 1e1::float8 + 0.5) / 1e1::float8) END AS \"Best Short\",\n       (floor(((floor((r.mu_bps)::float8 * 1e1::float8 + 0.5) / 1e1::float8) + 1 * (floor((r.sigma_bps)::float8 * 1e2::float8 + 0.5) / 1e2::float8))::float8 * 1e1::float8 + 0.5) / 1e1::float8) AS \"Mean + 1σ\",\n       (floor(((floor((r.mu_bps)::float8 * 1e1::float8 + 0.5) / 1e1::float8) - 1 * (floor((r.sigma_bps)::float8 * 1e2::float8 + 0.5) / 1e2::float8))::float8 * 1e1::float8 + 0.5) / 1e1::float8) AS \"Mean − 1σ\",\n       (floor(((floor((r.mu_bps)::float8 * 1e1::float8 + 0.5) / 1e1::float8) + 1.5 * (floor((r.sigma_bps)::float8 * 1e2::float8 + 0.5) / 1e2::float8))::float8 * 1e1::float8 + 0.5) / 1e1::float8) AS \"Mean + 1.5σ\",\n       (floor(((floor((r.mu_bps)::float8 * 1e1::float8 + 0.5) / 1e1::float8) - 1.5 * (floor((r.sigma_bps)::float8 * 1e2::float8 + 0.5) / 1e2::float8))::float8 * 1e1::float8 + 0.5) / 1e1::float8) AS \"Mean − 1.5σ\",\n       (floor(((floor((r.mu_bps)::float8 * 1e1::float8 + 0.5) / 1e1::float8) + 2 * (floor((r.sigma_bps)::float8 * 1e2::float8 + 0.5) / 1e2::float8))::float8 * 1e1::float8 + 0.5) / 1e1::float8) AS \"Mean + 2σ\",\n       (floor(((floor((r.mu_bps)::float8 * 1e1::float8 + 0.5) / 1e1::float8) - 2 * (floor((r.sigma_bps)::float8 * 1e2::float8 + 0.5) / 1e2::float8))::float8 * 1e1::float8 + 0.5) / 1e1::float8) AS \"Mean − 2σ\",\n       (floor(((floor((r.mu_bps)::float8 * 1e1::float8 + 0.5) / 1e1::float8) + 2.5 * (floor((r.sigma_bps)::float8 * 1e2::float8 + 0.5) / 1e2::float8))::float8 * 1e1::float8 + 0.5) / 1e1::float8) AS \"Mean + 2.5σ\",\n       (floor(((floor((r.mu_bps)::float8 * 1e1::float8 + 0.5) / 1e1::float8) - 2.5 * (floor((r.sigma_bps)::float8 * 1e2::float8 + 0.5) / 1e2::float8))::float8 * 1e1::float8 + 0.5) / 1e1::float8) AS \"Mean − 2.5σ\",\n       (floor(((floor((r.mu_bps)::float8 * 1e1::float8 + 0.5) / 1e1::float8) + 3 * (floor((r.sigma_bps)::float8 * 1e2::float8 + 0.5) / 1e2::float8))::float8 * 1e1::float8 + 0.5) / 1e1::float8) AS \"Mean + 3σ\",\n       (floor(((floor((r.mu_bps)::float8 * 1e1::float8 + 0.5) / 1e1::float8) - 3 * (floor((r.sigma_bps)::float8 * 1e2::float8 + 0.5) / 1e2::float8))::float8 * 1e1::float8 + 0.5) / 1e1::float8) AS \"Mean − 3σ\",\n       (floor((1 * (floor((r.sigma_bps)::float8 * 1e2::float8 + 0.5) / 1e2::float8))::float8 * 1e1::float8 + 0.5) / 1e1::float8) AS \"+1σ\",\n       -(floor((1 * (floor((r.sigma_bps)::float8 * 1e2::float8 + 0.5) / 1e2::float8))::float8 * 1e1::float8 + 0.5) / 1e1::float8) AS \"−1σ\",\n       (floor((1.5 * (floor((r.sigma_bps)::float8 * 1e2::float8 + 0.5) / 1e2::float8))::float8 * 1e1::float8 + 0.5) / 1e1::float8) AS \"+1.5σ\",\n       -(floor((1.5 * (floor((r.sigma_bps)::float8 * 1e2::float8 + 0.5) / 1e2::float8))::float8 * 1e1::float8 + 0.5) / 1e1::float8) AS \"−1.5σ\",\n       (floor((2 * (floor((r.sigma_bps)::float8 * 1e2::float8 + 0.5) / 1e2::float8))::float8 * 1e1::float8 + 0.5) / 1e1::float8) AS \"+2σ\",\n       -(floor((2 * (floor((r.sigma_bps)::float8 * 1e2::float8 + 0.5) / 1e2::float8))::float8 * 1e1::float8 + 0.5) / 1e1::float8) AS \"−2σ\",\n       (floor((2.5 * (floor((r.sigma_bps)::float8 * 1e2::float8 + 0.5) / 1e2::float8))::float8 * 1e1::float8 + 0.5) / 1e1::float8) AS \"+2.5σ\",\n       -(floor((2.5 * (floor((r.sigma_bps)::float8 * 1e2::float8 + 0.5) / 1e2::float8))::float8 * 1e1::float8 + 0.5) / 1e1::float8) AS \"−2.5σ\",\n       (floor((3 * (floor((r.sigma_bps)::float8 * 1e2::float8 + 0.5) / 1e2::float8))::float8 * 1e1::float8 + 0.5) / 1e1::float8) AS \"+3σ\",\n       -(floor((3 * (floor((r.sigma_bps)::float8 * 1e2::float8 + 0.5) / 1e2::float8))::float8 * 1e1::float8 + 0.5) / 1e1::float8) AS \"−3σ\"\nFROM v CROSS JOIN LATERAL (SELECT x.*, coalesce(v.d, v.k * x.sigma_bps) AS entry, CASE WHEN v.d IS NULL AND v.k IS NOT NULL AND x.sigma_bps IS NULL AND x.s_bps IS NOT NULL AND NOT x.past_t AND x.mu_bps IS NOT NULL AND coalesce(v.n > 0, false) THEN 'No Sigma' ELSE etfpair.combo_signal(x.s_bps, x.past_t, x.mu_bps, v.n, x.basis = 'mid', x.s_long_bps, x.s_short_bps, x.partial_long, x.partial_short, coalesce(v.d, v.k * x.sigma_bps)) END AS sig FROM etfpair.combo_range('$combo', '$venue', '$ma', v.ma_n, v.sig_n, $__from, $__to, (SELECT CASE WHEN r <= 1000 THEN 1000 WHEN r <= 5000 THEN 5000 WHEN r <= 10000 THEN 10000 WHEN r <= 30000 THEN 30000 ELSE ceil(r / 60000) * 60000 END::bigint FROM (SELECT ($__to - $__from) / 2000.0 AS r) x), v.n, v.d) x) r\nWINDOW w AS (ORDER BY r.ts_ms)\nORDER BY r.ts_ms"
     }
    ],
    "fieldConfig": {
@@ -4316,6 +4316,16 @@
       "include": {
        "names": [
         "time",
+        "Mean + 1σ",
+        "Mean − 1σ",
+        "Mean + 1.5σ",
+        "Mean − 1.5σ",
+        "Mean + 2σ",
+        "Mean − 2σ",
+        "Mean + 2.5σ",
+        "Mean − 2.5σ",
+        "Mean + 3σ",
+        "Mean − 3σ",
         "Spread",
         "Mean",
         "Mean + Entry",
@@ -4340,316 +4350,6 @@
         "Ask Bear USDT"
        ]
       }
-     }
-    },
-    {
-     "id": "calculateField",
-     "options": {
-      "mode": "binary",
-      "binary": {
-       "left": {
-        "matcher": {
-         "id": "byName",
-         "options": "Sigma"
-        }
-       },
-       "operator": "*",
-       "right": {
-        "fixed": "1.5"
-       }
-      },
-      "alias": "1.5σ · Step",
-      "replaceFields": false
-     }
-    },
-    {
-     "id": "calculateField",
-     "options": {
-      "mode": "binary",
-      "binary": {
-       "left": {
-        "matcher": {
-         "id": "byName",
-         "options": "Sigma"
-        }
-       },
-       "operator": "*",
-       "right": {
-        "fixed": "2"
-       }
-      },
-      "alias": "2σ · Step",
-      "replaceFields": false
-     }
-    },
-    {
-     "id": "calculateField",
-     "options": {
-      "mode": "binary",
-      "binary": {
-       "left": {
-        "matcher": {
-         "id": "byName",
-         "options": "Sigma"
-        }
-       },
-       "operator": "*",
-       "right": {
-        "fixed": "2.5"
-       }
-      },
-      "alias": "2.5σ · Step",
-      "replaceFields": false
-     }
-    },
-    {
-     "id": "calculateField",
-     "options": {
-      "mode": "binary",
-      "binary": {
-       "left": {
-        "matcher": {
-         "id": "byName",
-         "options": "Sigma"
-        }
-       },
-       "operator": "*",
-       "right": {
-        "fixed": "3"
-       }
-      },
-      "alias": "3σ · Step",
-      "replaceFields": false
-     }
-    },
-    {
-     "id": "calculateField",
-     "options": {
-      "mode": "binary",
-      "binary": {
-       "left": {
-        "matcher": {
-         "id": "byName",
-         "options": "Mean"
-        }
-       },
-       "operator": "+",
-       "right": {
-        "matcher": {
-         "id": "byName",
-         "options": "Sigma"
-        }
-       }
-      },
-      "alias": "Mean + 1σ",
-      "replaceFields": false
-     }
-    },
-    {
-     "id": "calculateField",
-     "options": {
-      "mode": "binary",
-      "binary": {
-       "left": {
-        "matcher": {
-         "id": "byName",
-         "options": "Mean"
-        }
-       },
-       "operator": "-",
-       "right": {
-        "matcher": {
-         "id": "byName",
-         "options": "Sigma"
-        }
-       }
-      },
-      "alias": "Mean − 1σ",
-      "replaceFields": false
-     }
-    },
-    {
-     "id": "calculateField",
-     "options": {
-      "mode": "binary",
-      "binary": {
-       "left": {
-        "matcher": {
-         "id": "byName",
-         "options": "Mean"
-        }
-       },
-       "operator": "+",
-       "right": {
-        "matcher": {
-         "id": "byName",
-         "options": "1.5σ · Step"
-        }
-       }
-      },
-      "alias": "Mean + 1.5σ",
-      "replaceFields": false
-     }
-    },
-    {
-     "id": "calculateField",
-     "options": {
-      "mode": "binary",
-      "binary": {
-       "left": {
-        "matcher": {
-         "id": "byName",
-         "options": "Mean"
-        }
-       },
-       "operator": "-",
-       "right": {
-        "matcher": {
-         "id": "byName",
-         "options": "1.5σ · Step"
-        }
-       }
-      },
-      "alias": "Mean − 1.5σ",
-      "replaceFields": false
-     }
-    },
-    {
-     "id": "calculateField",
-     "options": {
-      "mode": "binary",
-      "binary": {
-       "left": {
-        "matcher": {
-         "id": "byName",
-         "options": "Mean"
-        }
-       },
-       "operator": "+",
-       "right": {
-        "matcher": {
-         "id": "byName",
-         "options": "2σ · Step"
-        }
-       }
-      },
-      "alias": "Mean + 2σ",
-      "replaceFields": false
-     }
-    },
-    {
-     "id": "calculateField",
-     "options": {
-      "mode": "binary",
-      "binary": {
-       "left": {
-        "matcher": {
-         "id": "byName",
-         "options": "Mean"
-        }
-       },
-       "operator": "-",
-       "right": {
-        "matcher": {
-         "id": "byName",
-         "options": "2σ · Step"
-        }
-       }
-      },
-      "alias": "Mean − 2σ",
-      "replaceFields": false
-     }
-    },
-    {
-     "id": "calculateField",
-     "options": {
-      "mode": "binary",
-      "binary": {
-       "left": {
-        "matcher": {
-         "id": "byName",
-         "options": "Mean"
-        }
-       },
-       "operator": "+",
-       "right": {
-        "matcher": {
-         "id": "byName",
-         "options": "2.5σ · Step"
-        }
-       }
-      },
-      "alias": "Mean + 2.5σ",
-      "replaceFields": false
-     }
-    },
-    {
-     "id": "calculateField",
-     "options": {
-      "mode": "binary",
-      "binary": {
-       "left": {
-        "matcher": {
-         "id": "byName",
-         "options": "Mean"
-        }
-       },
-       "operator": "-",
-       "right": {
-        "matcher": {
-         "id": "byName",
-         "options": "2.5σ · Step"
-        }
-       }
-      },
-      "alias": "Mean − 2.5σ",
-      "replaceFields": false
-     }
-    },
-    {
-     "id": "calculateField",
-     "options": {
-      "mode": "binary",
-      "binary": {
-       "left": {
-        "matcher": {
-         "id": "byName",
-         "options": "Mean"
-        }
-       },
-       "operator": "+",
-       "right": {
-        "matcher": {
-         "id": "byName",
-         "options": "3σ · Step"
-        }
-       }
-      },
-      "alias": "Mean + 3σ",
-      "replaceFields": false
-     }
-    },
-    {
-     "id": "calculateField",
-     "options": {
-      "mode": "binary",
-      "binary": {
-       "left": {
-        "matcher": {
-         "id": "byName",
-         "options": "Mean"
-        }
-       },
-       "operator": "-",
-       "right": {
-        "matcher": {
-         "id": "byName",
-         "options": "3σ · Step"
-        }
-       }
-      },
-      "alias": "Mean − 3σ",
-      "replaceFields": false
      }
     },
     {
@@ -4691,12 +4391,7 @@
        "Ask Bear USDT": 32
       },
       "renameByName": {},
-      "excludeByName": {
-       "1.5σ · Step": true,
-       "2σ · Step": true,
-       "2.5σ · Step": true,
-       "3σ · Step": true
-      }
+      "excludeByName": {}
      }
     }
    ]
@@ -5903,7 +5598,17 @@
         "Signed Real Long Deviation · Tooltip",
         "Signed Real Short Deviation · Tooltip",
         "Sigma · Tooltip",
-        "Signal"
+        "Signal",
+        "+1σ",
+        "−1σ",
+        "+1.5σ",
+        "−1.5σ",
+        "+2σ",
+        "−2σ",
+        "+2.5σ",
+        "−2.5σ",
+        "+3σ",
+        "−3σ"
        ]
       }
      }
@@ -5933,206 +5638,6 @@
        "reducer": "lastNotNull"
       },
       "alias": "Band Bottom",
-      "replaceFields": false
-     }
-    },
-    {
-     "id": "calculateField",
-     "options": {
-      "mode": "binary",
-      "binary": {
-       "left": {
-        "matcher": {
-         "id": "byName",
-         "options": "Sigma"
-        }
-       },
-       "operator": "*",
-       "right": {
-        "fixed": "1"
-       }
-      },
-      "alias": "+1σ",
-      "replaceFields": false
-     }
-    },
-    {
-     "id": "calculateField",
-     "options": {
-      "mode": "binary",
-      "binary": {
-       "left": {
-        "matcher": {
-         "id": "byName",
-         "options": "Sigma"
-        }
-       },
-       "operator": "*",
-       "right": {
-        "fixed": "-1"
-       }
-      },
-      "alias": "−1σ",
-      "replaceFields": false
-     }
-    },
-    {
-     "id": "calculateField",
-     "options": {
-      "mode": "binary",
-      "binary": {
-       "left": {
-        "matcher": {
-         "id": "byName",
-         "options": "Sigma"
-        }
-       },
-       "operator": "*",
-       "right": {
-        "fixed": "1.5"
-       }
-      },
-      "alias": "+1.5σ",
-      "replaceFields": false
-     }
-    },
-    {
-     "id": "calculateField",
-     "options": {
-      "mode": "binary",
-      "binary": {
-       "left": {
-        "matcher": {
-         "id": "byName",
-         "options": "Sigma"
-        }
-       },
-       "operator": "*",
-       "right": {
-        "fixed": "-1.5"
-       }
-      },
-      "alias": "−1.5σ",
-      "replaceFields": false
-     }
-    },
-    {
-     "id": "calculateField",
-     "options": {
-      "mode": "binary",
-      "binary": {
-       "left": {
-        "matcher": {
-         "id": "byName",
-         "options": "Sigma"
-        }
-       },
-       "operator": "*",
-       "right": {
-        "fixed": "2"
-       }
-      },
-      "alias": "+2σ",
-      "replaceFields": false
-     }
-    },
-    {
-     "id": "calculateField",
-     "options": {
-      "mode": "binary",
-      "binary": {
-       "left": {
-        "matcher": {
-         "id": "byName",
-         "options": "Sigma"
-        }
-       },
-       "operator": "*",
-       "right": {
-        "fixed": "-2"
-       }
-      },
-      "alias": "−2σ",
-      "replaceFields": false
-     }
-    },
-    {
-     "id": "calculateField",
-     "options": {
-      "mode": "binary",
-      "binary": {
-       "left": {
-        "matcher": {
-         "id": "byName",
-         "options": "Sigma"
-        }
-       },
-       "operator": "*",
-       "right": {
-        "fixed": "2.5"
-       }
-      },
-      "alias": "+2.5σ",
-      "replaceFields": false
-     }
-    },
-    {
-     "id": "calculateField",
-     "options": {
-      "mode": "binary",
-      "binary": {
-       "left": {
-        "matcher": {
-         "id": "byName",
-         "options": "Sigma"
-        }
-       },
-       "operator": "*",
-       "right": {
-        "fixed": "-2.5"
-       }
-      },
-      "alias": "−2.5σ",
-      "replaceFields": false
-     }
-    },
-    {
-     "id": "calculateField",
-     "options": {
-      "mode": "binary",
-      "binary": {
-       "left": {
-        "matcher": {
-         "id": "byName",
-         "options": "Sigma"
-        }
-       },
-       "operator": "*",
-       "right": {
-        "fixed": "3"
-       }
-      },
-      "alias": "+3σ",
-      "replaceFields": false
-     }
-    },
-    {
-     "id": "calculateField",
-     "options": {
-      "mode": "binary",
-      "binary": {
-       "left": {
-        "matcher": {
-         "id": "byName",
-         "options": "Sigma"
-        }
-       },
-       "operator": "*",
-       "right": {
-        "fixed": "-3"
-       }
-      },
-      "alias": "−3σ",
       "replaceFields": false
      }
     },
@@ -7186,109 +6691,14 @@
         "Deviation · Tooltip",
         "Real Long Deviation · Tooltip",
         "Real Short Deviation · Tooltip",
-        "Signal"
+        "Signal",
+        "+1σ",
+        "+1.5σ",
+        "+2σ",
+        "+2.5σ",
+        "+3σ"
        ]
       }
-     }
-    },
-    {
-     "id": "calculateField",
-     "options": {
-      "mode": "binary",
-      "binary": {
-       "left": {
-        "matcher": {
-         "id": "byName",
-         "options": "Sigma"
-        }
-       },
-       "operator": "*",
-       "right": {
-        "fixed": "1"
-       }
-      },
-      "alias": "+1σ",
-      "replaceFields": false
-     }
-    },
-    {
-     "id": "calculateField",
-     "options": {
-      "mode": "binary",
-      "binary": {
-       "left": {
-        "matcher": {
-         "id": "byName",
-         "options": "Sigma"
-        }
-       },
-       "operator": "*",
-       "right": {
-        "fixed": "1.5"
-       }
-      },
-      "alias": "+1.5σ",
-      "replaceFields": false
-     }
-    },
-    {
-     "id": "calculateField",
-     "options": {
-      "mode": "binary",
-      "binary": {
-       "left": {
-        "matcher": {
-         "id": "byName",
-         "options": "Sigma"
-        }
-       },
-       "operator": "*",
-       "right": {
-        "fixed": "2"
-       }
-      },
-      "alias": "+2σ",
-      "replaceFields": false
-     }
-    },
-    {
-     "id": "calculateField",
-     "options": {
-      "mode": "binary",
-      "binary": {
-       "left": {
-        "matcher": {
-         "id": "byName",
-         "options": "Sigma"
-        }
-       },
-       "operator": "*",
-       "right": {
-        "fixed": "2.5"
-       }
-      },
-      "alias": "+2.5σ",
-      "replaceFields": false
-     }
-    },
-    {
-     "id": "calculateField",
-     "options": {
-      "mode": "binary",
-      "binary": {
-       "left": {
-        "matcher": {
-         "id": "byName",
-         "options": "Sigma"
-        }
-       },
-       "operator": "*",
-       "right": {
-        "fixed": "3"
-       }
-      },
-      "alias": "+3σ",
-      "replaceFields": false
      }
     },
     {
@@ -9561,10 +8971,15 @@
    {
     "name": "d",
     "label": "Entry",
-    "description": "Long: Real Long Spread ≤ Mean − Entry · Short: Real Short Spread ≥ Mean + Entry · pick a multiple of sigma (0.5σ to 3σ: each point's Entry is k × its sigma, the Sigma Scale's, as the sigma lines; none until sigma is ready: No Sigma) or type a number of bps and press Enter (10, 7.5, 10bps) · Enter picks the first option whose text contains what is typed, so 1, 2 and 3 need bps after them (2bps) · anything else: No Entry, no Entry lines.",
+    "description": "Long: Real Long Spread ≤ Mean − Entry · Short: Real Short Spread ≥ Mean + Entry · pick 10 bps or a multiple of sigma (½σ to 3σ: each point's Entry is k × its sigma, the Sigma Scale's, as the sigma lines; none until sigma is ready: No Sigma) or type a number of bps and press Enter (10, 7.5, 10bps) · Enter picks the first option whose text contains what is typed, so 1, 2 and 3 need bps after them (2bps) · anything else: No Entry, no Entry lines.",
     "type": "custom",
-    "query": "½σ : 0.5σ,1σ : 1σ,1½σ : 1.5σ,2σ : 2σ,2½σ : 2.5σ,3σ : 3σ",
+    "query": "10 bps : 10,½σ : 0.5σ,1σ : 1σ,1½σ : 1.5σ,2σ : 2σ,2½σ : 2.5σ,3σ : 3σ",
     "options": [
+     {
+      "text": "10 bps",
+      "value": "10",
+      "selected": true
+     },
      {
       "text": "½σ",
       "value": "0.5σ",
@@ -9597,7 +9012,7 @@
      }
     ],
     "current": {
-     "text": "10",
+     "text": "10 bps",
      "value": "10",
      "selected": true
     },

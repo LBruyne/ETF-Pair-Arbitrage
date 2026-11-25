@@ -124,7 +124,9 @@ def source_of(b, p):
 
 
 def fields(b, p):
-    """The fields a panel draws: its source's query columns through the panel's own transformations (keep, copy, organize)."""
+    """The fields a panel draws: its source's query columns through the panel's own transformations (keep, copy, organize).
+    No binary calculation: Grafana reads a NULL operand as 0, so a line made that way is drawn at 0 where it should break
+    (3.5's sigma lines, fixed in 3.5.1)."""
     names = columns(source_of(b, p)["targets"][0]["rawSql"])
     for t in p.get("transformations", []):
         o = t["options"]
@@ -132,10 +134,6 @@ def fields(b, p):
             names = [n for n in names if n in o["include"]["names"]]
         elif t["id"] == "calculateField" and o["mode"] == "reduceRow" and len(o["reduce"]["include"]) == 1 and not o["replaceFields"]:
             assert o["reduce"]["include"][0] in names, o
-            names = names + [o["alias"]]
-        elif t["id"] == "calculateField" and o["mode"] == "binary" and not o["replaceFields"]:
-            for side in ("left", "right"):
-                assert "fixed" in o["binary"][side] or o["binary"][side]["matcher"]["options"] in names, o
             names = names + [o["alias"]]
         elif t["id"] == "filterByValue":
             pass  # rows only
@@ -210,6 +208,11 @@ class Boards(unittest.TestCase):
         self.assertEqual(len(ids), len(set(ids)))
         names = [v["name"] for v in b["templating"]["list"]]
         self.assertEqual(names[:7], ["combo", "venue", "ma", "ma_minutes", "sigma_minutes", "d", "notional"])
+        # A list's default is one of its options: Grafana replaces one that is not by the first option (3.5 opened on Entry 0.5σ).
+        for v in b["templating"]["list"]:
+            if v["type"] == "custom":
+                self.assertIn(v["current"]["value"], [o["value"] for o in v["options"]], v["name"])
+        self.assertEqual(next(v for v in b["templating"]["list"] if v["name"] == "d")["current"]["value"], "10")
         for title, q in queries(b):
             # Every variable a query uses is one the board defines; the typed settings only as a whole quoted literal (the text
             # parsed in SQL, never pasted into it).
@@ -338,8 +341,8 @@ class Boards(unittest.TestCase):
             self.assertNotIn("< r.mu_bps", q, name)
             self.assertNotIn("> r.mu_bps", q, name)
         self.assertEqual([name for name, _ in board.DEVIATION_CHART], SIGNED)
-        # 3.4 (owner item 61): the sigma lines ±1, 1.5, 2, 2.5, 3 σ (Mean ± k σ on the Spread chart, + k σ on Entry Points), made
-        # in the browser from the frame's one Sigma column (k σ = Sigma × k, Mean ± it), grey, whole σ dashed and half σ dotted,
+        # 3.4 (owner item 61): the sigma lines ±1, 1.5, 2, 2.5, 3 σ (Mean ± k σ on the Spread chart, + k σ on Entry Points), columns
+        # of the Spread query since 3.5.1 (NULL where Sigma or the Mean is), grey, whole σ dashed and half σ dotted,
         # drawn before the data (behind it), in neither the legend nor the tooltip; Sigma itself a legend row without a line.
         for title, expected in (("Spread · Bps", [name for name, _ in board.SPREAD_SIGMAS]), ("Deviation · Bps", sigma_lines),
                                 ("Entry Points · Bps", [name for name, _ in board.ENTRY_SIGMAS])):
@@ -353,8 +356,7 @@ class Boards(unittest.TestCase):
                 self.assertLess(names_s.index(name), first_data, name)
                 self.assertEqual(props_s[name]["custom.hideFrom"], {"legend": True, "tooltip": True, "viz": False}, name)
                 self.assertEqual(props_s[name]["custom.lineStyle"]["dash"], [6, 4] if k == int(k) else [2, 3], name)
-                calcs = [t["options"]["binary"] for t in chart_s["transformations"] if t["id"] == "calculateField" and t["options"].get("alias") == name]
-                self.assertEqual(len(calcs), 1, name)
+                self.assertIn(name, dict(board.SIGMA_COLUMNS), name)
             if "Sigma" in props_s and title != "Entry Points · Bps":
                 self.assertEqual((props_s["Sigma"]["custom.lineWidth"], props_s["Sigma"]["custom.axisPlacement"]), (0, "hidden"))
         self.assertEqual(dict(board.SPREAD_CHART)["Sigma"], board.shown("r.sigma_bps", 2))
@@ -590,14 +592,16 @@ class Boards(unittest.TestCase):
         meanless = ("Mean", "Mean + Entry", "Mean − Entry", "Deviation", "Mean · Tooltip", "Deviation · Tooltip", "Real Long Deviation · Tooltip",
                     "Real Short Deviation · Tooltip", "Signal", "Long Points", "Short Points", "Deviation · Line", "Real Long Deviation · Faded",
                     "Real Short Deviation · Faded", "Real Long Deviation", "Real Short Deviation", "Past T", "Long Dots", "Short Dots", "Phase",
-                    "Long Point", "Short Point", "Partial Point", "Past T Point", "No Book Point", "Best Long", "Best Short", *SIGNED)
+                    "Long Point", "Short Point", "Partial Point", "Past T Point", "No Book Point", "Best Long", "Best Short", *SIGNED,
+                    *[name for name, _ in board.SPREAD_SIGMAS])
         no_mean, no_anchor = str(board.CODE["No Mean"]), str(board.CODE["No Anchor"])
         for value in ("abc", "", "0", "30.5"):
             got = runs["ma_minutes", value]
             self.assertEqual(len(got[spread]), len(mean[spread]), value)
             for a, w in zip(got[spread], mean[spread]):
                 self.assertEqual({k: v for k, v in a.items() if k not in meanless}, {k: v for k, v in w.items() if k not in meanless}, value)
-                self.assertEqual({a[c] for c in ("Mean", "Signed Deviation", "Phase", "Best Long", "Best Short", "Real Long Deviation", "Long Dots")}, {""}, value)
+                self.assertEqual({a[c] for c in ("Mean", "Signed Deviation", "Phase", "Best Long", "Best Short", "Real Long Deviation", "Long Dots",
+                                                 *[name for name, _ in board.SPREAD_SIGMAS])}, {""}, value)
                 if a["Spread · Tooltip"]:
                     self.assertIn(a["Mean · Tooltip"], (no_mean, no_anchor, str(board.CODE["Past T"])), value)
                     self.assertIn(codes[int(a["Signal"])], ("No Mean", "No Anchor", "Past T"), value)
@@ -626,19 +630,38 @@ class Boards(unittest.TestCase):
             if w["Signal"] in ("0", "1", "2", "3", "4", str(board.CODE["No Book"])):
                 self.assertEqual(a["Signal"], str(board.CODE["No Sigma"]), a)
         self.assertIn(nosig[last][0]["Signal"], ("No Sigma", "No Mean", "No Anchor", "Past T"))
+        # The sigma lines (3.5.1): k σ and Mean ± k σ from the Sigma and Mean as shown, to one decimal, and NULL wherever Sigma
+        # (or, for Mean ± k σ, the Mean) is NULL: never 0 there (3.5 drew them at 0 through each warm-up and gap). With no
+        # Sigma Scale every line is NULL at every row, the spread drawn.
+        lines = dict(board.SPREAD_SIGMAS + board.DEVIATION_SIGMAS)
+        checked = 0
+        for r in two[spread]:
+            for name, k in lines.items():
+                base_v = 0.0 if name in dict(board.DEVIATION_SIGMAS) else (float(r["Mean"]) if r["Mean"] else None)
+                if not r["Sigma"] or base_v is None:
+                    self.assertEqual(r[name], "", (name, r["time"]))
+                    continue
+                sign = -1 if "−" in name else 1
+                self.assertAlmostEqual(float(r[name]), base_v + sign * k * float(r["Sigma"]), delta=0.0501, msg=(name, r["time"]))
+                checked += 1
+        self.assertGreater(checked, 1000)
+        self.assertTrue(any(r["Spread"] for r in nosig[spread]))
+        for r in nosig[spread]:
+            self.assertEqual({r[name] for name in lines}, {""}, r["time"])
         # Sigma Scale (3.4): "60min" is 60; anything else no sigma (Sigma empty, its tooltip and strip No Sigma where there is a
         # spread and no Past T), every other figure as with a valid one.
         sig = runs["sigma_minutes", "60"]
         self.assertEqual(runs["sigma_minutes", "60min"], sig)
         self.assertTrue(any(r["Sigma"] for r in sig[spread]))
         no_sigma = str(board.CODE["No Sigma"])
+        sigmaless = ("Sigma", "Sigma · Tooltip", *[name for name, _ in board.SPREAD_SIGMAS + board.DEVIATION_SIGMAS])
         for value in ("abc", "", "0", "30.5"):
             got = runs["sigma_minutes", value]
-            self.assertEqual({r["Sigma"] for r in got[spread]}, {""}, value)
+            for name in sigmaless[:1] + sigmaless[2:]:
+                self.assertEqual({r[name] for r in got[spread]}, {""}, (value, name))
             self.assertEqual({r["Sigma · Tooltip"] for r in got[spread]} - {"", no_sigma, no_anchor, str(board.CODE["Past T"])}, set(), value)
             for a, w in zip(got[spread], sig[spread]):
-                self.assertEqual({k: v for k, v in a.items() if k not in ("Sigma", "Sigma · Tooltip")},
-                                 {k: v for k, v in w.items() if k not in ("Sigma", "Sigma · Tooltip")}, value)
+                self.assertEqual({k: v for k, v in a.items() if k not in sigmaless}, {k: v for k, v in w.items() if k not in sigmaless}, value)
             self.assertEqual(got[last][0]["Sigma"], no_sigma, value)
             self.assertEqual({k: v for k, v in got[last][0].items() if k != "Sigma"}, {k: v for k, v in sig[last][0].items() if k != "Sigma"}, value)
 
