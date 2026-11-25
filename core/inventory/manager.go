@@ -252,6 +252,10 @@ func (m *InventoryManager) CapitalPending() bool {
 	return m.capitalPending()
 }
 
+// Leverage is L, the leverage the quota is computed with and the two
+// contracts must be set to on the account.
+func (m *InventoryManager) Leverage() int { return int(m.cfg.Leverage.IntPart()) }
+
 // capitalPending is CapitalPending; the caller holds mu.
 func (m *InventoryManager) capitalPending() bool { return !m.capital.Equal(m.cfg.Capital) }
 
