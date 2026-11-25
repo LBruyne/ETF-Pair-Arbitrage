@@ -8,8 +8,10 @@ import (
 
 // The arrival rule of a simulated IOC: which part of its leg's book it may
 // take when it arrives, and how orders that arrive on the same book share
-// its quantity. The paper venue applies it to its own copy of the books;
-// the replay applies it to the books it builds from the recorded frames.
+// its quantity. The whole rule is the paper venue's: MatchIOC at each
+// arrival, and observeDepth on each depth frame it takes in
+// (PaperVenue.applyBookEvent); a replay drives a PaperVenue with the
+// recorded frames.
 
 // ArrivalSource names the part of a leg's book an IOC was matched on.
 type ArrivalSource string
@@ -70,13 +72,25 @@ func (l *LegTaken) Of(side Side) *TakenLevels {
 	return &l.Asks
 }
 
+// observeDepth forgets the takes whose price a depth frame just taken in
+// shows gone (within its levels, not listed): on that frame, not only when
+// the next order arrives, so that liquidity which comes back later can be
+// taken. A price beyond its levels is left to the next arrival, as
+// before: one frame that pushes the last level out is no sign it was taken.
+// The caller passes only a depth that no newer books1 contradicts: a depth
+// older than books1 may predate the frame a take met.
+func (l *LegTaken) observeDepth(d *depthState) {
+	l.Asks.observe(d.asks, SideBuy, 0)
+	l.Bids.observe(d.bids, SideSell, 0)
+}
+
 // TakenLevels is what earlier simulated IOCs took from one side of a leg's
 // book, by price. A simulated order leaves the real book as it was, so what
 // it took is subtracted from whatever the book later shows at that price.
 // A take is forgotten when the book shows the price empty: within its
 // visible levels (at or better than the last of them) and not listed. A
 // price beyond the last visible level is not observed; its take is
-// forgotten at the first depth newer than the take.
+// forgotten at the first depth newer than the take that an order meets.
 type TakenLevels struct{ levels []takenLevel }
 
 // takenLevel is what was taken at one price, and the seq of the book it
@@ -96,7 +110,11 @@ func MatchIOC(book ArrivalBook, side Side, limit, qty decimal.Decimal, taken *Ta
 	if side == SideSell {
 		inside = func(price decimal.Decimal) bool { return price.GreaterThanOrEqual(limit) }
 	}
-	taken.observe(book, side)
+	depthSeq := uint64(0) // a best-only book drops nothing beyond its level
+	if book.Source == ArrivalDepth {
+		depthSeq = book.Seq
+	}
+	taken.observe(book.Levels, side, depthSeq)
 	left := qty
 	for _, level := range book.Levels {
 		free := level.Qty.Sub(taken.at(level.Price))
@@ -118,11 +136,11 @@ func MatchIOC(book ArrivalBook, side Side, limit, qty decimal.Decimal, taken *Ta
 	return fills, available, remaining
 }
 
-// observe forgets every take the book no longer supports: its price lies
-// within the visible levels and is not listed, or lies beyond them and the
-// book is a depth newer than the take.
-func (t *TakenLevels) observe(book ArrivalBook, side Side) {
-	levels := book.Levels
+// observe forgets every take the levels of a book no longer support: its
+// price lies within them and is not listed, or lies beyond them and depthSeq,
+// the seq of a depth, is newer than the take. A depthSeq of 0 forgets
+// nothing beyond the levels.
+func (t *TakenLevels) observe(levels []BookLevel, side Side, depthSeq uint64) {
 	if len(levels) == 0 {
 		return
 	}
@@ -137,7 +155,7 @@ func (t *TakenLevels) observe(book ArrivalBook, side Side) {
 		case levelIndex(levels, tl.price) >= 0:
 		case visible(tl.price):
 			continue
-		case book.Source == ArrivalDepth && book.Seq > tl.seq:
+		case depthSeq > tl.seq:
 			continue
 		}
 		kept = append(kept, tl)

@@ -144,9 +144,10 @@ var defaultRESTTimings = restTimings{timeout: 10 * time.Second, idleConn: 5 * ti
 // speaks HTTP/1.1; over HTTP/2 one connection carries both.
 const restIdleConns = 4
 
-// feeDecimals is the scale an order's fee is rounded to. The exchange
-// reports the same fee with eight decimals by order query and unrounded in
-// the order history; rounded, every source gives the same number.
+// feeDecimals is the scale an order's fee is cut to. The exchange reports
+// the same fee with eight decimals by order query and in the fills, cut,
+// not rounded, and with more decimals in the order push; cut, every source
+// gives the same number.
 const feeDecimals = 8
 
 // --- wire: REST ---

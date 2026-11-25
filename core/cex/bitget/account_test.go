@@ -713,3 +713,17 @@ func TestAccountSideNeedsCredentials(t *testing.T) {
 		t.Errorf("Name = %q", client.Name())
 	}
 }
+
+// A pushed order carries its fee with ten decimals; order-info and the
+// fills give it cut to eight, not rounded. The record keeps the venue's
+// eight: 0.0003574896 is 0.00035748 (step 9 check, SOXS entry of
+// 2026-11-25), and 0.000357344 stays 0.00035734.
+func TestOrderFeeIsCutToTheVenuesEightDecimals(t *testing.T) {
+	for raw, want := range map[string]string{"0.0003574896": "0.00035748", "0.000357344": "0.00035734"} {
+		rec, err := orderRecord(orderRow{ClientOid: "etfp1795598077400-0001BE", OrderStatus: "filled", CumExecQty: "0.08",
+			FeeDetail: []feeDetailRow{{FeeCoin: "USDT", Fee: raw}}})
+		if err != nil || !rec.Fee.Equal(d(want)) {
+			t.Errorf("fee %s: recorded %s, %v; want %s", raw, rec.Fee, err, want)
+		}
+	}
+}

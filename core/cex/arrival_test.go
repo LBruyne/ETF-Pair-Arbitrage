@@ -179,7 +179,7 @@ func TestPaperArrivalBestOnlyAndUnobservable(t *testing.T) {
 	}
 }
 
-// MatchIOC on its own, as the replay calls it. A best-only book at 40.50
+// MatchIOC on its own, the arrival half of the rule. A best-only book at 40.50
 // shows 40.46 empty (better than its level, not listed): the take there is
 // forgotten and the 5 shown later can be taken again. 40.52 lies beyond
 // that book's level and is not observed: its take stands.
@@ -317,5 +317,73 @@ func TestMatchIOCDropsATakeBeyondTheWindowOnANewerDepth(t *testing.T) {
 	}
 	if !total.Equal(dec("10")) {
 		t.Fatalf("after the price came back: fills %+v, want 10", fills)
+	}
+}
+
+// A buy takes the 5 at 40.46; the next depth shows the best ask at 40.47,
+// 40.46 gone; a later depth shows 5 at 40.46 again. The frame in between
+// proved the take's lots gone, so the next buy at the same limit takes the
+// 5 that came back, though no order arrived on that frame (audit
+// 2026-11-25).
+func TestPaperTakeForgottenOnTheDepthThatShowsThePriceGone(t *testing.T) {
+	r := newPaperRig(t)
+	r.bullBook(100, lv("40.46", "5"), lv("40.47", "10"))
+	buy := func(i int) OrderRecord {
+		r.place(t, orderReq(i, Bull, PurposeEntry, SideBuy, "40.46", "5"))
+		r.timer.advance(15 * time.Millisecond)
+		_, orders, _ := r.take()
+		return orders[0]
+	}
+	if o := buy(1); !o.CumExecQty.Equal(dec("5")) {
+		t.Fatalf("the first buy filled %s, want 5", o.CumExecQty)
+	}
+	r.bullBook(101, lv("40.47", "10"))
+	r.bullBook(102, lv("40.46", "5"), lv("40.47", "10"))
+	if o := buy(2); !o.CumExecQty.Equal(dec("5")) {
+		t.Fatalf("after 40.46 was shown gone and back: filled %s, want 5", o.CumExecQty)
+	}
+}
+
+// books1 runs ahead of books5. A buy takes the 5 at 40.46 that books1 seq
+// 105 shows, while the depth (seq 100) is contradicted. A depth of seq 103
+// then arrives without 40.46: it is older than the frame the take met and
+// still contradicted, so it frees nothing, and a second buy on books1 105
+// takes nothing.
+func TestPaperContradictedDepthDoesNotFreeATake(t *testing.T) {
+	r := newPaperRig(t)
+	r.bullBook(100, lv("40.47", "10"))
+	r.bullBest(105, lv("40.45", "10"), lv("40.46", "5"))
+	buy := func(i int) OrderRecord {
+		r.place(t, orderReq(i, Bull, PurposeEntry, SideBuy, "40.46", "5"))
+		r.timer.advance(15 * time.Millisecond)
+		_, orders, _ := r.take()
+		return orders[0]
+	}
+	if o := buy(1); !o.CumExecQty.Equal(dec("5")) {
+		t.Fatalf("the first buy filled %s, want the 5 of books1", o.CumExecQty)
+	}
+	r.bullBook(103, lv("40.47", "10"))
+	if o := buy(2); !o.CumExecQty.IsZero() {
+		t.Fatalf("after a contradicted older depth: filled %s, want 0", o.CumExecQty)
+	}
+}
+
+// A buy sweeps to 40.51, the last visible ask, and takes its 5. An ask
+// posted at 40.50 pushes 40.51 out of the window for one frame and is then
+// cancelled. The frame in between did not show 40.51, so it frees nothing:
+// a take beyond the window is dropped only by a newer depth an order meets,
+// as before, and the next buy at 40.51 finds the 5 still taken.
+func TestPaperTakePushedOutOfTheWindowStaysTaken(t *testing.T) {
+	r := newPaperRig(t)
+	inner := []BookLevel{lv("40.46", "1"), lv("40.47", "1"), lv("40.48", "1"), lv("40.49", "1")}
+	r.bullBook(100, append(inner, lv("40.51", "5"))...)
+	r.place(t, orderReq(1, Bull, PurposeEntry, SideBuy, "40.51", "9"))
+	r.timer.advance(15 * time.Millisecond)
+	r.bullBook(101, append(inner, lv("40.50", "1"))...)
+	r.bullBook(102, append(inner, lv("40.51", "5"))...)
+	r.place(t, orderReq(2, Bull, PurposeEntry, SideBuy, "40.51", "5"))
+	r.timer.advance(15 * time.Millisecond)
+	if _, orders, _ := r.take(); len(orders) != 2 || !orders[0].CumExecQty.Equal(dec("9")) || !orders[1].CumExecQty.IsZero() {
+		t.Fatalf("orders %+v; want 9, then nothing", orders)
 	}
 }

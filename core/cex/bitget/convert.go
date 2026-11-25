@@ -175,7 +175,7 @@ func accountAssets(data assetsData, at time.Time) (cex.AccountAssets, error) {
 // its price left the allowed band carries the price-limit kind, like an
 // order refused for it.
 //
-// The fee is the sum of the fee details, rounded to feeDecimals, and counts
+// The fee is the sum of the fee details, cut to feeDecimals, and counts
 // as known once it is not zero: the account pays a taker fee on every fill,
 // so a zero beside a fill is a fee not reported yet. This takes the fee of
 // a report to cover the filled quantity of the same report; a report whose
@@ -215,7 +215,7 @@ func orderRecord(row orderRow) (cex.OrderRecord, error) {
 	if err != nil {
 		return rec, fmt.Errorf("bitget: order %s: %w", row.ClientOid, err)
 	}
-	rec.Fee = fee.Round(feeDecimals)
+	rec.Fee = fee.Truncate(feeDecimals)
 	rec.FeeKnown = rec.CumExecQty.IsPositive() && !rec.Fee.IsZero()
 	return rec, nil
 }

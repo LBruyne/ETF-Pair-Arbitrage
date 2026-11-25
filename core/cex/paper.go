@@ -162,7 +162,11 @@ func (p *PaperVenue) SubscribeBooks(ctx context.Context, subs []BookSubscription
 
 // applyBookEvent takes one forwarded frame into the leg's own book, and at
 // the first frame after a funding settlement captures the leg's position
-// and mid price for the paper funding record.
+// and mid price for the paper funding record. A depth frame that leaves the
+// leg with the depth of its own seq, and no newer books1 contradicting it,
+// also forgets the earlier paper takes it shows gone (observeDepth). The
+// same frame again from another connection is checked again, which changes
+// nothing; an older frame is not.
 func (p *PaperVenue) applyBookEvent(ev BookEvent) {
 	leg, ok := p.legOf(ev.Symbol)
 	if !ok {
@@ -170,10 +174,14 @@ func (p *PaperVenue) applyBookEvent(ev BookEvent) {
 	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	b := &p.books[leg]
 	if ev.Topic == TopicBooks1 {
-		p.books[leg].applyBest(ev)
+		b.applyBest(ev)
 	} else {
-		p.books[leg].applyDepth(ev) // an update that does not chain drops the depth; the manager subscribes the leg again
+		b.applyDepth(ev) // an update that does not chain drops the depth; the manager subscribes the leg again
+		if b.depth != nil && b.depth.seq == ev.Seq && b.conflictSeq == 0 {
+			p.taken[leg].observeDepth(b.depth)
+		}
 	}
 	p.captureSettlement(leg, ev.ReceivedAt)
 }
