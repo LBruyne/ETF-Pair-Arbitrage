@@ -42,10 +42,11 @@ var testCombos = []scan.Combo{
 		{Venue: "bitget", BullSymbol: "TQQQUSDT", BearSymbol: "SQQQUSDT", RefSymbol: "QQQUSDT"}}},
 }
 
-// The configured combos give one Bitget feed per combo (4 topics per
-// contract in one frame, the book topic by the contract's price tick) and
-// two Binance feeds over every contract once, in configuration order. Each
-// venue's instrument list is read once.
+// The configured combos give one Bitget feed per combo (every topic of
+// every contract in one frame, the book topics by the contract's price tick:
+// books5, or books50 and then books5) and two Binance feeds over every
+// contract once, in configuration order. Each venue's instrument list is
+// read once.
 func TestFeedsOfCombos(t *testing.T) {
 	// Bitget lists SOXSUSDT with a 0.001 tick, as it does; the Binance
 	// SOXSUSDT tick of 0.001 is made up to show the rule on that venue.
@@ -70,8 +71,11 @@ func TestFeedsOfCombos(t *testing.T) {
 
 	soxl, tqqq := feeds[0], feeds[1]
 	var want []bitgetArg
-	for _, c := range []struct{ symbol, book string }{{"SOXLUSDT", "books5"}, {"SOXSUSDT", "books50"}, {"SOXXUSDT", "books5"}} {
-		for _, topic := range []string{c.book, "books1", "publicTrade", "ticker", "funding-rate"} {
+	for _, c := range []struct {
+		symbol string
+		books  []string
+	}{{"SOXLUSDT", []string{"books5"}}, {"SOXSUSDT", []string{"books50", "books5"}}, {"SOXXUSDT", []string{"books5"}}} {
+		for _, topic := range append(c.books, "books1", "publicTrade", "ticker", "funding-rate") {
 			want = append(want, bitgetArg{"usdt-futures", topic, c.symbol})
 		}
 	}
@@ -82,7 +86,8 @@ func TestFeedsOfCombos(t *testing.T) {
 	if err := json.Unmarshal(soxl.request, &req); err != nil || req.Op != "subscribe" || !slices.Equal(req.Args, want) {
 		t.Fatalf("bitget request %s: %v", soxl.request, err)
 	}
-	if soxl.url != "wss://b" || string(soxl.ping) != "ping" || len(soxl.streams) != 15 || soxl.streams[5] != "SOXSUSDT.books50" || soxl.streams[6] != "SOXSUSDT.books1" {
+	if soxl.url != "wss://b" || string(soxl.ping) != "ping" || len(soxl.streams) != 16 || soxl.streams[5] != "SOXSUSDT.books50" ||
+		soxl.streams[6] != "SOXSUSDT.books5" || soxl.streams[7] != "SOXSUSDT.books1" {
 		t.Fatalf("bitget feed %+v", soxl)
 	}
 	if !strings.Contains(string(tqqq.request), `"topic":"books5","symbol":"QQQUSDT"`) || strings.Contains(string(tqqq.request), "books50") {
@@ -288,6 +293,67 @@ func TestBooks50StoredWhole(t *testing.T) {
 	}
 }
 
+// A fine-tick Bitget contract also records books5, in the files only: its
+// frames are stored under SOXSUSDT.books5 and make no row, so the contract's
+// book rows keep coming from books50 alone, while a coarse contract's books5
+// on the same feed still makes its rows.
+func TestFineTickBooks5FilesOnly(t *testing.T) {
+	f, _ := testFeed(t, bitgetFeed("SOXL-SOXS", []string{"SOXLUSDT", "SOXSUSDT"}, map[string]int{"SOXLUSDT": levelsCoarse, "SOXSUSDT": levelsFineBitget}, "wss://b"))
+	for stream, tracked := range map[string]bool{"SOXLUSDT.books5": true, "SOXSUSDT.books50": true, "SOXSUSDT.books5": false, "SOXSUSDT.books1": false} {
+		if s := f.tapes[stream]; s == nil || (s.tracker != nil) != tracked {
+			t.Fatalf("%s: tape %+v, per-second rows %v", stream, s, tracked)
+		}
+	}
+	bids, asks := ladder(52.924, -0.001, 50), ladder(52.929, 0.001, 50)
+	// The books5 frames are newer than the first books50 frame and carry other prices.
+	soxs5 := []frame{
+		{receivedMs: midnight + 1510, payload: booksFrame("books5", "SOXSUSDT", midnight+1500, lv("9.999/1"), lv("10.001/1"))},
+		{receivedMs: midnight + 2510, payload: booksFrame("books5", "SOXSUSDT", midnight+2500, lv("9.998/1"), lv("10.002/1"))},
+	}
+	mustBegin(t, f, midnight)
+	process(t, f, frame{receivedMs: midnight + 100, payload: booksFrame("books50", "SOXSUSDT", midnight+90, bids, asks)},
+		frame{receivedMs: midnight + 110, payload: books5("SOXLUSDT", midnight+95, "1", "1", "2", "1")})
+	process(t, f, soxs5...)
+	process(t, f, frame{receivedMs: midnight + 3100, payload: booksFrame("books50", "SOXSUSDT", midnight+3090, bids[1:], asks[1:])},
+		frame{receivedMs: midnight + 3110, payload: books5("SOXLUSDT", midnight+3095, "1.1", "1", "2", "1")})
+	if err := f.closeFiles(); err != nil {
+		t.Fatal(err)
+	}
+
+	lines := streamLines(t, f.output, "bitget", "SOXSUSDT.books5")
+	if len(lines) != len(soxs5) {
+		t.Fatalf("SOXSUSDT.books5 stored %q", lines)
+	}
+	for i, fr := range soxs5 {
+		if want := fmt.Sprintf(`{"received_ms":%d,"payload":%s}`, fr.receivedMs, fr.payload); string(lines[i]) != want {
+			t.Fatalf("SOXSUSDT.books5 line %d: %s, want %s", i, lines[i], want)
+		}
+	}
+	var soxs, soxl []row // seconds 1000 to 3000 of each contract, all of its first book frame
+	for _, r := range f.rows.queued {
+		switch {
+		case r.kind != kindBook:
+			t.Fatalf("row %+v", r)
+		case r.symbol == "SOXSUSDT":
+			soxs = append(soxs, r)
+		case r.symbol == "SOXLUSDT":
+			soxl = append(soxl, r)
+		}
+	}
+	if len(soxs) != 3 || len(soxl) != 3 {
+		t.Fatalf("rows: SOXS %+v, SOXL %+v", soxs, soxl)
+	}
+	for i := range 3 {
+		if r := soxs[i]; r.secondMs != midnight+int64(i+1)*1000 || r.event.exchangeMs != midnight+90 ||
+			!reflect.DeepEqual(r.event.bids, bids) || !reflect.DeepEqual(r.event.asks, asks) {
+			t.Fatalf("SOXS row %d is not of books50: %+v", i, r)
+		}
+		if r := soxl[i]; r.secondMs != midnight+int64(i+1)*1000 || r.event.exchangeMs != midnight+95 || r.event.bids[0][0] != "1" {
+			t.Fatalf("SOXL row %d: %+v", i, r)
+		}
+	}
+}
+
 // The per-second rules on the Bitget recording of research/test_booktape.py
 // (Seconds.test_bitget_rules), with the rows seconds() derives from it: the
 // newest event stamped before T, ties by the larger trade id, a frame's
@@ -417,6 +483,7 @@ func TestBitgetFeedReconnectsAndShutsDown(t *testing.T) {
 	now := time.Now().UnixMilli()
 	sent1 := [][]byte{books5("SOXLUSDT", now, "1", "1", "2", "1"), fills("SOXLUSDT", fill{2, now, "1.5"}, fill{1, now, "1.4"}),
 		booksFrame("books50", "SOXSUSDT", now, ladder(52.924, -0.001, 50), ladder(52.929, 0.001, 50)),
+		booksFrame("books5", "SOXSUSDT", now, ladder(52.924, -0.001, 5), ladder(52.929, 0.001, 5)),
 		[]byte(`{"action":"snapshot","arg":{"instType":"usdt-futures","topic":"ticker","symbol":"SOXLUSDT"},"data":[{"markPrice":"1.5"}],"ts":1}`),
 		[]byte(`{"action":"snapshot","arg":{"instType":"usdt-futures","topic":"funding-rate","symbol":"SOXLUSDT"},"data":[{"fundingRate":"0"}],"ts":1}`)}
 	sent2 := [][]byte{books5("SOXLUSDT", now+1, "1.1", "1", "2", "1"), fills("SOXLUSDT", fill{3, now + 1, "1.6"})}
@@ -679,7 +746,9 @@ func TestManagerRunWritesRows(t *testing.T) {
 			var frames [][]byte
 			switch r.URL.Path {
 			case "/bitget":
+				// SOXS books5, newer and with other levels, must not reach the rows.
 				frames = [][]byte{books5("SOXLUSDT", now-3, "1.00", "1", "1.01", "2"), booksFrame("books50", "SOXSUSDT", now-3, bids12, asks12),
+					booksFrame("books5", "SOXSUSDT", now-2, ladder(52.900, -0.001, 5), ladder(52.950, 0.001, 5)),
 					fills("SOXLUSDT", fill{i, now - 2, "1.005"})}
 			case "/public/stream":
 				frames = [][]byte{depthFrame("SOXLUSDT", 5, now-3, ladder(2.00, -0.01, 5), ladder(2.01, 0.01, 5))}

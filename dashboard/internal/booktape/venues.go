@@ -32,9 +32,9 @@ const (
 	binanceInstruments = "/fapi/v1/exchangeInfo"
 )
 
-// bitgetTopics are recorded for every Bitget contract after its book topic
-// (bitgetBook). books1 (every change of the best bid and ask) is kept in the
-// files only; the per-second rows take their levels from the book topic.
+// bitgetTopics are recorded for every Bitget contract after its book topics
+// (bitgetBooks). books1 (every change of the best bid and ask) is kept in the
+// files only; the per-second rows take their levels from the first book topic.
 var bitgetTopics = []string{"books1", "publicTrade", "ticker", "funding-rate"}
 
 // binanceMarket are the channels binance-market carries for every contract:
@@ -222,12 +222,12 @@ type bitgetArg struct {
 }
 
 // bitgetFeed subscribes every topic of the combo's contracts in one frame:
-// the book topic of the contract's depth, then bitgetTopics.
+// the book topics of the contract's depth, then bitgetTopics.
 func bitgetFeed(comboID string, symbols []string, levels map[string]int, endpoint string) *feed {
 	var args []bitgetArg
 	var streams []string
 	for _, symbol := range symbols {
-		for _, topic := range append([]string{bitgetBook(levels[symbol])}, bitgetTopics...) {
+		for _, topic := range append(bitgetBooks(levels[symbol]), bitgetTopics...) {
 			args = append(args, bitgetArg{InstType: "usdt-futures", Topic: topic, Symbol: symbol})
 			streams = append(streams, symbol+"."+topic)
 		}
@@ -236,13 +236,15 @@ func bitgetFeed(comboID string, symbols []string, levels map[string]int, endpoin
 		request: subscribeFrame(args), ping: []byte("ping"), streams: streams}
 }
 
-// bitgetBook is the book topic of a depth: books5, or books50 for
-// levelsFineBitget.
-func bitgetBook(levels int) string {
+// bitgetBooks are the book topics of a depth; the per-second rows read the
+// first. levelsFineBitget gets books50 and then books5, which stays in the
+// files only: the trading program prices on books5, of whose sequences
+// books50 carries only part, so a replay needs it.
+func bitgetBooks(levels int) []string {
 	if levels == levelsFineBitget {
-		return "books50"
+		return []string{"books50", "books5"}
 	}
-	return "books5"
+	return []string{"books5"}
 }
 
 func subscribeFrame(args []bitgetArg) []byte {
@@ -275,9 +277,11 @@ func binanceBook(levels int) [2]string {
 }
 
 // rowKind is the part of the per-second rows a topic carries: the book
-// columns from every book frame (Bitget books5 and books50, Binance depth5
-// and depth10), the trade columns from every trade (Bitget publicTrade,
-// Binance aggTrade), or none.
+// columns from a book topic (Bitget books5 and books50, Binance depth5 and
+// depth10), the trade columns from a trade topic (Bitget publicTrade, Binance
+// aggTrade), or none. Of a contract's streams of one kind only the first in
+// subscription order carries it (newManager): Bitget books5 after books50
+// stays in the files.
 func rowKind(venue, topic string) kind {
 	switch venue + "." + topic {
 	case "bitget.books5", "bitget.books50", "binance.depth5", "binance.depth10":

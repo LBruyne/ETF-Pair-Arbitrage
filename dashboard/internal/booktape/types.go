@@ -62,7 +62,7 @@ type feed struct {
 // tape is the recording state of one stream of a feed.
 type tape struct {
 	file    *tapeFile // the open data file; nil until the stream's first record
-	tracker *tracker  // its kind of the per-second rows; nil for a stream without one
+	tracker *tracker  // its kind of the per-second rows; nil for a stream without one or kept in the files only
 	seen    bool      // a frame arrived on the current connection
 }
 

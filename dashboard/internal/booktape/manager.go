@@ -43,7 +43,10 @@ func NewManager(ctx context.Context, cfg Config, dsn, output string, log *slog.L
 	return newManager(feeds, pool, output, log), nil
 }
 
-// newManager binds the feeds to the output, the logger and one writer.
+// newManager binds the feeds to the output, the logger and one writer. A
+// contract's rows of one kind come from one stream, the feed's first of that
+// kind in subscription order; a later one (Bitget books5 after books50) is
+// kept in the files only.
 func newManager(feeds []*feed, pool *pgxpool.Pool, output string, log *slog.Logger) *Manager {
 	w := &writer{pool: pool, log: log, pending: map[rowKey]row{}}
 	for _, f := range feeds {
@@ -52,13 +55,24 @@ func newManager(feeds []*feed, pool *pgxpool.Pool, output string, log *slog.Logg
 		for _, stream := range f.streams {
 			s := &tape{}
 			symbol, topic, _ := strings.Cut(stream, ".")
-			if k := rowKind(f.venue, topic); k != kindNone {
+			if k := rowKind(f.venue, topic); k != kindNone && !f.tracks(symbol, k) {
 				s.tracker = &tracker{venue: f.venue, symbol: symbol, kind: k}
 			}
 			f.tapes[stream] = s
 		}
 	}
 	return &Manager{feeds: feeds, rows: w, output: output, log: log}
+}
+
+// tracks reports whether a stream of the feed already derives the
+// contract's rows of kind k.
+func (f *feed) tracks(symbol string, k kind) bool {
+	for _, s := range f.tapes {
+		if s.tracker != nil && s.tracker.symbol == symbol && s.tracker.kind == k {
+			return true
+		}
+	}
+	return false
 }
 
 // Run records until ctx ends or a file cannot be written (the error). At the
