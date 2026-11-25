@@ -590,8 +590,10 @@ func tablesOf(rows []statement) string {
 // LoadState reads what a restarted process continues from, of the store's
 // own mode: the unfinished cycle (status open or takeover, whatever its
 // session) with its lots and orders, the inventory state, the minute bars
-// and anchor facts of sessionID, and the last lot that was built. main calls
-// it before any manager runs.
+// and anchor facts of sessionID, the last lot that was built, and what the
+// ledger needs beside the cycle: the funding records booked and the
+// finished cycles whose funding is not known yet.
+// main calls it before any manager runs.
 func (s *Store) LoadState(ctx context.Context, sessionID string) (State, error) {
 	var st State
 	live := s.cfg.Live
@@ -639,6 +641,15 @@ func (s *Store) LoadState(ctx context.Context, sessionID string) (State, error) 
 	}
 	if len(last) == 1 {
 		st.LastEntry = &last[0]
+	}
+
+	// The ledger's own: the funding records booked and the finished cycles
+	// still waiting for funding.
+	if st.Funding, err = load[FundingRow](ctx, s.pool, "live = $1 ORDER BY ts_ms, record_id", live); err != nil {
+		return st, err
+	}
+	if st.PendingFunding, err = load[CycleRow](ctx, s.pool, "live = $1 AND status = 'closed' AND NOT funding_known ORDER BY opened_ms", live); err != nil {
+		return st, err
 	}
 	return st, nil
 }

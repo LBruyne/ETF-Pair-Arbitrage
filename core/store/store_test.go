@@ -161,6 +161,16 @@ func TestFake(t *testing.T) {
 	if got := f.Rows("event"); len(got) != 3 || got[2].(EventRow).Kind != "d" || !f.Healthy() {
 		t.Errorf("after the failure: event rows = %+v, healthy = %t", got, f.Healthy())
 	}
+
+	// The other meaning of a WriteSync error: the rows were written.
+	f.FailAfterWrite(failure)
+	if err := f.WriteSync(EventRow{Kind: "e"}); !errors.Is(err, failure) || f.Healthy() {
+		t.Errorf("failing after the write: WriteSync = %v, healthy = %t", err, f.Healthy())
+	}
+	f.Fail(nil)
+	if got := f.Rows("event"); len(got) != 4 || got[3].(EventRow).Kind != "e" || !f.Healthy() {
+		t.Errorf("after a failure that kept its rows: event rows = %+v, healthy = %t", got, f.Healthy())
+	}
 }
 
 // A database that cannot be reached, or a dsn that cannot be parsed, refuses
@@ -458,13 +468,13 @@ func TestWriteSyncReadBack(t *testing.T) {
 	clearTables(t, check)
 	ctx := context.Background()
 
-	cycle := CycleRow{CycleID: "c-sync", SessionID: "2026-11-23", Direction: "long", Status: "open", DustAtOpen: json.RawMessage(`{"bull":{"qty":"0.03","avg_price":"71.9","cycle_id":"c-old","lot_id":"c-old-1"}}`),
+	cycle := CycleRow{CycleID: "c-sync", SessionID: "2026-11-23", Direction: "long", Status: "open",
 		PairAnchorKind: "bell", PairAnchorBull: dec("72.1234"), PairAnchorBear: dec("59.5010"), OpenedMs: 1_795_000_000_000,
 		Gross: dec("-0.25"), Fees: dec("0.0936"), Funding: dec("0"), FundingKnown: true, Net: dec("-0.3436")}
 	lot := LotRow{LotID: "c-sync-1", CycleID: "c-sync", Seq: 1, Status: "building", Direction: "long", XD: -4.25, MuD: 1.5, SigmaD: 2.75, FeeD: 2.6,
 		FeeUSDTEst: dec("1.3"), EntryQtyBull: dec("10"), EntryValueBull: dec("720.05"), EntryFeeBull: dec("0.0468"), OpenedMs: 1_795_000_000_100}
 	order := OrderRow{ClientOrderID: "etfp-sync-1", CycleID: "c-sync", LotID: "c-sync-1", Leg: "bull", Symbol: "SOXLUSDT", Purpose: "entry", Side: "buy",
-		Price: dec("72.01"), Qty: dec("10.00"), Status: "pending", FeeKnown: true, SubmittedMs: 1_795_000_000_100}
+		Price: dec("72.01"), Qty: dec("10.00"), QuotaPrice: dec("72.01"), Status: "pending", FeeKnown: true, SubmittedMs: 1_795_000_000_100}
 	if err := s.WriteSync(cycle, lot, order); err != nil {
 		t.Fatal(err)
 	}
@@ -844,7 +854,7 @@ func TestLoadState(t *testing.T) {
 		cycle("c-open", "open", 5000),
 		lot("c-open-2", "c-open", 2, "building", 7000), lot("c-open-1", "c-open", 1, "open", 5000),
 		order("etfp-open-3", "c-open", "c-open-2", "pending", 7000), order("etfp-open-1", "c-open", "c-open-1", "filled", 5000), order("etfp-open-2", "c-open", "c-open-1", "cancelled", 5001),
-		InventoryStateRow{Capital: dec("1000"), RClosed: dec("-12.5"), Dust: json.RawMessage(`{"bear":{"qty":"-0.02"}}`)},
+		InventoryStateRow{Capital: dec("1000"), RClosed: dec("-12.5"), Dust: json.RawMessage(`{"bear":{"qty":"-0.02","avg_price":"59.42"}}`)},
 		MinuteBarRow{MinuteMs: 120_000, SessionID: session, MidBull: 72.5, MidBear: 59.25, F: 0.9995, Valid: true, Source: "own"},
 		MinuteBarRow{MinuteMs: 60_000, SessionID: session, Valid: false, Source: "perp_second", MidBull: math.NaN(), MidBear: math.NaN(), F: math.NaN()},
 		MinuteBarRow{MinuteMs: 30_000, SessionID: earlier, MidBull: 70, MidBear: 61, F: 1, Valid: true, Source: "own"},
@@ -920,6 +930,101 @@ func TestLoadState(t *testing.T) {
 	}
 	if st, err = s.LoadState(ctx, session); err != nil || st.Cycle != nil || len(st.Lots) != 0 || len(st.Orders) != 0 || st.LastEntry == nil || st.LastEntry.LotID != "c-open-1" {
 		t.Errorf("after the close: cycle = %+v, lots %d, orders %d, last entry %+v, err %v", st.Cycle, len(st.Lots), len(st.Orders), st.LastEntry, err)
+	}
+}
+
+// What the ledger needs from LoadState beside the unfinished cycle: every
+// funding record booked, oldest first, so a record is booked once; the
+// finished cycles whose funding is not known yet, so a late record completes
+// them; and the dust as the last cycle recorded it. The other mode's rows
+// stay out.
+func TestLoadStateForTheLedger(t *testing.T) {
+	s, check := startStore(t, Config{Live: false}, testConfig(t), testTimings())
+	clearTables(t, check)
+	live, _ := startStore(t, Config{Live: true}, testConfig(t), testTimings())
+	ctx := context.Background()
+	const session = "2026-11-23"
+
+	awaited := json.RawMessage(`[{"settlement_ms":3500,"leg":"bull"}]`)
+	cycle := func(id, status string, openedMs, closedMs int64, fundingKnown bool) CycleRow {
+		row := CycleRow{CycleID: id, SessionID: session, Direction: "short", Status: status, PairAnchorKind: "bell",
+			PairAnchorBull: dec("40"), PairAnchorBear: dec("60"), OpenedMs: openedMs, ClosedMs: closedMs, FundingKnown: fundingKnown,
+			DustBear: dec("-0.02")}
+		if status == "closed" && !fundingKnown {
+			row.FundingAwaited = awaited
+		}
+		return row
+	}
+	funding := func(id, symbol, amount string, tsMs, settlementMs int64, cycleID string) FundingRow {
+		return FundingRow{RecordID: id, Symbol: symbol, Type: "funding", Amount: dec(amount), TsMs: tsMs, SettlementMs: settlementMs, CycleID: cycleID}
+	}
+	dust := json.RawMessage(`{"bear":{"qty":"-0.02","avg_price":"60"}}`)
+	if err := s.WriteSync(
+		cycle("c-known", "closed", 1000, 2000, true),
+		cycle("c-wait-2", "closed", 5000, 6000, false),
+		cycle("c-wait-1", "closed", 3000, 4000, false),
+		cycle("c-open", "open", 7000, 0, false), // unfinished: it is State.Cycle, not a pending one
+		funding("f-2", "SOXSUSDT", "0.05", 3600, 3500, "c-wait-1"),
+		funding("f-1", "SOXLUSDT", "-0.12", 1600, 1500, "c-known"),
+		funding("f-3", "SOXLUSDT", "-0.01", 9000, 8900, ""),
+		InventoryStateRow{Capital: dec("1000"), SinceMs: 900, RClosed: dec("15.62529116"), Dust: dust},
+	); err != nil {
+		t.Fatal(err)
+	}
+	// A funding record is a fact: a second write of its id changes nothing.
+	if err := s.WriteSync(funding("f-1", "SOXLUSDT", "-99", 1600, 1500, "c-known")); err != nil {
+		t.Fatal(err)
+	}
+	if err := live.WriteSync(cycle("c-live-wait", "closed", 3000, 4000, false), funding("f-live", "SOXLUSDT", "1", 1600, 1500, "")); err != nil {
+		t.Fatal(err)
+	}
+
+	st, err := s.LoadState(ctx, session)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st.Cycle == nil || st.Cycle.CycleID != "c-open" {
+		t.Errorf("cycle = %+v, want c-open", st.Cycle)
+	}
+	var ids []string
+	for _, f := range st.Funding {
+		ids = append(ids, f.RecordID)
+	}
+	if !reflect.DeepEqual(ids, []string{"f-1", "f-2", "f-3"}) {
+		t.Errorf("funding = %v, want paper's three, oldest first", ids)
+	}
+	if f := st.Funding[0]; !f.Amount.Equal(dec("-0.12")) || f.SettlementMs != 1500 || f.CycleID != "c-known" || f.Symbol != "SOXLUSDT" {
+		t.Errorf("funding f-1 = %+v, want the first write: -0.12 of settlement 1500 on c-known", f)
+	}
+	if st.Funding[2].CycleID != "" {
+		t.Errorf("funding f-3 cycle = %q, want none", st.Funding[2].CycleID)
+	}
+	ids = nil
+	for _, c := range st.PendingFunding {
+		ids = append(ids, c.CycleID)
+	}
+	if !reflect.DeepEqual(ids, []string{"c-wait-1", "c-wait-2"}) {
+		t.Errorf("cycles awaiting funding = %v, want c-wait-1 and c-wait-2, oldest first", ids)
+	}
+	if c := st.PendingFunding[0]; c.OpenedMs != 3000 || c.ClosedMs != 4000 || !c.DustBear.Equal(dec("-0.02")) || !c.PairAnchorBear.Equal(dec("60")) ||
+		!reflect.DeepEqual(asMap(t, c)["funding_awaited"], asMap(t, CycleRow{FundingAwaited: awaited})["funding_awaited"]) {
+		t.Errorf("pending cycle = %+v, want the whole row with what it awaits", c)
+	}
+	if len(st.Cycle.FundingAwaited) != 0 {
+		t.Errorf("the open cycle's funding_awaited = %s, want NULL read back as empty", st.Cycle.FundingAwaited)
+	}
+	if st.Inventory == nil || !st.Inventory.RClosed.Equal(dec("15.62529116")) || st.Inventory.SinceMs != 900 ||
+		!reflect.DeepEqual(asMap(t, st.Inventory)["dust"], asMap(t, InventoryStateRow{Dust: dust})["dust"]) {
+		t.Errorf("inventory state = %+v, want since 900, r_closed 15.62529116 and the dust as written", st.Inventory)
+	}
+
+	// Live sees its own only.
+	lst, err := live.LoadState(ctx, session)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(lst.Funding) != 1 || lst.Funding[0].RecordID != "f-live" || len(lst.PendingFunding) != 1 || lst.PendingFunding[0].CycleID != "c-live-wait" || lst.Inventory != nil {
+		t.Errorf("live state = %+v, want only live's rows", lst)
 	}
 }
 

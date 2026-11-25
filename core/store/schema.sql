@@ -90,7 +90,7 @@ CREATE TABLE IF NOT EXISTS trade.signal_sample (
 CREATE TABLE IF NOT EXISTS trade.anchor_fact (
     live        BOOLEAN NOT NULL,
     session_id  TEXT NOT NULL,              -- the session the fact belongs to
-    kind        TEXT NOT NULL,              -- bell, nav_seen, nav or dividend
+    kind        TEXT NOT NULL,              -- bell_f, bell, nav_seen, nav or dividend
     leg         TEXT NOT NULL,              -- bull or bear
     known_ms    BIGINT NOT NULL,            -- when the process learned it
     run_id      TEXT NOT NULL,
@@ -109,8 +109,7 @@ CREATE TABLE IF NOT EXISTS trade.cycle (
     session_id        TEXT NOT NULL,        -- the session it was opened in
     direction         TEXT NOT NULL,        -- long (both legs bought) or short
     status            TEXT NOT NULL,        -- open, closed or takeover
-    dust_at_open      JSONB,                -- the dust carried in when it opened, as in inventory_state.dust
-    end_reason        TEXT,                 -- exit_line, close_window, stop, session_changed, no_fill or one_leg; NULL while open
+    end_reason        TEXT,                 -- exit_line, close_window, stop, session_changed, no_fill, one_leg or store_error (its row was not confirmed written, so it never traded); NULL while open
     pair_anchor_kind  TEXT NOT NULL,        -- the anchors that size all of its lots: their kind
     pair_anchor_bull  NUMERIC NOT NULL,     -- and their two values, USD per share
     pair_anchor_bear  NUMERIC NOT NULL,
@@ -119,9 +118,10 @@ CREATE TABLE IF NOT EXISTS trade.cycle (
     gross             NUMERIC NOT NULL,     -- realised before fees, USDT
     fees              NUMERIC NOT NULL,     -- trading fees paid, USDT
     funding           NUMERIC NOT NULL,     -- funding booked to it, USDT
-    funding_known     BOOLEAN NOT NULL,     -- false while a settlement it spans has no record yet
+    funding_known     BOOLEAN NOT NULL,     -- false while a leg it held through a settlement has a non-zero or unpublished rate and no record yet
+    funding_awaited   JSONB,                -- a finished cycle's settlements and legs still without a record: [{"settlement_ms": ..., "leg": "bull"}]; NULL when none
     net               NUMERIC NOT NULL,     -- realised after fees and funding, USDT
-    dust_bull         NUMERIC NOT NULL,     -- signed quantity it left unsendable on the bull leg
+    dust_bull         NUMERIC NOT NULL,     -- signed quantity it left on the bull leg because no order could be sent for it; recorded as dust, not traded
     dust_bear         NUMERIC NOT NULL,
     PRIMARY KEY (live, cycle_id)
 );
@@ -135,7 +135,7 @@ CREATE TABLE IF NOT EXISTS trade.lot (
     cycle_id          TEXT NOT NULL,
     seq               INTEGER NOT NULL,     -- its order within the cycle
     status            TEXT NOT NULL,        -- building, open, closed or void
-    void_reason       TEXT,                 -- no_fill or one_leg; NULL unless void
+    void_reason       TEXT,                 -- no_fill, one_leg or store_error (its row was not confirmed written, so its orders were never sent); NULL unless void
     direction         TEXT NOT NULL,
     x_d               DOUBLE PRECISION,     -- executable deviation at the decision, in spread units
     mu_d              DOUBLE PRECISION,     -- the mean at the decision
@@ -157,14 +157,8 @@ CREATE TABLE IF NOT EXISTS trade.lot (
     opened_ms         BIGINT NOT NULL,      -- when the batch was opened
     closed_ms         BIGINT,               -- NULL until closed or void
     gross             NUMERIC NOT NULL,     -- realised before fees, USDT
-    fees              NUMERIC NOT NULL,
+    fees              NUMERIC NOT NULL,     -- exit fees plus the entry fees of the quantity closed
     net               NUMERIC NOT NULL,     -- realised after fees, USDT
-    dust_qty_bull     NUMERIC NOT NULL,     -- dust it left that a later cycle has offset: quantity
-    dust_gross_bull   NUMERIC NOT NULL,     -- what that offset realised before fees
-    dust_fee_bull     NUMERIC NOT NULL,     -- and the fee share of the offsetting fills
-    dust_qty_bear     NUMERIC NOT NULL,
-    dust_gross_bear   NUMERIC NOT NULL,
-    dust_fee_bear     NUMERIC NOT NULL,
     PRIMARY KEY (live, lot_id)
 );
 
@@ -175,7 +169,7 @@ CREATE TABLE IF NOT EXISTS trade.cex_order (
     run_id               TEXT NOT NULL,     -- the run that wrote it last
     live                 BOOLEAN NOT NULL,
     cycle_id             TEXT NOT NULL,
-    lot_id               TEXT,              -- the entry batch it belongs to; NULL when it belongs to none
+    lot_id               TEXT,              -- the entry batch it is booked on, fixed once: sent with it, or assigned when an order recognised from the venue was first booked; NULL for exits and forced exits
     leg                  TEXT NOT NULL,     -- bull or bear
     symbol               TEXT NOT NULL,
     purpose              TEXT NOT NULL,     -- entry, complete, trim, exit or forced
@@ -183,6 +177,7 @@ CREATE TABLE IF NOT EXISTS trade.cex_order (
     reduce_only          BOOLEAN NOT NULL,
     price                NUMERIC NOT NULL,  -- the limit price
     qty                  NUMERIC NOT NULL,
+    quota_price          NUMERIC,           -- the price its notional is reserved at: the limit for a buy, the decision's raw best bid for a sell; NULL reserves at the limit
     status               TEXT NOT NULL,     -- pending, acked, filled, cancelled, rejected, not_sent or never_arrived
     unknown              BOOLEAN NOT NULL,  -- the outcome is not known yet and is being queried
     order_id             TEXT,              -- the venue's id; NULL until acknowledged
@@ -247,7 +242,7 @@ CREATE TABLE IF NOT EXISTS trade.funding (
     amount         NUMERIC NOT NULL,        -- as the venue reports it, USDT
     ts_ms          BIGINT NOT NULL,         -- the record's time
     settlement_ms  BIGINT NOT NULL,         -- the settlement it belongs to
-    cycle_id       TEXT,                    -- the cycle that held a position through that settlement; NULL when none did
+    cycle_id       TEXT,                    -- the cycle whose interval holds that settlement; NULL when none does
     PRIMARY KEY (live, record_id)
 );
 
@@ -273,8 +268,9 @@ CREATE TABLE IF NOT EXISTS trade.inventory_state (
     live      BOOLEAN PRIMARY KEY,
     run_id    TEXT NOT NULL,                -- the run that wrote it last
     capital   NUMERIC NOT NULL,             -- the configured capital r_closed was accumulated under
+    since_ms  BIGINT NOT NULL,              -- when this ledger started: at its first start and again when the capital changed; funding settled before it is not booked
     r_closed  NUMERIC NOT NULL,             -- net of all finished cycles plus booked funding, USDT
-    dust      JSONB                         -- per leg: signed quantity, average price, and the cycle_id and lot_id that left it
+    dust      JSONB                         -- per leg (keys bull, bear; only legs with dust): qty, the net signed quantity cycles left unsendable, and avg_price, its entry average price; recorded only
 );
 
 -- event (fact): alarms and state changes of every module, numbered by the store within a run.

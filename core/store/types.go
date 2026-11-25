@@ -197,7 +197,6 @@ type CycleRow struct {
 	SessionID      string          `json:"session_id"`
 	Direction      string          `json:"direction"`
 	Status         string          `json:"status"`
-	DustAtOpen     json.RawMessage `json:"dust_at_open"`
 	EndReason      string          `json:"end_reason,omitempty"`
 	PairAnchorKind string          `json:"pair_anchor_kind"`
 	PairAnchorBull decimal.Decimal `json:"pair_anchor_bull"`
@@ -208,6 +207,7 @@ type CycleRow struct {
 	Fees           decimal.Decimal `json:"fees"`
 	Funding        decimal.Decimal `json:"funding"`
 	FundingKnown   bool            `json:"funding_known"`
+	FundingAwaited json.RawMessage `json:"funding_awaited"`
 	Net            decimal.Decimal `json:"net"`
 	DustBull       decimal.Decimal `json:"dust_bull"`
 	DustBear       decimal.Decimal `json:"dust_bear"`
@@ -246,12 +246,6 @@ type LotRow struct {
 	Gross          decimal.Decimal `json:"gross"`
 	Fees           decimal.Decimal `json:"fees"`
 	Net            decimal.Decimal `json:"net"`
-	DustQtyBull    decimal.Decimal `json:"dust_qty_bull"`
-	DustGrossBull  decimal.Decimal `json:"dust_gross_bull"`
-	DustFeeBull    decimal.Decimal `json:"dust_fee_bull"`
-	DustQtyBear    decimal.Decimal `json:"dust_qty_bear"`
-	DustGrossBear  decimal.Decimal `json:"dust_gross_bear"`
-	DustFeeBear    decimal.Decimal `json:"dust_fee_bear"`
 }
 
 func (LotRow) Table() string { return "lot" }
@@ -268,6 +262,7 @@ type OrderRow struct {
 	ReduceOnly        bool            `json:"reduce_only"`
 	Price             decimal.Decimal `json:"price"`
 	Qty               decimal.Decimal `json:"qty"`
+	QuotaPrice        decimal.Decimal `json:"quota_price,omitempty"`
 	Status            string          `json:"status"`
 	Unknown           bool            `json:"unknown"`
 	OrderID           string          `json:"order_id,omitempty"`
@@ -357,6 +352,7 @@ func (InventorySampleRow) Table() string { return "inventory_sample" }
 // (inventory_state, written by inventory). There is one row per mode.
 type InventoryStateRow struct {
 	Capital decimal.Decimal `json:"capital"`
+	SinceMs int64           `json:"since_ms"`
 	RClosed decimal.Decimal `json:"r_closed"`
 	Dust    json.RawMessage `json:"dust"`
 }
@@ -388,6 +384,10 @@ type State struct {
 	MinuteBars  []MinuteBarRow     // the given session's minutes, oldest first
 	AnchorFacts []AnchorFactRow    // the given session's anchor facts, in the order they were learned
 	LastEntry   *LotRow            // the most recently opened lot that was built (status open or closed); nil when there is none
+
+	// What the ledger needs beyond the unfinished cycle.
+	Funding        []FundingRow // every funding record booked, oldest first: a record is booked once, by its record_id
+	PendingFunding []CycleRow   // the finished cycles whose funding is not known yet (funding_known false), oldest first
 }
 
 // --- test double ---
@@ -398,6 +398,7 @@ type Fake struct {
 	mu   sync.Mutex
 	rows []Row
 	err  error
+	keep bool // WriteSync keeps its rows although it returns err
 }
 
 // Record keeps the rows.
@@ -407,19 +408,21 @@ func (f *Fake) Record(rows ...Row) {
 	f.rows = append(f.rows, rows...)
 }
 
-// WriteSync keeps the rows, or returns the error set by Fail and keeps
-// nothing. (The Store's error is weaker: its rows may have been written.)
+// WriteSync keeps the rows and returns nil. While an error is set it returns
+// that error: after Fail it keeps nothing, after FailAfterWrite it keeps the
+// rows all the same. Those are the two things an error of the Store's
+// WriteSync can mean: not written, or written without the answer arriving in
+// time.
 func (f *Fake) WriteSync(rows ...Row) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	if f.err != nil {
-		return f.err
+	if f.err == nil || f.keep {
+		f.rows = append(f.rows, rows...)
 	}
-	f.rows = append(f.rows, rows...)
-	return nil
+	return f.err
 }
 
-// Healthy is false while an error is set by Fail.
+// Healthy is false while an error is set by Fail or FailAfterWrite.
 func (f *Fake) Healthy() bool {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -432,7 +435,16 @@ func (f *Fake) Healthy() bool {
 func (f *Fake) Fail(err error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.err = err
+	f.err, f.keep = err, false
+}
+
+// FailAfterWrite makes WriteSync keep its rows and return err all the same,
+// as the Store does when the commit succeeded and its answer came too late.
+// Fail(nil) ends it.
+func (f *Fake) FailAfterWrite(err error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.err, f.keep = err, true
 }
 
 // Rows returns the rows received for table, oldest first.
