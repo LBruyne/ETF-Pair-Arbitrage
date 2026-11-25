@@ -6,9 +6,12 @@
 package cex
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"time"
+
+	"github.com/shopspring/decimal"
 )
 
 // --- configuration ---
@@ -43,8 +46,10 @@ type LegConfig struct {
 	BookTopic string `yaml:"book_topic"`
 }
 
-// The depth topics a leg may subscribe.
+// The book topics. A leg subscribes one depth topic (TopicBooks5 or
+// TopicBooks50) and always TopicBooks1, the stream of its best bid and ask.
 const (
+	TopicBooks1  = "books1"
 	TopicBooks5  = "books5"
 	TopicBooks50 = "books50"
 )
@@ -106,8 +111,17 @@ func (c Config) Validate() error {
 			errs = append(errs, fmt.Errorf("%s.close must be %q or a New York time as HH:MM, got %q", path, CloseClosed, o.Close))
 		}
 	}
+	seen := map[CorporateAction]int{} // ticker, ex-date and kind -> the index that has them
 	for i, a := range c.CorporateActions {
 		path := fmt.Sprintf("cex.corporate_actions[%d]", i)
+		// The same action written twice would be applied twice: a dividend
+		// subtracted from the anchor two times.
+		key := CorporateAction{Ticker: a.Ticker, ExDate: a.ExDate, Kind: a.Kind}
+		if first, dup := seen[key]; dup {
+			errs = append(errs, fmt.Errorf("%s repeats cex.corporate_actions[%d] (%s %s %s): each action is written once", path, first, a.Ticker, a.ExDate, a.Kind))
+		} else {
+			seen[key] = i
+		}
 		if a.Ticker == "" || (a.Ticker != c.Pair.Bull.Ticker && a.Ticker != c.Pair.Bear.Ticker) {
 			errs = append(errs, fmt.Errorf("%s.ticker must be one of the pair's tickers, got %q", path, a.Ticker))
 		}
@@ -182,3 +196,498 @@ func (e Env) Validate(live bool) error {
 
 // Symbol is a contract on the exchange, such as SOXLUSDT.
 type Symbol string
+
+// Leg is one side of the pair. It indexes the [2]T arrays that hold one value
+// per leg.
+type Leg int
+
+const (
+	Bull Leg = iota // the leveraged long ETF's contract
+	Bear            // the leveraged short ETF's contract
+)
+
+// Legs lists both legs, for loops.
+var Legs = [2]Leg{Bull, Bear}
+
+// String is the leg's name in logs and in the database.
+func (l Leg) String() string {
+	if l == Bull {
+		return "bull"
+	}
+	return "bear"
+}
+
+// Side is the direction of one order.
+type Side string
+
+const (
+	SideBuy  Side = "buy"
+	SideSell Side = "sell"
+)
+
+// ClientOrderID is the order id the process makes; it is the idempotency key
+// of an order.
+type ClientOrderID string
+
+// OrderID is the id the venue assigns to an order it accepted.
+type OrderID string
+
+// OrderPurpose is why an order was sent. It is recorded and never sent to
+// the venue.
+type OrderPurpose string
+
+const (
+	PurposeEntry    OrderPurpose = "entry"    // opens a lot
+	PurposeComplete OrderPurpose = "complete" // adds to the leg that filled less
+	PurposeTrim     OrderPurpose = "trim"     // closes what the other leg did not match
+	PurposeExit     OrderPurpose = "exit"     // closes at the exit line
+	PurposeForced   OrderPurpose = "forced"   // closes before the regular close, after a stop signal or for an ended Session
+)
+
+// OrderStatus is the state of an order as the process knows it.
+type OrderStatus string
+
+const (
+	StatusPending      OrderStatus = "pending"       // registered and written, not yet answered by the venue
+	StatusAcked        OrderStatus = "acked"         // the venue accepted it; the outcome comes from the private stream
+	StatusFilled       OrderStatus = "filled"        // final: filled in full
+	StatusCancelled    OrderStatus = "cancelled"     // final: the IOC remainder was cancelled, with or without a partial fill
+	StatusRejected     OrderStatus = "rejected"      // final: the venue refused it
+	StatusNotSent      OrderStatus = "not_sent"      // final: nothing left the process
+	StatusNeverArrived OrderStatus = "never_arrived" // final: exec's verdict that the venue never had it
+)
+
+// Terminal reports whether the status is final: no later report changes the
+// order's state, only its filled quantity and fee may still be completed.
+func (s OrderStatus) Terminal() bool {
+	switch s {
+	case StatusFilled, StatusCancelled, StatusRejected, StatusNotSent, StatusNeverArrived:
+		return true
+	}
+	return false
+}
+
+// --- market data ---
+
+// BookLevel is one price level of a book.
+type BookLevel struct{ Price, Qty decimal.Decimal }
+
+// Book is one leg's published book. It is immutable: every change publishes
+// a new one. Bids and Asks are the depth levels, with the best level's
+// quantity taken from books1 when books1 is newer at the same prices.
+type Book struct {
+	Symbol           Symbol
+	Bids, Asks       []BookLevel // best first; empty while the leg has no depth
+	DepthSeq         uint64      // the matching sequence number of the depth held; 0 without depth
+	DepthReceivedAt  time.Time   // local arrival of the last accepted depth frame; zero without depth
+	Conflict         bool        // books1 is newer than the depth and one best price differs: wait for a newer depth
+	BestBid, BestAsk BookLevel   // from the newer of the depth and books1, by sequence number
+	BestReceivedAt   time.Time   // local arrival of the frame BestBid and BestAsk come from
+	Connected        bool        // the leg's connection is up and has delivered a frame
+}
+
+// BookAction is the kind of a depth frame.
+type BookAction string
+
+const (
+	ActionSnapshot BookAction = "snapshot" // the whole book of the topic
+	ActionUpdate   BookAction = "update"   // changed levels on top of the frame PrevSeq names
+)
+
+// BookSubscription names one topic of one contract.
+type BookSubscription struct {
+	Symbol Symbol
+	Topic  string // TopicBooks1, TopicBooks5 or TopicBooks50
+}
+
+// BookEvent is one book frame as a Venue hands it to the manager. A level
+// with quantity zero in an update deletes that price.
+type BookEvent struct {
+	Symbol       Symbol
+	Topic        string
+	Action       BookAction
+	Bids, Asks   []BookLevel // best first
+	Seq, PrevSeq uint64      // the matching sequence number of this frame, and of the frame an update follows
+	ExchangeTime time.Time   // the venue's time of the book state
+	ReceivedAt   time.Time   // local arrival
+}
+
+// --- reference ---
+
+// MarketRule is what the venue demands of an order on one contract.
+type MarketRule struct {
+	Symbol      Symbol
+	PriceTick   decimal.Decimal // prices are multiples of it
+	QtyStep     decimal.Decimal // quantities are multiples of it
+	MinQty      decimal.Decimal // the smallest order quantity, in shares
+	MinNotional decimal.Decimal // the smallest order value, in USDT
+	Online      bool            // the contract is trading
+}
+
+// Sendable reports whether the venue takes an order of qty at price: at
+// least the minimum quantity and the minimum value.
+func (r MarketRule) Sendable(qty, price decimal.Decimal) bool {
+	return qty.GreaterThanOrEqual(r.MinQty) && qty.Mul(price).GreaterThanOrEqual(r.MinNotional)
+}
+
+// AccountSettings is how the account is set up for the two contracts. The
+// process reads it and never changes it.
+type AccountSettings struct {
+	OneWay   bool // one-way position mode (not hedge mode)
+	BySymbol map[Symbol]SymbolSetting
+}
+
+// SymbolSetting is one contract's margin mode and leverage on the account.
+type SymbolSetting struct {
+	Crossed  bool // cross margin
+	Leverage int
+}
+
+// Position is the account's position in one contract.
+type Position struct {
+	Symbol    Symbol
+	Qty       decimal.Decimal // signed: a short position is negative
+	AvgPrice  decimal.Decimal
+	UpdatedAt time.Time // the venue's time of the position
+}
+
+// PositionSet is the account's positions in the two legs at one moment. A
+// leg without a position has no entry.
+type PositionSet struct {
+	BySymbol   map[Symbol]Position
+	ReceivedAt time.Time // local arrival of the read or push
+	Loaded     bool      // false until the first read or push: nothing is known yet, which is not "flat"
+}
+
+// FinancialRecord is one funding settlement booked on the account.
+type FinancialRecord struct {
+	ID     string
+	Symbol Symbol
+	Type   string          // the venue's record type
+	Amount decimal.Decimal // USDT; positive is received
+	At     time.Time       // the venue's time of the record, a few seconds after the settlement
+}
+
+// FundingSettlement is the funding rate one settlement of a contract used.
+type FundingSettlement struct {
+	Symbol Symbol
+	Rate   decimal.Decimal
+	At     time.Time // the settlement
+}
+
+// --- F, calendar, anchors ---
+
+// FX is F, the value of one USDT in USD: the mid of the source's best bid
+// and ask.
+type FX struct {
+	Price, Bid, Ask decimal.Decimal
+	ReceivedAt      time.Time // local arrival of the read it comes from
+}
+
+// FXMinute is the source's last trade price of USDT-USD in one minute.
+type FXMinute struct {
+	Minute time.Time // the start of the minute
+	Close  decimal.Decimal
+}
+
+// Session runs from one regular close of the US equity market to the next;
+// weekends and holidays belong to the Session before them.
+type Session struct {
+	ID          string    // New York date of the close that starts it, 2006-01-02
+	Start       time.Time // that regular close
+	RegularOpen time.Time // 09:30 New York of the trading day that ends it: entries stop here
+	End         time.Time // the next regular close (13:00 New York on an early-close day)
+}
+
+// ScheduleDay is one trading day of a venue's schedule of the US equity
+// market, compared with the calendar.
+type ScheduleDay struct {
+	Date                      string // New York date, 2006-01-02
+	RegularOpen, RegularClose time.Time
+}
+
+// AnchorKind is which anchor a Session uses at a moment.
+type AnchorKind string
+
+const (
+	AnchorNone AnchorKind = ""     // no anchor yet: no entries
+	AnchorBell AnchorKind = "bell" // F x the index price at the close
+	AnchorNAV  AnchorKind = "nav"  // the issuer's net asset value of the day, once stable
+)
+
+// Anchors is the pair of anchors of one Session as published. Both legs
+// always use the same kind.
+//
+// SessionID names the Session the values belong to. It follows the calendar
+// with a short lag: for a moment after a regular close, at most the length
+// of the anchor loop's reads in flight, the published value is still the
+// ended Session's. A reader compares SessionID with the ID of the Session it
+// is in and treats the anchors of another Session as no anchor.
+type Anchors struct {
+	SessionID  string
+	Kind       AnchorKind
+	Bull, Bear decimal.Decimal // USD per share, with a dividend already subtracted from the moment it took effect
+	KnownAt    time.Time       // when this pair of values became usable
+	EntryBan   bool            // inside a dividend or split window: no entries
+	RestartAt  time.Time       // the mean and sigma restart at this time (a dividend took effect); zero otherwise
+}
+
+// Distribution is one declared distribution of a fund.
+type Distribution struct {
+	ExDate   string          // New York date, 2006-01-02
+	Amount   decimal.Decimal // USD per share: income, capital gains and return of capital summed
+	Declared bool            // false: the issuer lists the ex-date without its amounts yet
+}
+
+// The kinds of AnchorFact, as stored in anchor_fact.kind.
+const (
+	FactBell     = "bell"     // the bell anchor of one leg
+	FactNAVSeen  = "nav_seen" // a NAV value read for the first time; its settle delay starts at KnownAt
+	FactNAV      = "nav"      // the NAV confirmed as the anchor
+	FactDividend = "dividend" // the amount of a dividend that takes effect in the Session
+)
+
+// AnchorFact is one thing the process learned about a Session's anchors, as
+// stored and as read back at a restart.
+type AnchorFact struct {
+	SessionID string
+	Kind      string // FactBellF, FactBell, FactNAVSeen, FactNAV or FactDividend
+	Leg       Leg
+	Value     decimal.Decimal // USD per share
+	F         decimal.Decimal // the USDT-USD rate inside a bell anchor; zero for the other kinds
+	Source    string
+	KnownAt   time.Time
+}
+
+// --- orders ---
+
+// OrderRequest is one IOC limit order to send.
+type OrderRequest struct {
+	ClientOrderID ClientOrderID
+	Symbol        Symbol
+	Leg           Leg
+	Side          Side
+	Price, Qty    decimal.Decimal
+	QuotaPrice    decimal.Decimal // recorded, not sent to the venue: the price the order's notional is reserved at, its limit for a buy and the decision's raw best bid for a sell; zero reserves at the limit
+	ReduceOnly    bool
+	Purpose       OrderPurpose // recorded, not sent to the venue
+	CycleID       string       // recorded, not sent to the venue
+	LotID         string       // recorded, not sent to the venue
+}
+
+// OrderRecord is one order with everything known about its outcome.
+type OrderRecord struct {
+	Request      OrderRequest
+	OrderID      OrderID
+	Status       OrderStatus
+	Unknown      bool      // the outcome is not known yet: being queried, never resent
+	UnknownSince time.Time // when Unknown was set
+	FeeKnown     bool      // the venue has reported the fee of what was filled; an order without a fill needs none
+	NotFound     bool      // unknown for 30 s, the venue says there is no such order, and no fill carries its id
+
+	CumExecQty, CumExecValue, AvgPrice decimal.Decimal
+	Fee                                decimal.Decimal // USDT; positive is paid
+	CancelReason                       string
+	ErrorCode, ErrorMessage            string
+
+	SubmittedAt, SentAt, AckedAt time.Time // local clock
+	ExchangeUpdatedAt            time.Time // the venue's time of its last change
+	UpdateReceivedAt             time.Time // local arrival of the last report
+	UpdateSeq                    uint64    // grows with every change of the record
+}
+
+// OrderAck is the venue's acceptance of an order. It says nothing about
+// fills.
+type OrderAck struct {
+	OrderID    OrderID
+	ReceivedAt time.Time
+}
+
+// Fill is one execution as the venue reported it.
+type Fill struct {
+	ExecID        string
+	OrderID       OrderID
+	ClientOrderID ClientOrderID
+	Symbol        Symbol
+	Side          Side
+	Price, Qty    decimal.Decimal
+	Value         decimal.Decimal // USDT
+	Fee           decimal.Decimal // USDT; positive is paid
+	ExecTime      time.Time       // the venue's time of the execution
+	ReceivedAt    time.Time
+}
+
+// PrivateEvent is one push of the private stream. Exactly one of Order, Fill
+// and Positions is set.
+type PrivateEvent struct {
+	Order      *OrderRecord
+	Fill       *Fill
+	Positions  *PositionSet
+	ReceivedAt time.Time
+}
+
+// --- errors ---
+
+var (
+	// ErrNotSent: the order did not leave the process.
+	ErrNotSent = errors.New("cex: order not sent")
+	// ErrOrderStateUnknown: the venue may or may not have the order.
+	ErrOrderStateUnknown = errors.New("cex: order state unknown")
+	// ErrUnknownOrder: the venue says there is no such order.
+	ErrUnknownOrder = errors.New("cex: the venue has no such order")
+	// ErrIssuerKey: the issuer's API key is missing or was refused. Its NAV
+	// and distributions cannot be read until the process restarts with a
+	// working key.
+	ErrIssuerKey = errors.New("cex: the issuer's API key is missing or was refused")
+)
+
+// ErrorKind groups the venue's refusals by what the sender does next.
+type ErrorKind string
+
+const (
+	ErrorRateLimited ErrorKind = "rate_limited" // the same order may be sent again later
+	ErrorPriceLimit  ErrorKind = "price_limit"  // the price is outside the venue's band: not resent at the same price
+	ErrorOther       ErrorKind = "other"
+)
+
+// VenueError is a refusal the venue stated: the request reached it and was
+// not carried out.
+type VenueError struct {
+	Code, Message string
+	Kind          ErrorKind
+}
+
+func (e *VenueError) Error() string {
+	return fmt.Sprintf("venue error %s: %s", e.Code, e.Message)
+}
+
+// --- interfaces ---
+
+// Venue is one exchange as cex uses it: reference reads, the market-data and
+// private streams, and the one order command. An implementation converts the
+// exchange's wire shapes to these types and does nothing else. It has no
+// method that cancels or amends an order or changes an account setting: the
+// process sends IOC orders only and reads the account's settings without
+// changing them.
+type Venue interface {
+	Name() string
+
+	// --- reference ---
+
+	// MarketRules reads the rules of the given contracts.
+	MarketRules(ctx context.Context, symbols []Symbol) (map[Symbol]MarketRule, error)
+	// AccountSettings reads the position mode and the given contracts'
+	// margin mode and leverage. A contract the account has no setting for
+	// is left out of BySymbol.
+	AccountSettings(ctx context.Context, symbols []Symbol) (AccountSettings, error)
+	// Positions reads the account's positions in the given contracts.
+	Positions(ctx context.Context, symbols []Symbol) (PositionSet, error)
+	// OrderByClientID reads one order. ErrUnknownOrder: the venue says
+	// there is no such order.
+	OrderByClientID(ctx context.Context, symbol Symbol, id ClientOrderID) (OrderRecord, error)
+	// RecentOrders reads the contract's orders since then, for a restart to
+	// recognise its own by their id format.
+	RecentOrders(ctx context.Context, symbol Symbol, since time.Time) ([]OrderRecord, error)
+	// Fills reads the account's executions since then, of every contract:
+	// the venue cannot filter by symbol, the caller does.
+	Fills(ctx context.Context, since time.Time) ([]Fill, error)
+	// FinancialRecords reads the funding settlements booked on the account
+	// since then, of every contract: the caller filters by symbol.
+	FinancialRecords(ctx context.Context, since time.Time) ([]FinancialRecord, error)
+	// FundingHistory reads the contract's most recent settled funding
+	// rates, newest first, at most limit of them.
+	FundingHistory(ctx context.Context, symbol Symbol, limit int) ([]FundingSettlement, error)
+
+	// --- streams ---
+	//
+	// A subscription lives until ctx ends and reconnects by itself. Its
+	// handlers run on the connection's read goroutine and must not block.
+	// onDown is called after every loss of the connection.
+
+	// SubscribeBooks streams the given topics over one connection.
+	SubscribeBooks(ctx context.Context, subs []BookSubscription, onEvent func(BookEvent), onDown func(error)) error
+	// SubscribePrivate streams the account's orders, fills and positions of
+	// the given contracts.
+	SubscribePrivate(ctx context.Context, symbols []Symbol, onEvent func(PrivateEvent), onDown func(error)) error
+
+	// --- command ---
+
+	// PlaceOrder sends one IOC limit order. ErrNotSent: nothing left the
+	// process. *VenueError: the venue refused it. ErrOrderStateUnknown: the
+	// venue may have it.
+	PlaceOrder(ctx context.Context, req OrderRequest) (OrderAck, error)
+}
+
+// IndexSource reads the index price behind the bell anchor and the venue's
+// schedule of the US equity market (Binance).
+type IndexSource interface {
+	// IndexClose is the close of the one-minute index kline of symbol that
+	// opens at minute. ok is false when the source has no kline of exactly
+	// that minute yet.
+	IndexClose(ctx context.Context, symbol Symbol, minute time.Time) (price decimal.Decimal, ok bool, err error)
+	// TradingSchedule lists the regular sessions the source publishes, about
+	// a week back and ahead, oldest first.
+	TradingSchedule(ctx context.Context) ([]ScheduleDay, error)
+}
+
+// FXSource reads USDT-USD (Coinbase).
+type FXSource interface {
+	// Quote is the best bid and ask now.
+	Quote(ctx context.Context) (bid, ask decimal.Decimal, err error)
+	// MinuteClose is the last trade price of the minute that starts at
+	// minute. ok is false when the source has no candle of that minute.
+	MinuteClose(ctx context.Context, minute time.Time) (price decimal.Decimal, ok bool, err error)
+	// MinuteCloses lists the minutes of [from, to) that have a candle,
+	// oldest first.
+	MinuteCloses(ctx context.Context, from, to time.Time) ([]FXMinute, error)
+}
+
+// IssuerSource reads the funds' net asset values and distributions
+// (Direxion). Both methods return ErrIssuerKey when the key is missing or
+// refused.
+type IssuerSource interface {
+	// NAV is the fund's net asset value of the trading day tradeDate (a New
+	// York date). ok is false while the issuer has not published it.
+	NAV(ctx context.Context, ticker string, tradeDate time.Time) (nav decimal.Decimal, ok bool, err error)
+	// Distributions lists the fund's distributions as the issuer declares
+	// them, one per ex-date.
+	Distributions(ctx context.Context, ticker string) ([]Distribution, error)
+}
+
+// --- timings ---
+
+// timings are the manager's clock and its fixed intervals and sizes. They
+// are not configuration; tests replace the clock and shorten the intervals.
+type timings struct {
+	clock func() time.Time // every loop reads the time here
+
+	bookInbox int           // book frames that may wait for Run; a frame arriving beyond this is dropped and counted
+	statusLog time.Duration // one status line this often
+
+	fxPoll time.Duration // F is read this often
+	fxKeep time.Duration // the last F of each minute is kept this long, for the bell anchor
+
+	anchorTick       time.Duration // the anchor state is advanced this often
+	bellDelay        time.Duration // the index kline of the closing minute is read this long after the close
+	anchorPoll       time.Duration // an anchor source that had nothing is asked again this often
+	distributionPoll time.Duration // each fund's distributions are checked against the configuration this often
+
+	referenceTick   time.Duration // the reference reads are checked for being due this often
+	referenceRetry  time.Duration // a reference read that failed is tried again after this
+	rulesPoll       time.Duration // the market rules are re-read this often
+	settingsPoll    time.Duration // the account settings are re-read this often
+	recordsPoll     time.Duration // the funding records are read this often
+	recordsLookback time.Duration // the first read of the funding records goes back this far
+	fundingPoll     time.Duration // the settled funding rates are read this often
+	fundingRates    int           // and this many of them per leg
+	schedulePoll    time.Duration // the calendar is compared with the venue's schedule this often
+	sourceCall      time.Duration // the limit of one read of a venue or a source
+}
+
+// defaultTimings are the values used against the real sources.
+var defaultTimings = timings{clock: time.Now, bookInbox: 4096, statusLog: 30 * time.Second,
+	fxPoll: 5 * time.Second, fxKeep: 10 * time.Minute,
+	anchorTick: time.Second, bellDelay: time.Minute, anchorPoll: 5 * time.Minute, distributionPoll: 24 * time.Hour,
+	referenceTick: time.Second, referenceRetry: 5 * time.Second, rulesPoll: time.Hour, settingsPoll: time.Minute,
+	recordsPoll: time.Minute, recordsLookback: 7 * 24 * time.Hour, fundingPoll: 5 * time.Minute, fundingRates: 100,
+	schedulePoll: time.Hour, sourceCall: 10 * time.Second}
