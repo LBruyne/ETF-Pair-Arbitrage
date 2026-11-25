@@ -422,7 +422,7 @@ func TestRestartKeepsRecognisedOrdersOnTheirLot(t *testing.T) {
 	// What main seeds a paper account with after a restart: the restored
 	// ledger's positions, signed. The paper venue then reports exactly
 	// them.
-	paper := cex.NewPaperVenue(venue, cex.PaperConfig{Pair: restartPair, Leverage: 10})
+	paper := cex.NewPaperVenue(venue, cex.PaperConfig{Pair: restartPair, Leverage: 10, DepthMaxAge: cex.DefaultConfig.DepthMaxAge})
 	paper.SeedPositions(p3.inv.LedgerPositions())
 	seeded, err := paper.Positions(context.Background(), nil)
 	if err != nil || !seeded.BySymbol["SOXLUSDT"].Qty.Equal(d("-20")) || !seeded.BySymbol["SOXSUSDT"].Qty.Equal(d("-10")) {

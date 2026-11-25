@@ -141,11 +141,11 @@ func (b *legBook) publish(symbol Symbol, connected bool) *Book {
 		out.Bids, out.Asks = b.depth.copyLevels()
 		out.DepthSeq, out.DepthReceivedAt = b.depth.seq, b.depth.receivedAt
 		if len(out.Bids) > 0 && len(out.Asks) > 0 {
-			out.BestBid, out.BestAsk, out.BestReceivedAt = out.Bids[0], out.Asks[0], b.depth.receivedAt
+			out.BestBid, out.BestAsk, out.BestSeq, out.BestReceivedAt = out.Bids[0], out.Asks[0], b.depth.seq, b.depth.receivedAt
 		}
 	}
 	if b.best != nil && (b.depth == nil || b.best.seq > b.depth.seq) {
-		out.BestBid, out.BestAsk, out.BestReceivedAt = b.best.bid, b.best.ask, b.best.receivedAt
+		out.BestBid, out.BestAsk, out.BestSeq, out.BestReceivedAt = b.best.bid, b.best.ask, b.best.seq, b.best.receivedAt
 		if b.depth != nil && !out.Conflict {
 			out.Bids[0].Qty, out.Asks[0].Qty = b.best.bid.Qty, b.best.ask.Qty // same prices, newer quantities
 		}

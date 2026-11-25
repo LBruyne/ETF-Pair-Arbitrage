@@ -18,6 +18,7 @@ type PaperConfig struct {
 	Latency     [2]time.Duration // by leg: an order meets its leg's book this long after it is sent
 	TakerFeeBps float64          // the fee of a fill, in basis points of its value
 	Leverage    int              // the leverage the account settings are reported with
+	DepthMaxAge time.Duration    // cex.depth_max_age: a depth whose best price arrived later than this after it is stale at an order's arrival
 }
 
 // paperTimings are the paper venue's clock and timer; tests replace them.
@@ -51,8 +52,9 @@ type PaperVenue struct {
 	emit sync.Mutex
 
 	mu        sync.Mutex
-	books     [2]legBook // each leg's raw book, built from the forwarded frames
-	bookConns [2]int     // by leg: the book connections that are up
+	books     [2]legBook  // each leg's raw book, built from the forwarded frames
+	bookConns [2]int      // by leg: the book connections that are up
+	taken     [2]LegTaken // by leg: what the paper orders took from the book they met
 	positions [2]Position
 	orders    map[ClientOrderID]*paperOrder
 	fills     []Fill
@@ -262,20 +264,23 @@ func (p *PaperVenue) PlaceOrder(ctx context.Context, req OrderRequest) (OrderAck
 	p.nextOrder++
 	orderID := OrderID(fmt.Sprintf("paper-%d-%d", now.UnixMilli(), p.nextOrder))
 	p.orders[req.ClientOrderID] = &paperOrder{rec: OrderRecord{Request: req, OrderID: orderID, Status: StatusAcked, SubmittedAt: now, AckedAt: now},
-		atSend: p.books[req.Leg].publish(req.Symbol, true)}
+		atSend: p.books[req.Leg].publish(req.Symbol, p.bookConns[req.Leg] > 0)}
 	p.mu.Unlock()
 	p.timing.after(p.cfg.Latency[req.Leg], func() { p.match(req.ClientOrderID) })
 	return OrderAck{OrderID: orderID, ReceivedAt: now, AcceptedAt: now, CreatedAt: now}, nil
 }
 
-// match fills a paper order on its leg's book of this moment: level by
-// level inside the limit until the order's quantity is taken. A reduce-only
-// order takes no more than the paper position it reduces. Filled in full it
-// is filled; otherwise the IOC remainder is cancelled, with whatever was
-// taken. The result goes to the private subscriber as fills, the order's
-// report and the new positions of both legs, and is recorded with the two
-// books. The events are delivered outside mu and under emit, so a later
-// match's positions never reach the subscriber before this one's.
+// match fills a paper order on the book it meets after its latency, by the
+// arrival rule (ArrivalLevels, MatchIOC): the raw levels of a current depth
+// that agrees with books1, the best level alone when the depth is
+// contradicted, stale or missing, nothing when no connection is up; each
+// level net of what earlier paper orders took from it. A reduce-only order
+// takes no more than the paper position it reduces. Filled in full it is filled; otherwise the IOC
+// remainder is cancelled, with whatever was taken. The result goes to the
+// private subscriber as fills, the order's report and the new positions of
+// both legs, and is recorded with the books. The events are delivered
+// outside mu and under emit, so a later match's positions never reach the
+// subscriber before this one's.
 func (p *PaperVenue) match(id ClientOrderID) {
 	p.emit.Lock()
 	defer p.emit.Unlock()
@@ -283,15 +288,13 @@ func (p *PaperVenue) match(id ClientOrderID) {
 	o := p.orders[id]
 	req, now := o.rec.Request, p.timing.clock()
 	leg := req.Leg
-	book := p.books[leg].publish(req.Symbol, true)
+	book := p.books[leg].publish(req.Symbol, p.bookConns[leg] > 0)
+	arrival := ArrivalLevels(book, req.Side, p.cfg.DepthMaxAge)
 
-	// The quantity to take, and the side of the book it is taken from.
-	want, levels := req.Qty, book.Asks
-	inside := func(price decimal.Decimal) bool { return price.LessThanOrEqual(req.Price) }
+	// The quantity to take.
+	want := req.Qty
 	signed := func(qty decimal.Decimal) decimal.Decimal { return qty }
 	if req.Side == SideSell {
-		levels = book.Bids
-		inside = func(price decimal.Decimal) bool { return price.GreaterThanOrEqual(req.Price) }
 		signed = func(qty decimal.Decimal) decimal.Decimal { return qty.Neg() }
 	}
 	if req.ReduceOnly {
@@ -299,29 +302,24 @@ func (p *PaperVenue) match(id ClientOrderID) {
 		reducible := decimal.Max(signed(p.positions[leg].Qty).Neg(), decimal.Zero)
 		want = decimal.Min(want, reducible)
 	}
+	takes, available, remaining := MatchIOC(arrival, req.Side, req.Price, want, p.taken[leg].Of(req.Side))
 
-	// Take the levels inside the limit.
 	var events []PrivateEvent
 	r := &o.rec
-	for _, level := range levels {
-		left := want.Sub(r.CumExecQty)
-		if !left.IsPositive() || !inside(level.Price) {
-			break
-		}
-		qty := decimal.Min(left, level.Qty)
-		if !qty.IsPositive() {
-			continue
-		}
-		value := qty.Mul(level.Price)
+	for _, level := range takes {
+		value := level.Qty.Mul(level.Price)
 		fill := Fill{ExecID: fmt.Sprintf("%s-%d", r.OrderID, len(events)+1), OrderID: r.OrderID, ClientOrderID: id, Symbol: req.Symbol, Side: req.Side,
-			Price: level.Price, Qty: qty, Value: value, Fee: value.Mul(p.fee), ExecTime: now, ReceivedAt: now}
+			Price: level.Price, Qty: level.Qty, Value: value, Fee: value.Mul(p.fee), ExecTime: now, ReceivedAt: now}
 		p.fills = append(p.fills, fill)
 		events = append(events, PrivateEvent{Fill: &fill, ReceivedAt: now})
-		r.CumExecQty, r.CumExecValue, r.Fee = r.CumExecQty.Add(qty), r.CumExecValue.Add(value), r.Fee.Add(fill.Fee)
-		p.positions[leg].Qty, p.positions[leg].UpdatedAt = p.positions[leg].Qty.Add(signed(qty)), now
+		r.CumExecQty, r.CumExecValue, r.Fee = r.CumExecQty.Add(level.Qty), r.CumExecValue.Add(value), r.Fee.Add(fill.Fee)
+		p.positions[leg].Qty, p.positions[leg].UpdatedAt = p.positions[leg].Qty.Add(signed(level.Qty)), now
 	}
 	r.Status, r.ExchangeUpdatedAt = StatusFilled, now
-	if r.CumExecQty.LessThan(req.Qty) {
+	switch {
+	case arrival.Source == ArrivalUnobservable:
+		r.Status, r.CancelReason = StatusCancelled, CancelReasonUnobservable
+	case r.CumExecQty.LessThan(req.Qty):
 		r.Status, r.CancelReason = StatusCancelled, "ioc"
 	}
 	if r.CumExecQty.IsPositive() {
@@ -332,7 +330,7 @@ func (p *PaperVenue) match(id ClientOrderID) {
 	onEvent, atSend := p.onEvent, o.atSend
 	p.mu.Unlock()
 
-	p.recordMatch(report, atSend, book, now)
+	p.recordMatch(report, atSend, book, arrival, available, remaining, now)
 	if onEvent != nil {
 		for _, ev := range events {
 			onEvent(ev)
@@ -342,24 +340,33 @@ func (p *PaperVenue) match(id ClientOrderID) {
 
 // recordMatch writes one decision row (kind paper_match) for a matched
 // paper order, beside the decision that sent it: the order, its result, the
-// leg's book when the venue took it and the book it was matched on, so that
-// a fill that differs from what the decision expected can be explained from
-// the record. The book at the send is the paper venue's own at that moment,
+// leg's book when the venue took it and the book it was matched on, and
+// what the arrival rule made of the latter - the source used, its frame
+// and books1's, the levels available net of the earlier paper orders'
+// takes and those left after this order, each list cut at its first
+// paperBookLevels - so that the fill can be computed again from the
+// record. The book at the send is the paper venue's own at that moment,
 // which may be a frame ahead of the one the decision read.
-func (p *PaperVenue) recordMatch(r OrderRecord, atSend, atMatch *Book, now time.Time) {
-	logger.GlobalLogger.Info("cex: paper order matched", "client_order_id", r.Request.ClientOrderID, "symbol", r.Request.Symbol, "side", string(r.Request.Side),
-		"price", r.Request.Price, "qty", r.Request.Qty, "status", string(r.Status), "cum_exec_qty", r.CumExecQty, "cum_exec_value_usdt", r.CumExecValue, "fee_usdt", r.Fee,
-		"latency", now.Sub(r.SubmittedAt), "depth_seq_at_send", atSend.DepthSeq, "depth_seq_at_match", atMatch.DepthSeq)
+func (p *PaperVenue) recordMatch(r OrderRecord, atSend, atMatch *Book, arrival ArrivalBook, available, remaining []BookLevel, now time.Time) {
+	log := logger.GlobalLogger.Info
+	if arrival.Source == ArrivalUnobservable {
+		log = logger.GlobalLogger.Warn
+	}
+	log("cex: paper order matched", "client_order_id", r.Request.ClientOrderID, "symbol", r.Request.Symbol, "side", string(r.Request.Side),
+		"price", r.Request.Price, "qty", r.Request.Qty, "status", string(r.Status), "cancel_reason", r.CancelReason, "cum_exec_qty", r.CumExecQty, "cum_exec_value_usdt", r.CumExecValue, "fee_usdt", r.Fee,
+		"latency", now.Sub(r.SubmittedAt), "arrival_source", string(arrival.Source), "arrival_seq", arrival.Seq, "depth_seq_at_send", atSend.DepthSeq, "depth_seq_at_match", atMatch.DepthSeq, "conflict_at_match", atMatch.Conflict)
 	if p.store == nil {
 		return
 	}
 	p.store.Record(store.DecisionRow{TsMs: now.UnixMilli(), CycleID: r.Request.CycleID, LotID: r.Request.LotID, Kind: "paper_match",
 		Detail: marshalDetail(map[string]any{
 			"client_order_id": r.Request.ClientOrderID, "leg": r.Request.Leg.String(), "side": r.Request.Side,
-			"price": r.Request.Price, "qty": r.Request.Qty, "reduce_only": r.Request.ReduceOnly, "status": r.Status,
+			"price": r.Request.Price, "qty": r.Request.Qty, "reduce_only": r.Request.ReduceOnly, "status": r.Status, "cancel_reason": r.CancelReason,
 			"cum_exec_qty": r.CumExecQty, "cum_exec_value": r.CumExecValue, "fee": r.Fee,
 			"sent_ms": r.SubmittedAt.UnixMilli(), "matched_ms": now.UnixMilli(),
-			"book_at_send": bookDetail(atSend, r.Request.Side), "book_at_match": bookDetail(atMatch, r.Request.Side)})})
+			"book_at_send": bookDetail(atSend, r.Request.Side), "book_at_match": bookDetail(atMatch, r.Request.Side),
+			"arrival": map[string]any{"source": arrival.Source, "seq": arrival.Seq, "best_seq": atMatch.BestSeq, "received_ms": unixMs(arrival.ReceivedAt),
+				"available": levelsDetail(available), "remaining": levelsDetail(remaining)}})})
 }
 
 // paperBookLevels is how many levels of the taken side a recorded book
@@ -374,12 +381,17 @@ func bookDetail(b *Book, side Side) map[string]any {
 	if side == SideSell {
 		levels = b.Bids
 	}
-	taken := make([][2]decimal.Decimal, 0, paperBookLevels)
-	for _, l := range levels[:min(len(levels), paperBookLevels)] {
-		taken = append(taken, [2]decimal.Decimal{l.Price, l.Qty})
-	}
 	return map[string]any{"depth_seq": b.DepthSeq, "depth_received_ms": unixMs(b.DepthReceivedAt), "conflict": b.Conflict,
-		"best_bid": b.BestBid.Price, "best_ask": b.BestAsk.Price, "levels": taken}
+		"best_bid": b.BestBid.Price, "best_ask": b.BestAsk.Price, "levels": levelsDetail(levels)}
+}
+
+// levelsDetail is the first levels of a side as [price, quantity] pairs.
+func levelsDetail(levels []BookLevel) [][2]decimal.Decimal {
+	out := make([][2]decimal.Decimal, 0, paperBookLevels)
+	for _, l := range levels[:min(len(levels), paperBookLevels)] {
+		out = append(out, [2]decimal.Decimal{l.Price, l.Qty})
+	}
+	return out
 }
 
 // --- paper funding ---

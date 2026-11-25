@@ -310,6 +310,7 @@ type Book struct {
 	DepthReceivedAt  time.Time   // local arrival of the last accepted depth frame; zero without depth
 	Conflict         bool        // books1 is newer than the depth and one best price differs: wait for a newer depth
 	BestBid, BestAsk BookLevel   // from the newer of the depth and books1, by sequence number
+	BestSeq          uint64      // the sequence number of the frame BestBid and BestAsk come from
 	BestReceivedAt   time.Time   // local arrival of the frame BestBid and BestAsk come from
 	Connected        bool        // one of the leg's connections is up and has delivered a frame
 }

@@ -118,7 +118,7 @@ func TestLiveBitgetPublic(t *testing.T) {
 
 	// The client has no API key, so the manager gets it the way a paper run
 	// does: inside the paper venue, which uses its public side only.
-	mgr, err := cex.NewManager(cfg, cex.NewPaperVenue(client, cex.PaperConfig{Pair: cfg.Pair, Leverage: 10}), noSource{}, noSource{}, noSource{})
+	mgr, err := cex.NewManager(cfg, cex.NewPaperVenue(client, cex.PaperConfig{Pair: cfg.Pair, Leverage: 10, DepthMaxAge: cfg.DepthMaxAge}), noSource{}, noSource{}, noSource{})
 	if err != nil {
 		t.Fatal(err)
 	}

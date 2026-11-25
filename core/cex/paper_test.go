@@ -77,12 +77,12 @@ type paperRig struct {
 }
 
 // newPaperRig builds a paper venue with latencies of 15 ms (bull) and 40 ms
-// (bear) and a taker fee of 0.65 bps, subscribed to both legs' books and to
+// (bear), a taker fee of 0.65 bps and a depth_max_age of 10 s, subscribed to both legs' books and to
 // its own private stream.
 func newPaperRig(t *testing.T) *paperRig {
 	t.Helper()
 	r := &paperRig{real: newFakeVenue(), timer: &manualTimer{now: t0}, sink: &store.Fake{}}
-	r.p = NewPaperVenue(r.real, PaperConfig{Pair: testConfig().Pair, Latency: [2]time.Duration{Bull: 15 * time.Millisecond, Bear: 40 * time.Millisecond}, TakerFeeBps: 0.65, Leverage: 10})
+	r.p = NewPaperVenue(r.real, PaperConfig{Pair: testConfig().Pair, Latency: [2]time.Duration{Bull: 15 * time.Millisecond, Bear: 40 * time.Millisecond}, TakerFeeBps: 0.65, Leverage: 10, DepthMaxAge: 10 * time.Second})
 	r.p.timing = paperTimings{clock: r.timer.clock, after: r.timer.after}
 	r.p.UseStore(r.sink)
 	ctx := context.Background()
@@ -495,7 +495,7 @@ func TestPaperFundingReachesTheManagerWhenTheRateIsLate(t *testing.T) {
 func TestPaperEventsOfConcurrentMatchesArriveInOrder(t *testing.T) {
 	for round := 0; round < 20; round++ {
 		real := newFakeVenue()
-		p := NewPaperVenue(real, PaperConfig{Pair: testConfig().Pair, Latency: [2]time.Duration{Bull: time.Millisecond, Bear: time.Millisecond}, TakerFeeBps: 0.65, Leverage: 10})
+		p := NewPaperVenue(real, PaperConfig{Pair: testConfig().Pair, Latency: [2]time.Duration{Bull: time.Millisecond, Bear: time.Millisecond}, TakerFeeBps: 0.65, Leverage: 10, DepthMaxAge: DefaultConfig.DepthMaxAge})
 		ctx := context.Background()
 		for _, symbol := range []Symbol{"SOXLUSDT", "SOXSUSDT"} {
 			if err := p.SubscribeBooks(ctx, []BookSubscription{{Symbol: symbol, Topic: TopicBooks5}}, func(BookEvent) {}, func(error) {}); err != nil {
@@ -558,7 +558,7 @@ func TestPaperEventsOfConcurrentMatchesArriveInOrder(t *testing.T) {
 // and the wrapped real venue receives no order and no account request.
 func TestPaperModeThroughTheManager(t *testing.T) {
 	real := newFakeVenue()
-	paper := NewPaperVenue(real, PaperConfig{Pair: testConfig().Pair, Latency: [2]time.Duration{Bull: 2 * time.Millisecond, Bear: 2 * time.Millisecond}, TakerFeeBps: 0.65, Leverage: 10})
+	paper := NewPaperVenue(real, PaperConfig{Pair: testConfig().Pair, Latency: [2]time.Duration{Bull: 2 * time.Millisecond, Bear: 2 * time.Millisecond}, TakerFeeBps: 0.65, Leverage: 10, DepthMaxAge: DefaultConfig.DepthMaxAge})
 	sink := &store.Fake{}
 	m, err := NewManager(testConfig(), paper, &fakeIndex{}, &fakeFX{}, &fakeIssuer{})
 	if err != nil {

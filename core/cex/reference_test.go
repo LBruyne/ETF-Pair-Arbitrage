@@ -123,7 +123,7 @@ func TestTradingReadyNeedsThePrivateStream(t *testing.T) {
 		t.Error("still ready after the private stream went down")
 	}
 
-	paper, err := NewManager(testConfig(), NewPaperVenue(venue, PaperConfig{Pair: testConfig().Pair, TakerFeeBps: 0.65, Leverage: 10}), &fakeIndex{}, &fakeFX{}, &fakeIssuer{})
+	paper, err := NewManager(testConfig(), NewPaperVenue(venue, PaperConfig{Pair: testConfig().Pair, TakerFeeBps: 0.65, Leverage: 10, DepthMaxAge: DefaultConfig.DepthMaxAge}), &fakeIndex{}, &fakeFX{}, &fakeIssuer{})
 	if err != nil {
 		t.Fatal(err)
 	}
