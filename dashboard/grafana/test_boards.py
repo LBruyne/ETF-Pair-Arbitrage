@@ -7,13 +7,17 @@ The address rules, the board's shape, the panels that share a query, the tooltip
 in dashboard/SPEC.md need nothing. Running the queries needs a database with the board's schema: set ETFPAIR_BOARD_PSQL to
 psql connection arguments ("-h 127.0.0.1 -p 5432 -U etfpair_reader -d etfpair", the password in PGPASSWORD); without it
 those tests are skipped. "Now" is the newest second the database holds (Bitget SOXLUSDT), so that a copy of the database
-reads as the live one did at that second.
+reads as the live one did at that second. The Live Monitor's checks (test_live_monitor.py) run here too; its queries need
+ETFPAIR_TRADE_DSN (the trade reader's DSN).
 """
 import csv, io, math, os, re, shlex, subprocess, sys, time, types, unittest
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import boardkit
 import combo_spread_board as board
+import live_monitor_board
+# The Live Monitor's own checks (test_live_monitor.py) run with these.
+from test_live_monitor import Queries as LiveMonitorQueries, Shape as LiveMonitorShape  # noqa: F401
 
 PSQL = os.environ.get("ETFPAIR_BOARD_PSQL")
 # The board's full description; the panels' notes point to it.
@@ -642,6 +646,10 @@ class Boards(unittest.TestCase):
         # The staged board is the generator's output, byte for byte (python3 dashboard/grafana/gen_dashboard.py writes it).
         with open(boardkit.board_file("combo-spread"), encoding="utf-8") as f:
             self.assertEqual(f.read(), boardkit.board_json("combo-spread", board.build()))
+
+    def test_live_monitor_staging_is_generated(self):
+        with open(boardkit.board_file("live-monitor"), encoding="utf-8") as f:
+            self.assertEqual(f.read(), boardkit.board_json("live-monitor", live_monitor_board.build()))
 
     def test_price_panels_draw_the_anchor_in_usdt(self):
         # The drawn anchor is A / F; A itself, in USD, is in the legend and the tooltip only: no line, a hidden axis.

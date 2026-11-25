@@ -1,10 +1,12 @@
 """Building blocks of the ETF-Pair boards: where a board is filed, colours,
-panel and variable constructors, and the output. Every query is PostgreSQL
-for the etfpair data source. Panel ids count up from reset_ids()."""
+panel and variable constructors, and the output. Every query is PostgreSQL,
+for the data source a board names in reset_ids() (Combo Spread: etfpair;
+Live Monitor: etfpair-trade); panel ids count up from it."""
 import json, os, re
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-PG = {"type": "grafana-postgresql-datasource", "uid": "etfpair"}
+PG = {"type": "grafana-postgresql-datasource", "uid": "etfpair"}             # the collector's tables, role etfpair_reader
+TRADE = {"type": "grafana-postgresql-datasource", "uid": "etfpair-trade"}  # the trading program's schema trade, role etfpair_trade_reader
 TIMEZONE = "Etc/GMT-8"  # IANA signs Etc zones backwards: this is UTC+8
 
 # A board's file path under dashboards/staging/ is its place in Grafana: the
@@ -14,7 +16,7 @@ TIMEZONE = "Etc/GMT-8"  # IANA signs Etc zones backwards: this is UTC+8
 # redirects the address to it (board_paths_conf).
 FOLDER = "Arbitrage/ETF-Pair"
 UID_PREFIX = "arb-etf-pair"
-BOARDS = {"combo-spread": "Combo Spread"}
+BOARDS = {"combo-spread": "Combo Spread", "live-monitor": "Live Monitor"}
 STAGING = os.path.join(HERE, "dashboards", "staging")
 
 # The hues of the arbitrage boards next door (dashboard/SPEC.md section 6):
@@ -34,6 +36,7 @@ LEGEND_PX, AXIS_PX = 400, 60  # a chart's legend table and its value axis
 # tooltip: true to every series hidden from the plot, which would take tooltip_only series out of the tooltip.
 SCHEMA_VERSION = 42
 _id = 0
+_ds = PG   # the data source of the board being built (reset_ids)
 
 
 def sql(text, **parts):
@@ -50,13 +53,14 @@ def nid():
     return _id
 
 
-def reset_ids():
-    global _id
-    _id = 0
+def reset_ids(datasource=PG):
+    """Starts a board: panel ids from 1, every query on datasource."""
+    global _id, _ds
+    _id, _ds = 0, datasource
 
 
 def target(q, ref="A"):
-    return {"refId": ref, "datasource": PG, "format": "table", "rawQuery": True, "editorMode": "code", "rawSql": q}
+    return {"refId": ref, "datasource": dict(_ds), "format": "table", "rawQuery": True, "editorMode": "code", "rawSql": q}
 
 
 # Grafana's own data source that hands a panel another panel's query result: the page runs a query once for several panels.
@@ -75,7 +79,7 @@ def panel(kind, title, q, x, y, w, h, description="", unit=None, decimals=None, 
         defaults["decimals"] = decimals
     if thresholds:
         defaults["thresholds"] = thresholds
-    p = {"id": nid(), "type": kind, "title": title, "description": description, "gridPos": {"x": x, "y": y, "w": w, "h": h}, "datasource": PG,
+    p = {"id": nid(), "type": kind, "title": title, "description": description, "gridPos": {"x": x, "y": y, "w": w, "h": h}, "datasource": dict(_ds),
          "targets": [target(q)], "fieldConfig": {"defaults": defaults, "overrides": overrides or []}, "options": options or {}}
     if source is not None:
         p["datasource"] = DASHBOARD
@@ -105,7 +109,8 @@ def copy_field(name, alias):
 
 def calc(alias, left, operator, right):
     """Transformation: a field alias = left operator right, made in the browser row by row (Grafana's binary operation);
-    left and right are field names or numbers. A NULL operand gives NULL, so the result breaks where its operands do."""
+    left and right are field names or numbers. Grafana 13 reads a NULL operand as 0 (Live Monitor round 2: the lines of a
+    break row, all NULL, came out 0), so a result over rows that break the lines must be computed in SQL instead."""
     def operand(x):
         return {"fixed": str(x)} if isinstance(x, (int, float)) else {"matcher": {"id": "byName", "options": x}}
     return {"id": "calculateField", "options": {"mode": "binary", "binary": {"left": operand(left), "operator": operator, "right": operand(right)},
@@ -279,7 +284,7 @@ def legend_dash(line):
 
 
 def query_var(name, label, q, description, hide=0):
-    return {"name": name, "label": label, "description": description, "type": "query", "datasource": PG, "definition": q, "query": q, "refresh": 1,
+    return {"name": name, "label": label, "description": description, "type": "query", "datasource": dict(_ds), "definition": q, "query": q, "refresh": 1,
             "sort": 0, "multi": False, "includeAll": False, "current": {}, "options": [], "hide": hide, "allowCustomValue": False}
 
 
@@ -330,18 +335,21 @@ def reset_link(name, variables, time_from, refresh, keep, tooltip):
             "tooltip": tooltip, "targetBlank": False, "keepTime": False, "includeVars": False}
 
 
-def bands(name, q, color):
-    """A shaded span on every chart for each (time, time_end, text) row of a
-    query. Always on: the bar holds only the settings."""
+def bands(name, q, color, panel_ids=None):
+    """A shaded span for each (time, time_end, text) row of a query, on every
+    chart or the given panels only. Always on: the bar holds only the settings."""
     mappings = {field: {"source": "field", "value": column} for field, column in (("time", "time"), ("timeEnd", "time_end"), ("text", "text"))}
-    return {"name": name, "datasource": PG, "enable": True, "hide": True, "iconColor": color, "rawQuery": q, "format": "table", "mappings": mappings}
+    out = {"name": name, "datasource": dict(_ds), "enable": True, "hide": True, "iconColor": color, "rawQuery": q, "format": "table", "mappings": mappings}
+    if panel_ids is not None:
+        out["filter"] = {"exclude": False, "ids": panel_ids}
+    return out
 
 
 def marks(name, q, color, panel_ids):
     """A marker at the time of each (time, text) row of a query, on the
     given panels only. Always on, as the bands are."""
     mappings = {field: {"source": "field", "value": column} for field, column in (("time", "time"), ("text", "text"))}
-    return {"name": name, "datasource": PG, "enable": True, "hide": True, "iconColor": color, "rawQuery": q, "format": "table", "mappings": mappings,
+    return {"name": name, "datasource": dict(_ds), "enable": True, "hide": True, "iconColor": color, "rawQuery": q, "format": "table", "mappings": mappings,
             "filter": {"exclude": False, "ids": panel_ids}}
 
 

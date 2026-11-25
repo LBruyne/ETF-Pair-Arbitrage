@@ -1,0 +1,25 @@
+# The etfpair-trade data source of the Live Monitor: schema trade of the
+# database etfpair (the trading program's records), read by the read-only
+# role etfpair_trade_reader (core/scripts/install_trade_db.sh creates it:
+# read-only, statement timeout 15 s, at most 10 connections). Its password
+# comes from dashboard/grafana.env, which deploy/install.sh fills from
+# core/.env.reader, through the drop-in of the Grafana unit. install.sh
+# copies this file into the provisioning directory of the Grafana that
+# serves the boards.
+apiVersion: 1
+
+datasources:
+  - name: etfpair-trade
+    uid: etfpair-trade
+    type: grafana-postgresql-datasource
+    access: proxy
+    editable: false
+    url: 127.0.0.1:5432
+    user: etfpair_trade_reader
+    secureJsonData:
+      password: $ETFPAIR_TRADE_READER_PASSWORD
+    jsonData:
+      database: etfpair
+      sslmode: disable
+      maxOpenConns: 5
+      postgresVersion: 1500
