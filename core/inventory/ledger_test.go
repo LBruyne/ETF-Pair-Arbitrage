@@ -989,3 +989,22 @@ func TestShareTake(t *testing.T) {
 		t.Errorf("left after the last part: %+v, want nothing", s)
 	}
 }
+
+// An exit fill beyond what the lots hold (an earlier fill of the leg not
+// known yet) is not booked: a warning once per quantity, not per sync.
+func TestExitBeyondTheHoldingIsWarned(t *testing.T) {
+	r := newRig(t, "1000", "10")
+	c := r.openCycle(t, strategy.Long)
+	lot := r.openLot(t)
+	bull := fill(ord(c.ID, 1, cex.Bull, cex.PurposeEntry, cex.SideBuy, lot.ID, "10", "10"), "10", "100", "0.01")
+	exit := fill(ord(c.ID, 2, cex.Bull, cex.PurposeExit, cex.SideSell, "", "10", "12"), "12", "120", "0.01")
+	logs := captureLogs(t)
+	r.m.Sync([]cex.OrderRecord{bull, exit})
+	r.m.Sync([]cex.OrderRecord{bull, exit})
+	if got := logs.lines("exit fill beyond"); len(got) != 1 || !strings.Contains(got[0], "qty=2") {
+		t.Errorf("warnings %q, want one for the 2 not booked", got)
+	}
+	if _, hold := r.m.Holdings(); !hold[cex.Bull].IsZero() {
+		t.Errorf("SOXL held %s, want 0", hold[cex.Bull])
+	}
+}

@@ -43,12 +43,10 @@ func (m *ExecManager) step(now time.Time) (done bool) {
 		return m.whileUnknown(r, u)
 	}
 	clear(m.unknown)
-	if m.noteBatchDone(r) || !now.Before(m.nextReconcile) {
-		m.reconcile(r)
-		if m.inv.Mismatch() {
-			return m.mismatched(r)
-		}
+	if !now.Before(m.nextReconcile) && m.reconcile(r) {
+		return m.mismatched(r)
 	}
+	m.noteBatchDone(r)
 
 	// Holding: the forced exit, the gap, the line exit, then a new entry.
 	if c := r.cycle; c != nil {
@@ -57,6 +55,15 @@ func (m *ExecManager) step(now time.Time) (done bool) {
 		}
 		if m.workGap(r) {
 			return false
+		}
+		// The batch's results are in and its gap sends nothing more: one
+		// comparison of the positions before it is settled, so that no
+		// completion or trim waits for a read.
+		if b := m.batch; b != nil && !b.doneAt.IsZero() && !b.compared {
+			b.compared = true
+			if m.reconcile(r) {
+				return m.mismatched(r)
+			}
 		}
 		m.settle(r)
 		if !m.closeIfFlat(r) {
@@ -139,32 +146,31 @@ func unknownOf(orders []cex.OrderRecord) (unknown []cex.OrderRecord) {
 // refused one. The next entry and line exit wait for depth that arrived
 // after this round's time (PRD 5.9), on the loop's clock. That time is read
 // before the snapshot, so a result may have arrived up to the length of the
-// round's reads after it: a depth frame of that instant counts as new. It
-// reports whether the batch became done in this round.
-func (m *ExecManager) noteBatchDone(r *round) bool {
+// round's reads after it: a depth frame of that instant counts as new.
+func (m *ExecManager) noteBatchDone(r *round) {
 	b := m.batch
 	if b == nil || !b.doneAt.IsZero() || len(b.orders) == 0 {
-		return false
+		return
 	}
 	rejected := false
 	for _, id := range b.orders {
 		o, found := orderIn(r.orders, id)
 		if !found || !o.Status.Terminal() {
-			return false
+			return
 		}
 		rejected = rejected || o.Status == cex.StatusRejected
 	}
 	b.doneAt, b.rejected = r.now, rejected
 	logger.GlobalLogger.Debug("exec: batch results in", "kind", string(b.kind), "orders", len(b.orders), "rejected", rejected, "took", r.now.Sub(b.sentAt).Round(time.Millisecond))
-	return true
 }
 
 // reconcile compares the venue's positions with the ledger (PRD 13.4,
-// 13.7), after every batch's results and otherwise every reconcileEvery
-// while nothing is in flight. A comparison that differs is repeated
-// reconcileAgain later: inventory takes two that differ, that far apart, for
-// a mismatch.
-func (m *ExecManager) reconcile(r *round) {
+// 13.7), once after each batch's results when its gap sends nothing more,
+// and otherwise every reconcileEvery while nothing is in flight. A
+// comparison that differs is repeated reconcileAgain later: inventory takes
+// two that differ, that far apart, for a mismatch. It reports whether the
+// positions do not match.
+func (m *ExecManager) reconcile(r *round) (mismatch bool) {
 	ctx, cancel := context.WithTimeout(m.ctx, m.timing.readTimeout)
 	err := m.inv.Reconcile(ctx)
 	cancel()
@@ -175,6 +181,7 @@ func (m *ExecManager) reconcile(r *round) {
 	if err != nil {
 		logger.GlobalLogger.Debug("exec: positions compared", "err", err, "next", showTime(m.nextReconcile))
 	}
+	return m.inv.Mismatch()
 }
 
 // mismatched is the round while the venue's positions do not match the
@@ -244,22 +251,20 @@ func (m *ExecManager) workGap(r *round) (decided bool) {
 	case strategy.GapBlocked:
 		m.idle(strategy.ReasonNoPrice)
 		return true
-	case strategy.GapTrim:
-		if !m.mayReduce(r, a.Leg, a.Price) {
-			return true
-		}
 	}
-	m.sendGap(r, a, false)
+	if m.maySend(r, a.Leg, a.Price) {
+		m.sendGap(r, a, false)
+	}
 	return true
 }
 
-// mayReduce reports whether a reducing order of leg at price may go now;
-// otherwise it records why not. Two of one leg are resend apart (PRD 8.4,
-// 10.4). One the venue refused for its price is not sent again at the same
-// price, only once the book gives another; a refusal of another kind, such
-// as a rate limit, does not hold the price back.
-func (m *ExecManager) mayReduce(r *round, leg cex.Leg, price decimal.Decimal) bool {
-	if r.now.Sub(m.lastReduceAt[leg]) < m.timing.resend {
+// maySend reports whether a reducing or completion order of leg at price may
+// go now; otherwise it records why not. Two of one leg are resend apart
+// (PRD 8.4, 10.4). One the venue refused for its price is not sent again at
+// the same price, only once the book gives another; a refusal of another
+// kind, such as a rate limit, does not hold the price back.
+func (m *ExecManager) maySend(r *round, leg cex.Leg, price decimal.Decimal) bool {
+	if r.now.Sub(m.lastSentAt[leg]) < m.timing.resend {
 		m.idle(strategy.ReasonAwaitOrders)
 		return false
 	}
@@ -270,12 +275,13 @@ func (m *ExecManager) mayReduce(r *round, leg cex.Leg, price decimal.Decimal) bo
 	return true
 }
 
-// refusedAt reports whether the last reducing order of leg in the snapshot
-// was refused by the venue for its price, and at this price.
+// refusedAt reports whether the last reducing or completion order of leg in
+// the snapshot was refused by the venue for its price, and at this price:
+// rejected at once, or accepted and then cancelled for it.
 func refusedAt(orders []cex.OrderRecord, leg cex.Leg, price decimal.Decimal) bool {
 	for i := len(orders) - 1; i >= 0; i-- {
-		if o := orders[i]; o.Request.Leg == leg && o.Request.ReduceOnly {
-			return o.Status == cex.StatusRejected && o.ErrorKind == cex.ErrorPriceLimit && o.Request.Price.Equal(price)
+		if o := orders[i]; o.Request.Leg == leg && (o.Request.ReduceOnly || o.Request.Purpose == cex.PurposeComplete) {
+			return o.ErrorKind == cex.ErrorPriceLimit && o.Request.Price.Equal(price)
 		}
 	}
 	return false

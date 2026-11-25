@@ -269,9 +269,20 @@ func (t *orderStore) notify() {
 // FeeKnown falls back to false until a report carries the fee of the new
 // quantity - this one, or a later push or query. A report with a fill also
 // shows that the venue has the order, which ends NotFound. A report that
-// changes nothing is dropped without a new UpdateSeq.
+// changes nothing is dropped without a new UpdateSeq, and so is any report
+// of an order exec ended as never_arrived.
 func (m *CexManager) mergeReport(in OrderRecord) {
 	m.editOrder(in.Request.ClientOrderID, func(r *OrderRecord, now time.Time) bool {
+		if r.Status == StatusNeverArrived {
+			// exec gave the verdict on three evidences; a report against it
+			// is not booked: the ledger keeps the order unfilled and the
+			// position check finds the fill as a mismatch (PRD 13.3, 13.7).
+			if in.CumExecQty.IsPositive() || in.Status != StatusNeverArrived {
+				logger.GlobalLogger.Error("cex: a report of an order taken as never arrived; not booked", "client_order_id", r.Request.ClientOrderID,
+					"status", string(in.Status), "cum_exec_qty", in.CumExecQty, "cum_exec_value_usdt", in.CumExecValue)
+			}
+			return false
+		}
 		changed := false
 		if r.OrderID == "" && in.OrderID != "" {
 			r.OrderID, changed = in.OrderID, true
@@ -322,15 +333,17 @@ func (m *CexManager) SetOrderLot(id ClientOrderID, lotID string) {
 // MarkNeverArrived ends an order whose outcome is unknown as never_arrived.
 // It is exec's verdict, given once the three evidences are in: the venue
 // does not have the order, no fill carries its id (NotFound), and the leg's
-// position equals the ledger.
-func (m *CexManager) MarkNeverArrived(id ClientOrderID) {
+// position equals the ledger. It reports whether it ended the order: one
+// that got a final state meanwhile keeps it.
+func (m *CexManager) MarkNeverArrived(id ClientOrderID) (marked bool) {
 	m.editOrder(id, func(r *OrderRecord, _ time.Time) bool {
 		if r.Status.Terminal() {
 			return false
 		}
-		r.Status, r.Unknown = StatusNeverArrived, false
+		r.Status, r.Unknown, marked = StatusNeverArrived, false, true
 		return true
 	})
+	return marked
 }
 
 // --- readers ---

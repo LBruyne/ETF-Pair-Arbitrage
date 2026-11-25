@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"slices"
+	"strings"
 	"testing"
 	"time"
 
@@ -301,9 +302,21 @@ func TestOrderNotFoundOnlyAfterThirtySecondsAndNoFill(t *testing.T) {
 	}
 	// A verdict on a finished order changes nothing.
 	seq := rec.UpdateSeq
-	r.m.MarkNeverArrived(req.ClientOrderID)
+	if r.m.MarkNeverArrived(req.ClientOrderID) {
+		t.Error("a second verdict took effect")
+	}
 	if got := r.order(t, req.ClientOrderID).UpdateSeq; got != seq {
 		t.Error("a second verdict changed the record")
+	}
+	// A fill reported after the verdict is not booked: an error, and the
+	// position check finds it.
+	logs := captureLogs(t)
+	r.m.onPrivateEvent(PrivateEvent{Order: ptr(report(req, StatusFilled, "10", "404.7", "0.026", true, t0.Add(41*time.Second)))})
+	if got := r.order(t, req.ClientOrderID); got.UpdateSeq != seq || got.Status != StatusNeverArrived || !got.CumExecQty.IsZero() {
+		t.Errorf("after a late fill: %s %s (seq %d, want %d)", got.Status, got.CumExecQty, got.UpdateSeq, seq)
+	}
+	if lines := logs.take(); len(lines) != 1 || !strings.HasPrefix(lines[0], "ERROR cex: a report of an order taken as never arrived") {
+		t.Errorf("logs %q, want the error", lines)
 	}
 }
 

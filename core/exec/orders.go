@@ -114,8 +114,8 @@ func (m *ExecManager) sendGap(r *round, a strategy.GapAction, byPositions bool) 
 		req.QuotaPrice = a.QuotaPrice
 	} else {
 		req.ReduceOnly = true
-		m.lastReduceAt[a.Leg] = r.now
 	}
+	m.lastSentAt[a.Leg] = r.now
 	hold := c.Hold()
 	_, _, left := m.inv.Quota()
 	logger.GlobalLogger.Info("exec: gap", "by_positions", byPositions, "cycle", c.ID, "lot", lot, "order", string(a.Kind), "purpose", string(purpose), "leg", a.Leg.String(), "side", string(a.Side),
@@ -241,16 +241,16 @@ func (m *ExecManager) forcedExit(r *round, byPositions bool) (done bool) {
 	var reqs []cex.OrderRequest
 	for _, leg := range cex.Legs {
 		o := orders[leg]
-		if o == nil || !m.mayReduce(r, leg, o.Price) {
+		if o == nil || !m.maySend(r, leg, o.Price) {
 			continue
 		}
 		req := m.orderRequest(c, r.orders, leg, cex.PurposeForced, o.Side, o.Price, o.Qty, r.rules[leg].Symbol)
 		req.ReduceOnly = true
 		reqs = append(reqs, req)
-		m.lastReduceAt[leg] = r.now
+		m.lastSentAt[leg] = r.now
 	}
 	if len(reqs) == 0 {
-		return false // mayReduce recorded why
+		return false // maySend recorded why
 	}
 	m.idleReason = ""
 	if m.batch == nil || m.batch.kind != cex.PurposeForced {
@@ -319,7 +319,9 @@ func (m *ExecManager) chase(r *round, unknown []cex.OrderRecord) {
 		if !pos.Loaded || !venue.Equal(ledger) {
 			continue // the position may hold its fill: no verdict
 		}
-		m.cex.MarkNeverArrived(id)
+		if !m.cex.MarkNeverArrived(id) {
+			continue // it got a final state since the snapshot
+		}
 		log.Error("exec: order taken as never arrived", "client_order_id", id, "leg", o.Request.Leg.String(), "position", venue)
 		m.event(r.now, "error", "order_never_arrived", "the venue has no such order, no fill carries its id and the position did not move: it never arrived; a fill of it later is a mismatch",
 			map[string]any{"client_order_id": id, "leg": o.Request.Leg.String(), "purpose": o.Request.Purpose, "qty": o.Request.Qty, "position": venue})
@@ -353,7 +355,7 @@ func (m *ExecManager) gapByPositions(r *round) bool {
 	in := m.gapInput(r)
 	in.Hold, in.Batch = m.positionHold(r, r.cycle.Direction, pos), nil
 	a := m.strat.EvaluateGap(in)
-	if a.Kind != strategy.GapTrim || !m.mayReduce(r, a.Leg, a.Price) {
+	if a.Kind != strategy.GapTrim || !m.maySend(r, a.Leg, a.Price) {
 		return false
 	}
 	m.sendGap(r, a, true)
@@ -362,9 +364,14 @@ func (m *ExecManager) gapByPositions(r *round) bool {
 
 // venuePositions is the venue's positions of the two legs, read again when
 // the last read is positionsRead old; between reads the published snapshot
-// serves (pushes keep it current).
+// serves (pushes keep it current). A snapshot older than the latest final
+// state among the cycle's orders is read again at once: the push of the
+// positions can come after the order's report, and a gap sized on the older
+// snapshot would be reduced twice. One still older after that read is not
+// used this round (Loaded is false).
 func (m *ExecManager) venuePositions(r *round) cex.PositionSet {
-	if !r.now.Before(m.nextPositionsRead) {
+	last := lastFinal(r.orders)
+	if !r.now.Before(m.nextPositionsRead) || m.cex.Positions().ReceivedAt.Before(last) {
 		m.nextPositionsRead = r.now.Add(m.timing.positionsRead)
 		ctx, cancel := context.WithTimeout(m.ctx, m.timing.readTimeout)
 		if _, err := m.cex.ReadPositions(ctx); err != nil {
@@ -372,14 +379,32 @@ func (m *ExecManager) venuePositions(r *round) cex.PositionSet {
 		}
 		cancel()
 	}
-	return m.cex.Positions()
+	pos := m.cex.Positions()
+	if pos.ReceivedAt.Before(last) {
+		pos.Loaded = false
+	}
+	return pos
+}
+
+// lastFinal is when the latest final state among the orders arrived, on
+// cex's clock.
+func lastFinal(orders []cex.OrderRecord) (last time.Time) {
+	for _, o := range orders {
+		if o.FinalAt.After(last) {
+			last = o.FinalAt
+		}
+	}
+	return last
 }
 
 // positionHold is what the venue's positions hold of a cycle in direction
-// dir, per leg: a short cycle holds negative positions.
+// dir, per leg: the net position less the ledger's dust, which is not the
+// cycle's (both signed), with a short cycle's negative positions counted
+// positive. The forced exit and the gap by positions both size on it.
 func (m *ExecManager) positionHold(r *round, dir strategy.Direction, pos cex.PositionSet) (hold [2]decimal.Decimal) {
+	dust := m.inv.Dust()
 	for _, leg := range cex.Legs {
-		q := pos.BySymbol[r.rules[leg].Symbol].Qty
+		q := pos.BySymbol[r.rules[leg].Symbol].Qty.Sub(dust[leg])
 		if dir == strategy.Short {
 			q = q.Neg()
 		}
@@ -501,7 +526,7 @@ func (m *ExecManager) send(r *round, reqs ...cex.OrderRequest) {
 	for _, req := range reqs {
 		m.batch.orders = append(m.batch.orders, req.ClientOrderID)
 	}
-	m.batch.doneAt, m.batch.rejected = time.Time{}, false
+	m.batch.doneAt, m.batch.rejected, m.batch.compared = time.Time{}, false, false
 }
 
 // ids lists the orders' client ids.

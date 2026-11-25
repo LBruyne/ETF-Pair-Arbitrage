@@ -5,6 +5,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"os"
@@ -103,7 +104,7 @@ func configCheckLine(configPath, envPath string, cfg *config.Config) string {
 // manager alone, which returns when the process may exit; then the other
 // managers are stopped and waited for, the stop time is written and the store
 // closed.
-func run(cfg *config.Config, signals <-chan os.Signal) error {
+func run(cfg *config.Config, signals chan os.Signal) error {
 	log := logger.GlobalLogger
 
 	// The store first: the run's row must be in the database before anything
@@ -165,19 +166,14 @@ func run(cfg *config.Config, signals <-chan os.Signal) error {
 	// settle delay continue instead of starting over, and the ledger (R,
 	// the dust, the booked funding and the unfinished cycle with its lots
 	// and orders).
-	// A read that fails is tried again: nothing stored is taken for nothing
-	// held. A stop signal meanwhile waits in the channel for exec.
 	sessionID := cmgr.Session(started).ID
-	var state store.State
-	for attempt := 1; ; attempt++ {
-		loadCtx, cancelLoad := context.WithTimeout(context.Background(), stateLoadTimeout)
-		state, err = st.LoadState(loadCtx, sessionID)
-		cancelLoad()
-		if err == nil {
-			break
+	state, err := loadState(st, sessionID, signals, cfg.Exec.StopAlarmAfter, stateLoadRetry)
+	if errors.Is(err, errTakenOver) {
+		processRun.StoppedMs = time.Now().UnixMilli()
+		if werr := st.WriteSync(processRun); werr != nil {
+			log.Error("ETF-arbitrage core: the stop time of the run was not written", "run_id", runID, "err", werr)
 		}
-		log.Warn("ETF-arbitrage core: the stored state was not read; retrying", "attempt", attempt, "err", err, "retry_in", stateLoadRetry)
-		time.Sleep(stateLoadRetry)
+		return nil
 	}
 	// The unfinished cycle's orders go into cex's order table first, which
 	// gives each record this process's UpdateSeq and turns those without a
@@ -236,6 +232,75 @@ const (
 	stateLoadTimeout = 10 * time.Second
 	stateLoadRetry   = 5 * time.Second
 )
+
+// stateLoader reads what the previous run stored (store.Store).
+type stateLoader interface {
+	LoadState(ctx context.Context, sessionID string) (store.State, error)
+}
+
+// errTakenOver is loadState's answer to a person taking over while the
+// state cannot be read.
+var errTakenOver = errors.New("taken over while the stored state could not be read")
+
+// loadState reads the stored state, trying a failed read again every retry:
+// nothing stored is taken for nothing held. The signals that arrive
+// meanwhile are put back for exec, which handles them once the state is in.
+// While the reads fail after a stop signal, the stop alarm is given every
+// alarmAfter (PRD 10.3), and a stop signal after the alarm is a person
+// taking over: the process leaves at once (errTakenOver), the stored cycle
+// as it is.
+func loadState(st stateLoader, sessionID string, signals chan os.Signal, alarmAfter, retry time.Duration) (store.State, error) {
+	log := logger.GlobalLogger
+	var kept []os.Signal
+	defer func() {
+		for _, sig := range kept {
+			select {
+			case signals <- sig:
+			default: // the channel is full of signals already
+			}
+		}
+	}()
+	var stopAt, nextAlarm time.Time
+	alarmed := false
+	for attempt := 1; ; attempt++ {
+		ctx, cancel := context.WithTimeout(context.Background(), stateLoadTimeout)
+		state, err := st.LoadState(ctx, sessionID)
+		cancel()
+		if err == nil {
+			return state, nil
+		}
+		log.Warn("ETF-arbitrage core: the stored state was not read; retrying", "attempt", attempt, "err", err, "retry_in", retry)
+		wait := time.After(retry)
+	waiting:
+		for {
+			var alarm <-chan time.Time // nil before a stop signal: no alarm
+			if !stopAt.IsZero() {
+				if now := time.Now(); !now.Before(nextAlarm) {
+					alarmed, nextAlarm = true, now.Add(alarmAfter)
+					log.Error("ETF-arbitrage core: stopped but the stored state is not read; a further stop signal takes over", "since", now.Sub(stopAt).Round(time.Second))
+				}
+				alarm = time.After(time.Until(nextAlarm))
+			}
+			select {
+			case sig := <-signals:
+				switch {
+				case sig == syscall.SIGUSR1 || stopAt.IsZero():
+					kept = append(kept, sig)
+					if sig != syscall.SIGUSR1 {
+						stopAt, nextAlarm = time.Now(), time.Now().Add(alarmAfter)
+					}
+				case alarmed:
+					kept = nil
+					log.Info("ETF-arbitrage core: taken over before the stored state was read", "signal", sig.String())
+					return store.State{}, errTakenOver
+				}
+			case <-alarm:
+			case <-wait:
+				break waiting
+			}
+		}
+	}
+}
 
 // processRunRow is the process_run row of this start: the effective
 // configuration, with nothing from the secrets file.

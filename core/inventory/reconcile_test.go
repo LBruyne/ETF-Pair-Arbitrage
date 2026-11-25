@@ -133,3 +133,28 @@ func TestSampleBeforePositionsAreRead(t *testing.T) {
 		t.Errorf("sample after a read = %+v, want venue positions of zero", s)
 	}
 }
+
+// One differing read starts the confirmation for that difference only. A
+// later read that differs by other amounts - another passing lag - starts
+// it again instead of confirming it; so does one that differs by the same
+// amounts more than twice reconcileConfirm after the first.
+func TestMismatchConfirmsOnlyTheSameRecentDifference(t *testing.T) {
+	r := newRig(t, "1000", "10")
+	c := r.openCycle(t, strategy.Long)
+	lot := r.openLot(t)
+	bull := fill(ord(c.ID, 1, cex.Bull, cex.PurposeEntry, cex.SideBuy, lot.ID, "10", "10"), "10", "100", "0.01")
+	bear := fill(ord(c.ID, 2, cex.Bear, cex.PurposeEntry, cex.SideBuy, lot.ID, "20", "5"), "5", "100", "0.01")
+	r.m.Sync([]cex.OrderRecord{bull, bear})
+	r.cex.setPositions("10", "4") // the venue's position lags the bear fill
+	reconcile(t, r, "first: SOXS 1 short", ErrPositionsDiffer, false)
+	r.clock.Add(1500 * time.Millisecond)
+	exit := fill(ord(c.ID, 3, cex.Bull, cex.PurposeExit, cex.SideSell, "", "10", "3"), "3", "30", "0.01")
+	r.m.Sync([]cex.OrderRecord{bull, bear, exit})
+	r.cex.setPositions("10", "5") // now the bull exit lags; the bear lag is gone
+	reconcile(t, r, "another difference: SOXL 3 long", ErrPositionsDiffer, false)
+
+	r.clock.Add(30 * time.Second) // no read meanwhile
+	reconcile(t, r, "the same difference, 30 s later", ErrPositionsDiffer, false)
+	r.clock.Add(1500 * time.Millisecond)
+	reconcile(t, r, "the same difference, confirmed", ErrPositionsDiffer, true)
+}

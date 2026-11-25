@@ -23,7 +23,10 @@ import (
 // explain (same leg, same side, not more than their unfilled quantity) is
 // agreement. Order reports and position updates arrive in no fixed order,
 // so one differing read proves nothing: Mismatch latches when a later read,
-// at least reconcileConfirm after the first differing one, still differs.
+// at least reconcileConfirm after the first differing one, still differs by
+// the same amounts. A read that differs by other amounts, or more than twice
+// reconcileConfirm after the first, is a first differing read again: it may
+// be another passing lag.
 func (m *InventoryManager) Reconcile(ctx context.Context) error {
 	read, err := m.cex.ReadPositions(ctx) // outside mu: it is a network call
 	if err == nil && !read.Loaded {
@@ -46,10 +49,11 @@ func (m *InventoryManager) Reconcile(ctx context.Context) error {
 	m.unread = false
 
 	venue, ledger := m.legQty(read), m.ledgerQty()
+	var by [2]decimal.Decimal
 	differs := false
 	for _, leg := range cex.Legs {
 		if diff := venue[leg].Sub(ledger[leg]); !diff.IsZero() && !m.explained(leg, diff) {
-			differs = true
+			by[leg], differs = diff, true
 		}
 	}
 	now := m.timing.clock()
@@ -57,11 +61,13 @@ func (m *InventoryManager) Reconcile(ctx context.Context) error {
 	case !differs:
 		m.differSince = time.Time{}
 		return nil
-	case m.differSince.IsZero(): // the first differing read
-		m.differSince = now
+	case m.mismatch:
+	case m.differSince.IsZero() || !by[cex.Bull].Equal(m.differBy[cex.Bull]) || !by[cex.Bear].Equal(m.differBy[cex.Bear]) ||
+		now.Sub(m.differSince) > 2*m.timing.reconcileConfirm: // a first differing read
+		m.differSince, m.differBy = now, by
 		log.Warn("inventory: positions differ from the ledger; reading again", "venue_bull", venue[cex.Bull], "venue_bear", venue[cex.Bear],
 			"ledger_bull", ledger[cex.Bull], "ledger_bear", ledger[cex.Bear], "confirm_after", m.timing.reconcileConfirm)
-	case !m.mismatch && now.Sub(m.differSince) >= m.timing.reconcileConfirm:
+	case now.Sub(m.differSince) >= m.timing.reconcileConfirm:
 		m.mismatch = true
 		log.Error("inventory: positions do not match the ledger; no orders until a person checks", "venue_bull", venue[cex.Bull], "venue_bear", venue[cex.Bear],
 			"ledger_bull", ledger[cex.Bull], "ledger_bear", ledger[cex.Bear], "dust_bull", m.dust[cex.Bull].Qty, "dust_bear", m.dust[cex.Bear].Qty)

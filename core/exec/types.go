@@ -71,6 +71,7 @@ type batchState struct {
 	planPrice [2]decimal.Decimal  // entry batches: the two limit prices
 	x         float64             // entry batches: the executable deviation at the decision, the e of the spacing rule
 	settled   bool                // entry batches: the lot was settled, built or void
+	compared  bool                // the venue's positions were compared with the ledger after its results
 }
 
 // observation is the last usable moment of the open minute: both legs'
@@ -167,8 +168,9 @@ type cexSource interface {
 	// ReadPositions reads the two legs' positions from the venue now and
 	// publishes them.
 	ReadPositions(ctx context.Context) (cex.PositionSet, error)
-	// MarkNeverArrived ends an order of unknown outcome as never_arrived.
-	MarkNeverArrived(id cex.ClientOrderID)
+	// MarkNeverArrived ends an order of unknown outcome as never_arrived;
+	// false when the order got a final state meanwhile.
+	MarkNeverArrived(id cex.ClientOrderID) bool
 	// RecoverOrders books the venue's orders of the unfinished cycle the
 	// table lacks and returns them; SetOrderLot stores the lot of one.
 	RecoverOrders(ctx context.Context, cycleID string) ([]cex.OrderRecord, error)
@@ -198,11 +200,11 @@ type timings struct {
 	clock func() time.Time // the loop reads the time here
 
 	step          time.Duration // the loop looks at the facts at least this often
-	resend        time.Duration // two reducing orders of one leg are at least this far apart
+	resend        time.Duration // two reducing or completion orders of one leg are at least this far apart
 	rejectBackoff time.Duration // after a batch with a refused order, the next entry waits at least this long
 	sample        time.Duration // one signal_sample row this often
 	statusLog     time.Duration // one status line this often
-	readTimeout   time.Duration // the limit of the positions read that confirms a cycle is flat
+	readTimeout   time.Duration // the limit of each read of the venue's positions
 	closeRetry    time.Duration // a cycle that could not be closed is not tried again sooner than this
 
 	unknownAlarm   time.Duration // an order unknown this long is an alarm, and its other leg is handled by the venue's positions (PRD 13.3)

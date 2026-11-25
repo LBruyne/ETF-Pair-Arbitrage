@@ -48,6 +48,7 @@ type InventoryManager struct {
 	since        time.Time                             // when this ledger started: its first start, or the last change of the capital (PRD 6.3)
 	dust         [2]Dust                               // by leg: the net of the remainders the finished cycles left; recorded, never traded
 	lotWritten   map[LotID]string                      // each open-cycle lot's row as last written, to write only changes
+	dropped      map[cex.ClientOrderID]decimal.Decimal // the exit fill of each order beyond what the lots held, as last warned of
 	cycleWritten string                                // the same for the open cycle's row
 	voids        []store.Row                           // rows that void a cycle or a lot whose first write failed; no entries until they are confirmed
 
@@ -55,9 +56,10 @@ type InventoryManager struct {
 	voidFailure, closeFailure, fundingFailure writeFailure
 
 	// reconciliation
-	mismatch    bool      // the venue's positions were found to differ from the ledger; never cleared
-	differSince time.Time // the first of the reads that differ in a row; zero when the last read agreed
-	unread      bool      // the last read of the positions failed
+	mismatch    bool               // the venue's positions were found to differ from the ledger; never cleared
+	differSince time.Time          // the first of the reads that differ in a row; zero when the last read agreed
+	differBy    [2]decimal.Decimal // by leg: the difference no open order explains, at differSince
+	unread      bool               // the last read of the positions failed
 
 	// funding
 	fundingBooked map[string]bool     // record ids booked into R, this run's and earlier ones'
@@ -137,7 +139,7 @@ func (m *InventoryManager) Restore(state store.State, orders []cex.OrderRecord) 
 	// The unfinished cycle.
 	if state.Cycle != nil {
 		m.cycle, m.cycleWritten = cycleFromRow(*state.Cycle, state.Lots), fmt.Sprint(*state.Cycle)
-		m.orders, m.assigned = map[cex.ClientOrderID]cex.OrderRecord{}, map[cex.ClientOrderID]LotID{}
+		m.orders, m.assigned, m.dropped = map[cex.ClientOrderID]cex.OrderRecord{}, map[cex.ClientOrderID]LotID{}, map[cex.ClientOrderID]decimal.Decimal{}
 		m.lotWritten = map[LotID]string{}
 		for _, row := range state.Lots {
 			m.lotWritten[LotID(row.LotID)] = fmt.Sprint(row)
@@ -232,6 +234,17 @@ func (m *InventoryManager) LedgerPositions() [2]decimal.Decimal {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	return m.ledgerQty()
+}
+
+// Dust returns the signed quantity of each leg's dust: what the finished
+// cycles left on the venue outside any cycle.
+func (m *InventoryManager) Dust() (qty [2]decimal.Decimal) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for _, leg := range cex.Legs {
+		qty[leg] = m.dust[leg].Qty
+	}
+	return qty
 }
 
 // Settled reports whether the open cycle's orders allow it to close: each

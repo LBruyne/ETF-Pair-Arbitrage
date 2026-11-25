@@ -35,7 +35,7 @@ type ExecManager struct {
 	signals <-chan os.Signal // SIGINT and SIGTERM stop the process; SIGUSR1 stops new entries
 
 	// owned by Run: the Session, the anchors and the minutes
-	ctx             context.Context      // Run's; the positions read that confirms a flat cycle runs under it
+	ctx             context.Context      // Run's; every read of the venue's positions runs under it
 	session         cex.Session          // the Session the loop is in
 	anchors         cex.Anchors          // the current anchors as the loop uses them: none until cex publishes this Session's
 	anchorChangedAt time.Time            // when the anchors' values last changed
@@ -52,7 +52,7 @@ type ExecManager struct {
 	lastEntry    *strategy.LastEntry // the last built entry batch, for the spacing rule
 	seqCycle     inventory.CycleID   // the cycle the order sequence counts in
 	orderSeq     int                 // the sequence number of that cycle's last order
-	lastReduceAt [2]time.Time        // by leg: when the last reducing order of a forced exit or a gap was sent
+	lastSentAt   [2]time.Time        // by leg: when the last reducing or completion order was sent
 	nextCloseTry time.Time           // a cycle whose close failed is not tried again before this
 
 	// bound by Restore, before Run
@@ -111,7 +111,7 @@ func (m *ExecManager) Run(ctx context.Context) error {
 			drained = true
 		}
 	}
-	if err := m.recover(ctx); err != nil {
+	if leave, err := m.recover(ctx); err != nil || leave {
 		return err
 	}
 	log.Info("exec: running", "live", m.cfg.Live, "mean_model", m.scfg.MeanModel, "mean_minutes", m.scfg.MeanMinutes, "sigma_minutes", m.scfg.SigmaMinutes,
@@ -142,8 +142,8 @@ func (m *ExecManager) Run(ctx context.Context) error {
 }
 
 // start sets the loop's state at the first round: the Session, the open
-// minute and no anchor yet. The minutes of a previous run are not read back:
-// the mean warms up from here.
+// minute and no anchor yet. The recovery then restores the Session's
+// minutes.
 func (m *ExecManager) start(now time.Time) {
 	m.session = m.cex.Session(now)
 	m.anchors = cex.Anchors{SessionID: m.session.ID}

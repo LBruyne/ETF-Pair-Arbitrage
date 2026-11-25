@@ -179,7 +179,7 @@ func TestRestartAfterTheSend(t *testing.T) {
 	sent := a.gate.placedTotal()
 
 	b := dbProcess(t, t0.Add(time.Second), a.exchange)
-	if err := b.m.recover(b.m.ctx); err != nil {
+	if _, err := b.m.recover(b.m.ctx); err != nil {
 		t.Fatal(err)
 	}
 	b.stepAt(t0.Add(time.Second))
@@ -223,7 +223,7 @@ func TestRestartBeforeTheSend(t *testing.T) {
 	a.down()
 
 	b := dbProcess(t, t0.Add(time.Second), a.exchange)
-	if err := b.m.recover(b.m.ctx); err != nil {
+	if _, err := b.m.recover(b.m.ctx); err != nil {
 		t.Fatal(err)
 	}
 	for _, id := range ids {
@@ -254,7 +254,7 @@ func TestRestartRecognisesAnUnrecordedOrder(t *testing.T) {
 	execSQL(t, "DELETE FROM trade.cex_order WHERE client_order_id = $1", string(bull))
 
 	b := dbProcess(t, utc8Time(11, 25, 5, 3, 10), a.exchange)
-	if err := b.m.recover(b.m.ctx); err != nil {
+	if _, err := b.m.recover(b.m.ctx); err != nil {
 		t.Fatal(err)
 	}
 	l := b.inv.Cycle().Lots[0]
@@ -286,7 +286,7 @@ func TestRestartAfterAnUnrecordedExit(t *testing.T) {
 	sent := a.gate.placedTotal()
 
 	b := dbProcess(t, t1.Add(time.Second), a.exchange)
-	if err := b.m.recover(b.m.ctx); err != nil {
+	if _, err := b.m.recover(b.m.ctx); err != nil {
 		t.Fatal(err)
 	}
 	b.stepAt(t1.Add(time.Second))
@@ -324,7 +324,7 @@ func TestRestartAfterATakeover(t *testing.T) {
 
 	t1 := utc8Time(11, 26, 4, 59, 10)
 	b := dbProcess(t, t1, a.exchange)
-	if err := b.m.recover(b.m.ctx); err != nil {
+	if _, err := b.m.recover(b.m.ctx); err != nil {
 		t.Fatal(err)
 	}
 	b.at(t1)
@@ -345,7 +345,7 @@ func TestRestartAcrossTheClose(t *testing.T) {
 		a.down()
 		t1 := utc8Time(11, 26, 5, 5, 0)
 		b := dbProcess(t, t1, a.exchange)
-		if err := b.m.recover(b.m.ctx); err != nil {
+		if _, err := b.m.recover(b.m.ctx); err != nil {
 			t.Fatal(err)
 		}
 		b.at(t1)
@@ -367,7 +367,7 @@ func TestRestartAcrossTheClose(t *testing.T) {
 		sent := a.gate.placedTotal()
 		t1 := utc8Time(11, 25, 5, 3, 10)
 		b := dbProcess(t, t1, a.exchange)
-		if err := b.m.recover(b.m.ctx); err != nil {
+		if _, err := b.m.recover(b.m.ctx); err != nil {
 			t.Fatal(err)
 		}
 		if !b.inv.Mismatch() {
@@ -424,7 +424,7 @@ func TestMinutesResumedPreferringOwnRows(t *testing.T) {
 	for i := range 4 {
 		r.src.fxCloses = append(r.src.fxCloses, cex.FXMinute{Minute: minute(i), Close: decimal.NewFromInt(1)})
 	}
-	if err := r.m.recover(r.m.ctx); err != nil {
+	if _, err := r.m.recover(r.m.ctx); err != nil {
 		t.Fatal(err)
 	}
 	if !perp.from.Equal(start) || !perp.to.Equal(minute(5)) {
@@ -464,3 +464,33 @@ func TestMinutesResumedPreferringOwnRows(t *testing.T) {
 
 // near1e9 compares two prices of a test.
 func near1e9(a, b float64) bool { d := a - b; return d < 1e-9 && d > -1e-9 }
+
+// A crash after the lot's row and before its orders' rows: the restart
+// finds a lot being built with no order, in the table or at the venue. It
+// is settled void at once, and the cycle ends as no_fill.
+func TestRestartWithALotWithoutOrders(t *testing.T) {
+	restartTest(t)
+	a := dbProcess(t, utc8Time(11, 25, 5, 1, 0), nil)
+	a.warmUp()
+	t0 := utc8Time(11, 25, 5, 3, 5)
+	a.at(t0)
+	a.books(entryBook())
+	a.gate.park("SOXLUSDT", "SOXSUSDT") // the orders never reach the venue
+	a.stepAt(t0)
+	waitFor(t, "both outcomes unknown", func() bool { return len(a.cex.UnresolvedOrders()) == 2 })
+	cycle := string(a.inv.Cycle().ID)
+	a.down()
+	execSQL(t, "DELETE FROM trade.cex_order WHERE cycle_id = $1", cycle)
+
+	t1 := t0.Add(time.Second)
+	b := dbProcess(t, t1, a.exchange)
+	if _, err := b.m.recover(b.m.ctx); err != nil {
+		t.Fatal(err)
+	}
+	b.at(t1)
+	b.books(entryBook())
+	b.stepAt(t1)
+	waitFor(t, "the cycle closed as no_fill", func() bool {
+		return querySQL[int](t, "SELECT count(*) FROM trade.cycle WHERE cycle_id = $1 AND status = 'closed' AND end_reason = 'no_fill'", cycle) == 1
+	})
+}

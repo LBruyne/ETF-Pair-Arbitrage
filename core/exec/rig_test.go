@@ -136,7 +136,8 @@ type gateVenue struct {
 	parked map[cex.Symbol]bool
 	waits  []cex.OrderRequest
 	lost   cex.Symbol
-	unread atomic.Bool // the positions cannot be read
+	unread atomic.Bool  // the positions cannot be read
+	reads  atomic.Int64 // reads of the positions
 	refuse func(req cex.OrderRequest) error
 	placed map[cex.ClientOrderID]int // PlaceOrder calls per order
 }
@@ -168,6 +169,7 @@ func (g *gateVenue) PlaceOrder(ctx context.Context, req cex.OrderRequest) (cex.O
 }
 
 func (g *gateVenue) Positions(ctx context.Context, symbols []cex.Symbol) (cex.PositionSet, error) {
+	g.reads.Add(1)
 	if g.unread.Load() {
 		return cex.PositionSet{}, errors.New("the test makes the positions unreadable")
 	}
@@ -331,11 +333,26 @@ type testCex struct {
 	settingsBad bool
 	notFound    map[cex.ClientOrderID]bool // orders cex reports as NotFound: its own verdict takes 30 s of wall time
 	fxCloses    []cex.FXMinute             // the source's minute closes of F; cex's source has none in tests
+	fxErr       error                      // when set, the minute closes of F cannot be read
+	lateVerdict bool                       // MarkNeverArrived finds the order final already, as when its result came after the snapshot
+}
+
+func (c *testCex) MarkNeverArrived(id cex.ClientOrderID) bool {
+	c.mu.Lock()
+	late := c.lateVerdict
+	c.mu.Unlock()
+	if late {
+		return false
+	}
+	return c.CexManager.MarkNeverArrived(id)
 }
 
 func (c *testCex) FXMinuteCloses(_ context.Context, from, to time.Time) ([]cex.FXMinute, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	if c.fxErr != nil {
+		return nil, c.fxErr
+	}
 	var out []cex.FXMinute
 	for _, m := range c.fxCloses {
 		if !m.Minute.Before(from) && m.Minute.Before(to) {

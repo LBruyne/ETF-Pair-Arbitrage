@@ -48,7 +48,7 @@ func (m *InventoryManager) OpenCycle(sessionID string, dir strategy.Direction, p
 	}
 
 	m.cycle, m.cycleWritten = c, fmt.Sprint(row)
-	m.orders, m.assigned = map[cex.ClientOrderID]cex.OrderRecord{}, map[cex.ClientOrderID]LotID{}
+	m.orders, m.assigned, m.dropped = map[cex.ClientOrderID]cex.OrderRecord{}, map[cex.ClientOrderID]LotID{}, map[cex.ClientOrderID]decimal.Decimal{}
 	m.lotWritten, m.fundingSeen = map[LotID]string{}, map[fundingKey]bool{}
 	m.reserved = decimal.Zero
 	logger.GlobalLogger.Info("inventory: cycle opened", "cycle", c.ID, "session", sessionID, "direction", dir,
@@ -139,7 +139,12 @@ func (m *InventoryManager) sync(orders []cex.OrderRecord, now time.Time) {
 		return
 	}
 	sent := m.ordersAsSent()
-	rebuild(c.Lots, sent, m.assigned)
+	for id, q := range rebuild(c.Lots, sent, m.assigned) {
+		if !q.Equal(m.dropped[id]) {
+			m.dropped[id] = q
+			logger.GlobalLogger.Warn("inventory: an exit fill beyond what the lots hold is not booked; the position check shows it", "cycle", c.ID, "client_order_id", id, "qty", q)
+		}
+	}
 	m.reserved = pendingNotional(sent)
 	m.refresh(now)
 }
@@ -237,8 +242,11 @@ func portion(total, part, whole decimal.Decimal) decimal.Decimal {
 // lot assigned to it; an order without one is left out. An order's value
 // and fee are spread over its quantity through share.take, at the order's
 // average price (PRD 1.4 narrows 7.4 so). The recorded dust plays no part:
-// every fill is booked by its order's purpose alone.
-func rebuild(lots []*Lot, orders []cex.OrderRecord, assigned map[cex.ClientOrderID]LotID) {
+// every fill is booked by its order's purpose alone. A closing fill beyond
+// what the lots hold is not booked; it is returned by order. It comes while
+// an earlier fill of the leg is not known yet, when the venue's positions
+// differ from the ledger anyway.
+func rebuild(lots []*Lot, orders []cex.OrderRecord, assigned map[cex.ClientOrderID]LotID) (dropped map[cex.ClientOrderID]decimal.Decimal) {
 	byID := make(map[LotID]*Lot, len(lots))
 	for _, lot := range lots {
 		lot.Legs = [2]LotLeg{}
@@ -272,8 +280,15 @@ func rebuild(lots []*Lot, orders []cex.OrderRecord, assigned map[cex.ClientOrder
 					lot.Legs[leg].addExit(rest.take(q))
 				}
 			}
+			if rest.qty.IsPositive() {
+				if dropped == nil {
+					dropped = map[cex.ClientOrderID]decimal.Decimal{}
+				}
+				dropped[o.Request.ClientOrderID] = rest.qty
+			}
 		}
 	}
+	return dropped
 }
 
 func (l *LotLeg) addEntry(part share) {

@@ -29,21 +29,30 @@ func (m *ExecManager) Restore(bars []store.MinuteBarRow, last *store.LotRow, per
 // is tried again every recoverRetry, never taken as "flat". A stop signal
 // meanwhile only sets stopping: the previous process may have left a
 // position or an order of unknown outcome, so recovery is finished first
-// and the loop then closes and leaves as after any stop.
-func (m *ExecManager) recover(ctx context.Context) error {
+// and the loop then closes and leaves as after any stop. While it is not,
+// the stop is checked as in a round (stopCheck): its alarm every
+// stop_alarm_after, and a stop signal after the alarm is a takeover, which
+// leaves at once (leave); so does a stop with no cycle and no order open.
+func (m *ExecManager) recover(ctx context.Context) (leave bool, err error) {
 	log := logger.GlobalLogger
 	for attempt := 1; ; attempt++ {
 		err := m.recoverOnce(ctx, m.timing.clock())
 		if err == nil {
-			return nil
+			return false, nil
 		}
 		log.Warn("exec: recovery not complete; retrying", "attempt", attempt, "err", err, "retry_in", m.timing.recoverRetry)
 		retry := time.After(m.timing.recoverRetry)
 	wait:
 		for {
+			now := m.timing.clock()
+			r := m.newRound(now)
+			r.cycle = m.inv.Cycle()
+			if m.stopCheck(r, now) {
+				return true, nil
+			}
 			select {
 			case <-ctx.Done():
-				return ctx.Err()
+				return false, ctx.Err()
 			case sig := <-m.signals:
 				m.onSignal(sig, m.timing.clock())
 			case <-retry:
@@ -89,7 +98,7 @@ func (m *ExecManager) recoverOnce(ctx context.Context, now time.Time) error {
 		}
 		m.recovered.minutes = true
 	}
-	m.restoreBatch(c)
+	m.restoreBatch(c, now)
 
 	// The venue's positions against the ledger. Unread is not flat; one
 	// read that differs proves nothing yet, two make a mismatch, and the
@@ -135,7 +144,9 @@ func (m *ExecManager) restoreMinutes(ctx context.Context, now time.Time) error {
 		}
 	}
 
-	// The recorder's minutes and F, read only when a minute is missing.
+	// The recorder's minutes and F, read only when a minute is missing. They
+	// only warm the mean up: when either cannot be read, the minutes the
+	// process did not record are invalid, and recovery goes on.
 	perp, fx := map[int64]store.PerpMinuteRow{}, map[int64]float64{}
 	missing := false
 	for t := from; t.Before(to) && !missing; t = t.Add(time.Minute) {
@@ -150,14 +161,14 @@ func (m *ExecManager) restoreMinutes(ctx context.Context, now time.Time) error {
 		}
 		rows, err := m.perp.LoadPerpMinutes(ctx, string(bull.Symbol), string(bear.Symbol), from, to)
 		if err != nil {
-			return fmt.Errorf("the recorder's minutes: %w", err)
+			logger.GlobalLogger.Warn("exec: the recorder's minutes not read; the minutes not recorded are invalid", "session", s.ID, "err", err)
 		}
 		for _, row := range rows {
 			perp[row.MinuteMs] = row
 		}
 		closes, err := m.cex.FXMinuteCloses(ctx, from, to)
 		if err != nil {
-			return fmt.Errorf("the minute closes of F: %w", err)
+			logger.GlobalLogger.Warn("exec: the minute closes of F not read; the minutes not recorded are invalid", "session", s.ID, "err", err)
 		}
 		for _, c := range closes {
 			fx[c.Minute.UnixMilli()] = c.Close.InexactFloat64()
@@ -204,8 +215,10 @@ func (m *ExecManager) restoreMinutes(ctx context.Context, now time.Time) error {
 // restoreBatch takes up the entry batch whose lot was still being built
 // when the previous process ended: its orders (as sent and as recognised)
 // and its first send, so that the gap of that lot is worked to its end and
-// the lot settled. Without such a lot there is no batch to take up.
-func (m *ExecManager) restoreBatch(c *inventory.Cycle) {
+// the lot settled. Without such a lot there is no batch to take up. A lot
+// whose orders were never written, nor found at the venue, is settled void
+// at once: nothing was sent for it.
+func (m *ExecManager) restoreBatch(c *inventory.Cycle, now time.Time) {
 	if m.batch != nil || c == nil {
 		return
 	}
@@ -231,6 +244,11 @@ func (m *ExecManager) restoreBatch(c *inventory.Cycle) {
 				b.sentAt = o.SubmittedAt
 			}
 		}
+	}
+	if len(b.orders) == 0 {
+		m.inv.SettleLot(lot.ID, false, now)
+		logger.GlobalLogger.Info("exec: a lot without orders settled void", "lot", lot.ID)
+		return
 	}
 	m.batch = b
 	logger.GlobalLogger.Info("exec: batch taken up", "lot", lot.ID, "orders", len(b.orders), "sent", showTime(b.sentAt))
