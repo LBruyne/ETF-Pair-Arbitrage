@@ -196,6 +196,8 @@ CREATE TABLE IF NOT EXISTS trade.cex_order (
     acked_ms             BIGINT,            -- local clock: the venue accepted it
     update_received_ms   BIGINT,            -- local clock: the last update arrived
     exchange_updated_ms  BIGINT,            -- the venue's clock: its last update
+    -- three more times of the order's way are added at the end of this file:
+    -- accepted_ms, exchange_created_ms, final_ms
     PRIMARY KEY (live, client_order_id)
 );
 
@@ -217,7 +219,9 @@ CREATE TABLE IF NOT EXISTS trade.cex_fill (
     PRIMARY KEY (live, exec_id)
 );
 
--- decision (fact): every decision of the loop, numbered by the store within a run.
+-- decision (fact): every decision of the loop, numbered by the store within a
+-- run; in paper mode also one row per matched paper order, beside the decision
+-- that sent it.
 CREATE TABLE IF NOT EXISTS trade.decision (
     run_id     TEXT NOT NULL,
     seq        BIGINT NOT NULL,             -- one sequence per run, shared with event
@@ -225,10 +229,10 @@ CREATE TABLE IF NOT EXISTS trade.decision (
     ts_ms      BIGINT NOT NULL,
     cycle_id   TEXT,
     lot_id     TEXT,
-    kind       TEXT NOT NULL,               -- entry, exit, complete, trim, forced or at_line_blocked
+    kind       TEXT NOT NULL,               -- entry, exit, complete, trim, forced or at_line_blocked; paper_match: a paper order as matched (written by cex)
     direction  TEXT,
     reason     TEXT,
-    detail     JSONB,                       -- the numbers needed to recompute the decision
+    detail     JSONB,                       -- the numbers needed to recompute the decision; of a paper_match, the order, its result and the leg's book when it was taken and when it was matched
     PRIMARY KEY (run_id, seq)
 );
 
@@ -295,5 +299,20 @@ DO $$ BEGIN
     END IF;
     IF to_regclass('trade.cex_order_cycle_idx') IS NULL THEN
         CREATE INDEX cex_order_cycle_idx ON trade.cex_order (live, cycle_id);
+    END IF;
+END $$;
+
+-- cex_order: the rest of an order's timestamps, for measuring where its time
+-- goes. With submitted_ms, sent_ms, acked_ms (local clock) and
+-- exchange_updated_ms (the venue's clock) they give: sent -> the venue's
+-- gateway took it -> the venue created the order -> its last change, and
+-- locally sent -> acceptance in hand -> final state in hand. Added only when
+-- missing (see the note at the top).
+DO $$ BEGIN
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema = 'trade' AND table_name = 'cex_order' AND column_name = 'final_ms') THEN
+        ALTER TABLE trade.cex_order
+            ADD COLUMN accepted_ms         BIGINT,  -- the venue's clock: its gateway took the request
+            ADD COLUMN exchange_created_ms BIGINT,  -- the venue's clock: it created the order
+            ADD COLUMN final_ms            BIGINT;  -- local clock: the final state arrived
     END IF;
 END $$;

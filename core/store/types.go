@@ -281,6 +281,9 @@ type OrderRow struct {
 	AckedMs           int64           `json:"acked_ms,omitempty"`
 	UpdateReceivedMs  int64           `json:"update_received_ms,omitempty"`
 	ExchangeUpdatedMs int64           `json:"exchange_updated_ms,omitempty"`
+	AcceptedMs        int64           `json:"accepted_ms,omitempty"`
+	ExchangeCreatedMs int64           `json:"exchange_created_ms,omitempty"`
+	FinalMs           int64           `json:"final_ms,omitempty"`
 }
 
 func (OrderRow) Table() string { return "cex_order" }
@@ -303,8 +306,9 @@ type FillRow struct {
 
 func (FillRow) Table() string { return "cex_fill" }
 
-// DecisionRow is one decision of the loop (decision, written by exec). The
-// store numbers it.
+// DecisionRow is one decision of the loop (decision, written by exec), or
+// one matched paper order (kind paper_match, written by cex's paper venue).
+// The store numbers it.
 type DecisionRow struct {
 	TsMs      int64           `json:"ts_ms"`
 	CycleID   string          `json:"cycle_id,omitempty"`
