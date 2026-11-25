@@ -494,3 +494,48 @@ func TestRestartWithALotWithoutOrders(t *testing.T) {
 		return querySQL[int](t, "SELECT count(*) FROM trade.cycle WHERE cycle_id = $1 AND status = 'closed' AND end_reason = 'no_fill'", cycle) == 1
 	})
 }
+
+// The old process's forced exit bought back both legs in full, and the
+// process ended before it heard of the fills. The new one books them, holds
+// nothing and has no forced exit in progress, but the cycle's forced orders
+// say why it ended: the cause that still holds (close_window), or stop when
+// none does - a stop signal is the one cause that does not outlive the
+// process. Not dust_only.
+func TestRestartAfterAnUnrecordedForcedExit(t *testing.T) {
+	for _, c := range []struct {
+		name string
+		at   time.Time
+		stop bool
+		want string
+	}{
+		{"close window", utc8Time(11, 26, 4, 59, 10), false, inventory.EndCloseWindow},
+		{"stop", utc8Time(11, 25, 5, 3, 25), true, inventory.EndStop},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			restartTest(t)
+			a := holdingProcess(t)
+			a.at(c.at)
+			a.books(exitBook())
+			a.gate.hold("SOXLUSDT", "SOXSUSDT")
+			if c.stop {
+				a.m.onSignal(syscall.SIGTERM, c.at)
+			}
+			a.stepAt(c.at)
+			waitFor(t, "the forced exits filled at the venue", func() bool {
+				pos, _ := a.paper.Positions(context.Background(), nil)
+				return len(pos.BySymbol) == 0
+			})
+			a.down()
+
+			b := dbProcess(t, c.at.Add(time.Second), a.exchange)
+			if _, err := b.m.recover(b.m.ctx); err != nil {
+				t.Fatal(err)
+			}
+			b.stepAt(c.at.Add(time.Second))
+			if got := b.lastCycle(); b.inv.Cycle() != nil || got.EndReason != c.want {
+				t.Fatalf("cycle open %t, end %q; want closed %s", b.inv.Cycle() != nil, got.EndReason, c.want)
+			}
+			b.gate.release()
+		})
+	}
+}

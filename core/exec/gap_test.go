@@ -1,6 +1,7 @@
 package exec
 
 import (
+	"slices"
 	"testing"
 	"time"
 
@@ -408,6 +409,60 @@ func TestOneLegCycles(t *testing.T) {
 			t.Errorf("ledger SOXS %s, want the dust -0.05", pos[cex.Bear])
 		}
 	})
+}
+
+// A batch built from fills too small to trade: SOXL sells 0.30 at 40.44,
+// SOXS 0.05 at 59.42. Past the completion window 0.22 SOXL, which SOXS does
+// not match, is trimmed; 0.08 SOXL (3.24 USDT) and 0.05 SOXS (2.97 USDT)
+// are left, both under the venue's 5 USDT. The cycle closes with them as
+// dust and no exit order: dust_only, not exit_line (audit 2026-11-25).
+func TestCycleOfTrimsAndDustEndsDustOnly(t *testing.T) {
+	r := gapRig(t, rigOptions{})
+	t0 := utc8Time(11, 25, 5, 3, 5)
+	match := thinBear()
+	match.bullBids = side{lv("40.44", "0.30"), lv("40.30", "500")}
+	match.bearBids = side{lv("59.42", "0.05"), lv("59.30", "50"), lv("59.29", "50"), lv("59.28", "50"), lv("59.27", "50")}
+	r.enterMatchedOn(t0, entryBook(), match)
+	r.at(t0.Add(6 * time.Second))
+	r.books(thinBear())
+	r.trade(t0.Add(6 * time.Second))
+	r.stepAt(t0.Add(7 * time.Second))
+	var purposes []cex.OrderPurpose
+	for _, o := range r.orders() {
+		purposes = append(purposes, o.Request.Purpose)
+	}
+	c := r.lastCycle()
+	if !slices.Equal(purposes, []cex.OrderPurpose{cex.PurposeEntry, cex.PurposeEntry, cex.PurposeTrim}) {
+		t.Fatalf("orders %v; want the entry's two and one trim", purposes)
+	}
+	if r.inv.Cycle() != nil || c.EndReason != inventory.EndDustOnly || !c.DustBull.Equal(dec("-0.08")) || !c.DustBear.Equal(dec("-0.05")) {
+		t.Errorf("cycle open %t, end %q, dust %s / %s; want closed dust_only with -0.08 / -0.05", r.inv.Cycle() != nil, c.EndReason, c.DustBull, c.DustBear)
+	}
+}
+
+// An exit at the line that leaves dust still ends at the line: example 2's
+// exit buys back all 105.30 SOXL but 70.15 of 70.20 SOXS, and the 0.05 left
+// (2.97 USDT) is under the venue's 5 USDT.
+func TestExitAtTheLineLeavingDustEndsExitLine(t *testing.T) {
+	r := gapRig(t, rigOptions{})
+	t0 := utc8Time(11, 25, 5, 3, 5)
+	r.at(t0)
+	r.books(entryBook())
+	r.trade(t0)
+
+	t1 := utc8Time(11, 25, 5, 3, 30)
+	r.at(t1)
+	r.books(exitBook())
+	r.stepAt(t1)
+	match := exitBook()
+	match.bearAsks = side{lv("59.385", "70.15"), lv("59.50", "100"), lv("59.51", "50"), lv("59.52", "50"), lv("59.53", "50")}
+	r.books(match)
+	r.results()
+	r.step()
+	r.stepAt(t1.Add(time.Second))
+	if c := r.lastCycle(); r.inv.Cycle() != nil || c.EndReason != inventory.EndExitLine || !c.DustBear.Equal(dec("-0.05")) {
+		t.Errorf("cycle open %t, end %q, SOXS dust %s; want closed exit_line with -0.05", r.inv.Cycle() != nil, c.EndReason, c.DustBear)
+	}
 }
 
 // V9, PRD 8.5: from the regular open a gap is only trimmed, completion

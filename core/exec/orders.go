@@ -175,20 +175,28 @@ func (m *ExecManager) forcedDue(c *inventory.Cycle, now time.Time, holding bool)
 	if !holding {
 		return false
 	}
-	switch {
-	case m.stop.stopping:
-		m.forced = inventory.EndStop
-	case c.SessionID != m.session.ID:
-		m.forced = inventory.EndSessionChanged
-	case !now.Before(m.session.End.Add(-m.scfg.ForcedExitBeforeClose)):
-		m.forced = inventory.EndCloseWindow
-	default:
+	if m.forced = m.forcedCause(c, now); m.forced == "" {
 		return false
 	}
 	hold := c.Hold()
 	logger.GlobalLogger.Info("exec: forced exit begins", "cycle", c.ID, "cause", m.forced, "cycle_session", c.SessionID, "session", m.session.ID,
 		"session_end", showTime(m.session.End), "direction", c.Direction, "hold_bull", hold[cex.Bull], "hold_bear", hold[cex.Bear])
 	return true
+}
+
+// forcedCause is why the cycle must be closed now regardless of the line: a
+// stop signal, a Session that has ended, or the close window; empty when
+// none holds.
+func (m *ExecManager) forcedCause(c *inventory.Cycle, now time.Time) string {
+	switch {
+	case m.stop.stopping:
+		return inventory.EndStop
+	case c.SessionID != m.session.ID:
+		return inventory.EndSessionChanged
+	case !now.Before(m.session.End.Add(-m.scfg.ForcedExitBeforeClose)):
+		return inventory.EndCloseWindow
+	}
+	return ""
 }
 
 // forcedExit closes everything the cycle holds with one reduce-only order
@@ -474,7 +482,7 @@ func (m *ExecManager) closeIfFlat(r *round) (read bool) {
 		m.idle(strategy.ReasonAwaitClose)
 		return true
 	}
-	reason := m.endReason(c)
+	reason := m.endReason(r)
 	if err := m.inv.CloseCycle(reason, r.now); err != nil {
 		m.nextCloseTry = r.now.Add(m.timing.closeRetry)
 		log.Debug("exec: cycle not closed yet", "cycle", c.ID, "reason", reason, "err", err, "retry_at", showTime(m.nextCloseTry))
@@ -504,18 +512,27 @@ func (m *ExecManager) onlyDust(r *round) bool {
 	return orders[cex.Bull] == nil && orders[cex.Bear] == nil
 }
 
-// endReason is why the cycle ends: no_fill or one_leg when none of its lots
-// was built, else the cause of the forced exit in progress, else the exit
-// line.
-func (m *ExecManager) endReason(c *inventory.Cycle) string {
+// endReason is why the cycle of the round ends, from the cycle and its own
+// orders: no_fill or one_leg when none of its lots was built; else the
+// cause of its forced exit - the one in progress, or, when a forced order
+// was sent by an earlier process, the cause that holds now (only a stop
+// does not outlive a restart, so none holding means a stop); else
+// exit_line when an exit order was sent; else dust_only: no exit order, and
+// what was built (after any trims) was left as dust only.
+func (m *ExecManager) endReason(r *round) string {
 	allVoid, oneLeg := true, false
-	for _, lot := range c.Lots {
+	for _, lot := range r.cycle.Lots {
 		switch {
 		case lot.Status != inventory.LotVoid:
 			allVoid = false
 		case lot.VoidReason == inventory.VoidOneLeg:
 			oneLeg = true
 		}
+	}
+	forced, exit := false, false
+	for _, o := range r.orders {
+		forced = forced || o.Request.Purpose == cex.PurposeForced
+		exit = exit || o.Request.Purpose == cex.PurposeExit
 	}
 	switch {
 	case allVoid && oneLeg:
@@ -524,8 +541,15 @@ func (m *ExecManager) endReason(c *inventory.Cycle) string {
 		return inventory.EndNoFill
 	case m.forced != "":
 		return m.forced
+	case forced:
+		if cause := m.forcedCause(r.cycle, r.now); cause != "" {
+			return cause
+		}
+		return inventory.EndStop
+	case exit:
+		return inventory.EndExitLine
 	}
-	return inventory.EndExitLine
+	return inventory.EndDustOnly
 }
 
 // --- sending ---

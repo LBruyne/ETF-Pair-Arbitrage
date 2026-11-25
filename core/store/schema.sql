@@ -109,7 +109,7 @@ CREATE TABLE IF NOT EXISTS trade.cycle (
     session_id        TEXT NOT NULL,        -- the session it was opened in
     direction         TEXT NOT NULL,        -- long (both legs bought) or short
     status            TEXT NOT NULL,        -- open, closed or takeover
-    end_reason        TEXT,                 -- exit_line, close_window, stop, session_changed, no_fill, one_leg or store_error (its row was not confirmed written, so it never traded); NULL while open
+    end_reason        TEXT,                 -- exit_line, close_window, stop, session_changed, no_fill, one_leg, dust_only (built, no exit order: what was built, after any trims, was left as dust only) or store_error (its row was not confirmed written, so it never traded); NULL while open
     pair_anchor_kind  TEXT NOT NULL,        -- the anchors that size all of its lots: their kind
     pair_anchor_bull  NUMERIC NOT NULL,     -- and their two values, USD per share
     pair_anchor_bear  NUMERIC NOT NULL,

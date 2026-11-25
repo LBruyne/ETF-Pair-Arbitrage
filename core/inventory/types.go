@@ -82,6 +82,7 @@ const (
 	EndSessionChanged = "session_changed" // it belonged to a Session that had ended
 	EndNoFill         = "no_fill"         // its only batch filled nothing
 	EndOneLeg         = "one_leg"         // its only batch filled one leg and was trimmed back
+	EndDustOnly       = "dust_only"       // built, no exit order: what was built (after any trims) was left as dust only
 	EndStoreError     = "store_error"     // its row could not be confirmed written, so it never traded
 )
 
