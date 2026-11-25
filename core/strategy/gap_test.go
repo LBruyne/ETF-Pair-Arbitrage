@@ -362,3 +362,20 @@ func TestEvaluateGap_BuyCompletionQuotaPrice(t *testing.T) {
 	wantDec(t, "quota price", got.QuotaPrice, "11")
 	wantDec(t, "reserved", got.Qty.Mul(got.QuotaPrice), "199.98")
 }
+
+// A five-price book covers little: a completion needs the visible levels to
+// hold its whole quantity. The bear bids 59.418 down to 59.414 hold 8 shares
+// of the 10.20 missing, so there is no completion and the gap is trimmed.
+// With 10.20 visible the completion is priced at the level that fills it.
+func TestEvaluateGap_FiveLevelBook(t *testing.T) {
+	in := gapInput()
+	in.Books[cex.Bear] = book(lv("59.418x2", "59.417x2", "59.416x2", "59.415x1", "59.414x1"), lv("59.43x200"))
+	checkAction(t, newStrategy(t, nil).EvaluateGap(in),
+		wantAction{kind: GapTrim, leg: cex.Bull, side: cex.SideBuy, price: "40.52", qty: "15.30"})
+
+	// 2 + 2 + 2 + 2 + 2.2 = 10.2: limit 59.414, worth 606.0428 against the
+	// plan's 606.084, a loss of 0.0412; the trim would lose 0.539464995.
+	in.Books[cex.Bear] = book(lv("59.418x2", "59.417x2", "59.416x2", "59.415x2", "59.414x2.2"), lv("59.43x200"))
+	checkAction(t, newStrategy(t, nil).EvaluateGap(in),
+		wantAction{GapComplete, cex.Bear, cex.SideSell, "59.414", "10.20", "0.0412", "0.539464995"})
+}

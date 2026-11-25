@@ -1,40 +1,11 @@
 package strategy
 
 import (
+	"strings"
 	"testing"
 
 	"etf-pair-arbitrage/core/cex"
 )
-
-// V2: asks round up to their bucket and bids round down, quantities in one
-// bucket add up, and a bucket below the minimum is skipped without lending
-// its quantity to the next.
-func TestEffectiveLevels(t *testing.T) {
-	tests := []struct {
-		name   string
-		raw    []cex.BookLevel
-		asks   bool
-		minQty string
-		want   []cex.BookLevel
-	}{
-		{"asks round up and one bucket adds up (PRD 3.2)", lv("72.003x1", "72.005x5"), true, "1", lv("72.01x6")},
-		{"a dust best bid is skipped (PRD 3.2)", lv("40.45x0.4", "40.44x500"), false, "1", lv("40.44x500")},
-		{"bids round down (appendix A example 1)", lv("59.437x0.4", "59.431x60", "59.425x80", "59.418x200"), false, "1",
-			lv("59.43x60.4", "59.42x80", "59.41x200")},
-		{"asks of appendix A example 2", lv("59.385x100", "59.396x100"), true, "1", lv("59.39x100", "59.40x100")},
-		{"a price on the bucket's edge stays in it", lv("72.01x2", "72.011x3"), true, "1", lv("72.01x2", "72.02x3")},
-		{"a bid on the bucket's edge stays in it", lv("59.43x2", "59.429x3"), false, "1", lv("59.43x2", "59.42x3")},
-		{"a bucket of exactly the minimum counts", lv("72.003x0.4", "72.005x0.6", "72.012x0.99"), true, "1", lv("72.01x1")},
-		{"dust is not carried into the next bucket", lv("72.001x0.6", "72.012x0.6", "72.03x4"), true, "1", lv("72.03x4")},
-		{"the minimum is configurable", lv("72.001x0.6", "72.012x0.6"), true, "0.5", lv("72.01x0.6", "72.02x0.6")},
-		{"an empty side", nil, true, "1", nil},
-	}
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			wantLevels(t, "levels", EffectiveLevels(tc.raw, tc.asks, dec("0.01"), dec(tc.minQty)), tc.want)
-		})
-	}
-}
 
 // A completion is capped by quantity x the limit it would be sent with, on
 // the raw book.
@@ -144,4 +115,96 @@ func TestThroughBest(t *testing.T) {
 	newer := book(lv("40.45x300"), lv("40.47x300"))
 	newer.BestAsk = lv("40.50x10")[0]
 	wantDec(t, "limit from the newer best price", throughBest(newer, Long, 10, dec("0.01")), "40.55") // 40.50 x 1.001 = 40.5405
+}
+
+// PRD 3.2: a leg's pricing level is its pricing_level-th level of the side
+// the order takes, as the book holds it: bull 2, bear 5. Its price is that
+// level's, at the leg's own tick, and its quantity is levels 1 to N
+// together; levels beyond N are not counted, and a side with fewer than N
+// levels has none. A level counts whatever its size.
+func TestPricingLevel(t *testing.T) {
+	tests := []struct {
+		name      string
+		leg       cex.Leg
+		dir       Direction // Short takes the bids, Long the asks
+		levels    []cex.BookLevel
+		edit      func(*Config)
+		wantPrice string // "" when there is no pricing level
+		wantQty   string
+	}{
+		// The bear leg: the fifth price at 0.001, nothing rounded.
+		{name: "bear bids across several 0.01 steps: the fifth", leg: cex.Bear, dir: Short,
+			levels: lv("59.452x10", "59.441x20", "59.438x30", "59.431x5", "59.427x40"), wantPrice: "59.427", wantQty: "105"},
+		{name: "bear bids inside one 0.01 step: the fifth", leg: cex.Bear, dir: Short,
+			levels: lv("59.438x40", "59.437x30", "59.436x50", "59.435x20", "59.434x60"), wantPrice: "59.434", wantQty: "200"},
+		{name: "bear bids of appendix A example 1", leg: cex.Bear, dir: Short,
+			levels: lv("59.437x0.4", "59.431x60", "59.428x30", "59.425x30", "59.420x20"), wantPrice: "59.42", wantQty: "140.4"},
+		{name: "bear asks across several 0.01 steps: the fifth", leg: cex.Bear, dir: Long,
+			levels: lv("59.418x10", "59.429x20", "59.432x30", "59.439x5", "59.443x40"), wantPrice: "59.443", wantQty: "105"},
+		{name: "bear asks of appendix A example 2", leg: cex.Bear, dir: Long,
+			levels: lv("59.385x100", "59.391x40", "59.394x30", "59.396x20", "59.400x10"), wantPrice: "59.40", wantQty: "200"},
+		{name: "bear bids, a tiny best level is a level", leg: cex.Bear, dir: Short,
+			levels: lv("59.441x0.4", "59.438x40", "59.437x30", "59.436x50", "59.435x20"), wantPrice: "59.435", wantQty: "140.4"},
+		{name: "bear bids, a sixth level is not counted", leg: cex.Bear, dir: Short,
+			levels: lv("59.452x10", "59.441x20", "59.438x30", "59.431x5", "59.427x40", "59.42x500"), wantPrice: "59.427", wantQty: "105"},
+		{name: "bear bids, four levels: none", leg: cex.Bear, dir: Short, levels: lv("59.452x10", "59.441x20", "59.438x30", "59.431x5")},
+		{name: "bear asks, four levels: none", leg: cex.Bear, dir: Long, levels: lv("59.418x10", "59.429x20", "59.432x30", "59.439x5")},
+		{name: "bear, an empty side: none", leg: cex.Bear, dir: Long},
+
+		// The bull leg: the second price, with the first one's quantity.
+		{name: "bull bids: the second level, the first counted", leg: cex.Bull, dir: Short,
+			levels: lv("40.45x300", "40.44x500"), wantPrice: "40.44", wantQty: "800"},
+		{name: "bull bids, five levels: the first two only", leg: cex.Bull, dir: Short,
+			levels: lv("40.45x300", "40.44x500", "40.43x100", "40.42x100", "40.41x100"), wantPrice: "40.44", wantQty: "800"},
+		{name: "bull bids, a tiny best level is a level", leg: cex.Bull, dir: Short,
+			levels: lv("40.45x0.4", "40.44x500", "40.43x300"), wantPrice: "40.44", wantQty: "500.4"},
+		{name: "bull asks, a tiny best level is a level", leg: cex.Bull, dir: Long,
+			levels: lv("40.46x0.4", "40.47x500", "40.48x100"), wantPrice: "40.47", wantQty: "500.4"},
+		{name: "bull bids, one level: none", leg: cex.Bull, dir: Short, levels: lv("40.45x300")},
+		{name: "bull asks, one level: none", leg: cex.Bull, dir: Long, levels: lv("40.46x300")},
+
+		// The level number is a parameter of each leg.
+		{name: "bull at level 1: the best alone", leg: cex.Bull, dir: Short, edit: func(c *Config) { c.PricingLevel.Bull = 1 },
+			levels: lv("40.45x300", "40.44x500"), wantPrice: "40.45", wantQty: "300"},
+		{name: "bear at level 3", leg: cex.Bear, dir: Short, edit: func(c *Config) { c.PricingLevel.Bear = 3 },
+			levels: lv("59.452x10", "59.441x20", "59.438x30", "59.431x5", "59.427x40"), wantPrice: "59.438", wantQty: "60"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			b := book(tc.levels, nil)
+			if tc.dir == Long {
+				b = book(nil, tc.levels)
+			}
+			level, ok := newStrategy(t, tc.edit).pricingLevel(b, tc.leg, tc.dir)
+			if ok != (tc.wantPrice != "") {
+				t.Fatalf("pricing level %v, ok %t; want ok %t", level, ok, tc.wantPrice != "")
+			}
+			if ok {
+				wantDec(t, "price", level.Price, tc.wantPrice)
+				wantDec(t, "quantity counted", level.Qty, tc.wantQty)
+			}
+		})
+	}
+}
+
+// pricing_level is 1 to 5 on each leg (both legs subscribe books5); the
+// default is bull 2, bear 5.
+func TestConfigPricingLevel(t *testing.T) {
+	for _, bad := range []LegLevels{{Bull: 0, Bear: 5}, {Bull: 2, Bear: 6}, {Bull: -1, Bear: 5}, {}} {
+		cfg := newStrategy(t, nil).cfg
+		cfg.PricingLevel = bad
+		if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "strategy.pricing_level.") {
+			t.Errorf("pricing_level %+v: Validate = %v, want it refused", bad, err)
+		}
+	}
+	for _, good := range []LegLevels{{Bull: 1, Bear: 1}, {Bull: 5, Bear: 5}} {
+		cfg := newStrategy(t, nil).cfg
+		cfg.PricingLevel = good
+		if err := cfg.Validate(); err != nil {
+			t.Errorf("pricing_level %+v: Validate = %v, want it accepted", good, err)
+		}
+	}
+	if got := DefaultConfig.PricingLevel; got != (LegLevels{Bull: 2, Bear: 5}) {
+		t.Errorf("default pricing_level = %+v, want bull 2, bear 5", got)
+	}
 }

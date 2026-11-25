@@ -13,9 +13,9 @@ import (
 // The exit line sits on the entry's axis: a short opened at +d_in x sigma
 // closes when x <= d_out x sigma, a long opened at -d_in x sigma closes when
 // x >= -d_out x sigma, so a negative d_out is past the mean. x is taken at
-// the second effective level of the side the exit takes. There is one line
-// for all positions, from the current mean and sigma, and no fee or entry
-// price in the test: it exits at a loss too.
+// the two legs' pricing levels on the side the exit takes (pricingLevel).
+// There is one line for all positions, from the current mean and sigma, and
+// no fee or entry price in the test: it exits at a loss too.
 //
 // Numbers that cannot be compared never yield a plan: an anchor that is not
 // positive is ReasonNoAnchor, an F that is not a positive finite number
@@ -45,11 +45,11 @@ func (s *Strategy) EvaluateExit(in ExitInput) (*ExitPlan, Reason) {
 	}
 
 	closing := in.Direction.Opposite() // a short cycle buys back: it takes the asks
-	levels := s.takerLevels(in.Books, closing)
-	if len(levels[cex.Bull]) < 2 || len(levels[cex.Bear]) < 2 {
+	levels, ok := s.pricingLevels(in.Books, closing)
+	if !ok {
 		return nil, ReasonNoLevels
 	}
-	price := [2]decimal.Decimal{levels[cex.Bull][1].Price, levels[cex.Bear][1].Price}
+	price := [2]decimal.Decimal{levels[cex.Bull].Price, levels[cex.Bear].Price}
 	x := Spread(in.F, price[cex.Bull].InexactFloat64(), in.Anchors.Bull.InexactFloat64(),
 		price[cex.Bear].InexactFloat64(), in.Anchors.Bear.InexactFloat64()) - mu
 	if (in.Direction == Short && x > s.cfg.DOut*sigma) || (in.Direction == Long && x < -s.cfg.DOut*sigma) {
@@ -63,19 +63,19 @@ func (s *Strategy) EvaluateExit(in ExitInput) (*ExitPlan, Reason) {
 	return &ExitPlan{Side: closing.Side(), Price: price, Qty: qty, X: x, Mu: mu, Sigma: sigma}, ""
 }
 
-// exitSize sizes one pair of exit orders. When take_ratio of the first two
-// effective levels covers what is left on both legs, both legs close all of
-// it. Otherwise the batch is sized like an entry: the smaller anchored
+// exitSize sizes one pair of exit orders. When take_ratio of the quantity
+// the pricing levels carry covers what is left on both legs, both legs close
+// all of it. Otherwise the batch is sized like an entry: the smaller anchored
 // amount of the two legs' books, not above what is held. A leg whose order
 // the venue would not take (below its minimum quantity or minimum value)
 // gets none: its quantity is zero. ok is false when neither leg has an
 // order. A remainder too small to send is left where it is: it is dust when
 // the cycle closes (PRD 8.1).
-func (s *Strategy) exitSize(levels [2][]cex.BookLevel, price [2]decimal.Decimal, in ExitInput) (qty [2]decimal.Decimal, ok bool) {
+func (s *Strategy) exitSize(levels [2]cex.BookLevel, price [2]decimal.Decimal, in ExitInput) (qty [2]decimal.Decimal, ok bool) {
 	anchor := [2]decimal.Decimal{in.PairAnchors.Bull, in.PairAnchors.Bear}
 	var offered [2]decimal.Decimal // quantity each leg's book offers
 	for l := range offered {
-		offered[l] = levels[l][0].Qty.Add(levels[l][1].Qty).Mul(s.cfg.TakeRatio)
+		offered[l] = levels[l].Qty.Mul(s.cfg.TakeRatio)
 	}
 	qty = in.Hold
 	if offered[cex.Bull].LessThan(in.Hold[cex.Bull]) || offered[cex.Bear].LessThan(in.Hold[cex.Bear]) {

@@ -1,4 +1,4 @@
-// Package strategy is the pure computation of the pair strategy: effective
+// Package strategy is the pure computation of the pair strategy: the pricing
 // levels, the spread, the mean and sigma, the entry and exit decisions, and
 // what to do when the two legs fill unevenly. It reads no clock, holds no
 // state, opens no connection and writes no log; its inputs and outputs are
@@ -31,9 +31,10 @@ type Config struct {
 	TakerFeeBps float64 `yaml:"taker_fee_bps"` // the trading account's taker fee per leg, of the traded notional
 	CostMarginD float64 `yaml:"cost_margin_d"` // what an entry must clear on top of the round-trip fee, in spread units
 
-	LevelBucket decimal.Decimal `yaml:"level_bucket"`  // raw book levels fold into price buckets of this size, in USDT
-	LevelMinQty decimal.Decimal `yaml:"level_min_qty"` // a bucket holding fewer shares than this is skipped
-	TakeRatio   decimal.Decimal `yaml:"take_ratio"`    // the share of the first two effective levels one batch takes
+	PricingLevel LegLevels       `yaml:"pricing_level"` // per leg: the number of the raw level on the side to take a line order is priced on
+	TakeRatio    decimal.Decimal `yaml:"take_ratio"`    // the share of the quantity down to that level one batch takes
+	// MinBatchNotional is the least an entry batch may be worth, both legs together at their limit prices, in USDT.
+	MinBatchNotional decimal.Decimal `yaml:"min_batch_notional"`
 
 	EntrySpacing     time.Duration `yaml:"entry_spacing"`     // a same-side entry sooner than this after the last one needs EntryStepD more
 	EntryStepD       float64       `yaml:"entry_step_d"`      // that extra deviation, in spread units
@@ -51,15 +52,33 @@ type Config struct {
 var DefaultConfig = Config{
 	DOut:                  math.NaN(),
 	TakerFeeBps:           math.NaN(),
-	LevelBucket:           decimal.RequireFromString("0.01"),
-	LevelMinQty:           decimal.NewFromInt(1),
+	PricingLevel:          LegLevels{Bull: 2, Bear: 5},
 	TakeRatio:             decimal.RequireFromString("0.5"),
+	MinBatchNotional:      decimal.RequireFromString("100"),
 	EntrySpacing:          60 * time.Second,
 	EntryStepD:            1,
 	CompletionWindow:      5 * time.Second,
 	ForcedSlipBps:         10,
 	ForcedExitBeforeClose: time.Minute,
 }
+
+// LegLevels is a level number per leg, 1 for the best level.
+type LegLevels struct {
+	Bull int `yaml:"bull"`
+	Bear int `yaml:"bear"`
+}
+
+// of returns the level number of the given leg.
+func (l LegLevels) of(leg cex.Leg) int {
+	if leg == cex.Bull {
+		return l.Bull
+	}
+	return l.Bear
+}
+
+// maxPricingLevel is the deepest pricing level: both legs subscribe books5,
+// which carries five levels a side.
+const maxPricingLevel = 5
 
 // MeanModel names how the mean of the spread is taken.
 type MeanModel string
@@ -107,11 +126,13 @@ func (c Config) Validate() error {
 	if !(c.CostMarginD >= 0) {
 		errs = append(errs, fmt.Errorf("strategy.cost_margin_d must not be negative, got %v", c.CostMarginD))
 	}
-	if !c.LevelBucket.IsPositive() {
-		errs = append(errs, fmt.Errorf("strategy.level_bucket must be positive, got %s", c.LevelBucket))
+	for _, leg := range cex.Legs {
+		if n := c.PricingLevel.of(leg); n < 1 || n > maxPricingLevel {
+			errs = append(errs, fmt.Errorf("strategy.pricing_level.%s must be 1 to %d, got %d", leg, maxPricingLevel, n))
+		}
 	}
-	if c.LevelMinQty.IsNegative() {
-		errs = append(errs, fmt.Errorf("strategy.level_min_qty must not be negative, got %s", c.LevelMinQty))
+	if c.MinBatchNotional.IsNegative() {
+		errs = append(errs, fmt.Errorf("strategy.min_batch_notional must not be negative, got %s", c.MinBatchNotional))
 	}
 	if !c.TakeRatio.IsPositive() || c.TakeRatio.GreaterThan(decimal.NewFromInt(1)) {
 		errs = append(errs, fmt.Errorf("strategy.take_ratio must be above 0 and at most 1, got %s", c.TakeRatio))
@@ -199,7 +220,7 @@ const (
 	ReasonZeroSigma Reason = "zero_sigma" // sigma is zero: no line to compare with
 
 	// Step 5: the book.
-	ReasonNoLevels Reason = "no_levels" // a leg has fewer than two effective levels on the side to take
+	ReasonNoLevels Reason = "no_levels" // a leg has no pricing level: fewer raw levels on the side to take than its pricing_level
 
 	// Step 6: condition 1, the signal.
 	ReasonNoSignal         Reason = "no_signal"          // the deviation has not reached the line
@@ -213,7 +234,7 @@ const (
 
 	// Step 9: the size.
 	ReasonQuotaExhausted Reason = "quota_exhausted" // the quota left does not hold a sendable batch
-	ReasonTooSmall       Reason = "too_small"       // the book gives less than the venue's minimum order
+	ReasonTooSmall       Reason = "too_small"       // the book gives less than the venue's minimum order, or the batch less than min_batch_notional
 
 	// Exits and forced exits.
 	ReasonDepth      Reason = "depth"       // a leg's depth is not usable or in conflict: no exit at the line
@@ -273,7 +294,7 @@ type LastEntry struct {
 // EntryPlan is one entry batch: an IOC limit order per leg, sent together.
 type EntryPlan struct {
 	Direction    Direction
-	Price, Qty   [2]decimal.Decimal // per leg: the limit (the second effective level) and the size
+	Price, Qty   [2]decimal.Decimal // per leg: the limit (the price of the leg's pricing level) and the size
 	QuotaPrice   [2]decimal.Decimal // per leg: the price the order's notional counts against the quota at (see quotaPrice)
 	X, Mu, Sigma float64            // the executable deviation, the mean and sigma, in spread units under the current anchors
 	FeeD         float64            // the round-trip fee at these limit prices, in spread units
@@ -301,7 +322,7 @@ type ExitInput struct {
 // takes.
 type ExitPlan struct {
 	Side         cex.Side           // of both orders
-	Price, Qty   [2]decimal.Decimal // per leg: the limit (the second effective level) and the size
+	Price, Qty   [2]decimal.Decimal // per leg: the limit (the price of the leg's pricing level) and the size
 	X, Mu, Sigma float64            // the executable deviation, the mean and sigma, in spread units under the current anchors
 }
 
@@ -320,7 +341,7 @@ type GapInput struct {
 	Direction   Direction          // of the cycle
 	Hold        [2]decimal.Decimal // the cycle's quantity per leg, from the ledger synced with the order snapshot
 	PairAnchors cex.Anchors        // the cycle's pairing anchors
-	Books       [2]*cex.Book       // read as raw levels, not effective levels
+	Books       [2]*cex.Book       // read level by level, as received
 	HasPrice    [2]bool            // per leg: a best price recent enough to price a reducing order
 	DepthOK     [2]bool            // per leg: the depth is usable and agrees with the best price (no conflict); otherwise only the best price is read
 	Rules       [2]cex.MarketRule

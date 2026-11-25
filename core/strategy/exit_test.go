@@ -10,15 +10,15 @@ import (
 )
 
 // exitInput is appendix A example 2: a short cycle of 165.30 / 110.20 shares
-// and asks whose second effective levels are 40.38 / 59.40, offering 350 /
-// 100 shares.
+// and asks whose pricing levels, the second bull ask and the fifth bear ask,
+// are 40.38 / 59.40, offering 350 / 100 shares.
 func exitInput() ExitInput {
 	return ExitInput{
 		Direction: Short,
 		Hold:      [2]decimal.Decimal{dec("165.30"), dec("110.20")},
 		Books: [2]*cex.Book{
 			book(lv("40.36x300", "40.35x400"), lv("40.37x300", "40.38x400")),
-			book(lv("59.37x100", "59.36x100"), lv("59.385x100", "59.396x100")),
+			book(lv("59.37x100", "59.36x100"), lv("59.385x100", "59.391x40", "59.394x30", "59.396x20", "59.400x10")),
 		},
 		DepthOK:     [2]bool{true, true},
 		Rules:       testRules,
@@ -41,7 +41,7 @@ func TestEvaluateExit_AppendixExample2(t *testing.T) {
 		t.Errorf("reason %q, side %s; want a buy", reason, plan.Side)
 	}
 	wantDec(t, "bull limit", plan.Price[cex.Bull], "40.38")
-	wantDec(t, "bear limit", plan.Price[cex.Bear], "59.40") // 59.396 rounds up to its bucket
+	wantDec(t, "bear limit", plan.Price[cex.Bear], "59.40") // the fifth ask
 	wantFloat(t, "x", plan.X, -25.0/3)                      // -5 - 3.3333 = -8.3333, past the line at -2
 	wantFloat(t, "mu", plan.Mu, 10.0/3)
 	wantFloat(t, "sigma", plan.Sigma, 4)
@@ -55,13 +55,16 @@ func TestEvaluateExit_AppendixExample2(t *testing.T) {
 // short exits at x <= -2 and a long at x >= +2: half a sigma past the mean.
 // d_out = +0.5 puts the line half a sigma before the mean.
 func TestEvaluateExit_Line(t *testing.T) {
-	// The second effective level of the side the exit takes, per leg; the
-	// levels are deep enough to take a small position whole.
+	// The pricing level of the side the exit takes, per leg: the second
+	// bull level and the fifth bear level. The levels are deep enough to
+	// take a small position whole.
 	asks := func(bull, bear string) [2]*cex.Book {
-		return [2]*cex.Book{book(nil, lv("40.00x900", bull+"x900")), book(nil, lv("59.00x900", bear+"x900"))}
+		return [2]*cex.Book{book(nil, lv("40.00x900", bull+"x900")),
+			book(nil, lv("59.001x900", "59.002x900", "59.003x900", "59.004x900", bear+"x900"))}
 	}
 	bids := func(bull, bear string) [2]*cex.Book {
-		return [2]*cex.Book{book(lv("41.00x900", bull+"x900"), nil), book(lv("60.00x900", bear+"x900"), nil)}
+		return [2]*cex.Book{book(lv("41.00x900", bull+"x900"), nil),
+			book(lv("60.004x900", "60.003x900", "60.002x900", "60.001x900", bear+"x900"), nil)}
 	}
 	tests := []struct {
 		name     string
@@ -119,7 +122,7 @@ func TestEvaluateExit_Line(t *testing.T) {
 func TestEvaluateExit_AtALoss(t *testing.T) {
 	in := exitInput()
 	in.Hold = [2]decimal.Decimal{dec("105.30"), dec("70.20")}
-	in.Books = [2]*cex.Book{book(nil, lv("40.59x900", "40.60x900")), book(nil, lv("59.59x900", "59.60x900"))}
+	in.Books = [2]*cex.Book{book(nil, lv("40.59x900", "40.60x900")), book(nil, lv("59.59x900", "59.592x900", "59.595x900", "59.598x900", "59.60x900"))}
 	in.Stats = Stats{Ready: true, MeanBullUSD: 40.70, MeanBearUSD: 59.60, Window: [][2]float64{{40.684, 59.60}, {40.716, 59.60}}}
 	plan, reason := newStrategy(t, func(c *Config) { c.TakerFeeBps = 50 }).EvaluateExit(in)
 	if plan == nil {
@@ -193,7 +196,7 @@ func TestEvaluateExit_Size(t *testing.T) {
 }
 
 // V10 and PRD 9.7: no exit at the line on a book that is not usable, without
-// two effective levels, or without statistics that were ever ready.
+// a pricing level on both legs, or without statistics that were ever ready.
 func TestEvaluateExit_NotJudged(t *testing.T) {
 	tests := []struct {
 		name string
@@ -205,8 +208,11 @@ func TestEvaluateExit_NotJudged(t *testing.T) {
 		{"statistics never ready", func(in *ExitInput) { in.Stats = Stats{} }, ReasonWarmup},
 		{"statistics not ready, though at the line", func(in *ExitInput) { in.Stats.Ready = false }, ReasonWarmup},
 		{"depth is checked before the statistics", func(in *ExitInput) { in.DepthOK[cex.Bear], in.Stats = false, Stats{} }, ReasonDepth},
-		{"one effective ask level on the bear leg", func(in *ExitInput) { in.Books[cex.Bear] = book(nil, lv("59.385x100", "59.386x100")) }, ReasonNoLevels},
-		{"the second ask level is dust", func(in *ExitInput) { in.Books[cex.Bull] = book(nil, lv("40.37x300", "40.38x0.5")) }, ReasonNoLevels},
+		{"four ask levels on the bear leg", func(in *ExitInput) {
+			in.Books[cex.Bear] = book(nil, lv("59.385x100", "59.391x40", "59.394x30", "59.396x20"))
+		}, ReasonNoLevels},
+		{"no asks on the bear leg", func(in *ExitInput) { in.Books[cex.Bear] = book(lv("59.37x100"), nil) }, ReasonNoLevels},
+		{"one ask level on the bull leg", func(in *ExitInput) { in.Books[cex.Bull] = book(nil, lv("40.37x300")) }, ReasonNoLevels},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -293,7 +299,7 @@ func TestEvaluateExit_InvalidNumbers(t *testing.T) {
 		{"F is negative", func(in *ExitInput) { in.F = -0.5 }, ReasonFXStale},
 		{"a mean that is not a number", func(in *ExitInput) { in.Stats.MeanBearUSD = math.NaN() }, ReasonWarmup},
 	}
-	farFromTheLine := [2]*cex.Book{book(nil, lv("40.50x300", "40.51x400")), book(nil, lv("59.50x100", "59.51x100"))}
+	farFromTheLine := [2]*cex.Book{book(nil, lv("40.50x300", "40.51x400")), book(nil, lv("59.50x100", "59.502x20", "59.505x20", "59.508x20", "59.51x100"))}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			for _, books := range [][2]*cex.Book{exitInput().Books, farFromTheLine} {
@@ -326,10 +332,10 @@ func TestEvaluateExit_OnTheLine(t *testing.T) {
 	s := newStrategy(t, nil)
 	short := exitInput()
 	short.Stats = statsAt(10)
-	short.Books = [2]*cex.Book{book(nil, lv("40.37x300", "40.38x400")), book(nil, lv("59.41x100", "59.42x100"))}
+	short.Books = [2]*cex.Book{book(nil, lv("40.37x300", "40.38x400")), book(nil, lv("59.41x100", "59.412x20", "59.415x20", "59.418x20", "59.42x100"))}
 	long := short
 	long.Direction = Long
-	long.Books = [2]*cex.Book{book(lv("40.43x300", "40.42x400"), nil), book(lv("59.43x100", "59.42x100"), nil)}
+	long.Books = [2]*cex.Book{book(lv("40.43x300", "40.42x400"), nil), book(lv("59.43x100", "59.428x20", "59.425x20", "59.422x20", "59.42x100"), nil)}
 	mu, half := short.Stats.Mu(testAnchors), -s.cfg.DOut*short.Stats.Sigma(testAnchors)
 
 	xShort := Spread(1, 40.38, 40, 59.42, 60) - mu
@@ -356,4 +362,49 @@ func TestEvaluateExit_OnTheLine(t *testing.T) {
 	if plan, reason := s.EvaluateExit(long); plan != nil || reason != ReasonNoSignal {
 		t.Errorf("long one tick inside the line: plan %+v, reason %q; want no_signal", plan, reason)
 	}
+}
+
+// PRD 3.2, 9.5: an exit on the levels as the book holds them. Example 2's
+// short buys back at the asks. Bull asks 40.37 x 0.4, 40.38 x 400, 40.39 x
+// 300: the tiny best ask is the first level, so the limit is 40.38 with 400.4
+// counted, 200.2 offered. Bear asks 59.381 x 40, 59.388 x 30, 59.392 x 50,
+// 59.397 x 20, 59.404 x 60 span three 0.01 steps: the limit is the fifth
+// price itself, 59.404, with 200 counted, 100 offered.
+//
+//	x = 10000 x (40.38/40 + 59.404/60 - 2) - 3.3333 = -4.3333 - 3.3333 = -7.6667, past the line at -2
+//	K = min(200.2 x 40, 100 x 60, 165.30 x 40, 110.20 x 60) = 6,000: 150 bull, 100 bear
+func TestEvaluateExit_RawLevels(t *testing.T) {
+	in := exitInput()
+	in.Books[cex.Bull] = book(in.Books[cex.Bull].Bids, lv("40.37x0.4", "40.38x400", "40.39x300"))
+	in.Books[cex.Bear] = book(in.Books[cex.Bear].Bids, lv("59.381x40", "59.388x30", "59.392x50", "59.397x20", "59.404x60"))
+	plan, reason := newStrategy(t, nil).EvaluateExit(in)
+	if plan == nil {
+		t.Fatalf("no plan: %s", reason)
+	}
+	wantDec(t, "bull limit", plan.Price[cex.Bull], "40.38")
+	wantDec(t, "bear limit", plan.Price[cex.Bear], "59.404")
+	wantDec(t, "bull quantity", plan.Qty[cex.Bull], "150")
+	wantDec(t, "bear quantity", plan.Qty[cex.Bear], "100")
+	wantFloat(t, "x", plan.X, -23.0/3)
+
+	// The five bear asks inside one 0.01 step, 59.391 up to 59.399: the
+	// limit is 59.399, not a rounded 59.40, and
+	// x = 10000 x (40.38/40 + 59.399/60 - 2) - 3.3333 = -5.1667 - 3.3333 = -8.5.
+	in.Books[cex.Bear] = book(in.Books[cex.Bear].Bids, lv("59.391x40", "59.393x30", "59.395x50", "59.397x20", "59.399x60"))
+	plan, reason = newStrategy(t, nil).EvaluateExit(in)
+	if plan == nil {
+		t.Fatalf("one step: no plan: %s", reason)
+	}
+	wantDec(t, "one step: bear limit", plan.Price[cex.Bear], "59.399")
+	wantFloat(t, "one step: x", plan.X, -8.5)
+
+	// The book takes everything that is left when it offers enough: 100
+	// offered on the bear leg cover a holding of 70.20.
+	in.Hold = [2]decimal.Decimal{dec("105.30"), dec("70.20")}
+	plan, reason = newStrategy(t, nil).EvaluateExit(in)
+	if plan == nil {
+		t.Fatalf("everything: no plan: %s", reason)
+	}
+	wantDec(t, "everything: bull quantity", plan.Qty[cex.Bull], "105.30")
+	wantDec(t, "everything: bear quantity", plan.Qty[cex.Bear], "70.20")
 }

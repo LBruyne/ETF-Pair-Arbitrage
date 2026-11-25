@@ -11,9 +11,9 @@ import (
 // Reason constants: an earlier failing check hides the later ones.
 //
 // The signal (condition 1) compares the executable deviation x with the
-// entry line and has no fee in it: x is the spread at the second effective
-// level of the side to take, minus the mean. The fee enters only the cost
-// cover (condition 2).
+// entry line and has no fee in it: x is the spread at the two legs' pricing
+// levels on the side to take (pricingLevel), minus the mean. The fee enters
+// only the cost cover (condition 2).
 //
 // Numbers that cannot be compared never yield a plan, whatever the caller
 // gathered in Blocked: an anchor that is not positive is ReasonNoAnchor, an
@@ -53,12 +53,12 @@ func (s *Strategy) EvaluateEntry(in EntryInput) (*EntryPlan, Reason) {
 	aBull, aBear := in.Anchors.Bull.InexactFloat64(), in.Anchors.Bear.InexactFloat64()
 	reason := ReasonNoLevels
 	for _, dir := range []Direction{Long, Short} {
-		// Step 5: two effective levels on the side to take, on both legs.
-		levels := s.takerLevels(in.Books, dir)
-		if len(levels[cex.Bull]) < 2 || len(levels[cex.Bear]) < 2 {
+		// Step 5: a pricing level on the side to take, on both legs.
+		levels, ok := s.pricingLevels(in.Books, dir)
+		if !ok {
 			continue
 		}
-		price := [2]decimal.Decimal{levels[cex.Bull][1].Price, levels[cex.Bear][1].Price}
+		price := [2]decimal.Decimal{levels[cex.Bull].Price, levels[cex.Bear].Price}
 		pBull, pBear := price[cex.Bull].InexactFloat64(), price[cex.Bear].InexactFloat64()
 
 		// Step 6: condition 1. A long needs x <= -d_in x sigma, a short
@@ -94,7 +94,14 @@ func (s *Strategy) EvaluateEntry(in EntryInput) (*EntryPlan, Reason) {
 			}
 			return nil, ReasonTooSmall
 		}
+		// Both legs together must reach the minimum batch (owner item 59).
 		notional := qty[cex.Bull].Mul(price[cex.Bull]).Add(qty[cex.Bear].Mul(price[cex.Bear]))
+		if notional.LessThan(s.cfg.MinBatchNotional) {
+			if quotaBound {
+				return nil, ReasonQuotaExhausted
+			}
+			return nil, ReasonTooSmall
+		}
 		return &EntryPlan{
 			Direction:  dir,
 			Price:      price,
@@ -130,19 +137,19 @@ func (s *Strategy) spacingOK(in EntryInput, dir Direction, x float64) bool {
 	return x >= in.Last.E+s.cfg.EntryStepD
 }
 
-// entrySize sizes one batch. Each leg offers take_ratio of its first two
-// effective levels; that is turned into an anchored amount (quantity x
+// entrySize sizes one batch. Each leg offers take_ratio of the quantity its
+// pricing level carries; that is turned into an anchored amount (quantity x
 // pairing anchor) and the smaller of the two legs is K, the anchored amount
 // of both. K is capped so that the two orders' notional at their quota
 // prices (the limits of a buy, the raw best bids of a sell) stays within the
 // quota left. Each leg's quantity is K / its pairing
 // anchor, rounded down to the quantity step, so the two legs carry about the
 // same anchored amount. quotaBound says that the quota, not the book, set K.
-func (s *Strategy) entrySize(levels [2][]cex.BookLevel, quotaAt [2]decimal.Decimal, in EntryInput) (qty [2]decimal.Decimal, k decimal.Decimal, quotaBound bool) {
+func (s *Strategy) entrySize(levels [2]cex.BookLevel, quotaAt [2]decimal.Decimal, in EntryInput) (qty [2]decimal.Decimal, k decimal.Decimal, quotaBound bool) {
 	anchor := [2]decimal.Decimal{in.PairAnchors.Bull, in.PairAnchors.Bear}
 	var offered [2]decimal.Decimal // anchored amount each leg's book offers, in USD
 	for l := range offered {
-		offered[l] = levels[l][0].Qty.Add(levels[l][1].Qty).Mul(s.cfg.TakeRatio).Mul(anchor[l])
+		offered[l] = levels[l].Qty.Mul(s.cfg.TakeRatio).Mul(anchor[l])
 	}
 	k = decimal.Min(offered[cex.Bull], offered[cex.Bear])
 

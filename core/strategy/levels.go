@@ -6,45 +6,36 @@ import (
 	"etf-pair-arbitrage/core/cex"
 )
 
-// --- effective levels ---
+// --- pricing level ---
 
-// EffectiveLevels folds raw levels (best first) into price buckets of size
-// bucket and keeps the buckets that hold at least minQty. Asks round up to
-// their bucket and bids round down, so a bucket's price is never better than
-// the levels in it. A bucket below minQty is dust: it is skipped and its
-// quantity is not added to the next one.
-func EffectiveLevels(raw []cex.BookLevel, asks bool, bucket, minQty decimal.Decimal) []cex.BookLevel {
-	var folded []cex.BookLevel
-	for _, lv := range raw {
-		p := lv.Price.Div(bucket)
-		if asks {
-			p = p.Ceil()
-		} else {
-			p = p.Floor()
-		}
-		p = p.Mul(bucket)
-		if n := len(folded); n > 0 && folded[n-1].Price.Equal(p) {
-			folded[n-1].Qty = folded[n-1].Qty.Add(lv.Qty)
-			continue
-		}
-		folded = append(folded, cex.BookLevel{Price: p, Qty: lv.Qty})
+// pricingLevel is the level one leg's line order is priced and sized on
+// (PRD 3.2): the n-th raw level, n the leg's pricing_level, of the side an
+// order in direction dir takes (the asks when it buys, the bids when it
+// sells), as the book holds it. Its price is that level's, the order's limit
+// and the leg's price in the spread; its quantity is the sum of levels 1 to
+// n, all of which the limit reaches. ok is false when the side holds fewer
+// than n levels.
+func (s *Strategy) pricingLevel(b *cex.Book, leg cex.Leg, dir Direction) (level cex.BookLevel, ok bool) {
+	n, levels := s.cfg.PricingLevel.of(leg), takerSide(b, dir)
+	if len(levels) < n {
+		return cex.BookLevel{}, false
 	}
-	out := folded[:0]
-	for _, lv := range folded {
-		if lv.Qty.GreaterThanOrEqual(minQty) {
-			out = append(out, lv)
-		}
+	level.Price = levels[n-1].Price
+	for _, l := range levels[:n] {
+		level.Qty = level.Qty.Add(l.Qty)
 	}
-	return out
+	return level, true
 }
 
-// takerLevels returns both legs' effective levels on the side a batch in
-// direction dir takes: the asks when it buys, the bids when it sells.
-func (s *Strategy) takerLevels(books [2]*cex.Book, dir Direction) (levels [2][]cex.BookLevel) {
-	for l, b := range books {
-		levels[l] = EffectiveLevels(takerSide(b, dir), dir == Long, s.cfg.LevelBucket, s.cfg.LevelMinQty)
+// pricingLevels returns both legs' pricing levels; ok is false when either
+// leg has none.
+func (s *Strategy) pricingLevels(books [2]*cex.Book, dir Direction) (levels [2]cex.BookLevel, ok bool) {
+	for _, leg := range cex.Legs {
+		if levels[leg], ok = s.pricingLevel(books[leg], leg, dir); !ok {
+			return levels, false
+		}
 	}
-	return levels
+	return levels, true
 }
 
 // --- raw book ---
