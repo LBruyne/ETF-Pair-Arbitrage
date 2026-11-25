@@ -14,6 +14,9 @@ dsn_env: ETFPAIR_BOARD_DSN
 # Each ETF's bell anchor is USD per USDT times Binance's index price of its
 # contract at the close (Bitget's for a session before Binance lists the
 # contract), so every combo needs a binance market.
+# Each market's bull_tick and bear_tick are the legs' price ticks on the venue (its instrument list: Binance
+# exchangeInfo PRICE_FILTER tickSize, Bitget's contract price step; the recorder logs them at start). They set
+# the board's pricing levels: 2 at 0.01, 5 at 0.001 (Bitget SOXS), the trading program's rule (PRD 3.2).
 combos:
   - id: SOXL-SOXS
     title: "SOXL / SOXS"
@@ -22,8 +25,8 @@ combos:
     ref_ticker: SOXX
     nav_source: direxion       # the issuer's NAVs, read through its website's data API, replace the bell anchors once stable
     markets:
-      - { venue: binance, bull_symbol: SOXLUSDT, bear_symbol: SOXSUSDT, ref_symbol: SOXXUSDT }
-      - { venue: bitget,  bull_symbol: SOXLUSDT, bear_symbol: SOXSUSDT, ref_symbol: SOXXUSDT }
+      - { venue: binance, bull_symbol: SOXLUSDT, bear_symbol: SOXSUSDT, ref_symbol: SOXXUSDT, bull_tick: 0.01, bear_tick: 0.01 }
+      - { venue: bitget,  bull_symbol: SOXLUSDT, bear_symbol: SOXSUSDT, ref_symbol: SOXXUSDT, bull_tick: 0.01, bear_tick: 0.001 }
   - id: TQQQ-SQQQ
     title: "TQQQ / SQQQ"
     bull_ticker: TQQQ
@@ -31,8 +34,8 @@ combos:
     ref_ticker: QQQ
     nav_source: proshares      # the product page's NAV (and the issuer's NAV files for past days) replaces the bell anchors once stable
     markets:
-      - { venue: binance, bull_symbol: TQQQUSDT, bear_symbol: SQQQUSDT, ref_symbol: QQQUSDT }
-      - { venue: bitget,  bull_symbol: TQQQUSDT, bear_symbol: SQQQUSDT, ref_symbol: QQQUSDT }
+      - { venue: binance, bull_symbol: TQQQUSDT, bear_symbol: SQQQUSDT, ref_symbol: QQQUSDT, bull_tick: 0.01, bear_tick: 0.01 }
+      - { venue: bitget,  bull_symbol: TQQQUSDT, bear_symbol: SQQQUSDT, ref_symbol: QQQUSDT, bull_tick: 0.01, bear_tick: 0.01 }
 
 # Fee levels of each venue, in bps of notional (negative maker = rebate), for
 # the board's Fee Levels table. source says where each rate comes from; a

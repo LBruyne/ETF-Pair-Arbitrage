@@ -40,9 +40,11 @@ func (s *store) seed(ctx context.Context, cfg Config) error {
 			ON CONFLICT (combo_id) DO UPDATE SET title = EXCLUDED.title, bull_ticker = EXCLUDED.bull_ticker, bear_ticker = EXCLUDED.bear_ticker,
 			ref_ticker = EXCLUDED.ref_ticker`, c.ID, c.Title, c.BullTicker, c.BearTicker, c.RefTicker)
 		for _, m := range c.Markets {
-			batch.Queue(`INSERT INTO etfpair.combo_market (combo_id, venue, bull_symbol, bear_symbol, ref_symbol) VALUES ($1, $2, $3, $4, $5)
+			batch.Queue(`INSERT INTO etfpair.combo_market (combo_id, venue, bull_symbol, bear_symbol, ref_symbol, bull_tick, bear_tick)
+				VALUES ($1, $2, $3, $4, $5, NULLIF($6, '')::numeric, NULLIF($7, '')::numeric)
 				ON CONFLICT (combo_id, venue) DO UPDATE SET bull_symbol = EXCLUDED.bull_symbol, bear_symbol = EXCLUDED.bear_symbol,
-				ref_symbol = EXCLUDED.ref_symbol`, c.ID, m.Venue, m.BullSymbol, m.BearSymbol, m.RefSymbol)
+				ref_symbol = EXCLUDED.ref_symbol, bull_tick = EXCLUDED.bull_tick, bear_tick = EXCLUDED.bear_tick`,
+				c.ID, m.Venue, m.BullSymbol, m.BearSymbol, m.RefSymbol, m.BullTick, m.BearTick)
 		}
 	}
 	batch.Queue(`DELETE FROM etfpair.fee_level`)

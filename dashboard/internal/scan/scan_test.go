@@ -420,8 +420,8 @@ func validConfig() Config {
 	return Config{DSNEnv: "X", HistoryStart: time.Date(2026, 7, 16, 0, 0, 0, 0, time.UTC), FXPoll: time.Second,
 		AnchorPoll: time.Minute, NAVSettleDelay: time.Hour,
 		Combos: []Combo{{ID: "A", BullTicker: "TQQQ", BearTicker: "SQQQ", RefTicker: "QQQ", NAVSource: "proshares",
-			Markets: []Market{{Venue: "bitget", BullSymbol: "TQQQUSDT", BearSymbol: "SQQQUSDT", RefSymbol: "QQQUSDT"},
-				{Venue: "binance", BullSymbol: "TQQQUSDT", BearSymbol: "SQQQUSDT", RefSymbol: "QQQUSDT"}}}}}
+			Markets: []Market{{Venue: "bitget", BullSymbol: "TQQQUSDT", BearSymbol: "SQQQUSDT", RefSymbol: "QQQUSDT", BullTick: "0.01", BearTick: "0.001"},
+				{Venue: "binance", BullSymbol: "TQQQUSDT", BearSymbol: "SQQQUSDT", RefSymbol: "QQQUSDT", BullTick: "0.01", BearTick: "0.01"}}}}}
 }
 
 // The settings are checked at start: a combo needs a Binance market for its
@@ -485,6 +485,9 @@ func TestValidate(t *testing.T) {
 		"no binance market":   func(c *Config) { c.Combos[0].Markets = c.Combos[0].Markets[:1] },
 		"no history_start":    func(c *Config) { c.HistoryStart = time.Time{} },
 		"no anchor_poll":      func(c *Config) { c.AnchorPoll = 0 },
+		"no bear_tick":        func(c *Config) { c.Combos[0].Markets[0].BearTick = "" },
+		"a zero bull_tick":    func(c *Config) { c.Combos[0].Markets[1].BullTick = "0" },
+		"a tick of no number": func(c *Config) { c.Combos[0].Markets[1].BullTick = "0.01x" },
 	} {
 		c := validConfig()
 		edit(&c)
@@ -2059,4 +2062,89 @@ func TestRefreshCoverageLoop(t *testing.T) {
 		t.Fatal("the refresh loop did not stop with its context")
 	}
 	expectLines(t, "minutes refreshed at start", dbLines(t, st, query, recent), "0 1")
+}
+
+// Board 3.4 (OWNER.md item 61): a leg's pricing levels follow its tick (2 at 0.01, 5 at 0.001); a side's depth is the
+// total of those levels in contracts and USDT (sum of price x size), none for a side with fewer levels.
+func TestPricingLevelsOnDatabase(t *testing.T) {
+	st := scratchStore(t)
+	got := dbLines(t, st, `SELECT coalesce(etfpair.pricing_levels(x)::text, '-') FROM unnest('{0.01, 0.001, 0.1, NULL}'::numeric[]) x`)
+	expectLines(t, "levels", got, "2", "5", "2", "-")
+	got = dbLines(t, st, `SELECT c.name || ': ' || coalesce(trim_scale(d.ct)::text, '-') || ' ct ' || coalesce(trim_scale(d.usdt)::text, '-') || ' USDT '
+		|| coalesce(etfpair.first_levels(c.px, c.n)::text, '-')
+		FROM (VALUES (1, 'two of three', '{40.45,40.44,40.43}'::numeric[], '{300,500,7}'::numeric[], 2),
+		             (2, 'five at 0.001', '{59.452,59.441,59.438,59.431,59.427,59.420}', '{10,20,30,5,40,99}', 5),
+		             (3, 'fewer than five', '{59.452,59.441}', '{10,20}', 5),
+		             (4, 'empty side', '{}', '{}', 2),
+		             (5, 'no levels count', '{40.45}', '{1}', NULL)) c(i, name, px, sz, n)
+		CROSS JOIN LATERAL etfpair.level_depth(c.px, c.sz, c.n) d ORDER BY c.i`)
+	expectLines(t, "depth", got,
+		"two of three: 800 ct 32355 USDT {40.45,40.44}",                            // 40.45 x 300 + 40.44 x 500
+		"five at 0.001: 105 ct 6240.715 USDT {59.452,59.441,59.438,59.431,59.427}", // PRD 3.2's example: 594.52 + 1188.82 + 1783.14 + 297.155 + 2377.08 = 6240.715
+		"fewer than five: - ct - USDT -", "empty side: - ct - USDT -", "no levels count: - ct - USDT -")
+}
+
+// Board 3.4 on combo_range (10 arguments) and combo_last (8): BULL at a 0.01 tick (levels 1-2), BEAR at 0.001 (1-5), around
+// the close of 2026-11-20 as in TestComboRangeOnDatabase, SMA and sigma of 2 minutes, N 10,000, Entry 10:
+//   - sigma at 15:59: the bars 15:57 (trades 40.10 / 59.90: s = 8.3333) and 15:58 (candles 40.20 / 59.80: s = 16.6667),
+//     population standard deviation 4.1667 = (16.6667 - 8.3333) / 2; none before two bars (15:57, 15:58) and none with a
+//     sigma length that is not positive;
+//   - 15:59:30: BULL's bids of its two levels 1000 + 20 = 1020 ct, 39.78 x 1000 + 39.77 x 20 = 40575.4 USDT; BEAR's five
+//     levels 1000 + 22 + 33 + 44 + 55 = 1154 ct, 59.58 x 1000 + 59.57 x 22 + 59.56 x 33 + 59.55 x 44 + 59.54 x 55 =
+//     68750.92 USDT; asks 2000 ct / 79610 USDT and 5000 ct / 298100 USDT; N fills at the best levels: the real spreads of
+//     3.2 (-116.6667, -125), Long;
+//   - 15:57:00 and 16:00:00: BEAR holds three asks, one bid (three at 15:57): fewer than five, so no real spread and no depth on those
+//     sides (3.2 gave 16:00:00 Short · Partial on the one bid): the Signal is None;
+//   - a basket larger than BEAR's five asks at 15:59:30 (N 1,000,000): K capped at 60 x 5000, Long · Partial.
+func TestPricingLevelsAndSigmaOnDatabase(t *testing.T) {
+	st := scratchStore(t)
+	closeAt, _ := Calendar{}.closeOf("2026-11-20")
+	c := closeAt.UnixMilli()
+	threeTwoBoard(t, st, Combo{ID: "Q", BullTicker: "BULL", BearTicker: "BEAR", RefTicker: "REF",
+		Markets: []Market{{Venue: "binance", BullSymbol: "BULLUSDT", BearSymbol: "BEARUSDT", RefSymbol: "REFUSDT", BullTick: "0.01", BearTick: "0.001"}}},
+		c-24*60*minuteMs, c+10*minuteMs)
+	close19, _ := Calendar{}.closeOf("2026-11-19")
+	for ticker, price := range map[string]string{"BULL": "40", "BEAR": "60", "REF": "300"} {
+		dbExec(t, st, `INSERT INTO etfpair.etf_bell VALUES ($1, '2026-11-19', $2::numeric, $2::numeric, 'binance', 1, $3, 1000)`, ticker, price, close19.UnixMilli()-minuteMs)
+	}
+	dbExec(t, st, `INSERT INTO etfpair.perp_minute VALUES ('binance', 'BULLUSDT', $1, 40.20, 0), ('binance', 'BEARUSDT', $1, 59.80, 0)`, c-2*minuteMs)
+	row := func(symbol string, at int64, price any, bids, bidSz, asks, askSz any) {
+		perpSecond(t, st, "binance", symbol, at, price, bids, bidSz, asks, askSz)
+	}
+	k3 := "{1000,1000,1000}"
+	row("BULLUSDT", c-180_000, "40.01", "{40.00,39.99,39.98}", k3, "{40.02,40.03,40.04}", k3)
+	row("BEARUSDT", c-180_000, "60.00", "{59.98,59.97,59.96}", k3, "{60.02,60.03,60.04}", k3)
+	row("BULLUSDT", c-120_000, "40.10", nil, nil, nil, nil)
+	row("BEARUSDT", c-120_000, "59.90", "{59.89,59.88,59.87}", "{1,2,3}", "{59.91,59.92,59.93}", "{4,5,6}")
+	row("BULLUSDT", c-30_000, "39.79", "{39.78,39.77,39.76,39.75,39.74}", "{1000,20,30,40,50}", "{39.80,39.81,39.82,39.83,39.84}", "{1000,1000,1000,1000,1000}")
+	row("BEARUSDT", c-30_000, "59.59", "{59.58,59.57,59.56,59.55,59.54}", "{1000,22,33,44,55}", "{59.60,59.61,59.62,59.63,59.64}", "{1000,1000,1000,1000,1000}")
+	row("BULLUSDT", c, "40.40", "{40.39,40.38,40.37}", k3, "{40.41,40.42,40.43}", k3)
+	row("BEARUSDT", c, "59.80", "{59.79}", "{50}", "{59.81,59.82,59.83}", k3)
+	const ny = "to_char(to_timestamp(ts_ms / 1000.0) AT TIME ZONE 'America/New_York', 'HH24:MI:SS')"
+	num := func(x string) string { return "coalesce(round(" + x + ", 4)::text, '-')" }
+	size := func(x string) string { return "coalesce(trim_scale(" + x + ")::text, '-')" }
+	line := `SELECT ` + ny + ` || ' sigma ' || ` + num("sigma_bps") + ` || ' long ' || ` + num("s_long_bps") + ` || ' short ' || ` + num("s_short_bps") +
+		` || ' ' || coalesce(partial_long::text, '-') || ' bids ' || ` + size("bid_ct_bull") + ` || '/' || ` + size("bid_ct_bear") + ` || ' ct ' || ` +
+		size("bid_usdt_bull") + ` || '/' || ` + size("bid_usdt_bear") + ` || ' asks ' || ` + size("ask_ct_bull") + ` || '/' || ` + size("ask_ct_bear") +
+		` || ' ct ' || ` + size("ask_usdt_bull") + ` || '/' || ` + size("ask_usdt_bear") + ` || ' ' || signal
+		FROM etfpair.combo_range('Q', 'binance', 'sma', 2, %s, $1, $2, 1000, %s, 10) WHERE basis IS NOT NULL ORDER BY ts_ms`
+	expectLines(t, "combo_range 3.4", dbLines(t, st, fmt.Sprintf(line, "2", "10000"), c-181_000, c),
+		"15:57:00 sigma - long - short - - bids 2000/- ct 79990/- asks 2000/- ct 80050/- No Mean",
+		"15:58:00 sigma - long - short - - bids -/- ct -/- asks -/- ct -/- No Mean",
+		"15:59:30 sigma 4.1667 long -116.6667 short -125.0000 false bids 1020/1154 ct 40575.4/68750.92 asks 2000/5000 ct 79610/298100 Long",
+		"16:00:00 sigma 4.1667 long - short - - bids 2000/- ct 80770/- asks 2000/- ct 80830/- None")
+	for _, n := range []string{"NULL", "0", "-5"} {
+		got := dbLines(t, st, fmt.Sprintf(`SELECT count(*) FILTER (WHERE sigma_bps IS NOT NULL) || ' ' || count(mu_bps)
+			FROM etfpair.combo_range('Q', 'binance', 'sma', 2, %s, $1, $2, 1000, 10000, 10)`, n), c-181_000, c)
+		expectLines(t, "sigma length "+n, got, "0 2")
+	}
+	expectLines(t, "capped at the five asks", dbLines(t, st, `SELECT round(s_long_bps, 4) || ' ' || partial_long || ' ' || signal
+		FROM etfpair.combo_range('Q', 'binance', 'sma', 2, 2, $1, $2, 1000, 1000000, 10) WHERE ts_ms = $2`, c-31_000, c-30_000),
+		// BULL holds 2000 ct in its two levels, BEAR 5000 in its five: K = min(40 x 2000, 60 x 5000) = 80,000, q = 2000 and
+		// 1333.33; BULL's two levels average 39.805, BEAR takes 1000 at 59.60 and 333.33 at 59.61, 59.6025:
+		// 10^4 (39.805 / 40 + 59.6025 / 60 - 2) = -115.
+		"-115.0000 true Long · Partial")
+	got := dbLines(t, st, `SELECT kind || ' ' || coalesce(round(sigma_bps, 4)::text, '-') || ' ' || coalesce(trim_scale(bid_ct_bear)::text, '-') || ' ' || coalesce(signal, '-')
+		FROM etfpair.combo_last('Q', 'binance', 'sma', 2, 2, 10000, 10, $1) ORDER BY kind`, c-1)
+	expectLines(t, "combo_last 3.4", got, "basis 4.1667 1154 Long")
 }

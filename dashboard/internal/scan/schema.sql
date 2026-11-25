@@ -26,6 +26,9 @@ CREATE TABLE IF NOT EXISTS etfpair.combo_market (
     PRIMARY KEY (combo_id, venue)
 );
 ALTER TABLE etfpair.combo_market ADD COLUMN IF NOT EXISTS ref_symbol text NOT NULL DEFAULT '';
+-- Board 3.4: each leg's price tick on the venue (config, from the venue's instrument list), which sets its pricing levels
+-- (pricing_levels); NULL until the collector has written the configuration.
+ALTER TABLE etfpair.combo_market ADD COLUMN IF NOT EXISTS bull_tick numeric, ADD COLUMN IF NOT EXISTS bear_tick numeric;
 
 -- Fee levels a viewer can price a round trip with. Rates are bps of notional;
 -- a negative maker rate is a rebate. source says where the rate comes from.
@@ -1364,4 +1367,379 @@ WITH tm AS MATERIALIZED (
 SELECT coalesce((SELECT sum(tm.seconds) FROM tm), 0) + raw.seconds, coalesce((SELECT sum(tm.books) FROM tm), 0) + raw.books,
        least((SELECT min(tm.least_levels) FROM tm), raw.least_levels), greatest((SELECT max(tm.most_levels) FROM tm), raw.most_levels)
 FROM raw
+$$;
+
+-- ---------------------------------------------------------------------------------------------------------------
+-- Board 3.4 (OWNER.md item 61; dashboard/SPEC.md section 4, "3.4 的函数"): the trading program's pricing levels and
+-- sigma. New overloads of range_points_sql, combo_range and combo_last (one more argument, p_sigma_n, and the new
+-- columns); the 3.2 versions above stay, unchanged, for a page opened before 3.4 was published, until a later
+-- collector drops them. Same rules as 3.2 except:
+--   Pricing levels (PRD 3.2, item 57): a leg's first L raw levels of a side, L = pricing_levels(its tick): 2 at a
+--   0.01 tick (SOXL), 5 at a 0.001 tick (Bitget SOXS), the levels as recorded, never folded to 0.01 and without a
+--   dust threshold. The real spreads sweep N through those levels only (book_pair on them: the volume-weighted price,
+--   both legs' q * A equal, capped at their totals, then Partial); a side with fewer than L levels has none. The
+--   depths are each side's total of those levels, contracts and USDT (sum of price * size), not the program's
+--   takeable half.
+--   Sigma (PRD 4.4): the population standard deviation of the minute bars' spread, 10^4 * (F * bar_bull / A_bull + F *
+--   bar_bear / A_bear - 2), over the last p_sigma_n bars of the run through the minute before the point, defined once
+--   the run has p_sigma_n bars: the mean's runs, restarts and bars.
+-- ---------------------------------------------------------------------------------------------------------------
+
+-- pricing_levels is the one definition of a leg's pricing levels by its tick: 5 below a 0.01 tick (Bitget SOXS's
+-- 0.001: five levels span about the prices of two at 0.01, item 15's alignment), else 2; NULL without a tick.
+CREATE OR REPLACE FUNCTION etfpair.pricing_levels(p_tick numeric)
+RETURNS integer LANGUAGE sql IMMUTABLE PARALLEL SAFE AS $$
+SELECT CASE WHEN p_tick < 0.01 THEN 5 WHEN p_tick >= 0.01 THEN 2 END
+$$;
+
+-- first_levels: a side's first p_levels levels, NULL when it has fewer (no pricing level) or no levels count.
+CREATE OR REPLACE FUNCTION etfpair.first_levels(p_px numeric[], p_levels integer)
+RETURNS numeric[] LANGUAGE sql IMMUTABLE PARALLEL SAFE AS $$
+SELECT CASE WHEN cardinality(p_px) >= p_levels THEN p_px[1:p_levels] END
+$$;
+
+-- level_depth is the one definition of a side's depth: the total size of its first p_levels levels (contracts) and
+-- what they cost (USDT, sum of price * size); NULL for a side with fewer levels or none (the caller passes NULL for a
+-- leg without a usable book).
+CREATE OR REPLACE FUNCTION etfpair.level_depth(p_px numeric[], p_sz numeric[], p_levels integer, OUT ct numeric, OUT usdt numeric)
+LANGUAGE plpgsql IMMUTABLE PARALLEL SAFE AS $$
+BEGIN
+    IF NOT coalesce(cardinality(p_px) >= p_levels AND p_levels > 0, false) THEN
+        RETURN;
+    END IF;
+    ct := 0; usdt := 0;
+    FOR i IN 1 .. p_levels LOOP
+        ct := ct + p_sz[i]; usdt := usdt + p_px[i] * p_sz[i];
+    END LOOP;
+END
+$$;
+
+-- range_points_sql (3.4): the points of the Spread row as in the 3.2 version, with sigma_bps and the pricing levels
+-- (this section's head): p_sigma_n sigma's minutes (positive) or NULL for none; p_levels_bull, p_levels_bear the legs'
+-- pricing levels. Columns: ts_ms, session_date, basis, past_t, fx, a_bull, a_bear, p_bull, p_bear, s_bps, mu_bps,
+-- sigma_bps, s_long_bps, s_short_bps, partial_long, partial_short, filled_long, filled_short, book_bull, book_bear,
+-- bid_ct_bull, bid_ct_bear, ask_ct_bull, ask_ct_bear, bid_usdt_bull, bid_usdt_bear, ask_usdt_bull, ask_usdt_bear, a_ok,
+-- signal. The real spreads only on mid points (both legs' usable books); a leg's depths wherever it has a usable book.
+-- p_bar_ms must reach the more of p_n and p_sigma_n minutes back (SMA) or the session's start (EMA).
+CREATE OR REPLACE FUNCTION etfpair.range_points_sql(p_venue text, p_bull text, p_bear text, p_ma text, p_n integer, p_sigma_n integer,
+                                                    p_first_ms bigint, p_last_ms bigint, p_step_ms bigint, p_notional numeric, p_entry numeric,
+                                                    p_bar_ms bigint, p_stretches text, p_levels_bull integer, p_levels_bear integer)
+RETURNS text LANGUAGE plpgsql IMMUTABLE AS $$
+DECLARE
+    v_mean text;
+    v_sigma text;
+BEGIN
+    -- The mean of each leg's F * bar over the run through the minute before: an SMA or an EMA, none without p_n. p_ma
+    -- only chooses the text.
+    IF p_n IS NULL THEN
+        v_mean := 'NULL::numeric AS m_bull, NULL::numeric AS m_bear';
+    ELSIF p_ma = 'ema' THEN
+        v_mean := format('etfpair.mean_ema(f.fx * f.x_bull, 2.0 / (%1$s::numeric + 1), f.restart) OVER (w ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING) AS m_bull, '
+                         'etfpair.mean_ema(f.fx * f.x_bear, 2.0 / (%1$s::numeric + 1), f.restart) OVER (w ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING) AS m_bear', p_n);
+    ELSE
+        v_mean := format('avg(f.fx * f.x_bull) OVER (w ROWS BETWEEN %1$s PRECEDING AND 1 PRECEDING) AS m_bull, '
+                         'avg(f.fx * f.x_bear) OVER (w ROWS BETWEEN %1$s PRECEDING AND 1 PRECEDING) AS m_bear', p_n);
+    END IF;
+    -- sigma: the population standard deviation of the minute bars' spread over the last p_sigma_n bars of the run through
+    -- the minute before (the anchors are those of the run's minutes), none without p_sigma_n.
+    IF p_sigma_n IS NULL THEN
+        v_sigma := 'NULL::numeric AS sd';
+    ELSE
+        v_sigma := format('stddev_pop(10000 * (f.fx * f.x_bull / f.a_bull + f.fx * f.x_bear / f.a_bear - 2)) OVER (w ROWS BETWEEN %1$s PRECEDING AND 1 PRECEDING) AS sd',
+                          p_sigma_n);
+    END IF;
+    RETURN format($q$
+WITH seg AS MATERIALIZED (
+    SELECT * FROM %1$s WHERE NOT (gap_bull OR gap_bear)
+), mm AS MATERIALIZED (
+    -- Every minute from the first bar to the last point's, with its stretch.
+    SELECT g.session_date, g.a_bull, g.a_bear, g.past_t, g.tv_bull, g.tv_bear, m.j
+    FROM seg g
+    CROSS JOIN LATERAL generate_series(greatest(g.from_ms, %8$s::bigint), least(g.to_ms, %9$s::bigint + 60000) - 60000, 60000) m(j)
+), fxm AS MATERIALIZED (
+    SELECT q.minute_ms, q.price FROM etfpair.fx_minute q WHERE q.pair = 'USDT-USD' AND q.minute_ms >= %8$s::bigint AND q.minute_ms <= %9$s::bigint
+), ends AS MATERIALIZED (
+    -- Both legs' final minute rows that have the end row's price or mid (perp_second_minute), of the minutes that began
+    -- at least 66 minutes ago: a newer minute may still take a row the recorder held back, after its last refresh.
+    SELECT t.symbol, t.minute_ms, t.end_price, t.end_trade_ms, t.end_mid, t.end_book_ms FROM etfpair.perp_second_minute t
+    WHERE t.venue = %2$L AND t.symbol IN (%3$L, %4$L) AND t.minute_ms >= %8$s::bigint AND t.minute_ms <= %9$s::bigint
+      AND t.minute_ms <= floor(extract(epoch FROM now()) * 1000)::bigint - 3960000
+      AND etfpair.perp_minute_final(t.minute_ms, t.refreshed_ms) AND (t.end_price IS NOT NULL OR t.end_mid IS NOT NULL)
+), minutes AS MATERIALIZED (
+    -- Each minute's F (fx_minute: that minute's, else the newest of the five before it) and what both legs' rows at
+    -- its end hold: the price, its trade_ms, the mid of a book usable leaving the split rule aside and its book_ms,
+    -- from ends where the minute is there, else from the row in perp_second; book_usable's split rule (a book from
+    -- before T_v) and trade_usable are applied here, so the bar is what the row itself gives. Set joins, with a
+    -- lookup only for the minutes they miss.
+    SELECT mm.session_date, mm.a_bull, mm.a_bear, mm.past_t, mm.tv_bull, mm.tv_bear, mm.j,
+           CASE WHEN fe.minute_ms IS NOT NULL THEN fe.price
+                ELSE (SELECT q.price FROM etfpair.fx_minute q WHERE q.pair = 'USDT-USD' AND q.minute_ms < mm.j AND q.minute_ms >= mm.j - 300000
+                      ORDER BY q.minute_ms DESC LIMIT 1) END AS fx,
+           b.price AS price_bull, b.mid IS NOT NULL AND NOT coalesce(b.book_ms < mm.tv_bull, false) AS book_bull,
+           etfpair.trade_usable(b.price, b.trade_ms, mm.tv_bull) AS trade_bull, b.mid AS mid_bull,
+           s.price AS price_bear, s.mid IS NOT NULL AND NOT coalesce(s.book_ms < mm.tv_bear, false) AS book_bear,
+           etfpair.trade_usable(s.price, s.trade_ms, mm.tv_bear) AS trade_bear, s.mid AS mid_bear
+    FROM mm
+    LEFT JOIN fxm fe ON fe.minute_ms = mm.j
+    LEFT JOIN ends eb ON eb.symbol = %3$L AND eb.minute_ms = mm.j
+    LEFT JOIN ends es ON es.symbol = %4$L AND es.minute_ms = mm.j
+    LEFT JOIN LATERAL (SELECT eb.end_price AS price, eb.end_trade_ms AS trade_ms, eb.end_mid AS mid, eb.end_book_ms AS book_ms
+                       WHERE eb.minute_ms IS NOT NULL
+                       UNION ALL
+                       SELECT r.price, r.trade_ms, CASE WHEN etfpair.book_usable(r.bid_px, r.bid_sz, r.ask_px, r.ask_sz, NULL, NULL)
+                                                        THEN (r.bid_px[1] + r.ask_px[1]) / 2 END, r.book_ms
+                       FROM etfpair.perp_second r WHERE eb.minute_ms IS NULL AND r.venue = %2$L AND r.symbol = %3$L AND r.second_ms = mm.j + 60000) b ON true
+    LEFT JOIN LATERAL (SELECT es.end_price AS price, es.end_trade_ms AS trade_ms, es.end_mid AS mid, es.end_book_ms AS book_ms
+                       WHERE es.minute_ms IS NOT NULL
+                       UNION ALL
+                       SELECT r.price, r.trade_ms, CASE WHEN etfpair.book_usable(r.bid_px, r.bid_sz, r.ask_px, r.ask_sz, NULL, NULL)
+                                                        THEN (r.bid_px[1] + r.ask_px[1]) / 2 END, r.book_ms
+                       FROM etfpair.perp_second r WHERE es.minute_ms IS NULL AND r.venue = %2$L AND r.symbol = %4$L AND r.second_ms = mm.j + 60000) s ON true
+), bars AS (
+    -- Minute j's bar: both legs' mid prices, else both trade prices, else both candle closes, else none.
+    SELECT mi.session_date, mi.a_bull, mi.a_bear, mi.past_t, mi.tv_bull, mi.tv_bear, mi.j, mi.fx,
+           CASE WHEN mi.book_bull AND mi.book_bear THEN mi.mid_bull WHEN mi.trade_bull AND mi.trade_bear THEN mi.price_bull
+                ELSE (SELECT c.price FROM etfpair.perp_minute c WHERE c.venue = %2$L AND c.symbol = %3$L AND c.minute_ms = mi.j) END AS x_bull,
+           CASE WHEN mi.book_bull AND mi.book_bear THEN mi.mid_bear WHEN mi.trade_bull AND mi.trade_bear THEN mi.price_bear
+                ELSE (SELECT c.price FROM etfpair.perp_minute c WHERE c.venue = %2$L AND c.symbol = %4$L AND c.minute_ms = mi.j) END AS x_bear
+    FROM minutes mi OFFSET 0
+), flagged AS (
+    -- A run restarts at a minute without a bar or F, after one, after a missing minute, and where the session, an anchor
+    -- or the side of a T past T changes.
+    SELECT l.*, NOT coalesce(l.has_bar AND l.prev_has_bar AND l.j - l.prev_j = 60000 AND l.session_date IS NOT DISTINCT FROM l.prev_session
+                             AND l.a_bull IS NOT DISTINCT FROM l.prev_a_bull AND l.a_bear IS NOT DISTINCT FROM l.prev_a_bear
+                             AND l.past_t = l.prev_past_t, false) AS restart
+    FROM (SELECT b.*, b.x_bull IS NOT NULL AND b.x_bear IS NOT NULL AND b.fx IS NOT NULL AS has_bar,
+                 lag(b.x_bull IS NOT NULL AND b.x_bear IS NOT NULL AND b.fx IS NOT NULL) OVER w AS prev_has_bar, lag(b.j) OVER w AS prev_j,
+                 lag(b.session_date) OVER w AS prev_session, lag(b.a_bull) OVER w AS prev_a_bull, lag(b.a_bear) OVER w AS prev_a_bear,
+                 lag(b.past_t) OVER w AS prev_past_t
+          FROM bars b WINDOW w AS (ORDER BY b.j)) l
+), means AS (
+    -- Over the minutes before this one: where the minute before's run began, and the mean through the minute before.
+    SELECT f.*, f.prev_j - max(CASE WHEN f.restart THEN f.j END) OVER (w ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING) AS prev_run_ms, %12$s
+    FROM flagged f WINDOW w AS (ORDER BY f.j)
+), mins AS MATERIALIZED (
+    -- The minutes that hold a point, with the mean through the minute before when that minute is of the same session,
+    -- anchors and side of T and ends a run of at least p_n bars.
+    SELECT q.j, q.session_date, q.a_bull, q.a_bear, q.past_t, q.tv_bull, q.tv_bear, q.fx,
+           CASE WHEN q.prev_j = q.j - 60000 AND q.prev_has_bar AND q.prev_run_ms >= (%6$L::bigint - 1) * 60000
+                     AND q.session_date IS NOT DISTINCT FROM q.prev_session AND q.a_bull IS NOT DISTINCT FROM q.prev_a_bull
+                     AND q.a_bear IS NOT DISTINCT FROM q.prev_a_bear AND q.past_t = q.prev_past_t
+                THEN 10000 * (q.m_bull / q.a_bull + q.m_bear / q.a_bear - 2) END AS mu_bps,
+           CASE WHEN q.prev_j = q.j - 60000 AND q.prev_has_bar AND q.prev_run_ms >= (%14$L::bigint - 1) * 60000
+                     AND q.session_date IS NOT DISTINCT FROM q.prev_session AND q.a_bull IS NOT DISTINCT FROM q.prev_a_bull
+                     AND q.a_bear IS NOT DISTINCT FROM q.prev_a_bear AND q.past_t = q.prev_past_t
+                THEN q.sd END AS sigma_bps
+    FROM means q
+    WHERE greatest((q.j / %7$s::bigint + 1) * %7$s::bigint, %10$s::bigint) <= least(q.j + 60000, %11$s::bigint)
+), secs AS (
+    SELECT mi.session_date, mi.a_bull, mi.a_bear, mi.past_t, mi.fx, mi.mu_bps, mi.sigma_bps, t.ts,
+           b.price AS price_bull, b.bid_px AS bid_px_bull, b.bid_sz AS bid_sz_bull, b.ask_px AS ask_px_bull, b.ask_sz AS ask_sz_bull,
+           s.price AS price_bear, s.bid_px AS bid_px_bear, s.bid_sz AS bid_sz_bear, s.ask_px AS ask_px_bear, s.ask_sz AS ask_sz_bear,
+           u.book_bull, u.book_bear, u.trade_bull, u.trade_bear
+    FROM mins mi
+    CROSS JOIN LATERAL generate_series(greatest((mi.j / %7$s::bigint + 1) * %7$s::bigint, %10$s::bigint), least(mi.j + 60000, %11$s::bigint), %7$s::bigint) t(ts)
+    CROSS JOIN LATERAL (SELECT r.* FROM etfpair.perp_second r WHERE r.venue = %2$L AND r.symbol = %3$L AND r.second_ms = t.ts OFFSET 0) b
+    CROSS JOIN LATERAL (SELECT r.* FROM etfpair.perp_second r WHERE r.venue = %2$L AND r.symbol = %4$L AND r.second_ms = t.ts OFFSET 0) s
+    CROSS JOIN LATERAL (SELECT etfpair.book_usable(b.bid_px, b.bid_sz, b.ask_px, b.ask_sz, b.book_ms, mi.tv_bull) AS book_bull,
+                               etfpair.book_usable(s.bid_px, s.bid_sz, s.ask_px, s.ask_sz, s.book_ms, mi.tv_bear) AS book_bear,
+                               etfpair.trade_usable(b.price, b.trade_ms, mi.tv_bull) AS trade_bull,
+                               etfpair.trade_usable(s.price, s.trade_ms, mi.tv_bear) AS trade_bear OFFSET 0) u
+    WHERE u.book_bull AND u.book_bear OR u.trade_bull AND u.trade_bear
+), points AS (
+    SELECT c.ts, c.session_date, c.basis, c.past_t, c.fx, c.a_bull, c.a_bear, c.p_bull, c.p_bear,
+           10000 * (c.fx * c.p_bull / c.a_bull + c.fx * c.p_bear / c.a_bear - 2) AS s_bps, c.mu_bps, c.sigma_bps,
+           bp.s_long_bps, bp.s_short_bps, bp.partial_long, bp.partial_short, bp.filled_long, bp.filled_short, c.book_bull, c.book_bear,
+           db.ct AS bid_ct_bull, ds.ct AS bid_ct_bear, ab.ct AS ask_ct_bull, as_.ct AS ask_ct_bear,
+           db.usdt AS bid_usdt_bull, ds.usdt AS bid_usdt_bear, ab.usdt AS ask_usdt_bull, as_.usdt AS ask_usdt_bear,
+           c.a_bull IS NOT NULL AND c.a_bear IS NOT NULL AND c.fx IS NOT NULL AS a_ok
+    FROM (SELECT w.*, CASE WHEN w.book_bull AND w.book_bear THEN 'mid' ELSE 'trade' END AS basis,
+                 CASE WHEN w.book_bull AND w.book_bear THEN (w.bid_px_bull[1] + w.ask_px_bull[1]) / 2 ELSE w.price_bull END AS p_bull,
+                 CASE WHEN w.book_bull AND w.book_bear THEN (w.bid_px_bear[1] + w.ask_px_bear[1]) / 2 ELSE w.price_bear END AS p_bear
+          FROM secs w OFFSET 0) c
+    -- The real spreads on each leg's pricing levels only (a side with fewer has none: no pricing level).
+    LEFT JOIN LATERAL (SELECT * FROM etfpair.book_pair(etfpair.first_levels(c.bid_px_bull, %15$L::integer), c.bid_sz_bull[1:%15$L::integer],
+                                                       etfpair.first_levels(c.ask_px_bull, %15$L::integer), c.ask_sz_bull[1:%15$L::integer],
+                                                       etfpair.first_levels(c.bid_px_bear, %16$L::integer), c.bid_sz_bear[1:%16$L::integer],
+                                                       etfpair.first_levels(c.ask_px_bear, %16$L::integer), c.ask_sz_bear[1:%16$L::integer],
+                                                       c.a_bull, c.a_bear, c.fx, %5$L::numeric)
+                       WHERE c.basis = 'mid') bp ON true
+    LEFT JOIN LATERAL etfpair.level_depth(CASE WHEN c.book_bull THEN c.bid_px_bull END, c.bid_sz_bull, %15$L::integer) db ON true
+    LEFT JOIN LATERAL etfpair.level_depth(CASE WHEN c.book_bear THEN c.bid_px_bear END, c.bid_sz_bear, %16$L::integer) ds ON true
+    LEFT JOIN LATERAL etfpair.level_depth(CASE WHEN c.book_bull THEN c.ask_px_bull END, c.ask_sz_bull, %15$L::integer) ab ON true
+    LEFT JOIN LATERAL etfpair.level_depth(CASE WHEN c.book_bear THEN c.ask_px_bear END, c.ask_sz_bear, %16$L::integer) as_ ON true
+)
+SELECT p.ts AS ts_ms, p.session_date, p.basis, p.past_t, p.fx, p.a_bull, p.a_bear, p.p_bull, p.p_bear, p.s_bps, p.mu_bps, p.sigma_bps,
+       p.s_long_bps, p.s_short_bps, p.partial_long, p.partial_short, p.filled_long, p.filled_short, p.book_bull, p.book_bear,
+       p.bid_ct_bull, p.bid_ct_bear, p.ask_ct_bull, p.ask_ct_bear, p.bid_usdt_bull, p.bid_usdt_bear, p.ask_usdt_bull, p.ask_usdt_bear, p.a_ok,
+       etfpair.combo_signal(p.s_bps, p.past_t, p.mu_bps, %5$L::numeric, p.basis = 'mid', p.s_long_bps, p.s_short_bps, p.partial_long,
+                            p.partial_short, %13$L::numeric) AS signal
+FROM (SELECT * FROM points OFFSET 0) p
+$q$, p_stretches, p_venue, p_bull, p_bear, p_notional, p_n, p_step_ms, p_bar_ms, (p_last_ms - 1) / 60000 * 60000, p_first_ms, p_last_ms,
+       v_mean || ', ' || v_sigma, p_entry, p_sigma_n, p_levels_bull, p_levels_bear);
+END
+$$;
+
+
+-- combo_range (3.4): what the Spread row draws, as the 3.2 version, with sigma_bps and the depths of the pricing levels
+-- in place of the 1+2 depths (contracts and USDT); p_sigma_n not positive: no sigma.
+CREATE OR REPLACE FUNCTION etfpair.combo_range(p_combo text, p_venue text, p_ma text, p_n integer, p_sigma_n integer, p_from_ms bigint,
+                                               p_to_ms bigint, p_step_ms bigint, p_notional numeric, p_entry numeric)
+RETURNS TABLE (ts_ms bigint, session_date date, phase text, phase_sort integer, basis text, past_t boolean, s_bps numeric, mu_bps numeric,
+               sigma_bps numeric, s_long_bps numeric, s_short_bps numeric, partial_long boolean, partial_short boolean, book_bull boolean,
+               book_bear boolean, bid_ct_bull numeric, bid_ct_bear numeric, ask_ct_bull numeric, ask_ct_bear numeric, bid_usdt_bull numeric,
+               bid_usdt_bear numeric, ask_usdt_bull numeric, ask_usdt_bear numeric, a_ok boolean, signal text)
+LANGUAGE plpgsql STABLE AS $$
+DECLARE
+    v_bull text;
+    v_bear text;
+    v_n integer := CASE WHEN p_n > 0 THEN p_n END;   -- the mean's minutes, NULL for no mean
+    v_y integer := CASE WHEN p_sigma_n > 0 THEN p_sigma_n END;   -- sigma's minutes, NULL for no sigma
+    v_lb integer;            -- the legs' pricing levels
+    v_le integer;
+    v_first bigint;          -- the first and the last point
+    v_last bigint;
+    v_bar bigint;            -- the first minute whose bar the means need
+BEGIN
+    IF NOT coalesce(p_step_ms > 0, false) THEN
+        RETURN;
+    END IF;
+    v_first := (p_from_ms / p_step_ms + 1) * p_step_ms;
+    v_last := p_to_ms / p_step_ms * p_step_ms;
+    SELECT m.bull_symbol, m.bear_symbol, etfpair.pricing_levels(m.bull_tick), etfpair.pricing_levels(m.bear_tick) INTO v_bull, v_bear, v_lb, v_le
+    FROM etfpair.combo_market m WHERE m.combo_id = p_combo AND m.venue = p_venue;
+    IF v_bull IS NULL OR NOT coalesce(v_first <= v_last, false) THEN
+        RETURN;
+    END IF;
+    -- The EMA from the start of the session of the first point's minute; the SMA and sigma from p_n, p_sigma_n minutes
+    -- before it, the more of the two (not before that session's start: a run never crosses it); from that minute itself
+    -- before the first close (no session, no mean) and without a mean and a sigma.
+    SELECT coalesce(max(s.close_ms), (v_first - 1) / 60000 * 60000) INTO v_bar FROM etfpair.etf_session s WHERE s.close_ms <= (v_first - 1) / 60000 * 60000;
+    IF v_n IS NOT NULL AND p_ma = 'ema' THEN
+        NULL;
+    ELSIF coalesce(v_n, v_y) IS NULL THEN
+        v_bar := (v_first - 1) / 60000 * 60000;
+    ELSE
+        v_bar := greatest(v_bar, (v_first - 1) / 60000 * 60000 - greatest(v_n, v_y) * 60000::bigint);
+    END IF;
+    RETURN QUERY EXECUTE format($q$
+WITH p AS MATERIALIZED (%1$s), marked AS MATERIALIZED (
+    SELECT p.*, lag(p.ts_ms) OVER w AS prev_ts, lag(p.session_date) OVER w AS prev_session
+    FROM p WINDOW w AS (ORDER BY p.ts_ms)
+)
+SELECT m.ts_ms, m.session_date, ph.phase, array_position(ARRAY['Pre-Market', 'Regular', 'After-Hours', 'Overnight', 'Closed'], ph.phase),
+       m.basis, m.past_t, m.s_bps, m.mu_bps, m.sigma_bps, m.s_long_bps, m.s_short_bps, m.partial_long, m.partial_short, m.book_bull,
+       m.book_bear, m.bid_ct_bull, m.bid_ct_bear, m.ask_ct_bull, m.ask_ct_bear, m.bid_usdt_bull, m.bid_usdt_bear, m.ask_usdt_bull,
+       m.ask_usdt_bear, m.a_ok, m.signal
+FROM marked m
+LEFT JOIN LATERAL (SELECT e.phase FROM etfpair.etf_phase e WHERE e.start_ms < m.ts_ms AND e.end_ms >= m.ts_ms
+                   AND m.s_bps IS NOT NULL AND m.mu_bps IS NOT NULL ORDER BY e.start_ms DESC LIMIT 1) ph ON true
+UNION ALL
+SELECT m.prev_ts + 1, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL,
+       NULL, NULL, NULL, NULL
+FROM marked m
+WHERE m.prev_ts IS NOT NULL AND (m.ts_ms - m.prev_ts > %2$s::bigint OR m.session_date IS DISTINCT FROM m.prev_session)
+ORDER BY 1
+$q$, etfpair.range_points_sql(p_venue, v_bull, v_bear, p_ma, v_n, v_y, v_first, v_last, p_step_ms, p_notional, p_entry, v_bar,
+                              etfpair.range_stretches(p_combo, p_venue, v_bar, (v_last - 1) / 60000 * 60000 + 60000), v_lb, v_le),
+       p_step_ms);
+END
+$$;
+
+
+-- combo_last (3.4): the snapshot strips' two newest seconds, as the 3.2 version, with sigma_bps and the depths of the
+-- pricing levels; p_sigma_n not positive: no sigma.
+CREATE OR REPLACE FUNCTION etfpair.combo_last(p_combo text, p_venue text, p_ma text, p_n integer, p_sigma_n integer, p_notional numeric,
+                                              p_entry numeric, p_now_ms bigint)
+RETURNS TABLE (kind text, ts_ms bigint, session_date date, basis text, past_t boolean, fx numeric,
+               a_bull numeric, a_bear numeric, a_ref numeric, p_bull numeric, p_bear numeric, p_ref numeric,
+               s_bps numeric, mu_bps numeric, sigma_bps numeric, s_long_bps numeric, s_short_bps numeric, partial_long boolean,
+               partial_short boolean, filled_long numeric, filled_short numeric, book_bull boolean, book_bear boolean,
+               bid_ct_bull numeric, bid_ct_bear numeric, ask_ct_bull numeric, ask_ct_bear numeric,
+               bid_usdt_bull numeric, bid_usdt_bear numeric, ask_usdt_bull numeric, ask_usdt_bear numeric,
+               anchor_status text, signal text)
+LANGUAGE plpgsql STABLE AS $$
+DECLARE
+    v_bull text;
+    v_bear text;
+    v_ref text;
+    v_n integer := CASE WHEN p_n > 0 THEN p_n END;                 -- the mean's minutes, NULL for no mean
+    v_y integer := CASE WHEN p_sigma_n > 0 THEN p_sigma_n END;     -- sigma's minutes, NULL for no sigma
+    v_lb integer;                                                  -- the legs' pricing levels
+    v_le integer;
+    v_kmin bigint := (p_now_ms - 600000) / 60000 * 60000;          -- the minutes of the ten
+    v_kmax bigint := (p_now_ms - 1) / 60000 * 60000;
+    v_bar bigint;
+    v_seg text;
+    v_basis bigint;
+    v_prices bigint;
+BEGIN
+    SELECT m.bull_symbol, m.bear_symbol, m.ref_symbol, etfpair.pricing_levels(m.bull_tick), etfpair.pricing_levels(m.bear_tick)
+    INTO v_bull, v_bear, v_ref, v_lb, v_le FROM etfpair.combo_market m
+    WHERE m.combo_id = p_combo AND m.venue = p_venue;
+    IF v_bull IS NULL OR p_now_ms IS NULL THEN
+        RETURN;
+    END IF;
+    -- The stretches from the first bar any of the ten minutes needs (as combo_range) to the last.
+    SELECT coalesce(max(s.close_ms), v_kmin) INTO v_bar FROM etfpair.etf_session s WHERE s.close_ms <= v_kmin;
+    IF v_n IS NOT NULL AND p_ma = 'ema' THEN
+        NULL;
+    ELSIF coalesce(v_n, v_y) IS NULL THEN
+        v_bar := v_kmin;
+    ELSE
+        v_bar := greatest(v_bar, v_kmin - greatest(v_n, v_y) * 60000::bigint);
+    END IF;
+    v_seg := etfpair.range_stretches(p_combo, p_venue, v_bar, v_kmax + 60000);
+    EXECUTE format($q$
+WITH seg AS MATERIALIZED (SELECT * FROM %1$s WHERE NOT (gap_bull OR gap_bear))
+SELECT (SELECT b.second_ms FROM etfpair.perp_second b
+        CROSS JOIN LATERAL (SELECT g.tv_bull, g.tv_bear FROM seg g WHERE g.from_ms <= (b.second_ms - 1) / 60000 * 60000
+                            AND g.to_ms > (b.second_ms - 1) / 60000 * 60000 LIMIT 1) g
+        CROSS JOIN LATERAL (SELECT x.* FROM etfpair.perp_second x WHERE x.venue = %2$L AND x.symbol = %4$L AND x.second_ms = b.second_ms OFFSET 0) s
+        WHERE b.venue = %2$L AND b.symbol = %3$L AND b.second_ms > %6$s::bigint - 600000 AND b.second_ms <= %6$s::bigint
+          AND (etfpair.book_usable(b.bid_px, b.bid_sz, b.ask_px, b.ask_sz, b.book_ms, g.tv_bull)
+               AND etfpair.book_usable(s.bid_px, s.bid_sz, s.ask_px, s.ask_sz, s.book_ms, g.tv_bear)
+               OR etfpair.trade_usable(b.price, b.trade_ms, g.tv_bull) AND etfpair.trade_usable(s.price, s.trade_ms, g.tv_bear))
+        ORDER BY b.second_ms DESC LIMIT 1),
+       (SELECT b.second_ms FROM etfpair.perp_second b
+        CROSS JOIN LATERAL (SELECT g.tv_bull, g.tv_bear, g.tv_ref, g.gap_ref FROM seg g WHERE g.from_ms <= (b.second_ms - 1) / 60000 * 60000
+                            AND g.to_ms > (b.second_ms - 1) / 60000 * 60000 LIMIT 1) g
+        CROSS JOIN LATERAL (SELECT x.price, x.trade_ms FROM etfpair.perp_second x WHERE x.venue = %2$L AND x.symbol = %4$L AND x.second_ms = b.second_ms OFFSET 0) s
+        CROSS JOIN LATERAL (SELECT x.price, x.trade_ms FROM etfpair.perp_second x WHERE x.venue = %2$L AND x.symbol = %5$L AND x.second_ms = b.second_ms OFFSET 0) r
+        WHERE b.venue = %2$L AND b.symbol = %3$L AND b.second_ms > %6$s::bigint - 600000 AND b.second_ms <= %6$s::bigint
+          AND etfpair.trade_usable(b.price, b.trade_ms, g.tv_bull) AND etfpair.trade_usable(s.price, s.trade_ms, g.tv_bear)
+          AND NOT g.gap_ref AND etfpair.trade_usable(r.price, r.trade_ms, g.tv_ref)
+        ORDER BY b.second_ms DESC LIMIT 1)
+$q$, v_seg, p_venue, v_bull, v_bear, v_ref, p_now_ms) INTO v_basis, v_prices;
+    IF v_basis IS NOT NULL THEN
+        RETURN QUERY EXECUTE format($q$
+SELECT 'basis'::text, p.ts_ms, p.session_date, p.basis, p.past_t, p.fx, p.a_bull, p.a_bear, g.a_ref, p.p_bull, p.p_bear,
+       CASE WHEN NOT g.gap_ref AND etfpair.trade_usable(r.price, r.trade_ms, g.tv_ref) THEN r.price END,
+       p.s_bps, p.mu_bps, p.sigma_bps, p.s_long_bps, p.s_short_bps, p.partial_long, p.partial_short, p.filled_long, p.filled_short,
+       p.book_bull, p.book_bear, p.bid_ct_bull, p.bid_ct_bear, p.ask_ct_bull, p.ask_ct_bear, p.bid_usdt_bull, p.bid_usdt_bear, p.ask_usdt_bull,
+       p.ask_usdt_bear,
+       (SELECT cs.status FROM etfpair.combo_sessions(%3$L) cs WHERE cs.session_date = p.session_date), p.signal
+FROM (%1$s) p
+CROSS JOIN LATERAL (SELECT g.a_ref, g.gap_ref, g.tv_ref FROM (SELECT * FROM %2$s) g
+                    WHERE g.from_ms <= (p.ts_ms - 1) / 60000 * 60000 AND g.to_ms > (p.ts_ms - 1) / 60000 * 60000) g
+LEFT JOIN LATERAL (SELECT x.price, x.trade_ms FROM etfpair.perp_second x WHERE x.venue = %4$L AND x.symbol = %5$L AND x.second_ms = p.ts_ms OFFSET 0) r ON true
+$q$, etfpair.range_points_sql(p_venue, v_bull, v_bear, p_ma, v_n, v_y, v_basis, v_basis, 1000, p_notional, p_entry, v_bar, v_seg, v_lb, v_le),
+             v_seg, p_combo, p_venue, v_ref);
+    END IF;
+    IF v_prices IS NOT NULL THEN
+        RETURN QUERY EXECUTE format($q$
+SELECT 'prices'::text, %5$s::bigint, g.session_date, NULL::text, NULL::boolean, f.price, g.a_bull, g.a_bear, g.a_ref, b.price, s.price, r.price,
+       NULL::numeric, NULL::numeric, NULL::numeric, NULL::numeric, NULL::numeric, NULL::boolean, NULL::boolean, NULL::numeric, NULL::numeric,
+       NULL::boolean, NULL::boolean, NULL::numeric, NULL::numeric, NULL::numeric, NULL::numeric, NULL::numeric, NULL::numeric, NULL::numeric,
+       NULL::numeric, NULL::text, NULL::text
+FROM (SELECT * FROM %1$s) g
+JOIN etfpair.perp_second b ON b.venue = %2$L AND b.symbol = %3$L AND b.second_ms = %5$s::bigint
+JOIN etfpair.perp_second s ON s.venue = %2$L AND s.symbol = %4$L AND s.second_ms = %5$s::bigint
+JOIN etfpair.perp_second r ON r.venue = %2$L AND r.symbol = %6$L AND r.second_ms = %5$s::bigint
+LEFT JOIN LATERAL (SELECT q.price FROM etfpair.fx_minute q WHERE q.pair = 'USDT-USD' AND q.minute_ms <= (%5$s::bigint - 1) / 60000 * 60000
+                   AND q.minute_ms >= (%5$s::bigint - 1) / 60000 * 60000 - 300000 ORDER BY q.minute_ms DESC LIMIT 1) f ON true
+WHERE g.from_ms <= (%5$s::bigint - 1) / 60000 * 60000 AND g.to_ms > (%5$s::bigint - 1) / 60000 * 60000
+$q$, v_seg, p_venue, v_bull, v_bear, v_prices, v_ref);
+    END IF;
+END
 $$;

@@ -17,6 +17,7 @@ import (
 	"errors"
 	"fmt"
 	"slices"
+	"strconv"
 	"time"
 
 	"github.com/shopspring/decimal"
@@ -85,6 +86,12 @@ type Market struct {
 	BullSymbol string `yaml:"bull_symbol"`
 	BearSymbol string `yaml:"bear_symbol"`
 	RefSymbol  string `yaml:"ref_symbol"`
+	// BullTick and BearTick are the legs' price ticks on the venue, as its
+	// instrument list gives them (the recorder logs them at its start). The
+	// board's pricing levels follow from them (etfpair.pricing_levels: 2 at
+	// 0.01, 5 at 0.001), and its Book strip shows them.
+	BullTick string `yaml:"bull_tick"`
+	BearTick string `yaml:"bear_tick"`
 }
 
 // symbols lists the market's contracts: the two legs and the reference.
@@ -119,6 +126,13 @@ func (c Config) Validate() error {
 		// Binance's index price of each contract gives the bell anchor of its ETF.
 		if !slices.ContainsFunc(combo.Markets, func(m Market) bool { return m.Venue == "binance" }) {
 			errs = append(errs, fmt.Errorf("combo %q needs a binance market: its index prices give the bell anchors", combo.ID))
+		}
+		for _, m := range combo.Markets {
+			for name, tick := range map[string]string{"bull_tick": m.BullTick, "bear_tick": m.BearTick} {
+				if v, err := strconv.ParseFloat(tick, 64); err != nil || !(v > 0) {
+					errs = append(errs, fmt.Errorf("combo %q, %s market: %s %q is not a positive price tick", combo.ID, m.Venue, name, tick))
+				}
+			}
 		}
 		if !slices.Contains([]string{"", "direxion", "proshares"}, combo.NAVSource) {
 			errs = append(errs, fmt.Errorf("combo %q: nav_source %q is not direxion, proshares or empty", combo.ID, combo.NAVSource))
