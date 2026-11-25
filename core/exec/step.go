@@ -1,0 +1,387 @@
+package exec
+
+import (
+	"time"
+
+	"etf-pair-arbitrage/core/cex"
+	"etf-pair-arbitrage/core/inventory"
+	"etf-pair-arbitrage/core/logger"
+	"etf-pair-arbitrage/core/strategy"
+)
+
+// step is one round of the loop at now (PRD 13.2): the minutes and the
+// anchors, the order snapshot booked into the ledger, then at most one
+// decision - wait, the forced exit, the cycle's gap, the exit at the line or
+// an entry. It reports whether the process may leave. Every exit that sends
+// nothing goes through idle, which records why.
+func (m *ExecManager) step(now time.Time) (done bool) {
+	r := m.newRound(now)
+
+	// The minute that ended is closed on the observations taken inside it
+	// before this moment's observation is taken.
+	m.closeMinutes(now)
+	m.observe(r)
+	m.idleReason = ""
+	defer m.report(r)
+
+	// One snapshot of the cycle's orders, booked; every check below reads it.
+	m.syncOrders(r)
+	if m.stopCheck(r.cycle, now) {
+		return true
+	}
+	if m.inv.Mismatch() {
+		return m.idle(strategy.ReasonPositionMismatch) // no order at all until a person checks
+	}
+	if anyInFlight(r.orders) {
+		return m.idle(strategy.ReasonAwaitOrders) // neither final nor unknown: its result is due within about two seconds
+	}
+	if anyUnknown(r.orders) {
+		// Nothing is decided until the outcome is known. cex queries the
+		// order; the forced exit sized by the venue's positions and the
+		// verdicts after 30 s are not taken here.
+		return m.idle(strategy.ReasonOrderUnknown)
+	}
+	m.noteBatchDone(r)
+
+	// Holding: the forced exit, the gap, the line exit, then a new entry.
+	if c := r.cycle; c != nil {
+		if m.forcedDue(c, now) {
+			return m.forcedExit(r)
+		}
+		if reason, wait := m.workGap(r); wait {
+			return m.idle(reason)
+		}
+		m.settle(r)
+		if !m.closeIfFlat(r) {
+			if r.cycle.Flat() {
+				return m.idle(strategy.ReasonAwaitClose) // nothing left to trade; the venue's positions have not confirmed it yet
+			}
+			if !m.freshDepthSince(r) {
+				return m.idle(strategy.ReasonAwaitDepth)
+			}
+			if m.exitAtLine(r) {
+				return false
+			}
+		}
+	}
+	plan, reason := m.strat.EvaluateEntry(m.entryInput(r))
+	if plan == nil {
+		m.noteAtLine(r, reason)
+		return m.idle(reason)
+	}
+	m.openBatch(r, plan)
+	return false
+}
+
+// newRound reads the facts this step decides on: both books in one read, F
+// and the rules.
+func (m *ExecManager) newRound(now time.Time) *round {
+	r := &round{now: now, books: m.cex.Books()}
+	r.fx, r.fxFresh = m.cex.FX(now)
+	okBull, okBear := false, false
+	r.rules[cex.Bull], okBull = m.cex.Rule(cex.Bull)
+	r.rules[cex.Bear], okBear = m.cex.Rule(cex.Bear)
+	r.rulesOK = okBull && okBear
+	return r
+}
+
+// idle records why this step sends nothing and reports that the loop goes
+// on.
+func (m *ExecManager) idle(reason strategy.Reason) (done bool) {
+	m.idleReason = reason
+	return false
+}
+
+// syncOrders takes one snapshot of the open cycle's orders from cex and
+// books it into the ledger; the round keeps the snapshot and the cycle as
+// booked. Without an open cycle there is nothing to take.
+func (m *ExecManager) syncOrders(r *round) {
+	c := m.inv.Cycle()
+	if c == nil {
+		return
+	}
+	r.orders = m.cex.CycleOrders(string(c.ID))
+	m.inv.Sync(r.orders)
+	r.cycle = m.inv.Cycle()
+}
+
+// anyInFlight reports whether an order has neither a final state nor an
+// unknown outcome: cex has it on its way, and its result comes soon.
+func anyInFlight(orders []cex.OrderRecord) bool {
+	for _, o := range orders {
+		if !o.Status.Terminal() && !o.Unknown {
+			return true
+		}
+	}
+	return false
+}
+
+// anyUnknown reports whether an order's outcome is not known: cex queries
+// it and never sends it again.
+func anyUnknown(orders []cex.OrderRecord) bool {
+	for _, o := range orders {
+		if !o.Status.Terminal() && o.Unknown {
+			return true
+		}
+	}
+	return false
+}
+
+// noteBatchDone marks the batch done in the first round whose snapshot holds
+// every one of its orders with a final state, and notes whether the venue
+// refused one. The next entry and line exit wait for depth that arrived
+// after this round's time (PRD 5.9), on the loop's clock. That time is read
+// before the snapshot, so a result may have arrived up to the length of the
+// round's reads after it: a depth frame of that instant counts as new.
+func (m *ExecManager) noteBatchDone(r *round) {
+	b := m.batch
+	if b == nil || !b.doneAt.IsZero() || len(b.orders) == 0 {
+		return
+	}
+	rejected := false
+	for _, id := range b.orders {
+		o, found := orderIn(r.orders, id)
+		if !found || !o.Status.Terminal() {
+			return
+		}
+		rejected = rejected || o.Status == cex.StatusRejected
+	}
+	b.doneAt, b.rejected = r.now, rejected
+	logger.GlobalLogger.Debug("exec: batch results in", "kind", string(b.kind), "orders", len(b.orders), "rejected", rejected, "took", r.now.Sub(b.sentAt).Round(time.Millisecond))
+}
+
+// orderIn finds an order of the snapshot by its id.
+func orderIn(orders []cex.OrderRecord, id cex.ClientOrderID) (cex.OrderRecord, bool) {
+	for _, o := range orders {
+		if o.Request.ClientOrderID == id {
+			return o, true
+		}
+	}
+	return cex.OrderRecord{}, false
+}
+
+// freshDepthSince reports whether both legs' depth arrived after the last
+// batch's results (PRD 5.9): the book the loop holds then is no longer the
+// one the batch traded on. It holds before the first batch.
+func (m *ExecManager) freshDepthSince(r *round) bool {
+	if m.batch == nil || m.batch.doneAt.IsZero() {
+		return true
+	}
+	for _, leg := range cex.Legs {
+		if !r.books.ByLeg[leg].DepthReceivedAt.After(m.batch.doneAt) {
+			return false
+		}
+	}
+	return true
+}
+
+// --- the gap ---
+
+// workGap asks strategy about the cycle's gap: the two legs' anchored
+// amounts that differ by more than the venue's minimum order. wait is true
+// when the round must not go further: a completion waits for the short
+// leg's new frame, a trim waits for a price, or a completion or a trim
+// would be sent. The loop sends neither; such a gap holds the batch
+// unsettled and leaves the cycle to the forced exit, which closes both legs
+// whatever they hold.
+func (m *ExecManager) workGap(r *round) (reason strategy.Reason, wait bool) {
+	if !r.rulesOK {
+		return strategy.ReasonNotReady, true
+	}
+	a := m.strat.EvaluateGap(m.gapInput(r))
+	switch a.Kind {
+	case strategy.GapNone:
+		return "", false
+	case strategy.GapWait:
+		return strategy.ReasonAwaitDepth, true
+	case strategy.GapBlocked:
+		return strategy.ReasonNoPrice, true
+	}
+	if !m.gapWarned {
+		m.gapWarned = true
+		hold := r.cycle.Hold()
+		logger.GlobalLogger.Warn("exec: the legs filled unevenly; no completion or trim is sent and the cycle waits for the forced exit",
+			"cycle", r.cycle.ID, "gap_order", string(a.Kind), "leg", a.Leg.String(), "side", string(a.Side), "qty", a.Qty, "price", a.Price,
+			"hold_bull", hold[cex.Bull], "hold_bear", hold[cex.Bear])
+	}
+	return reasonUnevenFills, true
+}
+
+// gapInput gathers the facts of one gap decision. The entry batch that is
+// not settled yet is the batch the gap came from; otherwise the gap can
+// only be trimmed.
+func (m *ExecManager) gapInput(r *round) strategy.GapInput {
+	c := r.cycle
+	in := strategy.GapInput{Direction: c.Direction, Hold: c.Hold(), PairAnchors: c.PairAnchors, Books: r.books.ByLeg, Rules: r.rules, Now: r.now}
+	_, _, in.QuotaLeft = m.inv.Quota()
+	settingsOK, _ := m.cex.SettingsOK(m.leverage)
+	mayAdd := r.now.Before(m.session.RegularOpen) && !m.stop.stopping && !m.stop.noEntries && settingsOK // PRD 8.5
+	for _, leg := range cex.Legs {
+		in.HasPrice[leg] = r.books.HasPrice(leg, r.now)
+		in.DepthOK[leg] = r.books.DepthOK(leg, r.now)
+		in.CanComplete[leg] = mayAdd && in.DepthOK[leg]
+	}
+	if b := m.batch; b != nil && b.kind == cex.PurposeEntry && !b.settled {
+		in.Batch = &strategy.GapBatch{PlanPrice: b.planPrice, SentAt: b.sentAt}
+		for _, id := range b.orders {
+			if o, found := orderIn(r.orders, id); found && o.Request.Purpose == cex.PurposeEntry {
+				in.Batch.AvgFill[o.Request.Leg] = o.AvgPrice
+			}
+		}
+		for _, leg := range cex.Legs {
+			book := r.books.ByLeg[leg]
+			in.BookNew[leg] = book.DepthReceivedAt.After(b.doneAt) || book.BestReceivedAt.After(b.doneAt)
+		}
+	}
+	return in
+}
+
+// --- the exit at the line ---
+
+// exitAtLine sends the exit pair when the open cycle is at the exit line;
+// it reports whether it sent one.
+func (m *ExecManager) exitAtLine(r *round) bool {
+	if !r.rulesOK {
+		return false
+	}
+	in := m.exitInput(r)
+	plan, reason := m.strat.EvaluateExit(in)
+	if plan == nil {
+		logger.GlobalLogger.Debug("exec: no exit at the line", "cycle", r.cycle.ID, "reason", string(reason))
+		return false
+	}
+	m.sendExit(r, plan, in)
+	return true
+}
+
+// exitInput gathers the facts of one exit decision (PRD 9.7): while the
+// mean warms up again the last ready mean and sigma stand in, and while F is
+// stale its last valid value does; both are expressed under the current
+// anchors.
+func (m *ExecManager) exitInput(r *round) strategy.ExitInput {
+	c := r.cycle
+	stats := m.stats
+	if !stats.Ready {
+		stats = m.lastReady
+	}
+	in := strategy.ExitInput{Direction: c.Direction, Hold: c.Hold(), Books: r.books.ByLeg, Rules: r.rules, F: r.fx.Price.InexactFloat64(),
+		Anchors: m.anchors, PairAnchors: c.PairAnchors, Stats: stats}
+	for _, leg := range cex.Legs {
+		in.DepthOK[leg] = r.books.DepthOK(leg, r.now)
+	}
+	return in
+}
+
+// --- the entry ---
+
+// entryInput gathers the facts of one entry decision. Steps 1 to 3 of PRD
+// 5.13 that the round has not left on already are in Blocked.
+func (m *ExecManager) entryInput(r *round) strategy.EntryInput {
+	in := strategy.EntryInput{Blocked: m.entryBlocked(r), Books: r.books.ByLeg, Rules: r.rules, F: r.fx.Price.InexactFloat64(),
+		Anchors: m.anchors, PairAnchors: m.anchors, Stats: m.stats, Last: m.lastEntry, AnchorChangedAt: m.anchorChangedAt, Now: r.now}
+	if c := r.cycle; c != nil {
+		in.Holding, in.PairAnchors = c.Direction, c.PairAnchors
+	}
+	_, _, in.QuotaLeft = m.inv.Quota()
+	return in
+}
+
+// entryBlocked is the first failing check of steps 1 to 3 of PRD 5.13, in
+// their order; empty when all pass. The position mismatch and the orders
+// without a final state are left on earlier in the round, and so is a cycle
+// of an ended Session: the forced exit takes the round until it is closed.
+func (m *ExecManager) entryBlocked(r *round) strategy.Reason {
+	now, books := r.now, r.books
+
+	// Step 1: the program and the account.
+	switch {
+	case m.stop.stopping:
+		return strategy.ReasonStopping
+	case m.stop.noEntries:
+		return strategy.ReasonNoNewEntries
+	case !r.rulesOK || !m.cex.TradingReady() || !m.cex.Positions().Loaded:
+		return strategy.ReasonNotReady
+	}
+	if ok, _ := m.cex.SettingsOK(m.leverage); !ok {
+		return strategy.ReasonSettings
+	}
+	if (m.store != nil && !m.store.Healthy()) || m.inv.StoreBlocked() {
+		return strategy.ReasonStoreError
+	}
+	if m.inv.CapitalPending() {
+		return strategy.ReasonCapitalPending
+	}
+
+	// Step 2: the trading hours and the anchors.
+	switch {
+	case !now.Before(m.session.RegularOpen):
+		return strategy.ReasonRegularHours
+	case m.anchors.Kind == cex.AnchorNone:
+		return strategy.ReasonNoAnchor
+	case m.anchors.EntryBan:
+		return strategy.ReasonActionWindow
+	}
+
+	// Step 3: the data.
+	switch {
+	case !books.DepthUsable(cex.Bull, now):
+		return strategy.ReasonDepthBull
+	case !books.DepthUsable(cex.Bear, now):
+		return strategy.ReasonDepthBear
+	case books.ByLeg[cex.Bull].Conflict:
+		return strategy.ReasonConflictBull
+	case books.ByLeg[cex.Bear].Conflict:
+		return strategy.ReasonConflictBear
+	case !r.fxFresh:
+		return strategy.ReasonFXStale
+	case !m.freshDepthSince(r):
+		return strategy.ReasonAwaitDepth
+	case m.batch != nil && m.batch.rejected && now.Sub(m.batch.doneAt) < m.timing.rejectBackoff:
+		return strategy.ReasonRejectedBackoff
+	}
+	return ""
+}
+
+// noteAtLine records an at_line_blocked decision when the entry signal held
+// and a later check refused the entry (PRD 5.13), once while the same reason
+// lasts.
+func (m *ExecManager) noteAtLine(r *round, reason strategy.Reason) {
+	if !atLineReasons[reason] {
+		m.atLine = ""
+		return
+	}
+	if reason == m.atLine {
+		return
+	}
+	m.atLine = reason
+	v := m.view(r)
+	dir := strategy.Short // the direction whose signal held
+	if m.strat.AtEntryLine(strategy.Long, v.xLong, v.sigma) {
+		dir = strategy.Long
+	}
+	logger.GlobalLogger.Info("exec: at the line, no entry", "reason", string(reason), "direction", dir, "x_long_d", v.xLong, "x_short_d", v.xShort, "mu_d", v.mu, "sigma_d", v.sigma)
+	m.recordDecision(r.now, "at_line_blocked", r.cycle, "", dir, reason, map[string]any{
+		"x_long_d": finite(v.xLong), "x_short_d": finite(v.xShort), "mu_d": finite(v.mu), "sigma_d": finite(v.sigma),
+		"anchor_kind": m.anchors.Kind, "f": r.fx.Price, "depth_seq_bull": r.books.ByLeg[cex.Bull].DepthSeq, "depth_seq_bear": r.books.ByLeg[cex.Bear].DepthSeq})
+}
+
+// phase is the part of the Session now is in.
+func (m *ExecManager) phase(now time.Time) string {
+	switch {
+	case now.Before(m.session.RegularOpen):
+		return phaseOffHours
+	case now.Before(m.session.End.Add(-m.scfg.ForcedExitBeforeClose)):
+		return phaseRegular
+	}
+	return phaseCloseWindow
+}
+
+// lotOf finds a lot of the cycle by its id.
+func lotOf(c *inventory.Cycle, id inventory.LotID) *inventory.Lot {
+	for _, lot := range c.Lots {
+		if lot.ID == id {
+			return lot
+		}
+	}
+	return nil
+}
