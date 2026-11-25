@@ -654,6 +654,41 @@ func (s *Store) LoadState(ctx context.Context, sessionID string) (State, error) 
 	return st, nil
 }
 
+// LoadPerpMinutes reads, for every minute of [from, to), the last second
+// of it at which the recorder's Bitget rows of both contracts (bull and
+// bear symbols) carry a best bid and ask: the second in (minute, minute +
+// 60 s] with the largest second_ms. A minute without such a second is left
+// out. Only a restart reads it, for the minutes the process did not record.
+func (s *Store) LoadPerpMinutes(ctx context.Context, bull, bear string, from, to time.Time) ([]PerpMinuteRow, error) {
+	rows, err := s.pool.Query(ctx, `SELECT a.second_ms, a.bid_px[1]::float8, a.ask_px[1]::float8, b.bid_px[1]::float8, b.ask_px[1]::float8
+		FROM etfpair.perp_second a
+		JOIN etfpair.perp_second b ON b.venue = a.venue AND b.symbol = $2 AND b.second_ms = a.second_ms
+		WHERE a.venue = 'bitget' AND a.symbol = $1 AND a.second_ms > $3 AND a.second_ms <= $4
+		  AND cardinality(a.bid_px) > 0 AND cardinality(a.ask_px) > 0 AND cardinality(b.bid_px) > 0 AND cardinality(b.ask_px) > 0
+		ORDER BY a.second_ms`, bull, bear, from.UnixMilli(), to.UnixMilli())
+	if err != nil {
+		return nil, fmt.Errorf("store: perp_second: %w", err)
+	}
+	defer rows.Close()
+	var out []PerpMinuteRow
+	for rows.Next() {
+		var r PerpMinuteRow
+		if err := rows.Scan(&r.SecondMs, &r.BidBull, &r.AskBull, &r.BidBear, &r.AskBear); err != nil {
+			return nil, fmt.Errorf("store: perp_second: %w", err)
+		}
+		r.MinuteMs = (r.SecondMs - 1) / 60_000 * 60_000
+		if n := len(out); n > 0 && out[n-1].MinuteMs == r.MinuteMs {
+			out[n-1] = r // a later second of the same minute
+			continue
+		}
+		out = append(out, r)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("store: perp_second: %w", err)
+	}
+	return out, nil
+}
+
 // load reads the rows of T's table that match where, a SQL condition with
 // its ORDER BY and $n arguments.
 func load[T Row](ctx context.Context, pool *pgxpool.Pool, where string, args ...any) ([]T, error) {

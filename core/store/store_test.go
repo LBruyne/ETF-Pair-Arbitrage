@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"etf-pair-arbitrage/core/internal/dbtest"
 	"fmt"
 	"log/slog"
 	"math"
@@ -210,13 +211,12 @@ func TestOpenErrorsCarryNothingOfTheDSN(t *testing.T) {
 // --- tests against a database ---
 
 // testConfig returns the pool configuration of the test database, or skips.
-// The tests delete rows, so the production port is refused.
+// The tests delete rows, so the production port is refused, and they hold
+// the database (dbtest.Lock) against the other packages' tests.
 func testConfig(t testing.TB) *pgxpool.Config {
 	t.Helper()
+	dbtest.Lock(t)
 	dsn := os.Getenv("ETFPAIR_TRADE_TEST_DSN")
-	if dsn == "" {
-		t.Skip("ETFPAIR_TRADE_TEST_DSN is not set: database test skipped (scripts/dev_db.sh start prints the value)")
-	}
 	pc, err := pgxpool.ParseConfig(dsn)
 	if err != nil {
 		t.Fatal("ETFPAIR_TRADE_TEST_DSN cannot be parsed")
@@ -1220,5 +1220,51 @@ func TestWriteSyncReturnsAtItsDeadline(t *testing.T) {
 	}
 	if !s.Healthy() || s.Rejected() != 1 {
 		t.Errorf("healthy = %t, rejected = %d; want true and 1", s.Healthy(), s.Rejected())
+	}
+}
+
+// The recorder's minutes for a restart: per minute (M, M + 60 s] the last
+// second in which both legs have a best bid and ask on Bitget. A second at
+// the minute's start closes the minute before; a second with one leg only,
+// or with an empty side, or of another venue, is not used.
+func TestLoadPerpMinutes(t *testing.T) {
+	s, check := openStore(t, Config{}, testConfig(t), testTimings())
+	ctx := context.Background()
+	if _, err := check.Exec(ctx, "DELETE FROM etfpair.perp_second"); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { check.Exec(context.Background(), "DELETE FROM etfpair.perp_second") })
+	m := time.Date(2026, 11, 24, 21, 0, 0, 0, time.UTC) // 11-25 05:00 UTC+8
+	put := func(venue, symbol string, after time.Duration, bid, ask string) {
+		t.Helper()
+		if _, err := check.Exec(ctx, `INSERT INTO etfpair.perp_second (venue, symbol, second_ms, bid_px, ask_px) VALUES ($1, $2, $3, $4::numeric[], $5::numeric[])`,
+			venue, symbol, m.Add(after).UnixMilli(), bid, ask); err != nil {
+			t.Fatal(err)
+		}
+	}
+	both := func(after time.Duration, bull, bear [2]string) {
+		put("bitget", "SOXLUSDT", after, "{"+bull[0]+"}", "{"+bull[1]+"}")
+		put("bitget", "SOXSUSDT", after, "{"+bear[0]+"}", "{"+bear[1]+"}")
+	}
+	both(0, [2]string{"1", "2"}, [2]string{"3", "4"})                              // closes the minute before
+	both(30*time.Second, [2]string{"40.1", "40.2"}, [2]string{"59.1", "59.2"})     // an earlier second
+	both(60*time.Second, [2]string{"40.41", "40.42"}, [2]string{"59.41", "59.43"}) // the close of 05:00
+	put("bitget", "SOXLUSDT", 90*time.Second, "{41}", "{42}")                      // SOXL only
+	put("bitget", "SOXLUSDT", 100*time.Second, "{41}", "{42}")
+	put("bitget", "SOXSUSDT", 100*time.Second, "{}", "{60}")                      // SOXS without a bid
+	both(110*time.Second, [2]string{"40.5", "40.52"}, [2]string{"59.3", "59.31"}) // the close of 05:01
+	put("binance", "SOXLUSDT", 115*time.Second, "{1}", "{2}")
+	put("binance", "SOXSUSDT", 115*time.Second, "{1}", "{2}")
+
+	got, err := s.LoadPerpMinutes(ctx, "SOXLUSDT", "SOXSUSDT", m, m.Add(2*time.Minute))
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []PerpMinuteRow{
+		{MinuteMs: m.UnixMilli(), SecondMs: m.Add(time.Minute).UnixMilli(), BidBull: 40.41, AskBull: 40.42, BidBear: 59.41, AskBear: 59.43},
+		{MinuteMs: m.Add(time.Minute).UnixMilli(), SecondMs: m.Add(110 * time.Second).UnixMilli(), BidBull: 40.5, AskBull: 40.52, BidBear: 59.3, AskBear: 59.31},
+	}
+	if fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Errorf("minutes\n got %+v\nwant %+v", got, want)
 	}
 }

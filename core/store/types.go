@@ -394,6 +394,17 @@ type State struct {
 	PendingFunding []CycleRow   // the finished cycles whose funding is not known yet (funding_known false), oldest first
 }
 
+// PerpMinuteRow is the last second of one minute at which the recorder's
+// etfpair.perp_second held a best bid and ask on both legs: what a restart
+// fills a minute it did not record itself with (PRD 3.7). It is read, never
+// written.
+type PerpMinuteRow struct {
+	MinuteMs         int64 // the start of the minute
+	SecondMs         int64 // the second taken, in (MinuteMs, MinuteMs + 60 s]
+	BidBull, AskBull float64
+	BidBear, AskBear float64
+}
+
 // --- test double ---
 
 // Fake is a Sink for other packages' tests: it keeps every row in memory, in
