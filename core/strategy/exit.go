@@ -50,8 +50,7 @@ func (s *Strategy) EvaluateExit(in ExitInput) (*ExitPlan, Reason) {
 		return nil, ReasonNoLevels
 	}
 	price := [2]decimal.Decimal{levels[cex.Bull].Price, levels[cex.Bear].Price}
-	x := Spread(in.F, price[cex.Bull].InexactFloat64(), in.Anchors.Bull.InexactFloat64(),
-		price[cex.Bear].InexactFloat64(), in.Anchors.Bear.InexactFloat64()) - mu
+	x := levelSpread(levels, in.F, in.Anchors) - mu
 	if (in.Direction == Short && x > s.cfg.DOut*sigma) || (in.Direction == Long && x < -s.cfg.DOut*sigma) {
 		return nil, ReasonNoSignal
 	}

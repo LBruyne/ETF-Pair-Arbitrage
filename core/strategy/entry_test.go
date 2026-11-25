@@ -517,3 +517,19 @@ func TestConfigMinBatchNotional(t *testing.T) {
 		t.Errorf("min_batch_notional 0: Validate = %v, want it accepted", err)
 	}
 }
+
+// Deviation gives the x of the decisions, for the record: example 1's short
+// x = +10.00; a side without the pricing level gives none.
+func TestDeviation(t *testing.T) {
+	s, in := newStrategy(t, nil), entryInput(shortBooks())
+	x, ok := s.Deviation(in.Books, Short, in.F, in.Anchors, in.Stats)
+	if !ok {
+		t.Fatal("no deviation")
+	}
+	wantFloat(t, "x", x, 10)
+	thin := in.Books
+	thin[cex.Bear] = book(lv("59.437 x 1"), nil)
+	if x, ok := s.Deviation(thin, Short, in.F, in.Anchors, in.Stats); ok || !math.IsNaN(x) {
+		t.Errorf("Deviation without a pricing level = %v, %t; want NaN, false", x, ok)
+	}
+}

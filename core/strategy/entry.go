@@ -63,8 +63,8 @@ func (s *Strategy) EvaluateEntry(in EntryInput) (*EntryPlan, Reason) {
 
 		// Step 6: condition 1. A long needs x <= -d_in x sigma, a short
 		// x >= +d_in x sigma.
-		x := Spread(in.F, pBull, aBull, pBear, aBear) - mu
-		if (dir == Long && x > -s.cfg.DIn*sigma) || (dir == Short && x < s.cfg.DIn*sigma) {
+		x := levelSpread(levels, in.F, in.Anchors) - mu
+		if !s.AtEntryLine(dir, x, sigma) {
 			reason = ReasonNoSignal
 			continue
 		}
@@ -116,6 +116,16 @@ func (s *Strategy) EvaluateEntry(in EntryInput) (*EntryPlan, Reason) {
 		}, ""
 	}
 	return nil, reason
+}
+
+// AtEntryLine is condition 1 of PRD 5.2: a long at x <= -d_in x sigma, a
+// short at x >= +d_in x sigma, x being the executable deviation of that
+// direction. No fee is in it.
+func (s *Strategy) AtEntryLine(dir Direction, x, sigma float64) bool {
+	if dir == Long {
+		return x <= -s.cfg.DIn*sigma
+	}
+	return x >= s.cfg.DIn*sigma
 }
 
 // spacingOK reports whether an entry in direction dir at deviation x may

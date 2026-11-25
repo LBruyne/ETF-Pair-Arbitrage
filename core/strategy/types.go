@@ -196,13 +196,13 @@ const (
 	ReasonNotReady         Reason = "not_ready"         // contract rules, connection or positions are not read yet
 	ReasonSettings         Reason = "settings"          // the account settings differ from what the strategy needs
 	ReasonStoreError       Reason = "store_error"       // records cannot be written
+	ReasonCapitalPending   Reason = "capital_pending"   // a changed capital waits for the open cycle to close: no new lot until then
 	ReasonPositionMismatch Reason = "position_mismatch" // the venue's positions differ from the ledger
 
 	// Step 2: the trading hours and the anchors.
-	ReasonRegularHours    Reason = "regular_hours"     // entries are made off-hours only
-	ReasonPrevSessionOpen Reason = "prev_session_open" // the previous Session's cycle is not closed yet
-	ReasonNoAnchor        Reason = "no_anchor"         // the Session has no anchor yet
-	ReasonActionWindow    Reason = "action_window"     // inside a dividend or split window
+	ReasonRegularHours Reason = "regular_hours" // entries are made off-hours only
+	ReasonNoAnchor     Reason = "no_anchor"     // the Session has no anchor yet
+	ReasonActionWindow Reason = "action_window" // inside a dividend or split window
 
 	// Step 3: the data.
 	ReasonDepthBull       Reason = "depth_bull"       // the bull leg's depth is not usable
