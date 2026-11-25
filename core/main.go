@@ -14,6 +14,10 @@ import (
 	"time"
 
 	"etf-pair-arbitrage/core/cex"
+	"etf-pair-arbitrage/core/cex/binance"
+	"etf-pair-arbitrage/core/cex/bitget"
+	"etf-pair-arbitrage/core/cex/coinbase"
+	"etf-pair-arbitrage/core/cex/direxion"
 	"etf-pair-arbitrage/core/config"
 	"etf-pair-arbitrage/core/exec"
 	"etf-pair-arbitrage/core/inventory"
@@ -120,12 +124,15 @@ func run(cfg *config.Config, signals <-chan os.Signal) error {
 
 	// The managers, in dependency order: cex holds the facts, inventory the
 	// ledger on top of them, strategy the pure computation, exec the loop
-	// that drives all three.
-	cmgr, err := cex.NewManager(cfg.Cex)
+	// that drives all three. The exchange client holds the account's key in
+	// live mode only: in paper mode cfg.Env.Bitget is empty and the client
+	// can read public data and nothing else.
+	venue := bitget.NewClient(cfg.Env.Bitget)
+	cmgr, err := cex.NewManager(cfg.Cex, venue, binance.NewClient(), coinbase.NewClient(), direxion.NewClient(cfg.Env.Direxion.SiteAPIKey))
 	if err != nil {
 		return err
 	}
-	imgr, err := inventory.NewManager(cfg.Inventory, cmgr)
+	imgr, err := inventory.NewManager(cfg.Inventory, cfg.Cex.Pair, cmgr)
 	if err != nil {
 		return err
 	}
@@ -140,6 +147,26 @@ func run(cfg *config.Config, signals <-chan os.Signal) error {
 	cmgr.UseStore(st)
 	imgr.UseStore(st)
 	emgr.UseStore(st)
+
+	// What the previous run stored is read back before any manager runs:
+	// the current Session's anchor facts, so the bell anchor and the NAV's
+	// settle delay continue instead of starting over, and the ledger (R,
+	// the dust, the booked funding and the unfinished cycle with its lots).
+	sessionID := cmgr.Session(started).ID
+	loadCtx, cancelLoad := context.WithTimeout(context.Background(), stateLoadTimeout)
+	state, err := st.LoadState(loadCtx, sessionID)
+	cancelLoad()
+	if err != nil {
+		return fmt.Errorf("the stored state was not read: %w", err)
+	}
+	cmgr.Restore(cex.AnchorFactsFromRows(state.AnchorFacts), nil)
+	// Restore is given no order records: the process keeps no order table,
+	// so the lots of an unfinished cycle stand with their stored amounts.
+	if err := imgr.Restore(state, nil); err != nil {
+		return fmt.Errorf("the stored ledger was not restored: %w", err)
+	}
+	log.Info("ETF-arbitrage core state loaded", "session", sessionID, "anchor_facts", len(state.AnchorFacts),
+		"unfinished_cycle", state.Cycle != nil, "funding_records", len(state.Funding))
 
 	mgrCtx, stopManagers := context.WithCancel(context.Background())
 	var managers sync.WaitGroup
@@ -161,6 +188,9 @@ func run(cfg *config.Config, signals <-chan os.Signal) error {
 	}
 	return err
 }
+
+// stateLoadTimeout is the limit of reading the stored state at start.
+const stateLoadTimeout = 10 * time.Second
 
 // processRunRow is the process_run row of this start: the effective
 // configuration, with nothing from the secrets file.
