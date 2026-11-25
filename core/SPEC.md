@@ -1,10 +1,10 @@
 # core 架构与设计方案
 
-版本：0.5 · 2026-11-24（UTC+8） · 状态：**设计稿；审计 2026-11-24 两次批复：可以分步骤离线实现（第 0、1 步和第 2 步的行情与参考数据），0.5 落实了第二次批复的五处修改；第 0、1 步实施中（用户第 43 条）。** 审计的两份原文、五轮检查报告和 0.1–0.4 的副本在 `experiments/decisions_20261123/spec_core_20261124/`。
+版本：0.8 · 2026-11-25（UTC+8） · 状态：**设计稿；审计五次批复后分步实施中：第 0–4 步已实现、通过测试并已提交，第 5 步（cex 订单与纸面、Bitget 账户侧）实施中，第 6 步起未开始。** 0.8 落实审计第五次意见（原文 `experiments/decisions_20261123/spec_core_20261124/external_audit_code_r5_20261125.md`）：有未结束的一轮时改 M，新 M 等这一轮结清才生效（5.3、5.4b）；正文里额度价的旧写法和强制平仓伪代码里已删除的调用改掉；第 5.1 步加一项真正经过数据库的重启验收。0.7 落实审计第四次意见（`external_audit_code_r4_20261125.md`，5.4a）。各轮审计原文、检查报告和 0.1–0.7 的副本在同一目录。
 
 core 是 ETF Pair Arbitrage 的交易进程：读 Bitget 上 SOXLUSDT / SOXSUSDT 两个永续合约的盘口，按锚点算出价差、均线和 σ，在非盘中两条腿同时偏离均线足够远时用 IOC 限价单同时买入（或同时卖出）两条腿，价差回到平仓线时平仓，每个美股常规收盘前全部平掉。
 
-- **规则在 [../PRD.md](../PRD.md)（3.4）**，本文件只写怎么实现：模块、接口、数据结构、算法的参考代码、落库和实施步骤。两者不一致时以 PRD 为准并修本文件。文中“PRD 5.3”指 PRD 的第 5.3 节。
+- **规则在 [../PRD.md](../PRD.md)（3.7）**，本文件只写怎么实现：模块、接口、数据结构、算法的参考代码、落库和实施步骤。两者不一致时以 PRD 为准并修本文件。文中“PRD 5.3”指 PRD 的第 5.3 节。
 - **设计取舍**（用户第 41 条：“不要考虑 Corner Case，不要冗余设计”）：每条规则只有一个实现位置；不为 PRD 没写的故障情形加机制；PRD 写明的例外情形（订单结果未知、成交不齐、零头、重启）各用一个通用机制覆盖，集中在 5.4 的“例外情形”等三小节，不在主流程里逐个分支。第 10 节是 PRD 条款到实现位置的对照。
 - 代码、标识符、注释、日志用英文；架构、命名、日志、配置的形式沿用相邻仓库 `../dex-cex-arbitrage/arb-core`（第 8 节）。代码从头写，不复制相邻仓库或已归档的旧代码。
 - 监控看板 ETF-Pair Live Monitor 读本进程写的表（5.6），看板自身的设计在 [../dashboard/SPEC.md](../dashboard/SPEC.md) 第 7 节。
@@ -199,10 +199,11 @@ type IndexSource interface { // binance
 type FXSource interface { // coinbase
     Quote(ctx context.Context) (bid, ask decimal.Decimal, err error)
     MinuteClose(ctx context.Context, minute time.Time) (price decimal.Decimal, ok bool, err error)
+    MinuteCloses(ctx context.Context, from, to time.Time) ([]FXMinute, error) // a range in one read, for restart
 }
 type IssuerSource interface { // direxion
     NAV(ctx context.Context, ticker string, tradeDate time.Time) (nav decimal.Decimal, ok bool, err error)
-    Distribution(ctx context.Context, ticker string, exDate time.Time) (amount decimal.Decimal, ok bool, err error)
+    Distributions(ctx context.Context, ticker string) ([]Distribution, error) // every declared round: ex-date, amount, whether the amount is declared
 }
 ```
 
@@ -328,10 +329,13 @@ func (m *CexManager) Restore(facts []AnchorFact, orders []OrderRecord) // before
 func (m *CexManager) Run(ctx context.Context)
 
 // --- market data ---
-func (m *CexManager) Book(leg Leg) *Book                  // latest snapshot, never nil
+func (m *CexManager) Books() Books                        // both legs' books from ONE load of the published view
 func (m *CexManager) BookChanged() <-chan struct{}        // closed at the next book publication
-func (m *CexManager) DepthUsable(leg Leg, now time.Time) bool // connected, has depth, the last depth frame within depth_max_age
-func (m *CexManager) HasPrice(leg Leg, now time.Time) bool    // a best price from either stream within depth_max_age
+// Books is one read of both legs; every question below is answered on that same snapshot.
+//   type Books struct { ByLeg [2]*Book; MaxAge time.Duration }
+//   func (b Books) DepthUsable(leg Leg, now time.Time) bool // connected, has depth, the last depth frame within MaxAge
+//   func (b Books) DepthOK(leg Leg, now time.Time) bool     // usable and without a conflict
+//   func (b Books) HasPrice(leg Leg, now time.Time) bool    // a best price from either stream within MaxAge
 
 // --- reference ---
 func (m *CexManager) FX(now time.Time) (fx FX, fresh bool) // fresh: read within fx_max_age
@@ -531,6 +535,28 @@ NAV                                  Kind = nav，A = NAV            # 之后不
 #### 日志（前缀 `cex:`，子包 `bitget:` 等）
 
 `running` / `stopped`（Info）；`book live` / `book down; resubscribing`（Info / Warn，带 `symbol`、`topic`、`seq`）；`depth chain broken; resubscribing`（Warn）；`anchor changed`（Info，`session`、`from`、`to`、两条腿的值、`known_at`）；`bell index not ready; retrying`（Info）；`fx stale`（Warn，`age`）；`calendar differs from the venue schedule`（Error）；`account settings differ`（Error，期望值和读到的值）；`order status changed`（Info，`client_order_id`、`from`、`to`、`cum_exec_qty`）；`order outcome unknown; querying`（Warn）；每 30 秒一行 `status`（Info：两条腿的深度年龄、冲突、F 的年龄、锚点种类、私有流是否在线、未出结果的订单数）。逐帧的内容只在 Debug。
+
+#### 第 2 步实现时定下的（2026-11-24）
+
+实现与上文的出入和上文没写、实现时定下的做法，以代码为准：
+
+- **连接**：每条腿一条公共连接（各调一次 `SubscribeBooks`）。增量接不上时重开这条腿的订阅。`Book.Connected` 因此按腿算。断线或增量接不上而丢深度时，最优价不跟着丢：深度的第一档比 `books1` 新就先存成最优价，所以 `HasPrice` 仍按最后一个最优价的到达时刻算，最多再撑 `depth_max_age`（PRD 3.1）。序号与已有深度相等的帧也丢弃。
+- **`Run` 是四个循环**：盘口在 `Run` 自己的 goroutine；F、锚点、参考数据各一个，读取内联、每次最多等 10 秒。
+- **`Venue.FinancialRecords` 只返回资金费结算流水**：流水类型是线上的字符串，留在适配器里，manager 只按合约筛。
+- **读取间隔**（`timings`）：资金费流水首次回看 7 天、之后每分钟读一次并重叠一个间隔；合约规则每小时；账户设置每分钟；结算费率每 5 分钟（每条腿 100 条）；持仓在启动时读到成功一次，之后只在 `ReadPositions` 时读。
+- **`TradingReady`** 目前只看规则已读到且两个合约在线；私有流的条件到第 5.2 步再加。`Restore` 的 `orders` 参数到第 5.1 步才用。
+- **NAV**：取到分；返回的交易日必须等于所问的日期；在“两条腿这一轮都读到、且都满 `nav_settle_delay` 没变”的那次读取时确认。铃锚点不取整。
+- **分红**：调整后的 `KnownAt` 取锚点得知时刻、T、金额读到时刻三者里最晚的；窗口跨两个 Session，按时刻判断。每天的核对在启动时做一次、之后每 24 小时，只对晚于当前 Session 起始日的除息日报警。Direxion 的密钥缺失或被拒：本次运行不再读，一条 Error 加 `event`。
+- **`SettingsOK`** 只在结果变化时打 Error 加 `event`。`event.kind` 新增：`account_settings_differ`、`calendar_differs`、`issuer_key`、`ex_date_not_configured`、`split_entry_ban`。
+- **日历**：`Calendar` 另有 `CarrierDay(exDate)`、`CompareSchedule(days)`；休市日和提前收盘日的表与看板采集器的日期相同。
+- **`main`**：`LoadState` 失败直接退出；“每 5 秒重试”随第 6.4 步的恢复流程实现。
+- **实测**（门控的公开测试，原始输出在 `experiments/core_step2/`）：60 秒里 SOXL `books5` 3,717 帧、`books1` 7,189 帧，SOXS `books50` 2,684 帧、`books1` 5,082 帧，全是 `snapshot`；两条腿 600 次采样深度都可用，深度帧最大间隔 269 ms / 190 ms。**冲突占采样的比例：SOXL 5.5%，SOXS 27%**（`books1` 经常领先 `books50`）——冲突期间不开仓、不按线平仓、不补齐，这个比例直接影响可交易的时间，纸面阶段继续统计。结算费率接口 `GET /api/v3/market/history-fund-rate` 返回 `data.resultList[]{symbol, fundingRate, fundingRateTimestamp}`，新的在前，落在 8 小时的格点上。
+- **Direxion**（用户第 48 条：“可以自己寻找新的或者用看板的有效的”）：2026-11-25 把看板那把有效的密钥放进了 `core/.env` 的 `direxion.site_api_key`（文件权限改为 600；密钥不进仓库），并把门控的实读测试跑了一次、通过：SOXL 11-24 的 NAV 当时还没公布（接口返回空，按“没读到”处理），分红列表读到 32 轮，最近一轮除息日 2026-09-22、金额 0.0929。这次测试没有把原始应答落盘。
+- **没做**：第 9 节 2.4 的“读到的指数、NAV 与看板库逐项相同”没有验收（要看板的只读连接串），留到第 6.5 步纸面联调时做。
+- **密钥缺失或被拒时的后果**（现在已配上，写在这里备查）：全程只用铃锚点；配置里有除息日时，分红金额读不到，从载体日纽约 04:00 起一直不开仓，直到读到金额——例如 12-22 除息：12-21 纽约 04:00 到 12-22 收盘整段不开仓。看板采集器的记录还表明 Direxion 接口里的分红数据比公告晚约一天，有密钥也可能出现同样的结果。12 月的除息日前后要看一次实际行为。
+
+- **独立代码审查之后的修改**（报告 `experiments/decisions_20261123/spec_core_20261124/review_code_step2.md`：没有必须改的，10 处建议改）：`corporate_actions` 里重复的（代码、除息日、种类）校验不通过（同一条分红写两遍会把锚点减两次）；日历与时段表的差异只在首次出现和内容变化时报警，消失时一条 Info；铃锚点重试的日志分三种——`bell index not ready; retrying`（Info）、`bell F of the minute missing; retrying`（Info）、`bell anchor read failed; retrying`（Warn）；断线的 Warn 只由 bitget 适配器打一条（`bitget: stream down; reconnecting`，键 `stream`、`symbol`），manager 这边是 Info `cex: book down`；注释和错误文本里不再出现步骤号。新增只供测试用的内部包 `cex/internal/livetest`：门控的联网测试把每个请求的地址、取得时刻、状态码和应答原文落盘（11-25 12:16 重跑的原始文件在 `experiments/core_step2/`：`bitget_public_rest_raw_…json`、`bitget_public_…jsonl.gz`、`binance_public_raw_…json`、`coinbase_public_raw_…json`）。
+- **11-25 重跑的实测**：60 秒里冲突占采样的比例 SOXL 22/599（3.7%）、SOXS 176/599（29%），与前一天的 5.5% / 27% 同一量级；最近一次结算费率 SOXL 0.000237、SOXS −0.000538（不为 0）。
 
 ### 5.2 `strategy`（Strategy）
 
@@ -744,32 +770,24 @@ func (s *Strategy) EvaluateExit(in ExitInput) (*ExitPlan, Reason) {
     return &ExitPlan{Side: in.Direction.Opposite().Side(), Price: p, Qty: qty, X: x, Mu: mu, Sigma: sigma}, ""
 }
 
-// exitSize is PRD 9.5 and 9.6: the same sizing as an entry, capped by what is held; when the
-// book cannot take everything, the batch is shrunk so that neither leg is left with a remainder
-// too small to send.
+// exitSize is PRD 9.5: the same sizing as an entry, capped by what is held. A leg whose order
+// could not be sent (below the minimum quantity or notional) gets no order; what can never be
+// sent is recorded as dust when the cycle closes (5.3).
 func (s *Strategy) exitSize(lv [2][]cex.BookLevel, p [2]decimal.Decimal, in ExitInput) (qty [2]decimal.Decimal, ok bool) {
     q := [2]decimal.Decimal{in.PairAnchors.Bull, in.PairAnchors.Bear}
     avail := func(l cex.Leg) decimal.Decimal { return lv[l][0].Qty.Add(lv[l][1].Qty).Mul(s.cfg.TakeRatio) }
     if avail(cex.Bull).GreaterThanOrEqual(in.Hold[0]) && avail(cex.Bear).GreaterThanOrEqual(in.Hold[1]) {
-        return in.Hold, true                                           // the book takes all that is left
+        qty = in.Hold                                                  // the book takes all that is left
+    } else {
+        k := decimal.Min(avail(cex.Bull).Mul(q[0]), avail(cex.Bear).Mul(q[1]), in.Hold[0].Mul(q[0]), in.Hold[1].Mul(q[1]))
+        for l := range qty { qty[l] = floorToStep(k.Div(q[l]), in.Rules[l].QtyStep) }
     }
-    k := decimal.Min(avail(cex.Bull).Mul(q[0]), avail(cex.Bear).Mul(q[1]), in.Hold[0].Mul(q[0]), in.Hold[1].Mul(q[1]))
-    size := func(k decimal.Decimal) (out [2]decimal.Decimal) {
-        for l := range out { out[l] = k.Div(q[l]).RoundFloor(stepPlaces(in.Rules[l])) }
-        return out
+    for l := range qty {
+        if !in.Rules[l].Sendable(qty[l], p[l]) { qty[l] = decimal.Zero } // no order for this leg
     }
-    qty = size(k)
-    for l := range qty {                                               // a remainder that could not be sent: shrink the whole batch
-        if rest := in.Hold[l].Sub(qty[l]); rest.IsPositive() && !in.Rules[l].Sendable(rest, p[l]) {
-            k = decimal.Min(k, in.Hold[l].Sub(minSendable(in.Rules[l], p[l])).Mul(q[l]))
-        }
-    }
-    qty = size(k)                                                      // both legs from the same anchored amount
-    return qty, in.Rules[0].Sendable(qty[0], p[0]) && in.Rules[1].Sendable(qty[1], p[1])
+    return qty, qty[0].IsPositive() || qty[1].IsPositive()
 }
 ```
-
-`minSendable(rule, price)` 是这个价位上发得出的最小数量：`max(MinQty, MinNotional ÷ price 向上取到数量步长)`。
 
 例（附录 A 例二）：持仓 165.30 / 110.20，卖盘有效档可用 350 / 100 份 → 锚定金额 14,000 / 6,000 → K = 6,000 → 买回 150.00 / 100.00，剩 15.30 / 10.20（都够一张单，不调整）。
 
@@ -878,6 +896,21 @@ func (s *Strategy) ForcedOrders(dir Direction, hold [2]decimal.Decimal, books [2
 
 例：平空（买），SOXS 卖一 59.385，让 10 bps → 59.385 × 1.001 = 59.444385 → 向上取到 0.001：59.445。
 
+#### 第 3 步实现时定下的（2026-11-25）
+
+上文的伪代码与实现的出入，以及上文没写、实现时定下的做法，以代码为准：
+
+- 取整到数量步长用 `floorToStep`（除以步长后向下取整），任意步长都对；伪代码里的 `stepPlaces` + `RoundFloor` 只对 10 的幂的步长成立。
+- 数量过小的原因：K 被额度封顶而发不出单是 `quota_exhausted`，否则 `too_small`。`Reason` 另有 `await_close`；`Strategy.Config()` 把配置交给 exec。
+- 开仓两个方向分别判断，都不开时原因取走得最远的那一步：一个方向档位不足、另一个没到线，记 `no_signal`；两个方向都不足才是 `no_levels`。
+- `capByLimit` 逐档试到吃够数量的那一档为止，取“数量 × 额度价 ≤ 额度”的最大数量，相等时取更好的价。额度价见 5.4a：买单是这一档的限价，卖单是决策那一刻盘口的原始买一（PRD 6.4）。
+- 平仓数量（用户第 47 条）：发不出单的那条腿数量为 0、这一批不下单，两条腿都发不出才是 `too_small`；exec 发单时跳过数量为 0 的腿。
+- 价格和锚点转 `float64` 只用于价差统计；费率和让价由 `decimal.NewFromFloat` 得到；比较不加容差。σ 以窗口第一分钟为基准求偏差，各分钟相同时严格等于 0。
+- 深度被丢弃但 `books1` 还有最优价时，回吐的损失按那一个最优档估；连最优价也没有就不读这条腿的盘口。`LossComplete` / `LossTrim` 只在两种单都发得出、做了比较时才填。
+- 整轮的差额不区分“累积的零头”和“本批的差额”（用户第 47 条：零头暂不处理）：差额发得出单时照普通的差额处理。
+
+- **独立代码审查之后的修改**（报告 `review_code_step34.md`）：无效的输入不出计划——锚点不为正是 `no_anchor`，μ、σ 不是有限值是 `warmup`，x 不是有限值（F 是 NaN）是 `fx_stale`；`EvaluateEntry`、`EvaluateExit`、`EvaluateGap`、`ForcedOrders` 的注释写明前提（步长、刻度、配比锚点为正，有最优价）。恰好在线上时由浮点比较决定（差在 1e-12 量级），测试固定了现在的结果。
+
 ### 5.3 `inventory`（InventoryManager）
 
 库存与资金：记下每一轮、每个仓位的数量和金额，算盈亏、R 和额度，与交易所的持仓核对，收资金费流水。它不下单，也不决定什么时候平仓。
@@ -887,7 +920,7 @@ inventory/
   types.go      Config（capital、leverage）、CycleID、LotID、Cycle、Lot、LotLeg、Holdings、Quota
   manager.go    InventoryManager：NewManager、Run（核对、采样、资金费）、读接口
   ledger.go     OpenCycle、OpenLot、Sync / rebuild（由订单重算，先开先平）、SettleLot、CloseCycle
-  quota.go      Quota、Reserve
+  quota.go      Quota（额度、R、未出结果的开仓和补齐单的预留）
   reconcile.go  与交易所持仓核对
   store.go      本模块的行（cycle、lot、funding、inventory_sample、inventory_state）
 ```
@@ -936,21 +969,20 @@ type Cycle struct {
 // order's cumulative fields go backwards, so the snapshot is used as it is.
 func (m *InventoryManager) Sync(orders []cex.OrderRecord) {
     m.mu.Lock(); defer m.mu.Unlock()
-    rebuild(m.cycle, m.dustAtOpen, orders)                             // lots, and the dust as it stands now
-    m.reserved = pendingNotional(orders)                               // entry and completion orders without a final state, at their limit price
+    rebuild(m.cycle, orders)                                           // every lot of the cycle, from scratch
+    m.reserved = pendingNotional(orders)                               // entry and completion orders without a final state: remaining quantity × QuotaPrice
     m.realise(orders)                                                  // lots' results and status, the cycle's totals; rows only when something changed
 }
 
 // rebuild recomputes every lot of the cycle from its orders, in the order they were sent
 // (the sequence number in the ClientOrderID). An order's money is spread over its quantity
 // at the order's average price through share.take, which gives the last part the remainder.
-func rebuild(c *Cycle, dustAtOpen [2]Dust, orders []cex.OrderRecord) {
-    c.resetLots(); c.dust = dustAtOpen
+func rebuild(c *Cycle, orders []cex.OrderRecord) {
+    c.resetLots()
     for _, o := range sortedBySeq(orders) {
         if !o.CumExecQty.IsPositive() { continue }
         rest := share{qty: o.CumExecQty, value: o.CumExecValue, fee: o.Fee} // what of this order is not allocated yet
         leg := o.Request.Leg
-        c.offsetDust(leg, o.Request.Side, &rest)                       // a fill that reduces recorded dust closes it first (PRD 8.1)
         switch o.Request.Purpose {
         case cex.PurposeEntry, cex.PurposeComplete:
             c.lot(o.Request.LotID).addEntry(leg, rest.take(rest.qty))
@@ -981,7 +1013,7 @@ func (s *share) take(q decimal.Decimal) (part share) {
 - 跨两个仓位的一张平仓单，两个仓位都按这张单的**成交均价**记（PRD 7.4 写的是按逐笔成交的先后；第 10 节把它列为首版的简化）：整轮的毛额、手续费、净额不受影响，只是同一张单内部在两个仓位之间不按逐笔的价格分。逐笔成交照样存在 `cex_fill` 里，供核对和看板用。
 - **盈亏**（USDT）：一条腿已平掉的部分，毛额 = 方向 × (平仓金额 − 已平数量 × 开仓均价)（做多 +1，做空 −1）；手续费 = 这部分的平仓手续费 + 开仓手续费按已平数量占开仓数量的比例。`realise` 按当前的账本算各仓位的已实现毛额和手续费。
 - 仓位的状态也由重算得出：`settle` 之前是 `building`；建成后两条腿都归零、并且这一轮此刻没有任何没有最终状态的订单时是 `closed`（平掉它的那张平仓单还没出结果时不算，否则会按中途的均价写定）。`lot`、`cycle` 的行只在重算的结果与上次写的不同才写。
-- **零头的盈亏归留下它的那个仓位**（PRD 8.1）：零头带着原来的 `lot_id` 和均价。后面某一轮里它被方向相反的成交冲掉时（`offsetDust`），这部分的毛额和手续费不进当前这一轮的合计；当前这一轮关闭时，`CloseCycle` 在同一次 `WriteSync` 里把它们加到原仓位那一行的 `dust_qty`、`dust_gross`、`dust_fee` 上，并计入 `r_closed`，只记一次。这一轮还开着时它由重算得出、算在 R 里；重启后从 `dust_at_open` 重算得到同样的数。
+- **零头只记录，不处理**（用户第 47 条）：成交只按上面的规则入账，没有“先冲掉旧零头”的步骤，也不把后面的成交归到以前的仓位上。
 - 认回的补齐单和回吐单（重启时本地没有记录，`ClientOrderID` 里没有仓位号）记给这一轮最后一个 `building` 的仓位：同一时刻只有它可能被补齐或回吐。
 - 例（附录 A 例二）：仓位 1 卖 105.30 @ 40.44、70.20 @ 59.42，买回 @ 40.38、59.40 → 毛额 105.30 × 0.06 + 70.20 × 0.02 = 7.722，手续费 0.65 bps × (4,258.33 + 4,171.28 + 4,252.01 + 4,169.88) = 1.095，净额 6.627。仓位 2 只平掉 44.70 / 29.80（开 60.00 / 40.00）：开仓手续费按 74.5% 摊，手续费合计 0.465，净额 6.389。
 - 没建成的批是 `void` 的 lot，`void_reason` 分两种：`no_fill`（两条腿都没成交）和 `one_leg`（只成交一条腿、全部回吐，PRD 8.6；亏损照实计入这一轮和 R）。回测的分项统计（PRD 16.5）按它分。
@@ -992,18 +1024,18 @@ func (s *share) take(q decimal.Decimal) (part share) {
 ```go
 // Quota is the notional the strategy may hold: L × (M + min(0, R)). Profit does not raise it.
 func (m *InventoryManager) Quota() (total, used, left decimal.Decimal) {
-    total = m.cfg.Leverage.Mul(m.cfg.Capital.Add(decimal.Min(decimal.Zero, m.r)))
+    total = m.cfg.Leverage.Mul(m.capital.Add(decimal.Min(decimal.Zero, m.r)))     // m.capital: the M the ledger runs on (see below)
     used = m.openEntryNotional().Add(m.reserved)     // open quantity × entry average price, both legs, unbuilt batches included;
-    return total, used, total.Sub(used)              // plus entry and completion orders without a final state, at their limit price
+    return total, used, total.Sub(used)              // plus entry and completion orders without a final state (remaining quantity × QuotaPrice), plus recorded dust
 }
 ```
 
-R = 已结束各轮的已实现净额（含 `void` 的亏损）+ 已入账的资金费 + 未结束这一轮的已实现净额。前两项的合计存在 `trade.inventory_state.r_closed`（每轮结束、每条资金费入账时更新），第三项随时从账本算，所以重启时重放这一轮的订单不会把它算两次。`inventory_state` 还带着对应的 `capital`：启动时配置的 `capital` 与库里的不同就把 `r_closed` 置 0、写一条 `event`（PRD 6.3：改 M 时从 0 重算）。例：M = 1,000、L = 10，R = −30 → 额度 9,700；R = +50 → 仍是 10,000。
+R = 已结束各轮的已实现净额（含 `void` 的亏损）+ 已入账的资金费 + 未结束这一轮的已实现净额。前两项的合计存在 `trade.inventory_state.r_closed`（每轮结束、每条资金费入账时更新），第三项随时从账本算，所以重启时重放这一轮的订单不会把它算两次。`inventory_state` 还带着对应的 `capital`（账本正在用的那一份 M）。**改 M**（PRD 6.3）：启动时配置的 `capital` 与库里的不同、且没有未结束的一轮，就在恢复时切到新基线——`capital` 取配置值、`r_closed` 置 0、`since_ms` 取当时、写一条 `event`（`capital_changed`）。有未结束的一轮时不切：按库里的旧 M、旧 `r_closed`、旧 `since_ms` 恢复，`CapitalPending()` 为真、不开新仓（`OpenLot` 返回 `ErrCapitalPending`），减仓、核对、关轮照常；这一轮关闭时，在关轮的同一次同步写里切到新基线（顺序 `cycle`、`lot`、`event`、`inventory_state`）。等待期间写库的 `capital` 一直是旧值，所以中途再重启会再次发现不同、继续等，不需要新列。例（审计的数字）：M 1,000 → 2,000、L = 10，旧轮已实现 −10、还持有 350 → 重启后额度 9,900、已用 350、不开仓；关轮后 M = 2,000、R = 0、额度 20,000。例：M = 1,000、L = 10，R = −30 → 额度 9,700；R = +50 → 仍是 10,000。
 
 #### 核对、零头、资金费（`reconcile.go`、`manager.go`）
 
 - **核对**（PRD 13.4、13.7）：用 REST 读的持仓（`cex.ReadPositions`，两个合约），推送只用来触发。只由 exec 的循环调用（`inv.Reconcile`），每次之前刚 `Sync` 过订单快照：`recover` 的最后一步；每批订单都有了最终状态之后；`closeIfFlat`；没有未出结果的订单时每 10 秒一次。inventory 的 `Run` 自己不核对。比的是两条腿带符号的数量与账本（各仓位的未平数量 + 零头）。差额能由还没查清的订单解释（同一条腿、同一方向、不超过它的未成交数量）不算不符。不符要间隔 1 秒再读一次、仍然不符才置 `Mismatch() = true`，打 Error；置位后不自动清除，人核对后重启。持仓读不到不当作空仓，也不当作不符，只是不开仓（`not_ready`）。
-- **零头**（PRD 8.1）：一轮结束时某条腿剩下发不出单的数量，由 `CloseCycle` 连同它的均价和所属的一轮写进 `inventory_state.dust`（与 `cycle` 行同一次 `WriteSync`）；下一轮开始时的零头抄在 `cycle.dust_at_open` 里，供重算用。核对时算上。之后这条腿上方向相反的成交先冲掉它（`offsetDust`），盈亏记给留下它的那个仓位和 R（见上面“记账”）。
+- **零头**（用户第 47 条：“零头暂时不处理，记录零头仓位和价格即可”）：一轮结束时某条腿剩下发不出单的数量（低于最小数量或最小名义），`CloseCycle` 把它从仓位里取出来记下：一行 `event`（`dust_left`，Warn：腿、带符号的数量、它的开仓均价、`cycle_id`、`lot_id`），并把每条腿的**净零头**（带符号的数量和均价）写进 `inventory_state.dust`，与 `cycle` 行、`r_closed` 同一次 `WriteSync`。零头不产生已实现盈亏：仓位和这一轮的毛额、手续费、净额以及 R 都只算实际平掉的部分。核对持仓时把净零头算上（交易所持仓 = 各仓位的未平数量 + 净零头），所以留着零头不会被当成持仓不符。之后不再对它做任何事——不冲抵、不归属、不专门去平；实盘里出现得多不多，从 `event` 和 `inventory_state` 看，再决定要不要处理。
 - **资金费**（PRD 7.6）：cex 每分钟读一次资金费流水（接口不能按合约过滤，读回后本地取两个合约的资金费类型），inventory 在 `cex.AccountChanged()` 时取新的流水：每条写一行 `funding`、计入 R，按它的结算时刻（流水时间向下取到 8 小时的结算点；实测流水比结算晚 2–6 秒）记给持仓区间包含这个时刻的那一轮。一轮跨过某个结算时刻时：这个时刻两个合约的结算费率（`FundingHistory`）是 0 就按 0 算已知；不是 0 而流水还没读到，`FundingKnown = false`，净额显示“待出账”。
 - **采样**：每 10 秒一行 `inventory_sample`（交易所持仓、账本持仓、R、额度、是否不符）。
 
@@ -1015,7 +1047,6 @@ type cexSource interface { // what inventory needs from cex; *cex.CexManager sat
     AccountChanged() <-chan struct{}
     FinancialRecords() []cex.FinancialRecord
     FundingRateAt(leg cex.Leg, settlement time.Time) (rate decimal.Decimal, ok bool)
-    UnresolvedOrders() []cex.OrderRecord
 }
 
 func NewManager(cfg Config, c cexSource) *InventoryManager
@@ -1036,10 +1067,53 @@ func (m *InventoryManager) MarkTakeover(now time.Time)                  // the c
 
 - `OpenCycle`、`OpenLot` 先把行同步写库（`store.WriteSync`），写成功才改内存；写失败返回错误，这一批不发（PRD 13.5），并把同一个主键的作废状态（`cycle` 记 `closed`、`end_reason = store_error`；`lot` 记 `void`、`void_reason = store_error`；订单记 `not_sent`）也用 `WriteSync` 写——`WriteSync` 的错误只说明没有确认写入，那一行可能已经在库里，不作废的话重启会读回一轮并不存在的仓位。作废行不能走 `Record`（队列满时会被丢掉）：它没有确认写入之前，每一拍重试，期间不开仓（`store_error`）；只减仓的单不受影响。重启时仍按订单和交易所持仓的事实核对。其余的行异步写。
 - 记账的方法只由 exec 的循环调用；`Run` 的 goroutine 只做核对、采样和资金费。两边共用一把 `mu`，每个方法在一次加锁内完成判断和修改；读方法返回拷贝。
-- 重启与在线走同一条路：`Restore` 读回这一轮和各仓位的身份、状态和决定时的数，零头取这一轮开始时的样子（`cycle.dust_at_open`），然后 `Sync` 这一轮的订单。`lot` 表里的金额列是算出来的结果，订单才是依据。
+- 重启与在线走同一条路：`Restore` 读回这一轮和各仓位的身份、状态和决定时的数，净零头取自 `inventory_state.dust`，然后 `Sync` 这一轮的订单。`lot` 表里的金额列是算出来的结果，订单才是依据。
 - 一轮结束时，`cycle` 行和 `inventory_state.r_closed` 在同一次 `WriteSync` 里写；资金费入账时，`funding` 行和 `r_closed` 同一次写。所以 `r_closed` 与已存的行总是一致，流水按 `record_id` 去重，重启后只取库里没有的。
 
 日志（前缀 `inventory:`）：`cycle opened` / `lot built` / `lot void` / `lot closed`（Info，带数量、均价、毛额、手续费、净额）/ `cycle closed`（Info，`reason`、合计、`funding_known`）/ `quota`（Debug）/ `positions do not match the ledger; no orders until a person checks`（Error，两边的数量）/ `dust left`（Warn）/ `funding booked`（Info）/ 每 30 秒一行 `status`。
+
+#### 第 4 步实现时定下的（2026-11-25）
+
+上文与实现的出入，以及上文没写、实现时定下的做法，以代码为准。exec 调用的签名：
+
+```go
+func NewManager(cfg Config, pair cex.Pair, c cexSource) (*InventoryManager, error) // the pair names the two contracts
+func (m *InventoryManager) UseStore(s store.Sink)
+func (m *InventoryManager) Restore(state store.State, orders []cex.OrderRecord) error
+func (m *InventoryManager) Run(ctx context.Context)
+func (m *InventoryManager) Cycle() *Cycle
+func (m *InventoryManager) Holdings() (strategy.Direction, [2]decimal.Decimal)
+func (m *InventoryManager) Quota() (total, used, left decimal.Decimal)
+func (m *InventoryManager) Mismatch() bool
+func (m *InventoryManager) Settled() bool       // every order of the cycle has a final state and, where filled, a confirmed fee
+func (m *InventoryManager) StoreBlocked() bool  // a voiding row is not confirmed yet: no entries
+func (m *InventoryManager) CapitalPending() bool // the configured capital waits for the open cycle to close: no entries
+func (m *InventoryManager) Reconcile(ctx context.Context) error // nil, ErrPositionsUnread or ErrPositionsDiffer
+func (m *InventoryManager) OpenCycle(sessionID string, dir strategy.Direction, pair cex.Anchors, now time.Time) (*Cycle, error)
+func (m *InventoryManager) OpenLot(plan *strategy.EntryPlan, now time.Time) (*Lot, error) // may return ErrStoreBlocked or ErrCapitalPending
+func (m *InventoryManager) Sync(orders []cex.OrderRecord)
+func (m *InventoryManager) SettleLot(id LotID, built bool, now time.Time)
+func (m *InventoryManager) CloseCycle(reason string, now time.Time) error // ErrNotSettled while orders or fees are open; a failed write changes nothing and is retried next round
+func (m *InventoryManager) MarkTakeover(now time.Time)
+```
+
+- `Sync` 对每张单按 `UpdateSeq` 留最新的一份，旧的快照不会把账本往回改；没有任何订单记录时不重算。
+- 核对所说的“还没查清的订单”取自最近一次 `Sync` 的快照（cex 的订单表在第 5.1 步才有）；`cexSource` 另有 `Positions()` 供采样。
+- 订单按 `ClientOrderID` 的字符串排序（同一轮前缀相同、序号定宽）。`LotID` 是 `<cycle_id>-<序号>`。预留 = 未成交数量 × `QuotaPrice`（订单请求里带着、存在 `cex_order.quota_price`；买单等于限价，卖单是决策时的原始买一）。按比例分摊保留 8 位小数，最后一份取余额。
+- 作废行由 `Run` 每 200 毫秒重试一次同步写，`store.Healthy()` 为假时跳过；确认之前 `StoreBlocked()` 为真。
+- 零头的均价取那个仓位的开仓均价；净零头的合并规则：同号相加、按数量加权均价，异号相减、保留剩余一侧的价，过零时余量取新的价。
+- 资金费记给持仓区间 `[OpenedAt, ClosedAt]` 包含结算时刻的那一轮。首次启动时 cex 回看 7 天，这两个合约在这 7 天里的旧资金费流水会记进 R——换到策略独占的新账户时没有旧流水；在现有账户上首次启动前要注意这一点（第 9 步）。
+- `takeover` 的轮重启后保持 `takeover`、照常记账；是否改回 `open` 随第 6.4 步定。
+- `store.LoadState` 新增两样：已入账的资金费流水（整行）和资金费未到账的已结束轮次。`main` 现在传给 `Restore` 的订单是空的（cex 还不能把 `cex_order` 行转成记录，第 5.1 步补上）：重启后仓位先显示库里的金额，到第一次 `Sync` 才重算。
+
+- **独立代码审查之后的修改**（报告 `review_code_step34.md`：一处必须改、十处建议改，都已修）：
+  - **回吐的记法**：回吐单先记在它那一批上，至多记到这一批这条腿的未平数量，余下的照先开先平（差额按整轮算，回吐量可能大于本批的开仓量；原先整张记在本批上会让仓位和 `r_closed` 记错）。
+  - **仓位 `closed` 的条件**与关轮相同：这一轮的订单都有最终状态、有成交的手续费都已确认。关轮的那次同步写带上这一轮的**全部**仓位行（此前被队列丢掉的行在这里补上）。`CloseCycle` 的前提是调用方已确认各腿剩余的数量发不出单、持仓核对相符。
+  - **账本的起点**：`inventory_state.since_ms`（第一次建这一行时和改 M 时取当时的时刻）；结算时刻早于它的资金费流水不入账、不写库（PRD 6.3：R 从这一份 M 生效起累计）。上面“首次启动会把 7 天的旧流水记进 R”的问题因此不再存在。
+  - **资金费只等有持仓的腿**：一轮跨过结算时刻时，只要求那一刻确有持仓的腿有流水（`one_leg` 的轮不会一直待出账）；已结束的轮还在等的（结算时刻、腿）存在 `cycle.funding_awaited` 里，重启后照样补记。持仓由订单的成交时刻推出，所以有成交的订单必须带成交时间（`ExchangeUpdatedAt`，没有时取 `UpdateReceivedAt`）。一次读到的新流水连同相关的轮和 `r_closed` 在**一次**同步写里落库，不在持锁期间逐条写。
+  - 写库失败的日志：开始时一条、期间每分钟至多一条、恢复时一条。`store.Fake` 有“报错但留下行”的模式，用来测“报错却已提交”的路径。
+  - `Sync` 的调用方要保证：同一张单的 `UpdateSeq` 在一个进程里严格递增（第 5.1 步的 cex 订单表负责）。
+  - 表：`inventory_state` 加 `since_ms`，`cycle` 加 `funding_awaited` JSONB；按第 1 步建过表的开发库要删掉重建。
 
 ### 5.4 `exec`（ExecManager）
 
@@ -1099,8 +1173,9 @@ func (m *ExecManager) Run(ctx context.Context) error {
 }
 
 func (m *ExecManager) step(now time.Time) (done bool) {
+    books := m.cex.Books()                           // ONE read of both legs for this round: freshness, conflict, levels and prices all come from it
     m.closeMinutes(now)                              // finish the minutes that have ended, then take this moment's observation
-    m.observe(now)
+    m.observe(now, books)
     defer m.sample(now)                              // one signal_sample row a second, with m.idleReason
     open := m.syncOrders()                           // one snapshot of the cycle's orders, booked into the ledger; returns those without a final state
     if m.stopCheck(now) { return true }              // the 60 s alarm; a takeover leaves here
@@ -1148,7 +1223,7 @@ func (m *ExecManager) step(now time.Time) (done bool) {
 
 - `syncOrders`：`orders := m.cex.CycleOrders(cycle.ID)` → `m.inv.Sync(orders)` → 返回其中没有最终状态的。这一拍后面所有的判断（在途、未知、差额、结清、平仓）都依据这同一份快照；通知只负责唤醒。两条腿都已有最终状态而只收到一条通知时，快照里两条腿都在，不会把另一条腿当成没成交。没有未结束的一轮时返回空。
 - 每个不发单的出口都经 `m.idle(reason)`：记下这一拍的原因（`m.idleReason`，随 `signal_sample` 落库）并返回 `false`。条件 1 成立而后面的步骤没过（`cost_not_covered`、`spacing`、`quota_exhausted`、`too_small`、`holding_other_side`）时另写一行 `decision`（kind `at_line_blocked`），同一原因持续期间只写一次。不开仓的原因只有这一个出口：`step` 里提前返回的（程序和订单的状态）与 `entryInput.Blocked` 里的（PRD 5.13 第 1–3 步的其余事实）不重复。
-- `entryInput.Blocked` 按 PRD 5.13 的顺序取第一个不满足的：停止或停新仓；`cex.TradingReady()`、`cex.SettingsOK(L)`、`store.Healthy()`；非盘中、上一个 Session 的仓位已平完、有锚点、`!Anchors.EntryBan`；两条腿 `DepthUsable` 且没有冲突、F 有效、`freshDepthSince(batch.doneAt)`；上一批有被拒的单时另等 1 秒（见第 10 节“本设计加的”）。
+- `entryInput.Blocked` 按 PRD 5.13 的顺序取第一个不满足的：停止或停新仓；`cex.TradingReady()`、`cex.SettingsOK(L)`、`store.Healthy()`、`!inv.StoreBlocked()`、`!inv.CapitalPending()`（原因 `capital_pending`）；非盘中、上一个 Session 的仓位已平完、有锚点、`!Anchors.EntryBan`；两条腿 `DepthUsable` 且没有冲突、F 有效、`freshDepthSince(batch.doneAt)`；上一批有被拒的单时另等 1 秒（见第 10 节“本设计加的”）。
 - `freshDepthSince(t)`：两条腿的 `DepthReceivedAt` 都晚于 `t`（PRD 5.9）；`t` 为零值时为真。
 - `gapInput`：`Hold` 取账本；`Batch = m.batch.gapBatch()`（平仓批和强制平仓批是 `nil`，只回吐）；`CanComplete[leg]` 是 PRD 8.5 的那几条（非盘中、没有停止或停新仓信号、账户设置相符、这条腿深度可用且没有冲突）；`BookNew[leg]` 是这条腿有晚于 `batch.doneAt` 的深度或 `books1`；`HasPrice[leg]` 来自 `cex.HasPrice`。
 - `gapOrder`：开仓批的差额单用途是 `complete` 或 `trim`（带这一批的 `lotID`，并入这一批）；平仓批的差额单用途是 `exit`（先开先平）。回吐和继续平仓的单记 `m.lastReduceAt[leg] = now`。
@@ -1173,11 +1248,12 @@ func (m *ExecManager) closeMinutes(now time.Time) {
 }
 
 // observe follows the Session and the anchors, then keeps this moment's observation if it is usable.
-func (m *ExecManager) observe(now time.Time) {
+func (m *ExecManager) observe(now time.Time, books cex.Books) {
     if s := m.cex.Session(now); s.ID != m.session.ID {               // a regular close passed: a new Session
         m.session, m.bars, m.runStart, m.stats = s, nil, 0, strategy.Stats{}
     }
     a := m.cex.Anchors()
+    if a.SessionID != m.session.ID { a = cex.Anchors{SessionID: m.session.ID} } // just after a close cex may still publish the previous Session's anchors: no anchor yet
     if a.RestartAt.After(m.restartedAt) {                            // a dividend took effect
         m.runStart, m.restartedAt, m.stats = len(m.bars), a.RestartAt, strategy.Stats{}
     }
@@ -1189,9 +1265,9 @@ func (m *ExecManager) observe(now time.Time) {
         m.event("anchor_changed", ...)                               // with the spread's jump (PRD 11.4)
     }
     m.anchors = a
-    if m.cex.DepthUsable(cex.Bull, now) && m.cex.DepthUsable(cex.Bear, now) {
+    if books.DepthUsable(cex.Bull, now) && books.DepthUsable(cex.Bear, now) {
         if fx, fresh := m.cex.FX(now); fresh {
-            m.obs = &observation{at: now, midBull: mid(m.cex.Book(cex.Bull)), midBear: mid(m.cex.Book(cex.Bear)), f: fx.Price}
+            m.obs = &observation{at: now, midBull: mid(books.ByLeg[cex.Bull]), midBear: mid(books.ByLeg[cex.Bear]), f: fx.Price}
         }
     }
 }
@@ -1243,7 +1319,7 @@ func (m *ExecManager) forcedExit(now time.Time, unknown bool) (done bool) {
         return false                                                  // leaving after a stop is decided in one place: stopCheck
     }
     for l := range hold {
-        if hold[l].IsPositive() && !m.cex.HasPrice(cex.Leg(l), now) {
+        if hold[l].IsPositive() && !books.HasPrice(cex.Leg(l), now) { // books: the one read taken at the start of this round
             return m.idle(ReasonNoPrice)                              // a leg without a price: both wait, the pair stays hedged (PRD 10.4)
         }
     }
@@ -1272,7 +1348,7 @@ func (m *ExecManager) forcedExit(now time.Time, unknown bool) (done bool) {
 | 未知满 30 秒（13.3） | `chase` 写 `event`（`order_unknown_30s`，Error）。`gapByPositions`：用交易所持仓代替账本算两条腿的差额，只回吐（`Batch = nil`），每条腿 200 毫秒一张。按持仓推出的数量只用来定这张回吐单，不写进账本；账本只随订单回报变 |
 | 认定“没有到达交易所”（13.3） | 三样证据：cex 给出的 `NotFound`（`order-info` 答 25204、成交记录里没有这个编号，且已满 30 秒）加上这条腿的交易所持仓等于账本。齐了 → `cex.MarkNeverArrived(id)`（最终状态 `never_arrived`）+ `event`。之后它又冒出成交：持仓核对会报不符，由人处理（13.7） |
 | 只成交一条腿（8.6） | 不单独处理：`EvaluateGap` 对“一条腿为零”的差额同样给出补齐或回吐；全部回吐后 `settle` 把这一批记为 `void`（`one_leg`） |
-| 零头（8.1、9.6） | `MarketRule.Sendable` 是唯一的判断；发不出的数量在这一轮关闭时由 `CloseCycle` 记进 `inventory_state.dust`，写 `event`（`dust_left`，Warn） |
+| 零头（8.1；用户第 47 条） | 只记录、不处理：`MarketRule.Sendable` 是唯一的判断；发不出的数量在这一轮关闭时由 `CloseCycle` 记进 `event` 和 `inventory_state.dust`（5.3） |
 | 交易所拒单（6.5） | `rejected` 是零成交的最终状态，后面与没成交相同；强制平仓和回吐 200 毫秒后按新盘口重发。因价格超限被拒的只减仓单，新算出的限价与被拒的那张相同时不重发，价格变了再发；限频等其他拒单照常重发（第 10 节） |
 | 持仓不符（13.4、13.7） | `inv.Mismatch()` → `step` 不发任何单，每 60 秒一条 Error；停止信号和人工接管仍然有效（`stopCheck` 在它前面） |
 | 一条腿没有价格（13.6） | `forcedExit` 里两条腿都等；`EvaluateGap` 的回吐没有价格时返回 `GapBlocked`，这一拍不发单、不结清，下一拍再看 |
@@ -1290,7 +1366,7 @@ func (m *ExecManager) forcedExit(now time.Time, unknown bool) (done bool) {
 
 读库在 `main` 里、所有 `go Run` 之前完成，各模块拿到的是值：
 
-1. `store.LoadState`：没结束的一轮（`status` 为 `open` 或 `takeover`，不限 Session）和它的 `lot`、`cex_order` 行；`inventory_state`；当前 Session 的 `minute_bar` 和 `anchor_fact`；`lastEntry`（最近一个建成的 lot 的开仓时刻、方向和 `x_d`）。 第 4 步实现 inventory 时再加三样（第 1 步的 `State` 还没有）：已入账的资金费流水的 `record_id`（去重用）、零头所属的那个 `lot` 整行（状态表是整行覆盖，写它的零头列要有整行）、已结束但 `funding_known = false` 的轮（流水到了要补记）。
+1. `store.LoadState`：没结束的一轮（`status` 为 `open` 或 `takeover`，不限 Session）和它的 `lot`、`cex_order` 行；`inventory_state`；当前 Session 的 `minute_bar` 和 `anchor_fact`；`lastEntry`（最近一个建成的 lot 的开仓时刻、方向和 `x_d`）。 第 4 步实现 inventory 时再加两样（第 1 步的 `State` 还没有）：已入账的资金费流水的 `record_id`（去重用）、已结束但 `funding_known = false` 的轮（流水到了要补记）。
 2. `cmgr.Restore(anchorFacts, orders)`（锚点、得知时刻、NAV 的计时不重来；订单表）→ `imgr.Restore(state, orders)` → `emgr.Restore(minuteBars, lastEntry)` → 纸面时 `PaperVenue.SeedPositions`。
 3. 各 manager `go Run`；exec 的 `recover`：
    - **认单**：`cex.RecoverOrders(ctx, since)`（两个合约的历史订单，自这一轮创建起；没有未结束的一轮时取最近 2 小时——交易所对被撤销的 IOC 只留 2 小时）里 `etfp` 前缀、本地没有的单，按 `ClientOrderID` 的几段补出记录（并入 cex 的订单表）。没有最终状态的订单由 cex 继续查询。
@@ -1306,6 +1382,38 @@ func (m *ExecManager) forcedExit(now time.Time, unknown bool) (done bool) {
 - `signal_sample` 每秒一行（`timings.sample`）：时段、锚点种类和两个值、F、中点价差、μ、σ、两个方向的可执行偏离 x、`idle_reason`（这一秒不发单的原因，发了单时为空）、两条腿深度是否可用和是否冲突、持仓方向和数量、额度、本 Session 的收盘时刻。看板的 Status、曲线和 Decisions 都读它；开仓线和平仓线由看板用 μ、σ 和 `process_run.config` 里的 d_in、d_out 现算。
 - `decision`：每次开仓、平仓、补齐、回吐、强制平仓的决定各一行，`detail` 带复算要用的数（x、μ、σ、限价、档位、数量、两种损失、往返手续费的两个单位；用旧均值平仓时带它的时刻和锚点种类）；“到线没开”一行。`detail`、`signal_sample` 和 `event` 里的统计量写库前检查：不是有限值的（没有锚点、没有档位时算不出来）写 NULL，不写 NaN。
 - 日志（前缀 `exec:`）：`running`（Info：`live`、参数、Session）/ `entry`、`exit`、`gap`、`forced exit`（Info，带同样的数）/ `batch settled`（Info：`built` 或 `void`）/ `order outcome unknown for 30 s; using positions`（Error）/ `stop requested`、`no new entries`、`taken over`（Info）/ `not flat 60 s after stop`（Error）/ `late exit past the close`（Error）/ 每 30 秒一行 `status`（Info：时段、锚点、μ、σ、x、原因、持仓、额度）。“报警”就是一条 Error 日志加一行 `event`（PRD 第 15 节）。
+
+### 5.4a 审计第四次意见之后的修改（2026-11-25）
+
+审计在第 2–4 步的代码上复现了六个问题，另提了两处口径；都已修并有回归测试（审计的数字原样用作断言）。上文与这里不同的地方以这里和代码为准。
+
+**每一拍一次读取两腿盘口**（cex，5.1 的读接口已改）：`Books()` 一次取出两条腿，新鲜度（`DepthUsable`）、能否用于开仓 / 按线平仓 / 补齐（`DepthOK` = 可用且无冲突）、有没有价格（`HasPrice`）、有效档位、回吐估价和订单限价都从这同一份得出；`observe`、`entryInput`、`exitInput`、`gapInput`、强制平仓都用 `step` 开头取的那一份。原先分开的 `Book(leg)`、`DepthUsable(leg, now)`、`HasPrice(leg, now)` 已删除——两次读取之间来一帧，通过检查的深度和参与计算的深度就不是同一版。纸面撮合（第 5.1 步）要把决策所用的快照和模拟成交所用的后续盘口都记下，便于解释成交差异。
+
+**铃锚点的 F 固定**（cex）：收盘前一分钟的有效 F 第一次取到时，就为这个 Session 固定数值和来源——程序自己记下的优先（`own`），当时没在运行才用 Coinbase 那一分钟的 K 线（`candle`）——并写一条 `anchor_fact`（kind `bell_f`，每条腿一行）。之后的重试只读缺的指数；重启先读回它。例：自记 F = 1.000、K 线 0.999，两条腿的指数 40、50 第 11 分钟才到 → 锚点 40 / 50（原先本地缓存已淘汰那一分钟，会算成 39.96 / 49.95）。
+
+**回吐的估价与限价用同一份盘口**（strategy，`GapInput.DepthOK [2]bool`）：这条腿深度可用且无冲突时逐档估；深度过期或冲突、但最优价还新鲜时，整笔按那个最优价估（限价本来就由它定）。例：做空，SOXL 要买回 15.30 份，开仓均价 40.44；旧深度卖一 40.47，新的 `books1` 卖一 40.60 × 300。按旧深度估回吐 0.5395 USDT，小于补齐的 0.714，会选回吐；按看得见的 40.60 估是 2.5286，应当补齐。少的那条腿的补齐门槛（`CanComplete`）不变。
+
+**两个按线判断要求 F 有限且大于零**（strategy）：`EvaluateEntry`、`EvaluateExit` 在 F 为零、负数或非有限值时返回 `fx_stale`、不出计划（进程还没读到过有效的 F 时读数就是零值）。开仓另要求 F 新鲜；按线平仓可以用最近一次有效的正值；强制平仓不看 F。
+
+**额度价**（strategy、inventory；PRD 6.4 已写明）：买单的额度按限价算；卖单按决策那一刻盘口的**原始买一**算——卖出的限价是最低接受价，成交可以更高，按限价算会低估它能占用的名义。开仓的额度封顶、补齐的 `capByLimit`、没出结果订单的预留用同一个口径。`EntryPlan.QuotaPrice [2]`、`GapAction.QuotaPrice` 把它带给 exec，exec 抄进 `cex.OrderRequest.QuotaPrice`（只记录，不发给交易所；库里是 `cex_order.quota_price`），inventory 的预留用它，为零时退回限价；平仓和强制平仓的单不带额度价。成交后按实际入账；发单之后价格再改善仍可能小额超出。例：剩余额度 5,000 USDT 时两腿卖单按限价预留 4,999.13，按当时的买盘实际可成交 5,000.22；改用买一后数量略小，按买盘成交不超过 5,000。
+
+**认回订单的归属只定一次**（inventory）：订单记录上没有仓位号时（重启时按编号认回的补齐单、回吐单），第一次见到它就定下归属并一直保持，`rebuild` 只按固定的归属分配；`LotOf(id cex.ClientOrderID) LotID` 把归属交给恢复代码，由它写进 `cex_order.lot_id`（第 5.1 / 6.4 步必须这样做，否则再重启又会重新定）。原先每次重算都“归到当前在建的批”，新一批开始后认回的成交会从旧批移到新批：总持仓对得上，逐批成本和盈亏却错了。
+
+**零头占额度**（inventory；零头仍只记录、不处理，用户第 47 条）：已用额度里加上每条腿 |净零头数量| × 它的均价，关轮前后、重启前后连续且只计一次。例：0.05 SOXL × 40 = 2 USDT，关轮后 `used = 2`、`left = 9,998`。后一轮方向相反时不按交易所的净仓抵减，偏保守。
+
+**资金费的归属与计入分开**（inventory）：先定一笔流水属于哪一轮（总是回答：记给那一轮、结束它的待出账、写 `funding` 行），再定它算不算进 R（结算时刻不早于账本起点 `since_ms` 才算）。例：改 M 之后才到的一笔属于旧轮的 −0.12：旧轮净额少 0.12、不再待出账；新基线的 R 仍是 0。
+
+**关于重启读回订单**：`cex_order` 表和它的读回（`store.LoadState`）第 1 步就有了；还缺的是把读回的订单接进 cex 的订单表和 inventory 的 `Restore`（`main` 现在传的是空），这是第 5.1 步的事。
+
+### 5.4b 审计第五次意见之后的修改（2026-11-25）
+
+原文 `experiments/decisions_20261123/spec_core_20261124/external_audit_code_r5_20261125.md`；用户第 50 条：“可以参考审计意见，修复和提交相关代码，然后完成第五步开发和测试”。
+
+**新 M 在旧的一轮结清后才生效**（inventory，5.3 额度一节）。审计复现：旧轮已实现 −10、还持有 350，M 从 1,000 改成 2,000 后重启，日志说 R 从零起，恢复出来的 R 却是 −10、额度 19,900——`Restore` 只清了 `r_closed`，未结束这一轮的已实现部分又被加了回来。改法取审计建议的那一种：有未结束的一轮时整个按旧基线恢复，关轮时才换。测试 `TestCapitalChangedWithACycleUnfinished`（重启后 9,900 / 不开仓 / 减仓照常；关轮前再重启仍在等；关轮后 2,000 / R = 0 / 20,000 / 可以再开）和原有的 `TestFundingOfAnOldCycleAfterCapitalChange`（改 M 之后才到的旧轮 −0.12：记给旧轮、不进新 R）分别覆盖两条路径。PRD 6.3 同步补了一句。
+
+**正文里的旧写法**：`capByLimit`、`Sync` 和 `Quota` 的注释、“预留 = 未成交数量 × 限价”四处改成按 `QuotaPrice`；强制平仓伪代码里的 `m.cex.HasPrice` 改成这一拍读到的 `books.HasPrice`。0.7 的 5.4a 说过“以这里和代码为准”，但正文留着相反的写法会让第 5、6 步照着旧的实现。
+
+**第 5.1 步多一项验收**（第 9 节）：真正经过数据库的重启测试——认回属于 A 批的一张订单 → 归属存进 `cex_order.lot_id` → 开 B 批 → 从库读回、重启、重放；断言 A、B 两批的数量和成本不变，卖单的 `quota_price` 读回后不变。
 
 ### 5.5 `config`、`.env`、`logger`、`main.go`
 
@@ -1423,15 +1531,15 @@ func (s *Store) LoadState(ctx context.Context, sessionID string) (State, error) 
 | `process_run` | 状态 / `run_id` | main：启动、停止 | `started_ms`、`stopped_ms`、`host`、`live`、`config` JSONB（生效的配置，不含 `.env`） |
 | `minute_bar` | 事实 / `(live, minute_ms)` | exec：每分钟结束 | 只有原始输入：`session_id`、`mid_bull`、`mid_bear`、`f`、`valid`、`source`（`own` / `perp_second`）。同一分钟不同的运行写出的值相同，可以跨运行复用；价差、均线、σ 随参数而变，不存在这里，各次运行按自己的配置重算，落在带 `run_id` 的 `signal_sample` 里 |
 | `signal_sample` | 采样 / `(ts_ms, run_id)` | exec：每秒 | `session_id`、`session_end_ms`、`phase`（`off_hours` / `regular` / `close_window`）、`anchor_kind`、`anchor_bull`、`anchor_bear`、`f`、`mid_d`、`mu_d`、`sigma_d`、`x_long_d`、`x_short_d`、`stats_ready`、`idle_reason`、`depth_ok_bull`、`depth_ok_bear`、`conflict_bull`、`conflict_bear`、`cycle_id`、`direction`、`hold_bull`、`hold_bear`、`quota_left` |
-| `anchor_fact` | 事实 / `(live, session_id, kind, leg, known_ms)` | cex：每次读到锚点、NAV、分红 | `kind`（`bell` / `nav_seen` / `nav` / `dividend`）、`value`、`f`、`source`、`detail` JSONB |
-| `cycle` | 状态 / `cycle_id` | inventory：开（同步）、每次记账、结束 | `session_id`、`direction`、`status`（`open` / `closed` / `takeover`）、`dust_at_open` JSONB、`end_reason`（`exit_line` / `close_window` / `stop` / `session_changed` / `no_fill` / `one_leg` / `store_error`）、`pair_anchor_kind`、`pair_anchor_bull`、`pair_anchor_bear`、`opened_ms`、`closed_ms`、`gross`、`fees`、`funding`、`funding_known`、`net`、`dust_bull`、`dust_bear` |
-| `lot` | 状态 / `lot_id` | inventory：开（同步）、每次记账、结清 | `cycle_id`、`seq`、`status`（`building` / `open` / `closed` / `void`）、`void_reason`、`direction`、`x_d`、`mu_d`、`sigma_d`、`fee_d`、`fee_usdt_est`、每条腿的 `entry_qty` / `entry_value` / `entry_fee` / `exit_qty` / `exit_value` / `exit_fee`（列名带 `_bull`、`_bear`）、`opened_ms`、`closed_ms`、`gross`、`fees`、`net`、它留下的零头后来被冲掉的 `dust_qty` / `dust_gross` / `dust_fee`（列名带 `_bull`、`_bear`） |
-| `cex_order` | 状态 / `client_order_id` | cex：登记（发单前同步写）和每次变化 | `cycle_id`、`lot_id`、`leg`、`symbol`、`purpose`、`side`、`reduce_only`、`price`、`qty`、`status`、`unknown`、`order_id`、`cum_exec_qty`、`cum_exec_value`、`avg_price`、`fee`、`cancel_reason`、`error_code`、`error_message`、`unknown_since_ms`、`not_found`、`fee_known`、本机 `submitted_ms` / `sent_ms` / `acked_ms` / `update_received_ms`、交易所 `exchange_updated_ms` |
+| `anchor_fact` | 事实 / `(live, session_id, kind, leg, known_ms)` | cex：每次读到锚点、NAV、分红 | `kind`（`bell_f` / `bell` / `nav_seen` / `nav` / `dividend`）、`value`、`f`、`source`、`detail` JSONB |
+| `cycle` | 状态 / `cycle_id` | inventory：开（同步）、每次记账、结束 | `session_id`、`direction`、`status`（`open` / `closed` / `takeover`）、`funding_awaited` JSONB、`end_reason`（`exit_line` / `close_window` / `stop` / `session_changed` / `no_fill` / `one_leg` / `store_error`）、`pair_anchor_kind`、`pair_anchor_bull`、`pair_anchor_bear`、`opened_ms`、`closed_ms`、`gross`、`fees`、`funding`、`funding_known`、`net`、`dust_bull`、`dust_bear` |
+| `lot` | 状态 / `lot_id` | inventory：开（同步）、每次记账、结清 | `cycle_id`、`seq`、`status`（`building` / `open` / `closed` / `void`）、`void_reason`、`direction`、`x_d`、`mu_d`、`sigma_d`、`fee_d`、`fee_usdt_est`、每条腿的 `entry_qty` / `entry_value` / `entry_fee` / `exit_qty` / `exit_value` / `exit_fee`（列名带 `_bull`、`_bear`）、`opened_ms`、`closed_ms`、`gross`、`fees`、`net` |
+| `cex_order` | 状态 / `client_order_id` | cex：登记（发单前同步写）和每次变化 | `cycle_id`、`lot_id`、`leg`、`symbol`、`purpose`、`side`、`reduce_only`、`price`、`qty`、`status`、`unknown`、`order_id`、`cum_exec_qty`、`cum_exec_value`、`avg_price`、`fee`、`cancel_reason`、`error_code`、`error_message`、`unknown_since_ms`、`not_found`、`fee_known`、`quota_price`、本机 `submitted_ms` / `sent_ms` / `acked_ms` / `update_received_ms`、交易所 `exchange_updated_ms` |
 | `cex_fill` | 事实 / `exec_id` | cex：每笔成交推送 | `client_order_id`、`order_id`、`symbol`、`side`、`price`、`qty`、`value`、`fee`、`exec_ms`（交易所）、`received_ms`（本机） |
 | `decision` | 事实 / `(run_id, seq)` | exec：每个决定 | `ts_ms`、`cycle_id`、`lot_id`、`kind`（`entry` / `exit` / `complete` / `trim` / `forced` / `at_line_blocked`）、`direction`、`reason`、`detail` JSONB |
 | `funding` | 事实 / `record_id` | inventory：每条资金费流水 | `symbol`、`type`、`amount`、`ts_ms`、`settlement_ms`、`cycle_id` |
 | `inventory_sample` | 采样 / `(ts_ms, run_id)` | inventory：每 10 秒 | `pos_bull`、`pos_bear`（交易所，带符号；持仓还没读到时为 NULL）、`ledger_bull`、`ledger_bear`、`r`、`quota_total`、`quota_used`、`mismatch` |
-| `inventory_state` | 状态 / `live` | inventory：一轮结束、资金费入账、零头变化时 | `capital`、`r_closed`、`dust` JSONB（每条腿：带符号的数量、均价、所属的 `cycle_id` 和 `lot_id`） |
+| `inventory_state` | 状态 / `live` | inventory：一轮结束、资金费入账、零头变化时 | `capital`、`r_closed`、`since_ms`（账本的起点）、`dust` JSONB（每条腿的净零头：带符号的数量和均价） |
 | `event` | 事实 / `(run_id, seq)` | 各模块：报警和状态变化 | `ts_ms`、`module`、`level`、`kind`、`message`、`detail` JSONB |
 
 每个事实只由掌握它的模块写一次：订单和成交是 cex 的，仓位和盈亏是 inventory 的，决定和采样是 exec 的。
@@ -1455,6 +1563,7 @@ func (s *Store) LoadState(ctx context.Context, sessionID string) (State, error) 
 | 低于最小名义的只减仓单能否成交 | 未核实，也不依赖：发不出单的数量一律按零头处理（PRD 8.1） |
 | 刚下单立刻查询是否会短暂返回 25204 | 未核实（要下单才能测）。设计不依赖它：25204 只在满 30 秒、且成交记录和持仓都对得上时才认定没有到达 |
 | 零成交的 IOC 在交易所的状态和撤单原因 | 状态已有证据：11-23 那次实盘试验导出的 36 张 IOC（`experiments/bitget_ema_wss_20261123/stop_orders.csv`）里有 12 张是 `cancelled` 且成交量为零（审计核对，本次复数相同），直接用作状态合并的测试样本。撤单原因的字符串那份记录没有存，仍未核实；合并不依赖它 |
+| Bitget 对金额为 0 的资金费结算是否出流水；只减仓单的数量大于交易所持仓（留有反向零头时）是截断成交还是拒单 | 都没有核实。前者影响“待出账”何时消失（费率不为 0 而流水不出时一轮会一直待出账）；后者影响零头在交易所一侧怎样相抵。第 9 步小额实盘时核对 |
 | 全仓资金费流水的 `type` | 文档（相邻仓库记的枚举页）给的是 `CONTRACT_MAIN_SETTLE_FEE_USER_IN/OUT`；今天读的 5 条流水都是别的合约的逐仓类型，说明不了全仓的情形。第 9 步小额实盘跨一次费率不为 0 的结算后核对 |
 | 限价比例（SOXL 0.08、SOXS 0.05）的参照价 | 文档写的是相对 “market price”，具体是哪一个价未实测。第 5.2 步读官方页面和 `ticker` 的字段核实：核实后强制平仓和回吐的限价按 PRD 8.4、10.4 夹进范围；核实不了就保持不夹取加“同价不重发”（第 10 节），并把价格超限的拒单在 `event` 里单列 |
 | 下单的往返延迟 | 16 个签名 GET（每个都是新连接，含握手）的往返：最小 37 ms、中位 58 ms、最大 274 ms；下单走长连接，要到实盘才能量。纸面和回测先用配置的 `sim_order_latency`，第 9 步实测后改 |
@@ -1476,19 +1585,19 @@ func (s *Store) LoadState(ctx context.Context, sessionID string) (State, error) 
 
 ## 9. 实施步骤与状态
 
-每一步结束时：`go build ./... && go vet ./... && go test -race ./...`（在 `core/` 下）通过，本步的验收项有测试，本文件与实现一致，向用户汇报后再进下一步。V 编号是 PRD 第 17 节的验收条目。每个 manager 的时钟都是注入的（`timings.clock`），测试和回放用假时钟。状态：**第 0、1 步已实现并通过测试（2026-11-24，用户第 43 条放行；独立代码审查和审计第三次意见的修改都已并入：连私有开发库 35 个顶层测试全过、无跳过），其余未开始**。
+每一步结束时：`go build ./... && go vet ./... && go test -race ./...`（在 `core/` 下）通过，本步的验收项有测试，本文件与实现一致，向用户汇报后再进下一步。V 编号是 PRD 第 17 节的验收条目。每个 manager 的时钟都是注入的（`timings.clock`），测试和回放用假时钟。状态：**第 0、1 步已实现、测试通过并已提交（2026-11-24；独立代码审查和审计第三次意见的修改都已并入）；第 2、3、4 步已实现并通过测试（2026-11-25，用户第 46 条；两份独立代码审查和审计第四次意见都已修：连私有开发库 176 个顶层测试通过、0 失败、无 race，4 个联网的门控测试默认跳过——3 个公开的各实跑过两次，Direxion 的实读跑过一次；未提交）；审计的结论是第 5.1 步可以开始，第 2–4 步在接入执行循环前还要它再看；其余未开始**。
 
 | # | 步骤 | 内容 | 验收 |
 |---|---|---|---|
 | 0 | 脚手架 | `go.mod` 依赖（decimal v1.4.0、yaml.v3 v3.0.1、gorilla/websocket v1.5.3、pgx/v5 v5.11.0，与本仓库根模块相同的版本）；`logger`；`config`（Load、各段 `Validate`、未知键拒绝）；`config.example.yaml`、`.env.example`（只有占位符）、`.gitignore`、`README.md`（怎么构建、配置、运行纸面）；`main.go` 改为 `package main`，`go.mod` 的模块路径改为 `etf-pair-arbitrage/core`，启动流程与各 manager 的空骨架 | `-check-config` 对示例配置通过；缺参数、`d_out ≥ d_in`、未知键各有一条失败的测试 |
-| 1 | store | `schema.sql`、`Record` / `WriteSync` / `LoadState`、`store.Fake`；`core/scripts/dev_db.sh`（起私有库，建角色和 schema）；`lot` 的零头列和 `inventory_state.dust` 的 `lot_id` | 临时库上：三类写入规则各一例；写失败时 `Healthy()` 为假、恢复后补写；`process_run.config` 里没有任何密钥；量一次同步提交的耗时并记进 5.6 |
+| 1 | store | `schema.sql`、`Record` / `WriteSync` / `LoadState`、`store.Fake`；`core/scripts/dev_db.sh`（起私有库，建角色和 schema） | 临时库上：三类写入规则各一例；写失败时 `Healthy()` 为假、恢复后补写；`process_run.config` 里没有任何密钥；量一次同步提交的耗时并记进 5.6 |
 | 2.1 | cex 类型与盘口 | `cex/types.go` 全部类型和接口；`books.go`：深度帧与 `books1` 的合并、冲突、有效期 | V3 的盘口部分：全快照、连续增量（手编帧）、最优价变走又回来、迟到的深度（5.1 的例二）四段；旧序号丢弃；10 秒无新帧无效 |
 | 2.2 | bitget 公共流 | `bitget/ws.go`（拨号、ping、重连）、`public.go`（订阅、帧解码、断线回调）；`manager.go` 的行情部分、`BookChanged`、`DepthUsable`、`HasPrice` | 本地 WS 假服务的单测；门控的真实连接测试录 60 秒，两条腿各有有效盘口，原始帧落盘 |
 | 2.3 | 日历与 F | `calendar.go`（Session、提前收盘、人工改动、与时段表的核对）；`coinbase` 客户端与 `fx.go`；`binance` 客户端 | V11 的日历部分：周末、提前收盘日、休市日、夏令时切换各一例；F 失效的判定 |
-| 2.4 | 参考数据与锚点 | `reference.go`（规则、账户设置、持仓、资金费流水和结算费率的读取与发布；`TradingReady`、`SettingsOK`）；`direxion` 客户端；`anchors.go`：铃锚点、NAV 的 1 小时稳定、分红窗口和调整、拆股窗口；`cex/store.go` 的 `anchor_fact`；`Restore` | V12 的锚点和分红部分（假来源、假时钟；拆股只测窗口，见第 10 节）；V17 的设置部分；门控只读测试：读到的指数、NAV 与看板库同一 Session 的值逐项相同（用看板的只读角色，另给连接串） |
+| 2.4（验收里“与看板库逐项相同”一项未做，见 5.1） | 参考数据与锚点 | `reference.go`（规则、账户设置、持仓、资金费流水和结算费率的读取与发布；`TradingReady`、`SettingsOK`）；`direxion` 客户端；`anchors.go`：铃锚点、NAV 的 1 小时稳定、分红窗口和调整、拆股窗口；`cex/store.go` 的 `anchor_fact`；`Restore` | V12 的锚点和分红部分（假来源、假时钟；拆股只测窗口，见第 10 节）；V17 的设置部分；门控只读测试：读到的指数、NAV 与看板库同一 Session 的值逐项相同（用看板的只读角色，另给连接串） |
 | 3 | strategy | `levels.go`、`spread.go`、`stats.go`、`entry.go`、`exit.go`、`gap.go` | V1、V2、V4、V5、V6（间隔）、V9 和 V10 的计算部分；补齐的额度按“数量 × 最后一档的价”（5.2 的例子：最多 18.18 份）；附录 A 例一至例四逐数相等；5.2 的每个例子都是测试 |
-| 4 | inventory | `store.LoadState` 补上重启要的三样（5.4）；金额和手续费的分配用 `share.take`，各份之和与订单总额**精确相等**（验收）；`ledger.go`（`Sync` / `rebuild`：由订单记录重算仓位，先开先平、拆分、`void`）、`quota.go`、`reconcile.go`、零头、资金费、`Restore`、`store.go` | V7 的额度部分、V8；附录 A 例二的两个仓位逐数相等；**同一组成交按逐笔更新、只收最终订单、重启回放三种方式输入，逐批的数量、金额、手续费和净额都相等**，各份额之和等于订单的总额；A 轮留下零头、B 轮冲掉：连续运行和中途重启得到相同的 A、B 结果，R 的变化等于实际净额；最后一张 IOC 先报全成、手续费后到：关轮等到手续费，最终 `net` 和 R 含它；旧的快照不会把累计值写回去；能由未查清订单解释的差额不算不符 |
-| 5.1 | cex 订单与纸面 | `orders.go`（登记、同步写、合并、`OrdersChanged` / `CycleOrders`、结果未知的查询、`NotFound`、`RecoverOrders`）；`paper.go`（自己的盘口、每条腿的延迟、纸面持仓和资金费） | V14 的订单部分（假 `Venue`：迟到的推送、超时、25204、拒单；零成交被撤的 IOC 用 11-23 的记录作样本）；V18：纸面模式下假的真实客户端收到 0 次下单调用 |
+| 4 | inventory | `store.LoadState` 补上重启要的两样（5.4）；金额和手续费的分配用 `share.take`，各份之和与订单总额**精确相等**（验收）；`ledger.go`（`Sync` / `rebuild`：由订单记录重算仓位，先开先平、拆分、`void`）、`quota.go`、`reconcile.go`、零头、资金费、`Restore`、`store.go` | V7 的额度部分、V8；附录 A 例二的两个仓位逐数相等；**同一组成交按逐笔更新、只收最终订单、重启回放三种方式输入，逐批的数量、金额、手续费和净额都相等**，各份额之和等于订单的总额；一轮结束时留下零头：`event` 和 `inventory_state.dust` 记下腿、数量和价格，仓位和这一轮的结果不含它，持仓核对相符，重启后净零头读得回；最后一张 IOC 先报全成、手续费后到：关轮等到手续费，最终 `net` 和 R 含它；旧的快照不会把累计值写回去；能由未查清订单解释的差额不算不符 |
+| 5.1 | cex 订单与纸面 | `orders.go`（登记、同步写、合并、`OrdersChanged` / `CycleOrders`、结果未知的查询、`NotFound`、`RecoverOrders`）；`paper.go`（自己的盘口、每条腿的延迟、纸面持仓和资金费） | V14 的订单部分（假 `Venue`：迟到的推送、超时、25204、拒单；零成交被撤的 IOC 用 11-23 的记录作样本）；V18：纸面模式下假的真实客户端收到 0 次下单调用；经过数据库的重启验收（5.4b：认回 A 的订单 → 存归属 → 开 B → 从库重启 → 重放，A、B 的数量和成本不变，卖单的 `quota_price` 读回不变） |
 | 5.2 | bitget 账户侧 | `rest.go`（签名、规则、设置、持仓、订单查询、历史订单、成交、流水、下单）、`private.go`（登录、`order` / `fill` / `position`）。动手前按 `carefully-read-app-docs` 重读下单、私有频道、限速、限价范围四处的官方页面，把页面和日期补进第 11 节 | 签名向量与 httptest 单测（用已落盘的真实应答作样本）；门控只读测试重跑 5.1 的事实表；**下单方法只有单测，不对真实交易所调用** |
 | 6.1 | exec 主流程 | `manager.go`、`step.go`、`bars.go`、`orders.go` 的发单与结清：开仓、建成、再开仓、按线平仓、收盘前强制平仓 | 假时钟 + 假 `Venue` 的整段剧本：V3 的执行部分（冲突时不开仓不平仓、强制平仓不受影响）、V4（原因顺序）、V6（新深度）、V10、V11、V12（换锚不停开仓、配比不变）、V13 |
 | 6.2 | exec 成交不齐 | `gapInput`、补齐 / 回吐的发单、等新帧、`void`、零头 | V9 全部；V7 的“补齐不超过额度”；**两条腿都已有最终状态、第二条腿的通知被扣住时，额外的订单为零；放行后持仓和金额只记一次**；订单在第 0 秒发出并成交、订单的最终状态在第 4 秒才到、另一条腿第 6 秒才恢复时不发补齐单；附录 A 例三、例四走完整流程 |
@@ -1534,6 +1643,8 @@ func (s *Store) LoadState(ctx context.Context, sessionID string) (State, error) 
 | 7.4 一张平仓单的成交按逐笔的先后记给最早的仓位 | 账本由订单记录重算，跨两个仓位的一张单按它的成交均价分给两个仓位（5.3） | 审计指出按通知的增量记会让在线和重启后的逐批盈亏不同。由订单的最终累计值重算保证三种输入方式结果相同；代价是同一张单内部不按逐笔价格分，整轮合计不变 |
 | 8.2 补齐的 5 秒从第一笔成交的交易所时间起（V9） | 从这一批订单发出的本机时刻起 | 不晚于第一笔成交，本机可记、重启可恢复；审计同意，要求补齐、撤单、查询、重启都不刷新这个截止时刻 |
 | 11.6 确认后的 NAV 又被替换 | 首版不接受更正：确认后不再读，也没有替换的入口 | 审计：同意停读；PRD 同步写明 |
+| 8.1 零头：之后这条腿的成交先冲掉它、盈亏记在留下它的那次开仓上；各批的零头累积到发得出单时只回吐 | 零头只记录数量和价格，不冲抵、不归属、不专门处理；整轮的差额发得出单时照普通的差额处理 | 用户第 47 条：“零头暂时不处理，记录零头仓位和价格即可；回头我们看看这种情况实盘多不多再处理” |
+| 9.6 平完这一批后某条腿剩下的不够一张单时，把这一批减小 | 不减小；发不出单的那条腿这一批不发，最后剩下的记成零头 | 用户第 47 条：“剩余量低于最小下单额，是不是也可以按照零头处理；如果是零头，也可以暂时不处理” |
 
 0.3 列过的“分红数据只在配置了除息日时读”已取消：照 PRD 每天读一次（5.1 锚点一节），读到配置里没有的除息日就报警。
 
