@@ -429,6 +429,11 @@ func TestDustIsRecordedOnly(t *testing.T) {
 		fill(ord(a.ID, 3, cex.Bull, cex.PurposeExit, cex.SideBuy, "", "39.9", "100"), "100", "3990", "0.25935"),
 		fill(ord(a.ID, 4, cex.Bear, cex.PurposeExit, cex.SideBuy, "", "59.9", "66.64"), "66.64", "3991.736", "0.25946284"),
 	})
+	// What the ledger expects at the venue: the short cycle's 0.02 of the
+	// bear leg, negative.
+	if got := r.m.LedgerPositions(); !got[cex.Bull].IsZero() || !got[cex.Bear].Equal(dec("-0.02")) {
+		t.Errorf("ledger positions before A closes = %s / %s, want 0 / -0.02", got[cex.Bull], got[cex.Bear])
+	}
 	r.m.SettleLot(la.ID, true, r.clock.Now())
 	r.clock.Add(10 * time.Minute)
 	r.cex.setPositions("0", "-0.02")
@@ -493,6 +498,11 @@ func TestDustIsRecordedOnly(t *testing.T) {
 	if err := r.m.Reconcile(t.Context()); err != nil || r.m.Mismatch() {
 		t.Errorf("reconcile after the restart: %v, mismatch %t", err, r.m.Mismatch())
 	}
+	// The same after the restart, now as dust: what a paper account is
+	// seeded with.
+	if got := r.m.LedgerPositions(); !got[cex.Bull].IsZero() || !got[cex.Bear].Equal(dec("-0.02")) {
+		t.Errorf("ledger positions after the restart = %s / %s, want the dust: 0 / -0.02", got[cex.Bull], got[cex.Bear])
+	}
 	r.m.sample(r.clock.Now())
 	if s := lastOf(t, r.sink, func(store.InventorySampleRow) bool { return true }); !s.LedgerBear.Equal(dec("-0.02")) || !s.LedgerBull.IsZero() || !s.PosBear.Decimal.Equal(dec("-0.02")) {
 		t.Errorf("sample after the restart = ledger %s / %s, venue bear %s; want 0 / -0.02 and -0.02", s.LedgerBull, s.LedgerBear, s.PosBear.Decimal)
@@ -510,6 +520,9 @@ func TestDustIsRecordedOnly(t *testing.T) {
 	r.m.SettleLot(lb.ID, true, r.clock.Now())
 	wantLeg(t, "B lot bear", r.lot(t, 1).Legs[cex.Bear], "33.34", "1993.732", "0.12959258", "0", "0", "0")
 	r.cex.setPositions("50", "33.32") // the venue netted the 33.34 against its -0.02
+	if got := r.m.LedgerPositions(); !got[cex.Bull].Equal(dec("50")) || !got[cex.Bear].Equal(dec("33.32")) {
+		t.Errorf("ledger positions while B holds = %s / %s, want the long holdings plus the dust: 50 / 33.32", got[cex.Bull], got[cex.Bear])
+	}
 	if err := r.m.Reconcile(t.Context()); err != nil {
 		t.Errorf("reconcile while B holds: %v", err)
 	}

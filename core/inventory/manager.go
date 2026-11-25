@@ -224,6 +224,16 @@ func (m *InventoryManager) Holdings() (dir strategy.Direction, hold [2]decimal.D
 	return m.cycle.Direction, m.cycle.Hold()
 }
 
+// LedgerPositions returns the signed position the ledger expects on each
+// leg: the open cycle's holdings by its direction - a short cycle holds both
+// legs short - plus the dust. It is what Reconcile compares the venue's
+// positions with.
+func (m *InventoryManager) LedgerPositions() [2]decimal.Decimal {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.ledgerQty()
+}
+
 // Settled reports whether the open cycle's orders allow it to close: each
 // has a final state and each with a fill has its fee confirmed. It is true
 // without a cycle.
