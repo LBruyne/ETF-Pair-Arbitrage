@@ -754,7 +754,7 @@ func (s *Strategy) entrySize(lv [2][]cex.BookLevel, p [2]decimal.Decimal, in Ent
 
 例（附录 A 例一，做空，F = 1，A = 40 / 60，μ = 3.33，σ = 4，d_in = 2，d_out = −0.5）：有效买盘第 2 档 40.44 / 59.42 → x = 10000 × (40.44/40 + 59.42/60 − 2) − 3.33 = +10.00 ≥ 8；往返手续费 2 × 0.65 × (1.011 + 0.9903) = 2.60 ≤ (2 + 0.5) × 4 = 10；可用 400 / 70.2 份 → 锚定金额 16,000 / 4,212 → K = 4,212（额度折合 9,993.34，不封顶）→ 卖 105.30 / 70.20 份。测试直接用这组数。
 
-`Reason` 是成组的常量，值就是落库和日志里的字符串：步骤 1 `stopping`、`no_new_entries`、`not_ready`（规则 / 连接 / 持仓没读到）、`settings`、`store_error`、`position_mismatch`；步骤 2 `regular_hours`、`prev_session_open`、`no_anchor`、`action_window`；步骤 3 `depth_bull`、`depth_bear`、`conflict_bull`、`conflict_bear`、`fx_stale`、`await_depth`、`await_orders`、`order_unknown`、`rejected_backoff`；步骤 4 `warmup`、`zero_sigma`；步骤 5 `no_levels`；步骤 6 `no_signal`、`holding_other_side`；步骤 7 `cost_not_covered`；步骤 8 `spacing`；步骤 9 `quota_exhausted`、`too_small`。平仓和强制平仓另有 `depth`、`no_price`。
+`Reason` 是成组的常量，值就是落库和日志里的字符串：步骤 1 `stopping`、`no_new_entries`、`not_ready`（规则 / 连接 / 持仓没读到）、`settings`、`store_error`、`position_mismatch`；步骤 2 `regular_hours`、`no_anchor`、`action_window`（上一 Session 的轮不需要原因：强制平仓占住每一拍直到关轮）；步骤 3 `depth_bull`、`depth_bear`、`conflict_bull`、`conflict_bear`、`fx_stale`、`await_depth`、`await_orders`、`order_unknown`、`rejected_backoff`；步骤 4 `warmup`、`zero_sigma`；步骤 5 `no_levels`；步骤 6 `no_signal`、`holding_other_side`；步骤 7 `cost_not_covered`；步骤 8 `spacing`；步骤 9 `quota_exhausted`、`too_small`。平仓和强制平仓另有 `depth`、`no_price`。
 
 #### 平仓（PRD 第 9 节）
 
@@ -1443,6 +1443,20 @@ func (m *ExecManager) forcedExit(now time.Time, unknown bool) (done bool) {
 - `decision`：每次开仓、平仓、补齐、回吐、强制平仓的决定各一行，`detail` 带复算要用的数（x、μ、σ、限价、档位、数量、两种损失、往返手续费的两个单位；用旧均值平仓时带它的时刻和锚点种类）；“到线没开”一行。`detail`、`signal_sample` 和 `event` 里的统计量写库前检查：不是有限值的（没有锚点、没有档位时算不出来）写 NULL，不写 NaN。
 - 日志（前缀 `exec:`）：`running`（Info：`live`、参数、Session）/ `entry`、`exit`、`gap`、`forced exit`（Info，带同样的数）/ `batch settled`（Info：`built` 或 `void`）/ `order outcome unknown for 30 s; using positions`（Error）/ `stop requested`、`no new entries`、`taken over`（Info）/ `not flat 60 s after stop`（Error）/ `late exit past the close`（Error）/ 每 30 秒一行 `status`（Info：时段、锚点、μ、σ、x、原因、持仓、额度）。“报警”就是一条 Error 日志加一行 `event`（PRD 第 15 节）。
 
+#### 第 6.1 步实现时定下的（2026-11-25）
+
+用户第 59 条：“…然后开始实现第六章。” 6.1（主流程）在 `exec/manager.go`、`step.go`、`bars.go`、`orders.go`、`store.go`；独立审查 `experiments/decisions_20261123/spec_core_20261124/review_code_step61.md`（无必须改，3 处应改和 7 处小问题都已修）。与上文不同或上文没写的：
+
+- exec 依赖一个 `cexSource` 接口（相邻仓库的写法），不直接依赖 `*CexManager`；杠杆 L 从 inventory 取（`inventory.Leverage()`）。
+- 一批的 `doneAt` 取循环第一次看到这一批全部有最终状态的那一拍的时刻（exec 的时钟），之后等两条腿的新深度（V6）。
+- 关轮失败（写库失败、持仓暂时对不上）后 1 秒内不再试，这期间原因是 `await_close`——否则持仓读回会立刻再唤醒循环、连续请求持仓。
+- 接手一个不是本进程开的未结束的一轮时，订单编号从这一轮已有订单的最大序号接着编（`cex.ClientOrderSeq`）；从 1 重来会与已有订单重号。
+- 已经平空、只差确认的轮不再启动强制平仓，结束原因保持真实的那个（例如 `exit_line`）。
+- 新 Session 开始时锚点从无到有只记日志，不算换锚；进循环前先读完已排队的信号。
+- 原因新增 `capital_pending`（排在 `store_error` 之后）；`at_line_blocked` 行记下到线的方向（`strategy.AtEntryLine`）。
+- 6.1 只做了停止信号的最小部分：不开仓、强制平仓、平完退出。成交不齐时差额发得出单的，在 6.2 之前记 `uneven_fills`、交给强制平仓（6.2 实现补齐 / 回吐后删去）。
+- 测试（真实 cex 盘口 + 纸面交易所 + 真实 inventory / strategy）：`TestScriptedSession`（预热到收盘前 1 分钟强平的整段 Session，附录 A 例一、例二逐数）、`TestEntryReasonOrder`（V4，全部阻挡一次设好、逐个解除）、`TestConflictStopsEntryAndLineExitNotForcedExit`（V3）、`TestMinBatchBlocksEntryNotExit`、`TestExitAtTheLineAtALoss`、`TestReentryAfterPartialExitAndReverseAfterFlat`、`TestVoidEntryDoesNotResetSpacing`（V6、V10）、`TestAnchorChangeKeepsEntriesAndPairing`（V12）、`TestDataGaps`（V13）、`TestSessionTimes`（V11）、`TestCloseRetryWaits`、`TestOrderIDsContinueInATakenOverCycle`、`TestSignalsQueuedBeforeTheFirstRound`、`TestFlatCycleInTheCloseWindowKeepsItsEndReason`。
+
 ### 5.4a 审计第四次意见之后的修改（2026-11-25）
 
 审计在第 2–4 步的代码上复现了六个问题，另提了两处口径；都已修并有回归测试（审计的数字原样用作断言）。上文与这里不同的地方以这里和代码为准。
@@ -1761,11 +1775,11 @@ func (s *Store) LoadState(ctx context.Context, sessionID string) (State, error) 
 | 5.1（已实现，2026-11-25） | cex 订单与纸面 | `orders.go`（登记、同步写、合并、`OrdersChanged` / `CycleOrders`、结果未知的查询、`NotFound`、`RecoverOrders`）；`paper.go`（自己的盘口、每条腿的延迟、纸面持仓和资金费） | V14 的订单部分（假 `Venue`：迟到的推送、超时、25204、拒单；零成交被撤的 IOC 按 11-23 记录的形态手写样本）；V18：纸面模式下假的真实客户端收到 0 次下单调用；经过数据库的重启验收（5.4b：认回 A 的订单 → 存归属 → 开 B → 从库重启 → 重放，A、B 的数量和成本不变，卖单的 `quota_price` 读回不变） |
 | 5.2（已实现，2026-11-25；下单只有单测） | bitget 账户侧 | `rest.go`（签名、规则、设置、持仓、订单查询、历史订单、成交、流水、下单）、`private.go`（登录、`order` / `fill` / `position`）。动手前按 `carefully-read-app-docs` 重读下单、私有频道、限速、限价范围四处的官方页面，把页面和日期补进第 11 节 | 签名向量与 httptest 单测（样本按真实应答的形状手写，编号、数量、金额都是编的——账户的原始应答不进仓库）；门控只读测试重跑 5.1 的事实表；**下单方法只有单测，不对真实交易所调用** |
 | 5.3（已实现，2026-11-25，用户第 53、56 条；WSS 下单是默认通道，已用真实仓位验证） | 延迟相关的改动与 WSS 下单 | L1 每条腿 3 条公共行情连接；L2 下单连接保温；L3 私有连接按 ping 选；L4 订单计时落库、状态行带各连接的延迟 | L1：三条连接里一条晚 40 ms、一条断线时，盘口取最先到的帧、不失效（假 `Venue` 多路投递）；L2：空闲 120 秒后的请求不新建连接（httptest 数连接数）；L3：慢连接被重拨；L4：六个时刻都有值 |
-| 6.1 | exec 主流程 | `manager.go`、`step.go`、`bars.go`、`orders.go` 的发单与结清：开仓、建成、再开仓、按线平仓、收盘前强制平仓 | 假时钟 + 假 `Venue` 的整段剧本：V3 的执行部分（冲突时不开仓不平仓、强制平仓不受影响）、V4（原因顺序）、V6（新深度）、V10、V11、V12（换锚不停开仓、配比不变）、V13 |
+| 6.1（已实现，2026-11-25，经审查修订；见 5.4 末尾“第 6.1 步实现时定下的”） | exec 主流程 | `manager.go`、`step.go`、`bars.go`、`orders.go` 的发单与结清：开仓、建成、再开仓、按线平仓、收盘前强制平仓 | 假时钟 + 假 `Venue` 的整段剧本：V3 的执行部分（冲突时不开仓不平仓、强制平仓不受影响）、V4（原因顺序）、V6（新深度）、V10、V11、V12（换锚不停开仓、配比不变）、V13 |
 | 6.2 | exec 成交不齐 | `gapInput`、补齐 / 回吐的发单、等新帧、`void`、零头 | V9 全部；V7 的“补齐不超过额度”；**两条腿都已有最终状态、第二条腿的通知被扣住时，额外的订单为零；放行后持仓和金额只记一次**；订单在第 0 秒发出并成交、订单的最终状态在第 4 秒才到、另一条腿第 6 秒才恢复时不发补齐单；附录 A 例三、例四走完整流程 |
 | 6.3 | exec 例外与停止 | 结果未知的 30 秒和三样证据；持仓不符；停止信号、60 秒报警、人工接管 | **停止时先读到零持仓、随后那张结果未知的开仓单成交：程序继续减仓、结清后才退出，全程不开新仓**；同一盘口下两种拒单：价格超限的同价不重发、价格变了才发；临时限频解除后同价可以再发；V14 其余、V16（末句“平仓单已成交、本地还没记下就重启”在 6.4）、V17 |
 | 6.4 | exec 恢复 | `main` 的读回顺序、`recover.go`；纸面持仓回填 | **旧进程带仓 → 恢复时读取失败 → 收到停止 → 读取恢复 → 减仓并核对后才退出**；V15、V16 末句；“第二条腿的通知被扣住”在重启时再跑一次：发单前后各一个崩溃点；按 `ClientOrderID` 认回本地没记下的单；补分钟优先用自己的；接管后重启接回仓位 |
-| 6.5 | 纸面联调 | 正式库上建角色和 schema（`install.sh` 的新段，**要用户授权**）；对真实行情跑纸面：先 1 小时，再跨一个真实收盘 | 1 小时内状态行、`signal_sample`、`minute_bar` 连续；跨收盘那次收盘前确实持有仓位并在收盘前结清（PRD 第 17 节末段）；从 `cex_order` 重算的每轮合计与 `cycle` 一致（PRD 14.3） |
+| 6.5 | 纸面联调 | 正式库上建角色和 schema（`install.sh` 的新段；用户第 60 条已授权：“两个都同意，不用等我，直接进行测试和调试”）；对真实行情跑纸面：先 1 小时，再跨一个真实收盘 | 1 小时内状态行、`signal_sample`、`minute_bar` 连续；跨收盘那次收盘前确实持有仓位并在收盘前结清（PRD 第 17 节末段）；从 `cex_order` 重算的每轮合计与 `cycle` 一致（PRD 14.3） |
 | 7 | Live Monitor 看板 | `dashboard/grafana/live_monitor_board.py`、`boardkit`（数据源改为传入、`BOARDS` 加一项）、`gen_dashboard.py`、数据源的 provisioning；`dashboard/SPEC.md` 第 7 节、`dashboard/README.md` | V19：`test_boards.py` 的结构检查；私有 Grafana 上截图几轮审阅；页面数字与表逐项对照。发布另行授权 |
 | 8 | 回放与选参 | `cmd/replay`：自己读录制服务的原始帧文件（`experiments/book_tape`，格式见 dashboard/SPEC.md 附录 A；不引用 `dashboard/` 的 Go 包），按接收时间回放，驱动同一套盘口合并、strategy、inventory、exec 和 `PaperVenue`（每条腿各自的下单延迟）；历史的锚点（按得知时刻）、F 和日历从看板库读，只读。输出 PRD 16.5 的分项。选参：模型、X、Y、d_in、d_out 的网格在前一段完整 Session 上跑，参数冻结后在之后的 Session 上验证（PRD 16.2） | 固定原始帧、接收顺序和注入的时钟，回放两次的订单序列和账本相同；一个 Session 的回放与同期纸面运行的成交一致；回测方案和结果写成报告交用户定参数；**延迟敏感性**（5.7 的 L5）：每条腿 5 / 15 / 25 / 50 / 100 ms 各跑一遍，报成交率、只成交一条腿的比例和净额 |
 | 9 | 实盘前 | 用户定交易账户（第 7 节末项），在那个账户上重新确认权限、持仓模式、杠杆和两个合约的实际费率（0.65 bps 是所查账户当时的读数）；下单应答与订单最终状态分开验收；交易程序自己读到的指数、NAV、分红、日历与看板库逐项对照；参数由用户确认；**小额实盘要用户明确授权、有人值守**：核对第 7 节各项（零成交 IOC 的状态、资金费流水、下单延迟），账本与交易所流水逐笔对上 | PRD 第 17 节末段的三项；**延迟核对**（5.7 的 L6，下真实订单，另行授权）：REST 热连接对 ping 选出的 WebSocket 连接各发几张，比发出到建单的时间，并量 `order` 推送比建单晚多少 |

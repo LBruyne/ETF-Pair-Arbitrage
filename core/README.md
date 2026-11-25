@@ -113,5 +113,5 @@ go run . -config config.yaml -env .env
 | `cex/binance/`、`cex/coinbase/`、`cex/direxion/` | 三个只读来源：指数 K 线与时段表；USDT-USD 行情与分钟 K 线；NAV 与分红 |
 | `strategy/` | 纯计算：`types.go`（参数、`Direction`、`Reason`、各输入和计划）、`levels.go`（有效档位、原始盘口上的逐档计算、限价）、`spread.go`、`stats.go`（均线和 σ）、`entry.go`、`exit.go`（按线平仓、强制平仓）、`gap.go`（补齐还是回吐） |
 | `inventory/` | 库存：`ledger.go`（由订单重算的账本）、`quota.go`、`reconcile.go`、`manager.go`（恢复、资金费、关轮）、`store.go` |
-| `exec/` | 配置和空骨架，执行循环在第 6 步实现 |
+| `exec/` | 执行循环：`manager.go`（Run、信号、状态行）、`step.go`（每一拍的判断顺序、开仓阻挡）、`bars.go`（分钟 bar、均线重新开始、换锚）、`orders.go`（开仓、按线平仓、强制平仓、结清、关轮）、`store.go`（落库行）。6.1 已实现；补齐 / 回吐（6.2）、结果未知与停止的其余部分（6.3）、重启恢复（6.4）待做 |
 | `scripts/dev_db.sh` | 开发和测试用的私有数据库：`start` / `stop` / `status` |
