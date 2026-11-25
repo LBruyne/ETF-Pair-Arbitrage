@@ -26,6 +26,7 @@ const (
 	pathHistoryOrders    = "/api/v3/trade/history-orders"      // a contract's finished orders, newest first
 	pathFills            = "/api/v3/trade/fills"               // the account's executions; it has no symbol filter
 	pathFinancialRecords = "/api/v3/account/financial-records" // the account's ledger; it has no symbol filter
+	pathAssets           = "/api/v3/account/assets"            // the whole account's equity and margin ratio, for the board
 	pathPlaceOrder       = "/api/v3/trade/place-order"         // the one request that changes the account
 
 	wsLoginPath = "/user/verify" // the path signed in a private stream login
@@ -205,14 +206,27 @@ type listData[T any] struct {
 
 // positionRow is one position, as the REST endpoint and as the private
 // stream report it. The quantity is unsigned, in total (REST) or size
-// (stream); the direction is posSide.
+// (stream); the direction is posSide. The mark price, unrealised PnL and
+// liquidation price are kept for the board only.
 type positionRow struct {
-	Symbol      string     `json:"symbol"`
-	PosSide     string     `json:"posSide"` // long or short
-	Total       string     `json:"total"`   // REST
-	Size        string     `json:"size"`    // private stream
-	AvgPrice    string     `json:"avgPrice"`
-	UpdatedTime wireNumber `json:"updatedTime"` // unix milliseconds
+	Symbol           string     `json:"symbol"`
+	PosSide          string     `json:"posSide"` // long or short
+	Total            string     `json:"total"`   // REST
+	Size             string     `json:"size"`    // private stream
+	AvgPrice         string     `json:"avgPrice"`
+	UpdatedTime      wireNumber `json:"updatedTime"` // unix milliseconds
+	MarkPrice        string     `json:"markPrice"`
+	UnrealisedPnl    string     `json:"unrealisedPnl"`    // USDT
+	LiquidationPrice string     `json:"liquidationPrice"` // REST
+	LiqPrice         string     `json:"liqPrice"`         // private stream
+}
+
+// assetsData is the data of GET /api/v3/account/assets: the whole account,
+// whatever program holds its positions. Only the two fields the board shows
+// are read.
+type assetsData struct {
+	USDTEquity string `json:"usdtEquity"` // "Account equity (USDT)"
+	MgnRatio   string `json:"mgnRatio"`   // "Margin ratio": (maintenance margin + partial liquidation fees) / equity, by the UTA glossary
 }
 
 // feeDetailRow is one fee of an order or a fill: positive is paid.

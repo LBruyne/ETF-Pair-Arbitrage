@@ -11,6 +11,7 @@ import (
 	"github.com/shopspring/decimal"
 
 	"etf-pair-arbitrage/core/logger"
+	"etf-pair-arbitrage/core/store"
 )
 
 // referenceRead is one periodic read of the reference loop.
@@ -26,9 +27,9 @@ type referenceRead struct {
 
 // runReference reads the market rules, the account settings, the positions
 // (once: afterwards ReadPositions refreshes them), the funding records, the
-// settled funding rates and the venue's trading schedule, each at its own
-// interval, until ctx ends. A read that fails is tried again after
-// referenceRetry.
+// settled funding rates, the venue's trading schedule and the account's
+// equity and margin ratio, each at its own interval, until ctx ends. A read
+// that fails is tried again after referenceRetry.
 func (m *CexManager) runReference(ctx context.Context) {
 	reads := m.referenceReads()
 	ticker := time.NewTicker(m.timing.referenceTick)
@@ -43,9 +44,10 @@ func (m *CexManager) runReference(ctx context.Context) {
 	}
 }
 
-// referenceReads lists the reads of the reference loop.
+// referenceReads lists the reads of the reference loop. The account's
+// equity and margin ratio are read only from a venue that can read them.
 func (m *CexManager) referenceReads() []*referenceRead {
-	return []*referenceRead{
+	reads := []*referenceRead{
 		{name: "market rules", every: m.timing.rulesPoll, read: m.readRules},
 		{name: "account settings", every: m.timing.settingsPoll, read: m.readSettings},
 		{name: "positions", once: true, read: func(ctx context.Context, _ time.Time) error { _, err := m.ReadPositions(ctx); return err }},
@@ -53,6 +55,10 @@ func (m *CexManager) referenceReads() []*referenceRead {
 		{name: "funding rates", every: m.timing.fundingPoll, read: m.readFundingRates},
 		{name: "trading schedule", every: m.timing.schedulePoll, read: m.checkSchedule},
 	}
+	if reader, ok := m.venue.(AccountAssetsReader); ok {
+		reads = append(reads, &referenceRead{name: "account assets", every: m.timing.assetsPoll, read: func(ctx context.Context, _ time.Time) error { return m.readAssets(ctx, reader) }})
+	}
+	return reads
 }
 
 // stepReference runs every read that is due at now. The outcome of a read is
@@ -233,6 +239,31 @@ func (m *CexManager) legPositions(read PositionSet) PositionSet {
 	return positions
 }
 
+// --- the account's equity and margin ratio ---
+
+// readAssets reads the account's equity and margin ratio and keeps them for
+// the inventory samples. They are recorded for the board only.
+func (m *CexManager) readAssets(ctx context.Context, reader AccountAssetsReader) error {
+	assets, err := reader.AccountAssets(ctx)
+	if err != nil {
+		return err
+	}
+	m.assets.Store(&assets)
+	return nil
+}
+
+// AccountAssets returns the last read of the account's equity and margin
+// ratio; ok is false before one succeeded, when it is older than three read
+// intervals (the reads keep failing: an old figure is not shown as current),
+// and always on the paper venue.
+func (m *CexManager) AccountAssets() (assets AccountAssets, ok bool) {
+	a := m.assets.Load()
+	if a == nil || m.timing.clock().Sub(a.ReceivedAt) > 3*m.timing.assetsPoll {
+		return AccountAssets{}, false
+	}
+	return *a, true
+}
+
 // --- funding records and settled rates ---
 
 // readFinancialRecords reads the account's funding records since the last
@@ -282,11 +313,12 @@ func (m *CexManager) readFinancialRecords(ctx context.Context, now time.Time) er
 func (m *CexManager) FinancialRecords() []FinancialRecord { return m.account.Load().records }
 
 // readFundingRates reads both contracts' recent settled funding rates and
-// publishes the settlements that are new.
+// publishes the settlements that are new. Each new one is also recorded, a
+// funding_rate row for the board.
 func (m *CexManager) readFundingRates(ctx context.Context, _ time.Time) error {
 	old := m.reference.Load().funding
 	var next [2]map[int64]decimal.Decimal
-	added := 0
+	var added []store.Row // a funding_rate row per new settlement
 	for _, leg := range Legs {
 		settlements, err := m.venue.FundingHistory(ctx, m.symbols[leg], m.timing.fundingRates)
 		if err != nil {
@@ -299,13 +331,14 @@ func (m *CexManager) readFundingRates(ctx context.Context, _ time.Time) error {
 		for _, s := range settlements {
 			if _, held := next[leg][s.At.UnixMilli()]; !held {
 				next[leg][s.At.UnixMilli()] = s.Rate
-				added++
+				added = append(added, fundingRateRow(leg, m.symbols[leg], s))
 			}
 		}
 	}
-	if added > 0 {
+	if len(added) > 0 {
 		m.editReference(func(v *referenceView) { v.funding = next })
-		logger.GlobalLogger.Debug("cex: funding rates", "new_settlements", added)
+		m.record(added...)
+		logger.GlobalLogger.Debug("cex: funding rates", "new_settlements", len(added))
 	}
 	return nil
 }

@@ -371,12 +371,18 @@ type SymbolSetting struct {
 	Leverage int
 }
 
-// Position is the account's position in one contract.
+// Position is the account's position in one contract. The mark price,
+// unrealised PnL and liquidation price are recorded for the board only;
+// each is not valid when the venue did not report it (the paper venue
+// reports none).
 type Position struct {
-	Symbol    Symbol
-	Qty       decimal.Decimal // signed: a short position is negative
-	AvgPrice  decimal.Decimal
-	UpdatedAt time.Time // the venue's time of the position
+	Symbol        Symbol
+	Qty           decimal.Decimal // signed: a short position is negative
+	AvgPrice      decimal.Decimal
+	UpdatedAt     time.Time           // the venue's time of the position
+	MarkPrice     decimal.NullDecimal // USDT
+	UnrealisedPnL decimal.NullDecimal // USDT
+	LiqPrice      decimal.NullDecimal // USDT
 }
 
 // PositionSet is the account's positions in the two legs at one moment. A
@@ -385,6 +391,16 @@ type PositionSet struct {
 	BySymbol   map[Symbol]Position
 	ReceivedAt time.Time // local arrival of the read or push
 	Loaded     bool      // false until the first read or push: nothing is known yet, which is not "flat"
+}
+
+// AccountAssets is the whole account's equity and margin ratio as the venue
+// reported them at one moment. They are recorded for the board only: the
+// process takes no decision from them (PRD 6.6). The account may hold other
+// programs' positions too, so both are account-wide.
+type AccountAssets struct {
+	Equity      decimal.Decimal // USDT
+	MarginRatio decimal.Decimal // as the venue reports it
+	ReceivedAt  time.Time       // local arrival of the read
 }
 
 // FinancialRecord is one funding settlement booked on the account.
@@ -676,6 +692,13 @@ type VenueStatus interface {
 	StatusAttrs() []any
 }
 
+// AccountAssetsReader is implemented by a venue that reads the account's
+// equity and margin ratio: the real exchange. The paper venue does not: it
+// reads no private endpoint.
+type AccountAssetsReader interface {
+	AccountAssets(ctx context.Context) (AccountAssets, error)
+}
+
 // PrivateStreamStatus is implemented by a venue whose order outcomes and
 // position changes arrive over a connection that can be lost: the real
 // exchange. The paper venue matches inside the process and does not
@@ -748,6 +771,7 @@ type timings struct {
 	recordsLookback time.Duration // the first read of the funding records goes back this far
 	fundingPoll     time.Duration // the settled funding rates are read this often
 	fundingRates    int           // and this many of them per leg
+	assetsPoll      time.Duration // the account's equity and margin ratio are read this often, as often as inventory samples
 	schedulePoll    time.Duration // the calendar is compared with the venue's schedule this often
 	sourceCall      time.Duration // the limit of one read of a venue or a source
 
@@ -764,6 +788,6 @@ var defaultTimings = timings{clock: time.Now, bookInbox: 4096, statusLog: 30 * t
 	fxPoll: 5 * time.Second, fxKeep: 10 * time.Minute,
 	anchorTick: time.Second, bellDelay: time.Minute, anchorPoll: 5 * time.Minute, distributionPoll: 24 * time.Hour,
 	referenceTick: time.Second, referenceRetry: 5 * time.Second, rulesPoll: time.Hour, settingsPoll: time.Minute,
-	recordsPoll: time.Minute, recordsLookback: 7 * 24 * time.Hour, fundingPoll: 5 * time.Minute, fundingRates: 100,
+	recordsPoll: time.Minute, recordsLookback: 7 * 24 * time.Hour, fundingPoll: 5 * time.Minute, fundingRates: 100, assetsPoll: 10 * time.Second,
 	schedulePoll: time.Hour, sourceCall: 10 * time.Second,
 	placeTimeout: time.Second, ackGrace: time.Second, orderTick: 200 * time.Millisecond, orderQuery: time.Second, queryTimeout: 2 * time.Second, notFoundAfter: 30 * time.Second}

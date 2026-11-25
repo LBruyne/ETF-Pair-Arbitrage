@@ -60,6 +60,7 @@ type CexManager struct {
 	referenceMu sync.Mutex
 	account     atomic.Pointer[accountView] // written under accountMu
 	accountMu   sync.Mutex
+	assets      atomic.Pointer[AccountAssets] // the last account read, written by the reference loop alone; nil before one succeeded. It wakes no loop
 
 	// owned by the book loop
 	legBooks [2]legBook

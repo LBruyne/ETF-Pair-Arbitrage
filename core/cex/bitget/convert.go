@@ -134,10 +134,38 @@ func addPosition(positions map[cex.Symbol]cex.Position, row positionRow) error {
 	if err != nil {
 		return fmt.Errorf("bitget: position %s: avgPrice %q", row.Symbol, row.AvgPrice)
 	}
+	liq := row.LiquidationPrice
+	if liq == "" {
+		liq = row.LiqPrice
+	}
 	symbol := cex.Symbol(row.Symbol)
 	held := positions[symbol]
-	positions[symbol] = cex.Position{Symbol: symbol, Qty: held.Qty.Add(qty), AvgPrice: avg, UpdatedAt: wireTime(row.UpdatedTime)}
+	positions[symbol] = cex.Position{Symbol: symbol, Qty: held.Qty.Add(qty), AvgPrice: avg, UpdatedAt: wireTime(row.UpdatedTime),
+		MarkPrice: boardDecimal(row.MarkPrice), UnrealisedPnL: boardDecimal(row.UnrealisedPnl), LiqPrice: boardDecimal(liq)}
 	return nil
+}
+
+// boardDecimal reads a field kept for the board only: one that is missing
+// or not a number is not valid, and fails nothing.
+func boardDecimal(text string) decimal.NullDecimal {
+	d, err := decimal.NewFromString(text)
+	if err != nil {
+		return decimal.NullDecimal{}
+	}
+	return decimal.NewNullDecimal(d)
+}
+
+// accountAssets converts the account assets answer, received at.
+func accountAssets(data assetsData, at time.Time) (cex.AccountAssets, error) {
+	equity, err := decimal.NewFromString(data.USDTEquity)
+	if err != nil {
+		return cex.AccountAssets{}, fmt.Errorf("bitget: assets: usdtEquity %q", data.USDTEquity)
+	}
+	ratio, err := decimal.NewFromString(data.MgnRatio)
+	if err != nil {
+		return cex.AccountAssets{}, fmt.Errorf("bitget: assets: mgnRatio %q", data.MgnRatio)
+	}
+	return cex.AccountAssets{Equity: equity, MarginRatio: ratio, ReceivedAt: at}, nil
 }
 
 // orderRecord converts one order as the exchange reports it, by query or by

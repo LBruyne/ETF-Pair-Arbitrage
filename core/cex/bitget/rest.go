@@ -233,6 +233,17 @@ func (c *Client) Positions(ctx context.Context, symbols []cex.Symbol) (cex.Posit
 	return set, nil
 }
 
+// AccountAssets reads GET /api/v3/account/assets: the whole account's
+// equity in USDT and its margin ratio, for the board. The account holds
+// other programs' positions too, so both are account-wide.
+func (c *Client) AccountAssets(ctx context.Context) (cex.AccountAssets, error) {
+	var data assetsData
+	if err := c.call(ctx, http.MethodGet, pathAssets, nil, nil, true, &data); err != nil {
+		return cex.AccountAssets{}, err
+	}
+	return accountAssets(data, c.now())
+}
+
 // OrderByClientID reads GET /api/v3/trade/order-info by the client id. The
 // exchange's "Order does not exist" is cex.ErrUnknownOrder. That answer is
 // also given for a cancelled order without a fill once the exchange has

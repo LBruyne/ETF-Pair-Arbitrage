@@ -3,6 +3,7 @@ package cex
 import (
 	"context"
 	"errors"
+	"fmt"
 	"slices"
 	"strings"
 	"sync/atomic"
@@ -468,5 +469,115 @@ func TestScheduleCheckAlarmsOnChangeAndNeverFollows(t *testing.T) {
 	r.index.schedule = nil
 	if err := r.m.checkSchedule(ctx, r.clock.Now()); err == nil {
 		t.Error("an empty schedule counted as read")
+	}
+}
+
+// Each settled funding rate is recorded once, the first time it is read:
+// a later read that lists it again, even with another value, adds no row.
+func TestFundingRatesRecorded(t *testing.T) {
+	r := newRig(t, testConfig(), t0)
+	ctx := context.Background()
+	s1, s2 := time.Date(2026, 11, 23, 16, 0, 0, 0, time.UTC), time.Date(2026, 11, 24, 0, 0, 0, 0, time.UTC)
+	r.venue.funding["SOXLUSDT"] = []FundingSettlement{{Symbol: "SOXLUSDT", Rate: dec("0.0001"), At: s1}}
+	r.venue.funding["SOXSUSDT"] = []FundingSettlement{{Symbol: "SOXSUSDT", Rate: dec("-0.00002"), At: s1}}
+	if err := r.m.readFundingRates(ctx, t0); err != nil {
+		t.Fatal(err)
+	}
+	r.venue.funding["SOXLUSDT"] = []FundingSettlement{{Symbol: "SOXLUSDT", Rate: dec("-0.0003"), At: s2}, {Symbol: "SOXLUSDT", Rate: dec("0.9"), At: s1}}
+	if err := r.m.readFundingRates(ctx, t0); err != nil {
+		t.Fatal(err)
+	}
+	var got []string
+	for _, row := range r.sink.Rows("funding_rate") {
+		f := row.(store.FundingRateRow)
+		got = append(got, fmt.Sprintf("%s %s %d %s", f.Leg, f.Symbol, f.SettlementMs, f.Rate))
+	}
+	want := []string{fmt.Sprintf("bull SOXLUSDT %d 0.0001", s1.UnixMilli()), fmt.Sprintf("bear SOXSUSDT %d -0.00002", s1.UnixMilli()), fmt.Sprintf("bull SOXLUSDT %d -0.0003", s2.UnixMilli())}
+	if strings.Join(got, "; ") != strings.Join(want, "; ") {
+		t.Errorf("funding_rate rows\n%s\nwant\n%s", strings.Join(got, "; "), strings.Join(want, "; "))
+	}
+}
+
+// assetsVenue is a venue that also reads the account's equity and margin
+// ratio, as the real exchange does.
+type assetsVenue struct {
+	*fakeVenue
+	assets AccountAssets
+	reads  int
+}
+
+func (v *assetsVenue) AccountAssets(context.Context) (AccountAssets, error) {
+	if err := v.called("AccountAssets"); err != nil {
+		return AccountAssets{}, err
+	}
+	v.reads++
+	return v.assets, nil
+}
+
+// The account's equity and margin ratio are read by the reference loop, as
+// often as the inventory samples, from a venue that can read them; they
+// are published without waking anyone. A venue that cannot - the paper
+// venue - is never asked, and there is none.
+func TestAccountAssetsRead(t *testing.T) {
+	r := newRig(t, testConfig(), t0)
+	if _, ok := r.m.AccountAssets(); ok {
+		t.Error("account assets before any read")
+	}
+	for _, read := range r.m.referenceReads() {
+		if read.name == "account assets" {
+			t.Error("a venue without an account read has an account assets read")
+		}
+	}
+	if _, ok := any(&PaperVenue{}).(AccountAssetsReader); ok {
+		t.Error("the paper venue reads the account's assets")
+	}
+
+	v := &assetsVenue{fakeVenue: newFakeVenue(), assets: AccountAssets{Equity: dec("1234.5"), MarginRatio: dec("0.0123"), ReceivedAt: t0}}
+	m, err := NewManager(testConfig(), v, r.index, r.fx, r.issuer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	m.timing.clock = r.clock.Now
+	ctx := context.Background()
+	var reads []*referenceRead // the account read alone: the others publish
+	for _, read := range m.referenceReads() {
+		if read.name == "account assets" {
+			reads = append(reads, read)
+		}
+	}
+	if len(reads) != 1 {
+		t.Fatalf("%d account assets reads, want 1", len(reads))
+	}
+	account, reference := m.AccountChanged(), m.ReferenceChanged()
+	m.stepReference(ctx, reads, t0)
+	got, ok := m.AccountAssets()
+	if !ok || !got.Equity.Equal(dec("1234.5")) || !got.MarginRatio.Equal(dec("0.0123")) || !got.ReceivedAt.Equal(t0) {
+		t.Errorf("account assets = %+v (%t), want equity 1234.5 and margin ratio 0.0123", got, ok)
+	}
+	select {
+	case <-account:
+		t.Error("the account read closed AccountChanged")
+	case <-reference:
+		t.Error("the account read closed ReferenceChanged")
+	default:
+	}
+	m.stepReference(ctx, reads, t0.Add(9*time.Second))
+	if v.reads != 1 {
+		t.Errorf("%d account reads within 9 s, want 1", v.reads)
+	}
+	m.stepReference(ctx, reads, t0.Add(10*time.Second))
+	if v.reads != 2 {
+		t.Errorf("%d account reads after 10 s, want 2", v.reads)
+	}
+
+	// A read older than three intervals is not handed out: the samples write
+	// NULL rather than an old equity as if it were current.
+	r.clock.Set(t0.Add(30 * time.Second))
+	if _, ok := m.AccountAssets(); !ok {
+		t.Error("an account read 30 s old is not handed out")
+	}
+	r.clock.Set(t0.Add(30*time.Second + time.Millisecond))
+	if _, ok := m.AccountAssets(); ok {
+		t.Error("an account read older than 30 s is still handed out")
 	}
 }

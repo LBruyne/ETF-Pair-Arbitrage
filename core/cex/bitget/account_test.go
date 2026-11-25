@@ -195,6 +195,10 @@ func TestPositions(t *testing.T) {
 		!bear.Qty.Equal(d("-12.5")) || !bear.AvgPrice.Equal(d("49.512")) {
 		t.Errorf("positions = %+v, want +14.42 @ 42.93 and -12.5 @ 49.512, the third contract flat", got)
 	}
+	if !bull.MarkPrice.Valid || !bull.MarkPrice.Decimal.Equal(d("43.02")) || !bull.UnrealisedPnL.Valid || !bull.UnrealisedPnL.Decimal.Equal(d("1.02")) ||
+		!bull.LiqPrice.Valid || !bull.LiqPrice.Decimal.IsZero() {
+		t.Errorf("bull mark %v, unrealised PnL %v, liquidation price %v; want 43.02, 1.02 and 0 as the exchange reports them", bull.MarkPrice, bull.UnrealisedPnL, bull.LiqPrice)
+	}
 	calls := server.seen()
 	if len(calls) != 3 {
 		t.Fatalf("%d requests, want one per contract", len(calls))
@@ -205,6 +209,54 @@ func TestPositions(t *testing.T) {
 		}
 		assertSigned(t, calls[i])
 	}
+}
+
+// The fields kept for the board: REST names the liquidation price
+// liquidationPrice, the private stream liqPrice. A field the row does not
+// carry, or carries empty, is not valid and does not fail the position.
+func TestPositionBoardFields(t *testing.T) {
+	var pushed, bare positionRow
+	if err := json.Unmarshal([]byte(positionPush("SOXSUSDT", "short", "12.5", "49.5", "opening")), &pushed); err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal([]byte(`{"symbol":"SOXLUSDT","posSide":"long","total":"3","avgPrice":"42","markPrice":"","updatedTime":"1795570000222"}`), &bare); err != nil {
+		t.Fatal(err)
+	}
+	positions := map[cex.Symbol]cex.Position{}
+	for _, row := range []positionRow{pushed, bare} {
+		if err := addPosition(positions, row); err != nil {
+			t.Fatal(err)
+		}
+	}
+	bear, bull := positions["SOXSUSDT"], positions["SOXLUSDT"]
+	if !bear.Qty.Equal(d("-12.5")) || !bear.MarkPrice.Decimal.Equal(d("42.9")) || !bear.UnrealisedPnL.Decimal.Equal(d("0.4")) || !bear.LiqPrice.Valid || !bear.LiqPrice.Decimal.IsZero() {
+		t.Errorf("pushed position = %+v, want -12.5 with mark 42.9, unrealised PnL 0.4 and liquidation price 0", bear)
+	}
+	if !bull.Qty.Equal(d("3")) || bull.MarkPrice.Valid || bull.UnrealisedPnL.Valid || bull.LiqPrice.Valid {
+		t.Errorf("position without the fields = %+v, want 3 with none of them valid", bull)
+	}
+}
+
+// The account's equity and margin ratio are read with one signed GET of
+// the account assets: usdtEquity and mgnRatio as the exchange reports
+// them, received now.
+func TestAccountAssets(t *testing.T) {
+	client, server := newAccountServer(t, func(restCall) (int, string) {
+		return ok(`{"accountEquity":"1233.9","usdtEquity":"1234.5","btcEquity":"0.0125","unrealisedPnl":"1.4","usdtUnrealisedPnl":"1.4","btcUnrealizedPnl":"0","effEquity":"1100.2","mmr":"15.2","imr":"120.4","mgnRatio":"0.0123","positionMgnRatio":"0.0123","positionValue":"1204","leverage":"1","assets":[{"coin":"USDT","equity":"1234.5","usdValue":"1233.9","balance":"1233.1","available":"1100","debt":"0","locked":"0","bonus":"0","interestBase":"0","balanceOriginal":"1233.1","collateralLimitStatus":"normal"}]}`)
+	})
+	var reader cex.AccountAssetsReader = client
+	got, err := reader.AccountAssets(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !got.Equity.Equal(d("1234.5")) || !got.MarginRatio.Equal(d("0.0123")) || !got.ReceivedAt.Equal(fixedNow) {
+		t.Errorf("account assets = %+v, want equity 1234.5 USDT and margin ratio 0.0123, received now", got)
+	}
+	calls := server.seen()
+	if len(calls) != 1 || calls[0].target() != "GET /api/v3/account/assets?" {
+		t.Fatalf("requests %v, want one GET of /api/v3/account/assets", calls)
+	}
+	assertSigned(t, calls[0])
 }
 
 // --- orders ---

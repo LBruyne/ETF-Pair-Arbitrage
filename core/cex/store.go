@@ -20,6 +20,20 @@ func (m *CexManager) recordFact(f AnchorFact, detail map[string]any) {
 		Value: f.Value, F: f.F, Source: f.Source, Detail: marshalDetail(detail)})
 }
 
+// fundingRateRow is the funding_rate row of one settlement of the leg's
+// contract.
+func fundingRateRow(leg Leg, symbol Symbol, s FundingSettlement) store.FundingRateRow {
+	return store.FundingRateRow{Leg: leg.String(), Symbol: string(symbol), SettlementMs: s.At.UnixMilli(), Rate: s.Rate}
+}
+
+// record queues rows for the store, in their order.
+func (m *CexManager) record(rows ...store.Row) {
+	if m.store == nil {
+		return
+	}
+	m.store.Record(rows...)
+}
+
 // recordEvent writes one event row of this module. An alarm is an Error log
 // line, written by the caller, plus an event of level "error".
 func (m *CexManager) recordEvent(level, kind, message string, detail map[string]any) {
