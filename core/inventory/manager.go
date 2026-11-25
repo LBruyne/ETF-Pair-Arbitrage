@@ -59,6 +59,7 @@ type InventoryManager struct {
 	mismatch    bool               // the venue's positions were found to differ from the ledger; never cleared
 	differSince time.Time          // the first of the reads that differ in a row; zero when the last read agreed
 	differBy    [2]decimal.Decimal // by leg: the difference no open order explains, at differSince
+	differAt    [2]decimal.Decimal // by leg: the ledger's position at differSince
 	unread      bool               // the last read of the positions failed
 
 	// funding

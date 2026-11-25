@@ -200,7 +200,9 @@ func (m *ExecManager) forcedDue(c *inventory.Cycle, now time.Time, holding bool)
 // and not at a price the venue refused it for. What cannot be sent at all
 // is dust, and the cycle then closes with it (PRD 8.1). byPositions sizes
 // the orders by the venue's positions instead of the ledger: an order's
-// outcome is unknown and the ledger may lack its fill (PRD 13.3).
+// outcome is unknown and the ledger may lack its fill (PRD 13.3); when the
+// round had to read them it ends there, and the next round prices the orders
+// on its own books.
 func (m *ExecManager) forcedExit(r *round, byPositions bool) (done bool) {
 	log := logger.GlobalLogger
 	c := r.cycle
@@ -223,9 +225,14 @@ func (m *ExecManager) forcedExit(r *round, byPositions bool) (done bool) {
 		if hold = m.positionHold(r, c.Direction, pos); hold[cex.Bull].IsZero() && hold[cex.Bear].IsZero() {
 			return m.idle(strategy.ReasonOrderUnknown) // nothing at the venue to reduce: the outcome decides
 		}
+		if r.read {
+			return m.idle(strategy.ReasonOrderUnknown) // the quantity is known; the prices come from the next round's books
+		}
 	} else if c.Flat() {
-		m.closeIfFlat(r) // closed this round or not, nothing is left to send
-		return m.idle(strategy.ReasonAwaitClose)
+		if !m.closeIfFlat(r) { // closed this round or not, nothing is left to send
+			m.idle(strategy.ReasonAwaitClose)
+		}
+		return false
 	}
 	for _, leg := range cex.Legs {
 		if hold[leg].IsPositive() && !r.books.HasPrice(leg, r.now) {
@@ -234,8 +241,10 @@ func (m *ExecManager) forcedExit(r *round, byPositions bool) (done bool) {
 	}
 	orders := m.strat.ForcedOrders(c.Direction, hold, r.books.ByLeg, r.rules)
 	if orders[cex.Bull] == nil && orders[cex.Bear] == nil {
-		m.closeIfFlat(r) // only dust is left
-		return m.idle(strategy.ReasonAwaitClose)
+		if !m.closeIfFlat(r) { // only dust is left
+			m.idle(strategy.ReasonAwaitClose)
+		}
+		return false
 	}
 
 	var reqs []cex.OrderRequest
@@ -279,7 +288,8 @@ func (m *ExecManager) forcedExit(r *round, byPositions bool) (done bool) {
 // position at the venue is the ledger's. A forced exit due meanwhile is
 // sized by the venue's positions; past unknownAlarm the other leg's gap is
 // trimmed by the venue's positions too. What the positions show is never
-// booked: the ledger follows the order reports alone.
+// booked: the ledger follows the order reports alone. A round that read the
+// positions sends nothing after the read: the next one prices on its books.
 func (m *ExecManager) whileUnknown(r *round, unknown []cex.OrderRecord) bool {
 	m.chase(r, unknown)
 	if c := r.cycle; c != nil && m.forcedDue(c, r.now, true) {
@@ -292,7 +302,12 @@ func (m *ExecManager) whileUnknown(r *round, unknown []cex.OrderRecord) bool {
 }
 
 // chase follows each order of unknown outcome: the 30 s alarm, once, and
-// the verdict of PRD 13.3 when its three evidences are in.
+// the verdict of PRD 13.3 when its three evidences are in. The third, the
+// leg's position equal to the ledger's, must come from a read of the
+// positions that succeeded in or after the round that first saw cex's
+// NotFound: a snapshot from before it may predate a fill, and a read that
+// failed proves nothing, so the order stays unknown (and is never sent
+// again) until such a read agrees.
 func (m *ExecManager) chase(r *round, unknown []cex.OrderRecord) {
 	log := logger.GlobalLogger
 	held := map[cex.ClientOrderID]bool{}
@@ -314,9 +329,17 @@ func (m *ExecManager) chase(r *round, unknown []cex.OrderRecord) {
 		if !o.NotFound {
 			continue
 		}
-		pos := m.venuePositions(r)
-		venue, ledger := pos.BySymbol[o.Request.Symbol].Qty, m.inv.LedgerPositions()[o.Request.Leg]
-		if !pos.Loaded || !venue.Equal(ledger) {
+		if u.notFoundAt.IsZero() {
+			u.notFoundAt = r.now
+		}
+		if !r.now.Before(m.nextPositionsRead) {
+			m.readPositions(r)
+		}
+		if m.readAt.Before(u.notFoundAt) {
+			continue // no read since NotFound succeeded: no verdict
+		}
+		venue, ledger := m.cex.Positions().BySymbol[o.Request.Symbol].Qty, m.inv.LedgerPositions()[o.Request.Leg]
+		if !venue.Equal(ledger) {
 			continue // the position may hold its fill: no verdict
 		}
 		if !m.cex.MarkNeverArrived(id) {
@@ -349,8 +372,8 @@ func (m *ExecManager) gapByPositions(r *round) bool {
 		return false
 	}
 	pos := m.venuePositions(r)
-	if !pos.Loaded {
-		return false
+	if !pos.Loaded || r.read {
+		return false // a round that read the positions prices nothing on its older books
 	}
 	in := m.gapInput(r)
 	in.Hold, in.Batch = m.positionHold(r, r.cycle.Direction, pos), nil
@@ -368,22 +391,34 @@ func (m *ExecManager) gapByPositions(r *round) bool {
 // state among the cycle's orders is read again at once: the push of the
 // positions can come after the order's report, and a gap sized on the older
 // snapshot would be reduced twice. One still older after that read is not
-// used this round (Loaded is false).
+// used this round (Loaded is false). A read ends the round (readPositions).
 func (m *ExecManager) venuePositions(r *round) cex.PositionSet {
 	last := lastFinal(r.orders)
 	if !r.now.Before(m.nextPositionsRead) || m.cex.Positions().ReceivedAt.Before(last) {
-		m.nextPositionsRead = r.now.Add(m.timing.positionsRead)
-		ctx, cancel := context.WithTimeout(m.ctx, m.timing.readTimeout)
-		if _, err := m.cex.ReadPositions(ctx); err != nil {
-			logger.GlobalLogger.Debug("exec: positions not read", "err", err)
-		}
-		cancel()
+		m.readPositions(r)
 	}
 	pos := m.cex.Positions()
 	if pos.ReceivedAt.Before(last) {
 		pos.Loaded = false
 	}
 	return pos
+}
+
+// readPositions reads the venue's positions now, which cex publishes; the
+// next read for an unknown outcome waits positionsRead after it returned. The round sends
+// nothing after it (round.read). The round of a read that succeeds is kept
+// for the verdict "never arrived".
+func (m *ExecManager) readPositions(r *round) {
+	r.read = true
+	ctx, cancel := context.WithTimeout(m.ctx, m.timing.readTimeout)
+	_, err := m.cex.ReadPositions(ctx)
+	cancel()
+	m.nextPositionsRead = m.timing.clock().Add(m.timing.positionsRead) // from the read's return: a slow read does not fill the loop's time
+	if err != nil {
+		logger.GlobalLogger.Debug("exec: positions not read", "err", err)
+		return
+	}
+	m.readAt = r.now
 }
 
 // lastFinal is when the latest final state among the orders arrived, on
@@ -419,33 +454,36 @@ func (m *ExecManager) positionHold(r *round, dir strategy.Direction, pos cex.Pos
 // more: both legs hold nothing, or only what no order could be sent for.
 // Its orders must all have a final state and every filled one a confirmed
 // fee, and one read of the venue's positions must agree with the ledger.
-// An attempt that fails (the positions do not agree yet, or the close is not
-// written) is tried again closeRetry later: every read of the positions
-// publishes them and wakes the loop, which would otherwise read them again at
-// once. What is left is recorded as dust by the ledger (PRD 8.1). It reports
-// whether the cycle closed.
-func (m *ExecManager) closeIfFlat(r *round) bool {
+// An attempt whose read fails or differs is tried again when the next
+// comparison is due (compare's backoff); one whose close is not written,
+// closeRetry later: every read of the positions publishes them and wakes the
+// loop, which would otherwise read them again at once. What is left is recorded as dust by the ledger (PRD 8.1). It reports
+// whether it read the positions: the round then ends, with the reason
+// positions_read when the cycle closed and await_close when it did not.
+func (m *ExecManager) closeIfFlat(r *round) (read bool) {
 	log := logger.GlobalLogger
 	c := r.cycle
 	if c == nil || (!c.Flat() && !m.onlyDust(r)) || !m.inv.Settled() || r.now.Before(m.nextCloseTry) {
 		return false
 	}
-	ctx, cancel := context.WithTimeout(m.ctx, m.timing.readTimeout)
-	err := m.inv.Reconcile(ctx)
-	cancel()
+	err := m.compare(m.ctx, r.now)
+	r.read = true
 	if err != nil {
-		m.nextCloseTry = r.now.Add(m.timing.closeRetry)
+		m.nextCloseTry = m.nextReconcile // the comparison's own backoff: a difference again soon, a failed read later
 		log.Debug("exec: cycle not closed: the venue's positions do not confirm it yet", "cycle", c.ID, "err", err, "retry_at", showTime(m.nextCloseTry))
-		return false
+		m.idle(strategy.ReasonAwaitClose)
+		return true
 	}
 	reason := m.endReason(c)
 	if err := m.inv.CloseCycle(reason, r.now); err != nil {
 		m.nextCloseTry = r.now.Add(m.timing.closeRetry)
 		log.Debug("exec: cycle not closed yet", "cycle", c.ID, "reason", reason, "err", err, "retry_at", showTime(m.nextCloseTry))
-		return false
+		m.idle(strategy.ReasonAwaitClose)
+		return true
 	}
 	m.forced, m.lateLogged, m.nextCloseTry = "", false, time.Time{}
 	r.cycle, r.orders = nil, nil
+	m.idle(strategy.ReasonPositionsRead)
 	return true
 }
 

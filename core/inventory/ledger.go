@@ -103,8 +103,11 @@ func (m *InventoryManager) OpenLot(plan *strategy.EntryPlan, now time.Time) (*Lo
 // Sync books a snapshot of the open cycle's order records: the ledger is
 // recomputed from it. Of each order the newest record seen is kept (by
 // UpdateSeq), so a snapshot older than one already booked moves nothing
-// backwards. Records of another cycle are ignored; without an open cycle
-// Sync does nothing.
+// backwards, and one that holds no newer record than those booked - exec
+// books the snapshot at every wake-up of its loop - is not recomputed: only
+// whether the cycle's funding is awaited can change with the time alone.
+// Records of another cycle are ignored; without an open cycle Sync does
+// nothing.
 //
 // The caller guarantees what that rule rests on: within one process the
 // UpdateSeq of an order grows with every change of its record and never
@@ -123,20 +126,25 @@ func (m *InventoryManager) sync(orders []cex.OrderRecord, now time.Time) {
 	if c == nil {
 		return
 	}
+	changed := false
 	for _, o := range orders {
 		if CycleID(o.Request.CycleID) != c.ID {
 			continue
 		}
-		if held, ok := m.orders[o.Request.ClientOrderID]; ok && held.UpdateSeq > o.UpdateSeq {
+		if held, ok := m.orders[o.Request.ClientOrderID]; ok && held.UpdateSeq >= o.UpdateSeq {
 			continue
 		}
 		m.orders[o.Request.ClientOrderID] = o
 		m.assign(o)
+		changed = true
 	}
 	if len(m.orders) == 0 {
 		// Nothing to recompute from: the lots keep what they have, which is
 		// zero in a new cycle and the stored amounts after a restart.
 		return
+	}
+	if !changed && c.FundingKnown == (len(m.fundingAwaited(c.OpenedAt, now, m.fundingSeen)) == 0) {
+		return // booked already
 	}
 	sent := m.ordersAsSent()
 	for id, q := range rebuild(c.Lots, sent, m.assigned) {

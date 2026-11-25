@@ -9,6 +9,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -280,14 +281,14 @@ type testRig struct {
 // newRig builds a manager with the given capital and leverage on fakes, its
 // clock at t0. No loop runs: a test calls the methods and step functions
 // itself.
-func newRig(t *testing.T, capital, leverage string) *testRig {
+func newRig(t testing.TB, capital, leverage string) *testRig {
 	t.Helper()
 	return newRigOn(t, capital, leverage, &fakeClock{now: t0}, newFakeCex(), &testSink{Fake: &store.Fake{}})
 }
 
 // newRigOn builds a manager on the given clock, exchange and sink: a second
 // manager on the first one's sink is a restarted process.
-func newRigOn(t *testing.T, capital, leverage string, clock *fakeClock, c *fakeCex, sink *testSink) *testRig {
+func newRigOn(t testing.TB, capital, leverage string, clock *fakeClock, c *fakeCex, sink *testSink) *testRig {
 	t.Helper()
 	m, err := NewManager(Config{Capital: dec(capital), Leverage: dec(leverage)}, testPair, c)
 	if err != nil {
@@ -310,7 +311,7 @@ func (r *testRig) restart(t *testing.T, capital, leverage string, orders ...cex.
 }
 
 // openCycle opens a cycle at the rig's clock with anchors 40 / 60.
-func (r *testRig) openCycle(t *testing.T, dir strategy.Direction) *Cycle {
+func (r *testRig) openCycle(t testing.TB, dir strategy.Direction) *Cycle {
 	t.Helper()
 	c, err := r.m.OpenCycle("2026-11-23", dir, cex.Anchors{SessionID: "2026-11-23", Kind: cex.AnchorBell, Bull: dec("40"), Bear: dec("60")}, r.clock.Now())
 	if err != nil {
@@ -320,7 +321,7 @@ func (r *testRig) openCycle(t *testing.T, dir strategy.Direction) *Cycle {
 }
 
 // openLot opens a lot in the open cycle's direction at the rig's clock.
-func (r *testRig) openLot(t *testing.T) *Lot {
+func (r *testRig) openLot(t testing.TB) *Lot {
 	t.Helper()
 	lot, err := r.m.OpenLot(&strategy.EntryPlan{Direction: r.m.Cycle().Direction, X: 10, Mu: 3.33, Sigma: 4, FeeD: 2.6, FeeUSDT: dec("1.1")}, r.clock.Now())
 	if err != nil {
@@ -349,6 +350,11 @@ func (r *testRig) lot(t *testing.T, seq int) *Lot {
 
 // --- order records ---
 
+// recordSeq numbers the record versions the helpers below build, as cex's
+// order table does: every new version of a record has a larger UpdateSeq
+// (Sync relies on it). at sets one explicitly.
+var recordSeq atomic.Uint64
+
 // ord builds one order record of cycle c, without a fill and in status
 // pending. seq is its number within the cycle: the ids sort by it, as the
 // real ids do.
@@ -359,14 +365,14 @@ func ord(c CycleID, seq int, leg cex.Leg, purpose cex.OrderPurpose, side cex.Sid
 		symbol, legLetter = testPair.Bear.Symbol, "R"
 	}
 	id := fmt.Sprintf("etfp%s-%04d%s%s", strings.TrimPrefix(string(c), "c"), seq, legLetter, letter)
-	return cex.OrderRecord{Status: cex.StatusPending, Request: cex.OrderRequest{ClientOrderID: cex.ClientOrderID(id), Symbol: symbol, Leg: leg, Side: side,
+	return cex.OrderRecord{UpdateSeq: recordSeq.Add(1), Status: cex.StatusPending, Request: cex.OrderRequest{ClientOrderID: cex.ClientOrderID(id), Symbol: symbol, Leg: leg, Side: side,
 		Price: dec(price), Qty: dec(qty), ReduceOnly: purpose != cex.PurposeEntry && purpose != cex.PurposeComplete, Purpose: purpose, CycleID: string(c), LotID: string(lot)}}
 }
 
 // fill returns o with the given cumulative fill and a confirmed fee: filled
 // when the whole quantity traded, cancelled (the IOC's remainder) when less.
 func fill(o cex.OrderRecord, qty, value, fee string) cex.OrderRecord {
-	o.CumExecQty, o.CumExecValue, o.Fee, o.FeeKnown = dec(qty), dec(value), dec(fee), true
+	o.CumExecQty, o.CumExecValue, o.Fee, o.FeeKnown, o.UpdateSeq = dec(qty), dec(value), dec(fee), true, recordSeq.Add(1)
 	o.Status = cex.StatusCancelled
 	if o.CumExecQty.Equal(o.Request.Qty) {
 		o.Status = cex.StatusFilled
@@ -387,7 +393,7 @@ func working(o cex.OrderRecord, qty, value, fee string) cex.OrderRecord {
 // timed returns o with the venue's time of its last change, which dates its
 // fills.
 func timed(o cex.OrderRecord, t time.Time) cex.OrderRecord {
-	o.ExchangeUpdatedAt = t
+	o.ExchangeUpdatedAt, o.UpdateSeq = t, recordSeq.Add(1)
 	return o
 }
 

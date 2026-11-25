@@ -56,8 +56,9 @@ type ExecManager struct {
 	nextCloseTry time.Time           // a cycle whose close failed is not tried again before this
 
 	// bound by Restore, before Run
-	restoredBars []store.MinuteBarRow // the Session's minutes the previous run recorded
-	perp         minuteSource         // the recorder's per-second rows; nil: none
+	restoredBars  []store.MinuteBarRow  // the Session's minutes the previous run recorded
+	restoredFacts []store.AnchorFactRow // the Session's anchor facts the previous run recorded
+	perp          minuteSource          // the recorder's per-second rows; nil: none
 
 	// owned by Run: recovery
 	recovered struct{ orders, minutes bool } // the recovery steps done, so that a retry does not repeat them
@@ -65,7 +66,9 @@ type ExecManager struct {
 	// owned by Run: the exceptions
 	unknown           map[cex.ClientOrderID]*unknownOrder // the orders of unknown outcome
 	nextPositionsRead time.Time                           // the venue's positions are not read again for an unknown outcome before this
+	readAt            time.Time                           // the round of the last of those reads that succeeded
 	nextReconcile     time.Time                           // the next comparison of the venue's positions with the ledger
+	agreedAt          time.Time                           // the round of the last comparison that agreed: a stop leaves only after one made since the stop
 	nextMismatchAlarm time.Time                           // the next repetition of the mismatch alarm
 	forced            string                              // the end reason of the forced exit in progress (inventory.End*); empty while none
 	lateLogged        bool                                // the forced exit of a cycle of an ended Session was reported
@@ -166,6 +169,7 @@ func (m *ExecManager) onSignal(sig os.Signal, now time.Time) {
 		log.Info("exec: no new entries already asked for", "signal", sig.String())
 	case !m.stop.stopping:
 		m.stop.stopping, m.stop.at, m.stop.nextAlarm = true, now, now.Add(m.cfg.StopAlarmAfter)
+		m.nextReconcile = now // a stop leaves only on a comparison made after it
 		dir, hold := m.inv.Holdings()
 		log.Info("exec: stop requested", "signal", sig.String(), "direction", dir, "hold_bull", hold[cex.Bull], "hold_bear", hold[cex.Bear])
 	case m.stop.alarmed:
@@ -178,8 +182,10 @@ func (m *ExecManager) onSignal(sig os.Signal, now time.Time) {
 
 // stopCheck reports whether the process may leave after a stop signal: no
 // cycle is open (it closes only once its orders are settled and the venue's
-// positions agree, closeIfFlat) and no order of any cycle is without a
-// final state - a read of zero positions alone is not enough. While that is
+// positions agree, closeIfFlat), no order of any cycle is without a final
+// state - a read of zero positions alone is not enough - and a comparison
+// made since the stop found the venue's positions equal to the ledger's,
+// its recorded dust included (onSignal makes one due). While that is
 // not so, the stop's alarm is given stop_alarm_after after it and again at
 // every interval (PRD 10.3); a takeover asked for after the alarm leaves at
 // once, with the cycle kept as it is.
@@ -193,7 +199,7 @@ func (m *ExecManager) stopCheck(r *round, now time.Time) bool {
 		m.takeOver(r, unresolved, now)
 		return true
 	}
-	if r.cycle == nil && len(unresolved) == 0 {
+	if r.cycle == nil && len(unresolved) == 0 && !m.agreedAt.Before(m.stop.at) {
 		log.Info("exec: flat after the stop; leaving", "stop_asked", showTime(m.stop.at), "took", now.Sub(m.stop.at).Round(time.Millisecond))
 		return true
 	}

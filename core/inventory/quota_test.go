@@ -74,7 +74,7 @@ func TestQuota(t *testing.T) {
 	complete := ord(c.ID, 3, cex.Bull, cex.PurposeComplete, cex.SideBuy, lot.ID, "40.1", "60")
 	r.m.Sync([]cex.OrderRecord{bullDone, bearDone, complete})
 	wantQuota(t, r, "pending completion", "10000", "7001") // + 60 x 40.1
-	complete.Status = cex.StatusRejected
+	complete.Status, complete.UpdateSeq = cex.StatusRejected, recordSeq.Add(1)
 	r.m.Sync([]cex.OrderRecord{bullDone, bearDone, complete})
 	wantQuota(t, r, "completion rejected", "10000", "4595")
 	r.m.SettleLot(lot.ID, true, r.clock.Now())

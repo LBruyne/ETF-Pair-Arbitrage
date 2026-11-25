@@ -14,11 +14,11 @@ import (
 )
 
 // Restore takes what the previous run stored, before Run: the Session's
-// minute bars, the last built entry for the spacing rule, and where the
-// minutes the process did not record itself are read from (the recorder's
-// per-second rows; nil leaves them invalid).
-func (m *ExecManager) Restore(bars []store.MinuteBarRow, last *store.LotRow, perp minuteSource) {
-	m.restoredBars, m.perp = bars, perp
+// minute bars and anchor facts, the last built entry for the spacing rule,
+// and where the minutes the process did not record itself are read from
+// (the recorder's per-second rows; nil leaves them invalid).
+func (m *ExecManager) Restore(bars []store.MinuteBarRow, facts []store.AnchorFactRow, last *store.LotRow, perp minuteSource) {
+	m.restoredBars, m.restoredFacts, m.perp = bars, facts, perp
 	if last != nil {
 		m.lastEntry = &strategy.LastEntry{At: time.UnixMilli(last.OpenedMs), E: last.XD, Direction: strategy.Direction(last.Direction)}
 	}
@@ -26,7 +26,9 @@ func (m *ExecManager) Restore(bars []store.MinuteBarRow, last *store.LotRow, per
 
 // recover brings the loop up to what the venue and the stored records say
 // before the first decision (PRD 13.4). A step that cannot read its facts
-// is tried again every recoverRetry, never taken as "flat". A stop signal
+// is tried again every recoverRetry, never taken as "flat"; positions that
+// differ from the ledger are read again after reconcileAgain, so that
+// inventory can confirm the difference. A stop signal
 // meanwhile only sets stopping: the previous process may have left a
 // position or an order of unknown outcome, so recovery is finished first
 // and the loop then closes and leaves as after any stop. While it is not,
@@ -40,8 +42,14 @@ func (m *ExecManager) recover(ctx context.Context) (leave bool, err error) {
 		if err == nil {
 			return false, nil
 		}
-		log.Warn("exec: recovery not complete; retrying", "attempt", attempt, "err", err, "retry_in", m.timing.recoverRetry)
-		retry := time.After(m.timing.recoverRetry)
+		// A difference is read again as soon as inventory can confirm it, as
+		// in the loop; facts that could not be read wait longer.
+		wait := m.timing.recoverRetry
+		if errors.Is(err, inventory.ErrPositionsDiffer) {
+			wait = m.timing.reconcileAgain
+		}
+		log.Warn("exec: recovery not complete; retrying", "attempt", attempt, "err", err, "retry_in", wait)
+		retry := time.After(wait)
 	wait:
 		for {
 			now := m.timing.clock()
@@ -103,13 +111,10 @@ func (m *ExecManager) recoverOnce(ctx context.Context, now time.Time) error {
 	// The venue's positions against the ledger. Unread is not flat; one
 	// read that differs proves nothing yet, two make a mismatch, and the
 	// loop then sends nothing until a person checks.
-	rctx, cancel := context.WithTimeout(ctx, m.timing.readTimeout)
-	err := m.inv.Reconcile(rctx)
-	cancel()
+	err := m.compare(ctx, now)
 	if err != nil && !(errors.Is(err, inventory.ErrPositionsDiffer) && m.inv.Mismatch()) {
 		return fmt.Errorf("the venue's positions: %w", err)
 	}
-	m.nextReconcile = now.Add(m.timing.reconcileEvery)
 
 	// The anchors as they are, so that the first round sees no change.
 	if a := m.cex.Anchors(); a.SessionID == m.session.ID {
@@ -132,8 +137,10 @@ func (m *ExecManager) recoverOnce(ctx context.Context, now time.Time) error {
 // from the recorder's last second with both legs' best bid and ask in it,
 // with F the source's close of that minute; a minute with neither is
 // invalid. The mean and sigma then run as if the loop had closed every
-// minute itself: they restart after an invalid minute and at a dividend's
-// effect, and the last ready stats are kept for the exits.
+// minute itself: they restart after an invalid minute, at a dividend's
+// effect and, with rewarm_on_anchor_change, at rewarmMinute of the NAV that
+// replaced the bell anchor (navKnownAt), as anchorChanged does; the last
+// ready stats are kept for the exits.
 func (m *ExecManager) restoreMinutes(ctx context.Context, now time.Time) error {
 	s := m.session
 	from, to := s.Start.Truncate(time.Minute), now.Truncate(time.Minute)
@@ -176,9 +183,12 @@ func (m *ExecManager) restoreMinutes(ctx context.Context, now time.Time) error {
 	}
 
 	// Replay the minutes as closeMinutes would have closed them.
-	var restartAt time.Time
+	var restartAt, rewarmAt time.Time
 	if a := m.cex.Anchors(); a.SessionID == s.ID {
 		restartAt = a.RestartAt
+	}
+	if navAt := navKnownAt(m.restoredFacts, s.ID); m.scfg.RewarmOnAnchorChange && !navAt.IsZero() {
+		rewarmAt = rewarmMinute(navAt)
 	}
 	m.bars, m.runStart, m.stats = nil, 0, strategy.Stats{}
 	ownN, filled, restarted := 0, 0, false
@@ -197,6 +207,9 @@ func (m *ExecManager) restoreMinutes(ctx context.Context, now time.Time) error {
 		if !restartAt.IsZero() && !restarted && !t.Before(restartAt) {
 			m.runStart, restarted = len(m.bars), true // the dividend took effect: the run starts here
 		}
+		if t.Equal(rewarmAt) {
+			m.runStart = len(m.bars) // the NAV became the anchor in this minute
+		}
 		m.bars = append(m.bars, bar)
 		if !bar.Valid {
 			m.runStart = len(m.bars)
@@ -206,10 +219,35 @@ func (m *ExecManager) restoreMinutes(ctx context.Context, now time.Time) error {
 			m.lastReady = m.stats
 		}
 	}
+	if rewarmAt.Equal(to) { // in the minute still open
+		m.runStart, m.stats = len(m.bars), strategy.Stats{}
+	}
 	m.minute, m.obs, m.restartedAt = to, nil, restartAt
 	logger.GlobalLogger.Info("exec: minutes restored", "session", s.ID, "minutes", len(m.bars), "own", ownN, "from_recorder", filled,
 		"invalid", len(m.bars)-ownN-filled, "run_minutes", len(m.bars)-m.runStart, "stats_ready", m.stats.Ready)
 	return nil
+}
+
+// navKnownAt is when the NAV replaced the Session's bell anchor as the
+// stored facts say: the known time of its confirmed NAV (cex.FactNAV, one
+// time for both legs). Zero without it, and when no bell anchor was known
+// before it: the loop warms up again only when the NAV replaces the bell
+// anchor, not when it is the Session's first anchor.
+func navKnownAt(facts []store.AnchorFactRow, sessionID string) time.Time {
+	var bell, nav time.Time
+	for _, f := range facts {
+		switch known := time.UnixMilli(f.KnownMs); {
+		case f.SessionID != sessionID:
+		case f.Kind == cex.FactBell:
+			bell = known
+		case f.Kind == cex.FactNAV:
+			nav = known
+		}
+	}
+	if bell.IsZero() || !bell.Before(nav) {
+		return time.Time{}
+	}
+	return nav
 }
 
 // restoreBatch takes up the entry batch whose lot was still being built

@@ -137,7 +137,7 @@ func run(cfg *config.Config, signals chan os.Signal) error {
 	if !cfg.Exec.Live {
 		paper = cex.NewPaperVenue(venue, cex.PaperConfig{Pair: cfg.Cex.Pair,
 			Latency:     [2]time.Duration{cex.Bull: cfg.Exec.SimOrderLatency.Bull, cex.Bear: cfg.Exec.SimOrderLatency.Bear},
-			TakerFeeBps: cfg.Strategy.TakerFeeBps, Leverage: int(cfg.Inventory.Leverage.IntPart())})
+			TakerFeeBps: cfg.Strategy.TakerFeeBps, Leverage: int(cfg.Inventory.Leverage.IntPart()), DepthMaxAge: cfg.Cex.DepthMaxAge})
 		paper.UseStore(st)
 		venue = paper
 	}
@@ -195,7 +195,7 @@ func run(cfg *config.Config, signals chan os.Signal) error {
 	// The loop's own: the Session's minutes, the last built entry, and the
 	// recorder's per-second rows for the minutes it did not record. Its
 	// recovery (reading the venue's orders and positions) runs in Run.
-	emgr.Restore(state.MinuteBars, state.LastEntry, st)
+	emgr.Restore(state.MinuteBars, state.AnchorFacts, state.LastEntry, st)
 	log.Info("ETF-arbitrage core state loaded", "session", sessionID, "anchor_facts", len(state.AnchorFacts),
 		"unfinished_cycle", state.Cycle != nil, "orders", len(orders), "funding_records", len(state.Funding), "minute_bars", len(state.MinuteBars))
 

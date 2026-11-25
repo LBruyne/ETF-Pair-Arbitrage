@@ -138,6 +138,7 @@ type gateVenue struct {
 	lost   cex.Symbol
 	unread atomic.Bool  // the positions cannot be read
 	reads  atomic.Int64 // reads of the positions
+	onRead func()       // run once inside the next read of the positions, as what happens while a slow read is on its way
 	refuse func(req cex.OrderRequest) error
 	placed map[cex.ClientOrderID]int // PlaceOrder calls per order
 }
@@ -170,6 +171,13 @@ func (g *gateVenue) PlaceOrder(ctx context.Context, req cex.OrderRequest) (cex.O
 
 func (g *gateVenue) Positions(ctx context.Context, symbols []cex.Symbol) (cex.PositionSet, error) {
 	g.reads.Add(1)
+	g.mu.Lock()
+	during := g.onRead
+	g.onRead = nil
+	g.mu.Unlock()
+	if during != nil {
+		during()
+	}
 	if g.unread.Load() {
 		return cex.PositionSet{}, errors.New("the test makes the positions unreadable")
 	}
@@ -216,6 +224,10 @@ func (g *gateVenue) releaseParked() {
 		g.PaperVenue.PlaceOrder(context.Background(), req)
 	}
 }
+
+// duringRead sets what happens while the next read of the positions is on
+// its way.
+func (g *gateVenue) duringRead(f func()) { g.mu.Lock(); g.onRead = f; g.mu.Unlock() }
 
 // placeCalls is how often the order was handed to the venue.
 func (g *gateVenue) placeCalls(id cex.ClientOrderID) int {
@@ -522,7 +534,7 @@ func newRig(t *testing.T, now time.Time, opts rigOptions) *rig {
 	shared := opts.exchange != nil
 	if !shared {
 		ex := &exchange{venue: &fakeVenue{t: t, stream: map[cex.Symbol]func(cex.BookEvent){}}}
-		ex.paper = cex.NewPaperVenue(ex.venue, cex.PaperConfig{Pair: pair, Latency: [2]time.Duration{opts.latency, opts.latency}, TakerFeeBps: 0.65, Leverage: 10})
+		ex.paper = cex.NewPaperVenue(ex.venue, cex.PaperConfig{Pair: pair, Latency: [2]time.Duration{opts.latency, opts.latency}, TakerFeeBps: 0.65, Leverage: 10, DepthMaxAge: cex.DefaultConfig.DepthMaxAge})
 		ex.paper.UseStore(sink)
 		ex.gate = &gateVenue{PaperVenue: ex.paper}
 		opts.exchange = ex
@@ -569,9 +581,8 @@ func newRig(t *testing.T, now time.Time, opts rigOptions) *rig {
 		t.Fatal(err)
 	}
 	r.m.UseStore(sink)
-	r.m.Restore(state.MinuteBars, state.LastEntry, opts.perp)
+	r.m.Restore(state.MinuteBars, state.AnchorFacts, state.LastEntry, opts.perp)
 	r.m.timing.clock = r.clock
-	r.m.timing.recoverRetry = 20 * time.Millisecond
 
 	// cex runs its own loops; its first reference pass reads the rules, the
 	// paper account's settings and positions.
@@ -588,6 +599,7 @@ func newRig(t *testing.T, now time.Time, opts rigOptions) *rig {
 	}
 	r.m.ctx = ctx
 	r.m.start(now)
+	r.m.nextReconcile = now.Add(r.m.timing.reconcileEvery) // as the recovery leaves it
 	return r
 }
 
@@ -624,8 +636,22 @@ func (r *rig) at(t time.Time) {
 	}
 }
 
-// step runs one round of the loop at the test's time.
-func (r *rig) step() (done bool) { return r.m.step(r.clock()) }
+// step runs one round of the loop at the test's time, and the rounds that
+// follow a read of the positions in the process: a read ends its round,
+// and the loop runs again at once when the read published the positions,
+// or at the next tick (200 ms) when it failed; the rig runs those rounds at
+// the same time, at most three.
+func (r *rig) step() (done bool) {
+	for i := 0; ; i++ {
+		reads := r.gate.reads.Load()
+		if done = r.stepOnce(); done || i == 3 || r.gate.reads.Load() == reads {
+			return done
+		}
+	}
+}
+
+// stepOnce runs exactly one round of the loop at the test's time.
+func (r *rig) stepOnce() (done bool) { return r.m.step(r.clock()) }
 
 // stepAt moves the clock and runs one round.
 func (r *rig) stepAt(t time.Time) bool {

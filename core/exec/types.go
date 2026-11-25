@@ -104,6 +104,7 @@ type round struct {
 	rulesOK bool              // both legs' rules are loaded
 	orders  []cex.OrderRecord // the open cycle's order snapshot, as booked by this step; nil when flat
 	cycle   *inventory.Cycle  // the open cycle after that booking; nil when flat
+	read    bool              // the round read the venue's positions: the facts above are older than the read, so it sends nothing after it
 }
 
 // atLineReasons are the reasons an entry is refused after its signal held
@@ -187,8 +188,9 @@ type minuteSource interface {
 
 // unknownOrder is what the loop keeps of an order whose outcome is unknown.
 type unknownOrder struct {
-	since   time.Time // the round that first saw it unknown, on the loop's clock
-	alarmed bool      // the 30 s alarm was given
+	since      time.Time // the round that first saw it unknown, on the loop's clock
+	alarmed    bool      // the 30 s alarm was given
+	notFoundAt time.Time // the round that first saw cex's NotFound: the verdict needs a read of the positions from then on
 }
 
 // --- timings ---
@@ -212,7 +214,7 @@ type timings struct {
 	reconcileEvery time.Duration // with nothing in flight the venue's positions are compared with the ledger this often
 	reconcileAgain time.Duration // a comparison that differs is repeated this soon: two that differ make a mismatch (inventory)
 	mismatchAlarm  time.Duration // while positions do not match, the alarm is repeated this often
-	recoverRetry   time.Duration // a recovery step that could not read its facts is tried again after this
+	recoverRetry   time.Duration // a recovery step that could not read its facts, or a comparison that could not read the positions, is tried again after this
 }
 
 // defaultTimings are the values the process runs with.

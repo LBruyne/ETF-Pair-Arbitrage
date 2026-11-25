@@ -245,6 +245,7 @@ func TestLateVerdictWritesNothing(t *testing.T) {
 // takeover: the process leaves with the cycle marked takeover.
 func TestStopAlarmAndTakeoverDuringRecovery(t *testing.T) {
 	r := newRig(t, utc8Time(11, 25, 5, 1, 0), rigOptions{})
+	r.m.timing.recoverRetry = 20 * time.Millisecond // the recovery retries on the wall clock: the test's minutes pass in milliseconds
 	r.warmUp()
 	t0 := utc8Time(11, 25, 5, 3, 5)
 	r.at(t0)

@@ -24,9 +24,11 @@ import (
 // agreement. Order reports and position updates arrive in no fixed order,
 // so one differing read proves nothing: Mismatch latches when a later read,
 // at least reconcileConfirm after the first differing one, still differs by
-// the same amounts. A read that differs by other amounts, or more than twice
-// reconcileConfirm after the first, is a first differing read again: it may
-// be another passing lag.
+// the same amounts with the ledger where it was, however long after - a
+// slow read or a recovery retry must not keep a lasting difference from
+// being confirmed. A read that differs by other amounts, or after the ledger
+// moved, is a first differing read again (it may be another passing lag),
+// and one that agrees ends the confirmation.
 func (m *InventoryManager) Reconcile(ctx context.Context) error {
 	read, err := m.cex.ReadPositions(ctx) // outside mu: it is a network call
 	if err == nil && !read.Loaded {
@@ -62,9 +64,8 @@ func (m *InventoryManager) Reconcile(ctx context.Context) error {
 		m.differSince = time.Time{}
 		return nil
 	case m.mismatch:
-	case m.differSince.IsZero() || !by[cex.Bull].Equal(m.differBy[cex.Bull]) || !by[cex.Bear].Equal(m.differBy[cex.Bear]) ||
-		now.Sub(m.differSince) > 2*m.timing.reconcileConfirm: // a first differing read
-		m.differSince, m.differBy = now, by
+	case m.differSince.IsZero() || !sameQty(by, m.differBy) || !sameQty(ledger, m.differAt): // a first differing read
+		m.differSince, m.differBy, m.differAt = now, by, ledger
 		log.Warn("inventory: positions differ from the ledger; reading again", "venue_bull", venue[cex.Bull], "venue_bear", venue[cex.Bear],
 			"ledger_bull", ledger[cex.Bull], "ledger_bear", ledger[cex.Bear], "confirm_after", m.timing.reconcileConfirm)
 	case now.Sub(m.differSince) >= m.timing.reconcileConfirm:
@@ -84,6 +85,21 @@ func (m *InventoryManager) Mismatch() bool {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	return m.mismatch
+}
+
+// PositionsInDoubt reports whether the last read of the venue's positions
+// failed or differed from the ledger. exec opens nothing meanwhile: what the
+// venue holds is not known to be what the ledger says. Orders that only
+// reduce are not affected.
+func (m *InventoryManager) PositionsInDoubt() bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.unread || !m.differSince.IsZero()
+}
+
+// sameQty reports whether two per-leg quantities are equal on both legs.
+func sameQty(a, b [2]decimal.Decimal) bool {
+	return a[cex.Bull].Equal(b[cex.Bull]) && a[cex.Bear].Equal(b[cex.Bear])
 }
 
 // legQty is the signed position of each leg in a position set; a leg

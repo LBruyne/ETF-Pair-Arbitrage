@@ -284,8 +284,8 @@ func TestCompletionWindowFromTheFirstSend(t *testing.T) {
 	r.gate.hold("SOXLUSDT")
 	r.stepAt(t0)
 	r.books(thinBear()) // SOXS sells 60 of 70.20
-	r.best(cex.Bear, lv("59.41", "50"), lv("59.445", "50"))
 	waitFor(t, "SOXS's result and SOXL's held", func() bool { return len(r.cex.UnresolvedOrders()) == 1 && r.gate.heldEvents() > 0 })
+	r.best(cex.Bear, lv("59.41", "50"), lv("59.445", "50")) // after SOXS's match: its book is in conflict from now on
 	for s := 1; s <= 3; s++ {
 		r.idleAt(t0.Add(time.Duration(s)*time.Second), strategy.ReasonAwaitOrders)
 	}

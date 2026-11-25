@@ -240,8 +240,10 @@ func TestScriptedSession(t *testing.T) {
 		bearAsks: side{lv("59.30", "50"), lv("59.301", "50"), lv("59.302", "50"), lv("59.303", "50"), lv("59.304", "50")},
 	})
 	r.trade(utc8Time(11, 26, 4, 59, 1))
-	if r.m.idleReason != strategy.ReasonAwaitClose { // the round of the results closes the cycle and sends nothing
-		t.Errorf("idle reason of the round that closed the cycle %q, want await_close", r.m.idleReason)
+	// The round of the results closes the cycle on its read of the positions
+	// and sends nothing; the round that read wakes finds the regular hours.
+	if r.inv.Cycle() != nil || r.m.idleReason != strategy.ReasonRegularHours {
+		t.Errorf("cycle open %t, idle reason %q after the results; want closed, regular_hours", r.inv.Cycle() != nil, r.m.idleReason)
 	}
 	forced := r.decisions()[4]
 	if detail := decodeDetail(t, forced.Detail); forced.Kind != "forced" || detail["price_bull"] != "40.35" || detail["price_bear"] != "59.36" ||
@@ -309,7 +311,11 @@ func TestScriptedSession(t *testing.T) {
 	for _, row := range r.sink.Rows("signal_sample") {
 		reasons[row.(store.SignalSampleRow).IdleReason] = true
 	}
-	for _, want := range []string{"depth_bull", "warmup", "spacing", "regular_hours", "no_price", "await_depth"} {
+	// The script's rounds are seconds apart, so the routine comparison (every
+	// 10 s, as in production) falls on the rounds of 05:01:30 and of the
+	// warm-up: those seconds' samples say positions_read; their own reasons,
+	// depth_bull and warmup, are checked round by round above.
+	for _, want := range []string{"positions_read", "spacing", "regular_hours", "no_price", "await_depth"} {
 		if !reasons[want] {
 			t.Errorf("no signal_sample with idle_reason %s; got %v", want, reasons)
 		}

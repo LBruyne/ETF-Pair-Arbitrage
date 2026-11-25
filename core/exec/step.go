@@ -15,9 +15,17 @@ import (
 
 // step is one round of the loop at now (PRD 13.2): the minutes and the
 // anchors, the order snapshot booked into the ledger, then at most one
-// decision - wait, the forced exit, the cycle's gap, the exit at the line or
-// an entry. It reports whether the process may leave. Every exit that sends
-// nothing goes through idle, which records why.
+// decision - wait, the forced exit, the cycle's gap, the exit at the line,
+// the routine comparison of the positions or an entry. It reports whether
+// the process may leave. Every exit that sends nothing goes through idle,
+// which records why.
+//
+// A read of the venue's positions is a network call of up to readTimeout:
+// the time, the books and the phase the round read at its start are old
+// when it returns. So a read is the last action of its round (round.read);
+// the next round reads the facts again and decides on them. What sends an
+// order to reduce or complete goes before the routine comparison, and the
+// entry after it, so that a failed read holds the entry back.
 func (m *ExecManager) step(now time.Time) (done bool) {
 	r := m.newRound(now)
 
@@ -43,40 +51,19 @@ func (m *ExecManager) step(now time.Time) (done bool) {
 		return m.whileUnknown(r, u)
 	}
 	clear(m.unknown)
-	if !now.Before(m.nextReconcile) && m.reconcile(r) {
-		return m.mismatched(r)
-	}
 	m.noteBatchDone(r)
 
-	// Holding: the forced exit, the gap, the line exit, then a new entry.
-	if c := r.cycle; c != nil {
-		if m.forcedDue(c, now, !c.Flat()) {
-			return m.forcedExit(r, false)
+	// Holding: the forced exit, the gap, the line exit. A round that waits
+	// there still lets the routine comparison run.
+	if r.cycle != nil && m.holding(r) {
+		if m.idleReason != "" && m.compareDue(r) {
+			m.reconcile(r)
 		}
-		if m.workGap(r) {
-			return false
-		}
-		// The batch's results are in and its gap sends nothing more: one
-		// comparison of the positions before it is settled, so that no
-		// completion or trim waits for a read.
-		if b := m.batch; b != nil && !b.doneAt.IsZero() && !b.compared {
-			b.compared = true
-			if m.reconcile(r) {
-				return m.mismatched(r)
-			}
-		}
-		m.settle(r)
-		if !m.closeIfFlat(r) {
-			if r.cycle.Flat() {
-				return m.idle(strategy.ReasonAwaitClose) // nothing left to trade; the venue's positions have not confirmed it yet
-			}
-			if !m.freshDepthSince(r) {
-				return m.idle(strategy.ReasonAwaitDepth)
-			}
-			if m.exitAtLine(r) {
-				return false
-			}
-		}
+		return false
+	}
+	if m.compareDue(r) {
+		m.reconcile(r)
+		return false
 	}
 	plan, reason := m.strat.EvaluateEntry(m.entryInput(r))
 	if plan == nil {
@@ -85,6 +72,43 @@ func (m *ExecManager) step(now time.Time) (done bool) {
 	}
 	m.openBatch(r, plan)
 	return false
+}
+
+// holding is the part of the round that manages the open cycle, in order:
+// the forced exit, the gap, the comparison after a batch, the settling of
+// the batch and the close, the exit at the line. It reports whether the
+// round ends here - an order was sent, the positions were read, or the
+// cycle waits; otherwise the round goes on to a new entry.
+func (m *ExecManager) holding(r *round) (ended bool) {
+	c := r.cycle
+	if m.forcedDue(c, r.now, !c.Flat()) {
+		m.forcedExit(r, false)
+		return true
+	}
+	if m.workGap(r) {
+		return true
+	}
+	// The batch's results are in and its gap sends nothing more: one
+	// comparison of the positions before it is settled, so that no
+	// completion or trim waits for a read. It ends the round.
+	if b := m.batch; b != nil && !b.doneAt.IsZero() && !b.compared {
+		b.compared = true
+		m.reconcile(r)
+		return true
+	}
+	m.settle(r)
+	if m.closeIfFlat(r) {
+		return true
+	}
+	if r.cycle.Flat() {
+		m.idle(strategy.ReasonAwaitClose) // nothing left to trade; the venue's positions have not confirmed it yet
+		return true
+	}
+	if !m.freshDepthSince(r) {
+		m.idle(strategy.ReasonAwaitDepth)
+		return true
+	}
+	return m.exitAtLine(r)
 }
 
 // newRound reads the facts this step decides on: both books in one read, F
@@ -164,24 +188,57 @@ func (m *ExecManager) noteBatchDone(r *round) {
 	logger.GlobalLogger.Debug("exec: batch results in", "kind", string(b.kind), "orders", len(b.orders), "rejected", rejected, "took", r.now.Sub(b.sentAt).Round(time.Millisecond))
 }
 
+// compareDue reports whether the routine comparison of the venue's
+// positions with the ledger is due (nextReconcile) in a round that has not
+// read them yet.
+func (m *ExecManager) compareDue(r *round) bool {
+	return !r.read && !r.now.Before(m.nextReconcile)
+}
+
 // reconcile compares the venue's positions with the ledger (PRD 13.4,
 // 13.7), once after each batch's results when its gap sends nothing more,
-// and otherwise every reconcileEvery while nothing is in flight. A
-// comparison that differs is repeated reconcileAgain later: inventory takes
-// two that differ, that far apart, for a mismatch. It reports whether the
-// positions do not match.
-func (m *ExecManager) reconcile(r *round) (mismatch bool) {
-	ctx, cancel := context.WithTimeout(m.ctx, m.timing.readTimeout)
+// and otherwise when compareDue. The round ends with it: its reason is the
+// mismatch, not_ready for a failed read, else the reason of a round that
+// waited, else positions_read.
+func (m *ExecManager) reconcile(r *round) {
+	err := m.compare(m.ctx, r.now)
+	r.read = true
+	switch {
+	case m.inv.Mismatch():
+		m.mismatched(r)
+	case errors.Is(err, inventory.ErrPositionsUnread):
+		m.idle(strategy.ReasonNotReady)
+	case m.idleReason == "": // a round that waits keeps its reason
+		m.idle(strategy.ReasonPositionsRead)
+	}
+}
+
+// compare is one comparison of the venue's positions with the ledger
+// (inv.Reconcile) within readTimeout, at now on the loop's clock. One that
+// agrees is noted: a stop leaves only after one (stopCheck). The next
+// comparison is due from the moment this one returned: reconcileAgain
+// after a difference, which inventory confirms as a mismatch when it
+// persists; recoverRetry after a failed read, so that reads which time out
+// do not fill the loop's time; reconcileEvery otherwise. No entry is opened
+// while the last one failed or differed.
+func (m *ExecManager) compare(ctx context.Context, now time.Time) error {
+	ctx, cancel := context.WithTimeout(ctx, m.timing.readTimeout)
 	err := m.inv.Reconcile(ctx)
 	cancel()
-	m.nextReconcile = r.now.Add(m.timing.reconcileEvery)
-	if errors.Is(err, inventory.ErrPositionsDiffer) && !m.inv.Mismatch() {
-		m.nextReconcile = r.now.Add(m.timing.reconcileAgain)
+	next := m.timing.reconcileEvery
+	switch {
+	case err == nil:
+		m.agreedAt = now
+	case errors.Is(err, inventory.ErrPositionsUnread):
+		next = m.timing.recoverRetry
+	case !m.inv.Mismatch():
+		next = m.timing.reconcileAgain
 	}
+	m.nextReconcile = m.timing.clock().Add(next)
 	if err != nil {
 		logger.GlobalLogger.Debug("exec: positions compared", "err", err, "next", showTime(m.nextReconcile))
 	}
-	return m.inv.Mismatch()
+	return err
 }
 
 // mismatched is the round while the venue's positions do not match the
@@ -379,8 +436,8 @@ func (m *ExecManager) entryBlocked(r *round) strategy.Reason {
 		return strategy.ReasonStopping
 	case m.stop.noEntries:
 		return strategy.ReasonNoNewEntries
-	case !r.rulesOK || !m.cex.TradingReady() || !m.cex.Positions().Loaded:
-		return strategy.ReasonNotReady
+	case !r.rulesOK || !m.cex.TradingReady() || m.inv.PositionsInDoubt():
+		return strategy.ReasonNotReady // the last read of the positions failed or differed: what the venue holds is not known to be the ledger's
 	}
 	if ok, _ := m.cex.SettingsOK(m.leverage); !ok {
 		return strategy.ReasonSettings

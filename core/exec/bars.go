@@ -81,7 +81,8 @@ func (m *ExecManager) observe(r *round) {
 // Session is logged. A change from one anchor to another within the Session
 // (bell to NAV, a dividend adjustment) keeps the mean and sigma, which hold
 // no anchor and are expressed under the new one at once (PRD 11.3), unless
-// rewarm_on_anchor_change asks for a new warm-up after bell to NAV; it is an
+// rewarm_on_anchor_change asks for a new warm-up after bell to NAV, from
+// rewarmMinute on; it is an
 // event with the spread's jump at the current mids (PRD 11.4). Positions
 // and the cycle's pairing anchors are not touched (PRD 11.1, 11.2).
 func (m *ExecManager) anchorChanged(r *round, a cex.Anchors) {
@@ -94,7 +95,14 @@ func (m *ExecManager) anchorChanged(r *round, a cex.Anchors) {
 	}
 	rewarm := a.Kind != from.Kind && m.scfg.RewarmOnAnchorChange
 	if rewarm {
-		m.runStart, m.stats = len(m.bars), strategy.Stats{}
+		// A minute closed already when the loop sees the NAV only in the next
+		// one; never before the run's start (an invalid minute, a dividend).
+		start, from := rewarmMinute(a.KnownAt), len(m.bars)
+		for from > m.runStart && !m.bars[from-1].Minute.Before(start) {
+			from--
+		}
+		m.runStart = from
+		m.stats = strategy.ComputeStats(m.bars[m.runStart:], m.scfg)
 	}
 	jump := math.NaN()
 	if bull, bear := r.books.ByLeg[cex.Bull], r.books.ByLeg[cex.Bear]; hasMid(bull) && hasMid(bear) {
@@ -107,6 +115,12 @@ func (m *ExecManager) anchorChanged(r *round, a cex.Anchors) {
 		map[string]any{"session_id": a.SessionID, "from": from.Kind, "to": a.Kind, "from_bull": from.Bull, "from_bear": from.Bear, "to_bull": a.Bull, "to_bear": a.Bear,
 			"known_ms": a.KnownAt.UnixMilli(), "mid_jump_d": finite(jump), "rewarm": rewarm})
 }
+
+// rewarmMinute is the minute the mean and sigma start again from when the
+// NAV replaced the bell anchor (rewarm_on_anchor_change): the minute the NAV
+// became known in, whether the loop saw it in that minute or the next, and
+// at a restart.
+func rewarmMinute(navAt time.Time) time.Time { return navAt.Truncate(time.Minute) }
 
 // mid is a book's raw best bid and ask midpoint, in USDT.
 func mid(b *cex.Book) float64 {

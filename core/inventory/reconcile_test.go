@@ -176,9 +176,11 @@ func TestSampleCarriesTheVenueFigures(t *testing.T) {
 
 // One differing read starts the confirmation for that difference only. A
 // later read that differs by other amounts - another passing lag - starts
-// it again instead of confirming it; so does one that differs by the same
-// amounts more than twice reconcileConfirm after the first.
-func TestMismatchConfirmsOnlyTheSameRecentDifference(t *testing.T) {
+// it again instead of confirming it; a read that agrees ends it. The same
+// difference read again at least reconcileConfirm later confirms, however
+// long after: a slow read does not keep a lasting difference from being
+// confirmed (audit of step 6).
+func TestMismatchConfirmsOnlyTheSameDifference(t *testing.T) {
 	r := newRig(t, "1000", "10")
 	c := r.openCycle(t, strategy.Long)
 	lot := r.openLot(t)
@@ -193,8 +195,77 @@ func TestMismatchConfirmsOnlyTheSameRecentDifference(t *testing.T) {
 	r.cex.setPositions("10", "5") // now the bull exit lags; the bear lag is gone
 	reconcile(t, r, "another difference: SOXL 3 long", ErrPositionsDiffer, false)
 
+	r.clock.Add(500 * time.Millisecond)
+	r.cex.setPositions("7", "5")
+	reconcile(t, r, "agreeing", nil, false)
+	r.cex.setPositions("10", "5")
+	reconcile(t, r, "SOXL 3 long again, after an agreeing read", ErrPositionsDiffer, false)
 	r.clock.Add(30 * time.Second) // no read meanwhile
-	reconcile(t, r, "the same difference, 30 s later", ErrPositionsDiffer, false)
-	r.clock.Add(1500 * time.Millisecond)
-	reconcile(t, r, "the same difference, confirmed", ErrPositionsDiffer, true)
+	reconcile(t, r, "the same difference, 30 s later", ErrPositionsDiffer, true)
+}
+
+// The audit's case: in recovery the reads come 5 s apart (the retry of a
+// failed read). The same difference on ten of them is a mismatch.
+func TestPersistentMismatchInRecovery(t *testing.T) {
+	r := newRig(t, "1000", "10")
+	r.cex.setPositions("1", "0")
+	for i := 0; i < 10; i++ {
+		if e := r.m.Reconcile(context.Background()); !errors.Is(e, ErrPositionsDiffer) {
+			t.Fatal(e)
+		}
+		r.clock.Add(5 * time.Second)
+	}
+	if !r.m.Mismatch() {
+		t.Fatal("after 10 mismatching position reads spaced by the production recovery retry, mismatch is still false")
+	}
+}
+
+// Two unrelated lags of the same size are no mismatch (review of the audit
+// fixes): lot 1's SOXS lags by -1, the reads then fail for 20 s, and lot 2
+// of the same size lags by -1 again. The ledger changed between the two
+// reads, so the second is a first differing read.
+func TestUnrelatedEqualDifferencesDoNotConfirm(t *testing.T) {
+	r := newRig(t, "1000", "10")
+	c := r.openCycle(t, strategy.Long)
+	lot := r.openLot(t)
+	bull := fill(ord(c.ID, 1, cex.Bull, cex.PurposeEntry, cex.SideBuy, lot.ID, "10", "10"), "10", "100", "0.01")
+	bear := fill(ord(c.ID, 2, cex.Bear, cex.PurposeEntry, cex.SideBuy, lot.ID, "20", "5"), "5", "100", "0.01")
+	r.m.Sync([]cex.OrderRecord{bull, bear})
+	r.cex.setPositions("10", "4") // lot 1's bear lags
+	reconcile(t, r, "first lag", ErrPositionsDiffer, false)
+	r.cex.failReads(errTest)
+	for range 20 {
+		r.clock.Add(time.Second)
+		_ = r.m.Reconcile(t.Context())
+	}
+	r.cex.failReads(nil)
+	lot2 := r.openLot(t)
+	bull2 := fill(ord(c.ID, 3, cex.Bull, cex.PurposeEntry, cex.SideBuy, lot2.ID, "10", "10"), "10", "100", "0.01")
+	bear2 := fill(ord(c.ID, 4, cex.Bear, cex.PurposeEntry, cex.SideBuy, lot2.ID, "20", "5"), "5", "100", "0.01")
+	r.m.Sync([]cex.OrderRecord{bull, bear, bull2, bear2})
+	r.cex.setPositions("20", "9") // lot 2's bear lags by the same amount
+	reconcile(t, r, "second, unrelated lag of the same size", ErrPositionsDiffer, false)
+}
+
+// PositionsInDoubt is the result of the last read: true after one that
+// failed or differed from the ledger, false after one that agreed.
+func TestPositionsInDoubt(t *testing.T) {
+	r := newRig(t, "1000", "10")
+	if r.m.PositionsInDoubt() {
+		t.Fatal("in doubt before any read")
+	}
+	r.cex.setPositions("0", "0")
+	r.cex.failReads(errTest)
+	if e := r.m.Reconcile(context.Background()); !errors.Is(e, ErrPositionsUnread) || !r.m.PositionsInDoubt() {
+		t.Fatalf("failed read: %v, in doubt %t", e, r.m.PositionsInDoubt())
+	}
+	r.cex.failReads(nil)
+	r.cex.setPositions("1", "0")
+	if e := r.m.Reconcile(context.Background()); !errors.Is(e, ErrPositionsDiffer) || !r.m.PositionsInDoubt() {
+		t.Fatalf("read that differs: %v, in doubt %t", e, r.m.PositionsInDoubt())
+	}
+	r.cex.setPositions("0", "0")
+	if e := r.m.Reconcile(context.Background()); e != nil || r.m.PositionsInDoubt() {
+		t.Fatalf("read that agrees: %v, in doubt %t", e, r.m.PositionsInDoubt())
+	}
 }

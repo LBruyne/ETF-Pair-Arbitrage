@@ -622,7 +622,7 @@ func TestReservationAtTheQuotaPrice(t *testing.T) {
 	wantQuota(t, r, "one sell part filled", "10000", "4999.46594") // 809 + 42.44 x 40.45 + 2,473.76794
 
 	// Without a quota price the limit is used.
-	bear.Request.QuotaPrice = decimal.Zero
+	bear.Request.QuotaPrice, bear.UpdateSeq = decimal.Zero, recordSeq.Add(1)
 	r.m.Sync([]cex.OrderRecord{fill(bull, "62.44", "2525.698", "0"), bear})
 	wantQuota(t, r, "a pending sell without a quota price", "10000", "4998.7584") // 2,525.698 + 41.62 x 59.42
 }
