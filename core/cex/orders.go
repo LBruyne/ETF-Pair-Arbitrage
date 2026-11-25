@@ -89,6 +89,18 @@ func parseClientOrderID(id ClientOrderID) (cycleID string, leg Leg, purpose Orde
 	return "", 0, "", false
 }
 
+// ClientOrderSeq reads the sequence number of an id made by
+// NewClientOrderID: the order's place among its cycle's orders. ok is false
+// for any other id.
+func ClientOrderSeq(id ClientOrderID) (seq int, ok bool) {
+	if _, _, _, ours := parseClientOrderID(id); !ours {
+		return 0, false
+	}
+	_, tail, _ := strings.Cut(string(id), "-")
+	n, err := strconv.ParseInt(tail[:4], 36, 64)
+	return int(n), err == nil
+}
+
 // --- placing ---
 
 // PlaceOrders registers the orders as pending, commits their cex_order rows,

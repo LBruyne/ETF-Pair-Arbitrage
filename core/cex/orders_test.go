@@ -119,9 +119,17 @@ func TestClientOrderID(t *testing.T) {
 	if ids[0] != "etfp1795406754673-0009RF" || ids[1] != "etfp1795406754673-000ABC" || ids[2] != "etfp1795406754673-0010BX" {
 		t.Errorf("sorted ids = %v, want sequence 9, 10, 36", ids)
 	}
+	for _, seq := range []int{7, 36, 371} {
+		if got, ok := ClientOrderSeq(NewClientOrderID(cycleAt, seq, Bear, PurposeExit)); !ok || got != seq {
+			t.Errorf("ClientOrderSeq of the id of %d = %d, %t", seq, got, ok)
+		}
+	}
 	for _, other := range []ClientOrderID{"ep1795406754673-0007BE", "etfp1795406754673-0007BZ", "etfp1795406754673-0007QE", "etfpx-0007BE", "etfp1795406754673-007BE", ""} {
 		if _, _, _, ok := parseClientOrderID(other); ok {
 			t.Errorf("%q was taken for an id of this program", other)
+		}
+		if _, ok := ClientOrderSeq(other); ok {
+			t.Errorf("ClientOrderSeq read a sequence from %q", other)
 		}
 	}
 }
