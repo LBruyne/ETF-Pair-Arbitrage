@@ -1478,6 +1478,16 @@ func (m *ExecManager) forcedExit(now time.Time, unknown bool) (done bool) {
 - **停止信号**：不开仓、减仓并结清，没有未结束的一轮、也没有未出结果的订单时才退出；没平完每 60 秒一次 Error（`stop_not_flat`）。报警之前重复的停止信号不算，报警之后再来才算人工接管（`MarkTakeover`、`taken_over` 事件，级别 warn），留下这一轮直接退出。
 - 测试（`exec/exceptions_test.go`；九个关键机制逐一撤掉过，对应测试都会失败）：`TestStopWithAnUnknownEntryOrder`（停止时先读到零持仓、那张结果未知的开仓单随后成交：继续减仓、结清后才退出，全程不开仓，那张单只交给交易所一次）、`TestUnknownOrderNeverArrived`、`TestUnknownOrderPartlyFilled`、`TestRefusedReducingOrders`、`TestStopAlarmAndTakeover`、`TestNoNewEntriesKeepsExits`、`TestPositionMismatchStopsAllOrders`、`TestAccountSettings`（V17）。
 
+#### 第 6.4 步实现时定下的（2026-11-25）
+
+恢复（PRD 13.4）在 `exec/recover.go`，`Run` 进入主循环之前执行；`main` 读回库内状态也改为失败时每 5 秒重试，读到后 `Restore`。
+
+- 有未结束的一轮时依次：`RecoverOrders` → `inv.Sync(CycleOrders)` → 对每张认回的订单 `SetOrderLot`；接回仍在建的那一批和上一次建成的开仓（再开仓间隔用）；与交易所对账一次。读不到时每 5 秒重试，期间收到停止信号只置 stopping；恢复中确认持仓不符的，带着这个状态进入主循环，按 PRD 13.7 不发任何单。
+- 分钟：本程序自己的 `minute_bar` 优先；缺的分钟取录制服务 `perp_second` 在 (M, M+60 s] 内两条腿都有买一卖一的最后一秒，F 取那一分钟的收盘；都缺则是无效分钟。从录制服务补的分钟写成 `source = perp_second`。
+- 人工接管之后重启，这一轮保持 `takeover` 并照常管理到平仓，不回到 `open`。
+- 数据库测试的隔离：根包和 store 包的库测试先取一个会话级 advisory lock（`core/internal/dbtest`），并行的各包轮流使用同一个开发库；启动测试在锁内先清掉 `process_run` 以外的 `trade` 表。`scripts/dev_db.sh` 只在开发库里建 `etfpair.perp_second` 并授予写权限（正式库上交易程序只有 SELECT）。
+- 测试（`exec/restart_test.go`，前 7 个真实落库）：`TestRecoveryReadsBeforeItStops`（旧进程带仓 → 恢复时读取失败 → 收到停止 → 读取恢复 → 减仓并核对后才退出）、`TestRestartAfterTheSend` / `TestRestartBeforeTheSend`（第二条腿的通知被扣住，发单前后各一个崩溃点）、`TestRestartRecognisesAnUnrecordedOrder`、`TestRestartAfterAnUnrecordedExit`（V16 末句）、`TestRestartAfterATakeover`、`TestRestartAcrossTheClose`、`TestMinutesResumedPreferringOwnRows`（V15）；store 包 `TestLoadPerpMinutes`。五处关键改动逐一撤掉过，对应测试都会失败。
+
 ### 5.4a 审计第四次意见之后的修改（2026-11-25）
 
 审计在第 2–4 步的代码上复现了六个问题，另提了两处口径；都已修并有回归测试（审计的数字原样用作断言）。上文与这里不同的地方以这里和代码为准。
@@ -1799,7 +1809,7 @@ func (s *Store) LoadState(ctx context.Context, sessionID string) (State, error) 
 | 6.1（已实现，2026-11-25，经审查修订；见 5.4 末尾“第 6.1 步实现时定下的”） | exec 主流程 | `manager.go`、`step.go`、`bars.go`、`orders.go` 的发单与结清：开仓、建成、再开仓、按线平仓、收盘前强制平仓 | 假时钟 + 假 `Venue` 的整段剧本：V3 的执行部分（冲突时不开仓不平仓、强制平仓不受影响）、V4（原因顺序）、V6（新深度）、V10、V11、V12（换锚不停开仓、配比不变）、V13 |
 | 6.2（已实现，2026-11-25；见 5.4 末尾“第 6.2 步实现时定下的”） | exec 成交不齐 | `gapInput`、补齐 / 回吐的发单、等新帧、`void`、零头 | V9 全部；V7 的“补齐不超过额度”；**两条腿都已有最终状态、第二条腿的通知被扣住时，额外的订单为零；放行后持仓和金额只记一次**；订单在第 0 秒发出并成交、订单的最终状态在第 4 秒才到、另一条腿第 6 秒才恢复时不发补齐单；附录 A 例三、例四走完整流程 |
 | 6.3（已实现，2026-11-25；见 5.4 末尾“第 6.3 步实现时定下的”） | exec 例外与停止 | 结果未知的 30 秒和三样证据；持仓不符；停止信号、60 秒报警、人工接管 | **停止时先读到零持仓、随后那张结果未知的开仓单成交：程序继续减仓、结清后才退出，全程不开新仓**；同一盘口下两种拒单：价格超限的同价不重发、价格变了才发；临时限频解除后同价可以再发；V14 其余、V16（末句“平仓单已成交、本地还没记下就重启”在 6.4）、V17 |
-| 6.4 | exec 恢复 | `main` 的读回顺序、`recover.go`；纸面持仓回填 | **旧进程带仓 → 恢复时读取失败 → 收到停止 → 读取恢复 → 减仓并核对后才退出**；V15、V16 末句；“第二条腿的通知被扣住”在重启时再跑一次：发单前后各一个崩溃点；按 `ClientOrderID` 认回本地没记下的单；补分钟优先用自己的；接管后重启接回仓位 |
+| 6.4（已实现，2026-11-25；见 5.4 末尾“第 6.4 步实现时定下的”） | exec 恢复 | `main` 的读回顺序、`recover.go`；纸面持仓回填 | **旧进程带仓 → 恢复时读取失败 → 收到停止 → 读取恢复 → 减仓并核对后才退出**；V15、V16 末句；“第二条腿的通知被扣住”在重启时再跑一次：发单前后各一个崩溃点；按 `ClientOrderID` 认回本地没记下的单；补分钟优先用自己的；接管后重启接回仓位 |
 | 6.5 | 纸面联调 | 正式库上建角色和 schema（`install.sh` 的新段；用户第 60 条已授权：“两个都同意，不用等我，直接进行测试和调试”）；对真实行情跑纸面：先 1 小时，再跨一个真实收盘 | 1 小时内状态行、`signal_sample`、`minute_bar` 连续；跨收盘那次收盘前确实持有仓位并在收盘前结清（PRD 第 17 节末段）；从 `cex_order` 重算的每轮合计与 `cycle` 一致（PRD 14.3） |
 | 7 | Live Monitor 看板 | `dashboard/grafana/live_monitor_board.py`、`boardkit`（数据源改为传入、`BOARDS` 加一项）、`gen_dashboard.py`、数据源的 provisioning；`dashboard/SPEC.md` 第 7 节、`dashboard/README.md` | V19：`test_boards.py` 的结构检查；私有 Grafana 上截图几轮审阅；页面数字与表逐项对照。发布另行授权 |
 | 8 | 回放与选参 | `cmd/replay`：自己读录制服务的原始帧文件（`experiments/book_tape`，格式见 dashboard/SPEC.md 附录 A；不引用 `dashboard/` 的 Go 包），按接收时间回放，驱动同一套盘口合并、strategy、inventory、exec 和 `PaperVenue`（每条腿各自的下单延迟）；历史的锚点（按得知时刻）、F 和日历从看板库读，只读。输出 PRD 16.5 的分项。选参：模型、X、Y、d_in、d_out 的网格在前一段完整 Session 上跑，参数冻结后在之后的 Session 上验证（PRD 16.2） | 固定原始帧、接收顺序和注入的时钟，回放两次的订单序列和账本相同；一个 Session 的回放与同期纸面运行的成交一致；回测方案和结果写成报告交用户定参数；**延迟敏感性**（5.7 的 L5）：每条腿 5 / 15 / 25 / 50 / 100 ms 各跑一遍，报成交率、只成交一条腿的比例和净额 |
