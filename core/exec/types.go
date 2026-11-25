@@ -5,6 +5,7 @@
 package exec
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"time"
@@ -83,6 +84,9 @@ type stopState struct {
 	noEntries bool      // SIGUSR1: no new entries, positions are managed as usual
 	stopping  bool      // SIGINT or SIGTERM: close everything, then leave
 	at        time.Time // when the stop was asked for
+	nextAlarm time.Time // when the next not-flat alarm is due
+	alarmed   bool      // the not-flat alarm was given: a further stop signal is a takeover
+	takeover  bool      // a person takes the positions over: leave without closing the cycle
 }
 
 // round is the facts of one step, read once at its start: every check and
@@ -159,6 +163,17 @@ type cexSource interface {
 	// orders of any cycle without a final state.
 	CycleOrders(cycleID string) []cex.OrderRecord
 	UnresolvedOrders() []cex.OrderRecord
+	// ReadPositions reads the two legs' positions from the venue now and
+	// publishes them.
+	ReadPositions(ctx context.Context) (cex.PositionSet, error)
+	// MarkNeverArrived ends an order of unknown outcome as never_arrived.
+	MarkNeverArrived(id cex.ClientOrderID)
+}
+
+// unknownOrder is what the loop keeps of an order whose outcome is unknown.
+type unknownOrder struct {
+	since   time.Time // the round that first saw it unknown, on the loop's clock
+	alarmed bool      // the 30 s alarm was given
 }
 
 // --- timings ---
@@ -176,8 +191,15 @@ type timings struct {
 	statusLog     time.Duration // one status line this often
 	readTimeout   time.Duration // the limit of the positions read that confirms a cycle is flat
 	closeRetry    time.Duration // a cycle that could not be closed is not tried again sooner than this
+
+	unknownAlarm   time.Duration // an order unknown this long is an alarm, and its other leg is handled by the venue's positions (PRD 13.3)
+	positionsRead  time.Duration // while an outcome is unknown the venue's positions are read again at most this often
+	reconcileEvery time.Duration // with nothing in flight the venue's positions are compared with the ledger this often
+	reconcileAgain time.Duration // a comparison that differs is repeated this soon: two that differ make a mismatch (inventory)
+	mismatchAlarm  time.Duration // while positions do not match, the alarm is repeated this often
 }
 
 // defaultTimings are the values the process runs with.
 var defaultTimings = timings{clock: time.Now, step: 200 * time.Millisecond, resend: 200 * time.Millisecond, rejectBackoff: time.Second,
-	sample: time.Second, statusLog: 30 * time.Second, readTimeout: 2 * time.Second, closeRetry: time.Second}
+	sample: time.Second, statusLog: 30 * time.Second, readTimeout: 2 * time.Second, closeRetry: time.Second,
+	unknownAlarm: 30 * time.Second, positionsRead: time.Second, reconcileEvery: 10 * time.Second, reconcileAgain: time.Second, mismatchAlarm: time.Minute}

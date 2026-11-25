@@ -120,12 +120,90 @@ func (v *fakeVenue) feed(ev cex.BookEvent) bool {
 // contract is held, the reports and fills of its orders, and the position
 // sets, wait until the test releases them - the venue has the outcome, the
 // process does not know it yet.
+//
+// Orders can be made unknown too: a parked contract's orders do not reach
+// the paper venue until releaseParked (the venue has never seen them), a
+// lost contract's orders reach it while the answer is lost; both answer
+// ErrOrderStateUnknown. refuse, when set, answers an order with its error
+// instead. Queries of a held contract's orders fail.
 type gateVenue struct {
 	*cex.PaperVenue
-	mu    sync.Mutex
-	held  cex.Symbol
-	queue []cex.PrivateEvent
-	on    func(cex.PrivateEvent)
+	mu     sync.Mutex
+	held   cex.Symbol
+	queue  []cex.PrivateEvent
+	on     func(cex.PrivateEvent)
+	parked cex.Symbol
+	waits  []cex.OrderRequest
+	lost   cex.Symbol
+	refuse func(req cex.OrderRequest) error
+	placed map[cex.ClientOrderID]int // PlaceOrder calls per order
+}
+
+func (g *gateVenue) PlaceOrder(ctx context.Context, req cex.OrderRequest) (cex.OrderAck, error) {
+	g.mu.Lock()
+	if g.placed == nil {
+		g.placed = map[cex.ClientOrderID]int{}
+	}
+	g.placed[req.ClientOrderID]++
+	refuse, park, lose := g.refuse, g.parked == req.Symbol, g.lost == req.Symbol
+	if park {
+		g.waits = append(g.waits, req)
+	}
+	g.mu.Unlock()
+	if refuse != nil {
+		if err := refuse(req); err != nil {
+			return cex.OrderAck{}, err
+		}
+	}
+	if park {
+		return cex.OrderAck{}, cex.ErrOrderStateUnknown
+	}
+	ack, err := g.PaperVenue.PlaceOrder(ctx, req)
+	if lose {
+		return cex.OrderAck{}, cex.ErrOrderStateUnknown
+	}
+	return ack, err
+}
+
+func (g *gateVenue) OrderByClientID(ctx context.Context, symbol cex.Symbol, id cex.ClientOrderID) (cex.OrderRecord, error) {
+	g.mu.Lock()
+	held := g.held == symbol
+	g.mu.Unlock()
+	if held {
+		return cex.OrderRecord{}, errors.New("the test holds this contract's queries")
+	}
+	return g.PaperVenue.OrderByClientID(ctx, symbol, id)
+}
+
+// park keeps symbol's next orders from the venue; lose loses the answer to
+// them.
+func (g *gateVenue) park(symbol cex.Symbol) { g.mu.Lock(); g.parked = symbol; g.mu.Unlock() }
+func (g *gateVenue) lose(symbol cex.Symbol) { g.mu.Lock(); g.lost = symbol; g.mu.Unlock() }
+
+// setRefuse sets what answers the orders instead of the venue; nil lets
+// them through.
+func (g *gateVenue) setRefuse(f func(req cex.OrderRequest) error) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.refuse = f
+}
+
+// releaseParked hands the parked orders to the venue at last.
+func (g *gateVenue) releaseParked() {
+	g.mu.Lock()
+	waits := g.waits
+	g.waits, g.parked = nil, ""
+	g.mu.Unlock()
+	for _, req := range waits {
+		g.PaperVenue.PlaceOrder(context.Background(), req)
+	}
+}
+
+// placeCalls is how often the order was handed to the venue.
+func (g *gateVenue) placeCalls(id cex.ClientOrderID) int {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.placed[id]
 }
 
 func (g *gateVenue) SubscribePrivate(ctx context.Context, symbols []cex.Symbol, onEvent func(cex.PrivateEvent), onDown func(error)) error {
@@ -211,6 +289,30 @@ type testCex struct {
 	anchors     cex.Anchors
 	notReady    bool
 	settingsBad bool
+	notFound    map[cex.ClientOrderID]bool // orders cex reports as NotFound: its own verdict takes 30 s of wall time
+}
+
+// CycleOrders is cex's snapshot with the orders the test names marked
+// NotFound while their outcome is unknown.
+func (c *testCex) CycleOrders(cycleID string) []cex.OrderRecord {
+	orders := c.CexManager.CycleOrders(cycleID)
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for i := range orders {
+		if orders[i].Unknown && c.notFound[orders[i].Request.ClientOrderID] {
+			orders[i].NotFound = true
+		}
+	}
+	return orders
+}
+
+func (c *testCex) setNotFound(id cex.ClientOrderID) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.notFound == nil {
+		c.notFound = map[cex.ClientOrderID]bool{}
+	}
+	c.notFound[id] = true
 }
 
 func (c *testCex) TradingReady() bool {
@@ -467,26 +569,46 @@ func (r *rig) idleAt(t time.Time, want strategy.Reason) {
 	}
 }
 
-// orders lists every order cex registered, of any cycle, in id order.
+// orders lists every order cex registered, of any cycle, in the order they
+// were registered, each as its latest row says.
 func (r *rig) orders() []cex.OrderRecord {
 	var out []cex.OrderRecord
+	at := map[string]int{}
 	for _, row := range r.sink.Rows("cex_order") {
 		o := row.(store.OrderRow)
-		if !seen(out, o.ClientOrderID) {
-			out = append(out, cex.OrderRecordsFromRows([]store.OrderRow{o})...)
+		rec := cex.OrderRecordsFromRows([]store.OrderRow{o})[0]
+		if i, held := at[o.ClientOrderID]; held {
+			out[i] = rec
+			continue
 		}
+		at[o.ClientOrderID] = len(out)
+		out = append(out, rec)
 	}
 	return out
 }
 
-// seen reports whether the list holds the order.
-func seen(orders []cex.OrderRecord, id string) bool {
-	for _, o := range orders {
-		if string(o.Request.ClientOrderID) == id {
-			return true
-		}
+// tradeOn runs one round at t that must send orders and waits for the
+// results of those orders alone (an order of unknown outcome may stay), then
+// runs the round their arrival wakes.
+func (r *rig) tradeOn(t time.Time) {
+	r.t.Helper()
+	before := len(r.orders())
+	r.stepAt(t)
+	sent := r.orders()[before:]
+	if len(sent) == 0 {
+		r.t.Fatalf("no order sent at %s; idle reason %q", showTime(t), r.m.idleReason)
 	}
-	return false
+	waitFor(r.t, "the results of the orders just sent", func() bool {
+		for _, o := range r.cex.UnresolvedOrders() {
+			for _, s := range sent {
+				if o.Request.ClientOrderID == s.Request.ClientOrderID {
+					return false
+				}
+			}
+		}
+		return true
+	})
+	r.step()
 }
 
 // decisions returns the loop's decision rows, without the paper matches.

@@ -54,10 +54,16 @@ type ExecManager struct {
 	orderSeq     int                 // the sequence number of that cycle's last order
 	lastReduceAt [2]time.Time        // by leg: when the last reducing order of a forced exit or a gap was sent
 	nextCloseTry time.Time           // a cycle whose close failed is not tried again before this
-	forced       string              // the end reason of the forced exit in progress (inventory.End*); empty while none
-	lateLogged   bool                // the forced exit of a cycle of an ended Session was reported
-	atLine       strategy.Reason     // the at_line_blocked reason recorded last; empty when the last entry check did not stop there
-	stop         stopState
+
+	// owned by Run: the exceptions
+	unknown           map[cex.ClientOrderID]*unknownOrder // the orders of unknown outcome
+	nextPositionsRead time.Time                           // the venue's positions are not read again for an unknown outcome before this
+	nextReconcile     time.Time                           // the next comparison of the venue's positions with the ledger
+	nextMismatchAlarm time.Time                           // the next repetition of the mismatch alarm
+	forced            string                              // the end reason of the forced exit in progress (inventory.End*); empty while none
+	lateLogged        bool                                // the forced exit of a cycle of an ended Session was reported
+	atLine            strategy.Reason                     // the at_line_blocked reason recorded last; empty when the last entry check did not stop there
+	stop              stopState
 
 	// owned by Run: the record of each step
 	idleReason             strategy.Reason // why this step sent nothing; empty when it sent an order
@@ -73,7 +79,8 @@ func NewManager(cfg Config, c cexSource, inv *inventory.InventoryManager, strat 
 	if err := cfg.Validate(); err != nil {
 		return nil, err
 	}
-	return &ExecManager{cfg: cfg, cex: c, inv: inv, strat: strat, scfg: strat.Config(), leverage: inv.Leverage(), timing: defaultTimings, signals: signals}, nil
+	return &ExecManager{cfg: cfg, cex: c, inv: inv, strat: strat, scfg: strat.Config(), leverage: inv.Leverage(), timing: defaultTimings, signals: signals,
+		unknown: map[cex.ClientOrderID]*unknownOrder{}}, nil
 }
 
 // Run runs the loop until the process may exit and returns nil, or until
@@ -134,10 +141,11 @@ func (m *ExecManager) start(now time.Time) {
 	m.nextSample, m.nextStatus = now, now
 }
 
-// onSignal takes one process signal. SIGUSR1 stops new entries. The first
-// SIGINT or SIGTERM starts the stop: the forced exit closes what is held and
-// the loop leaves when the cycle is closed (stopCheck). A later one changes
-// nothing yet: taking the positions over by hand is not part of the loop.
+// onSignal takes one process signal (PRD 10.3). SIGUSR1 stops new entries.
+// The first SIGINT or SIGTERM starts the stop: the forced exit closes what
+// is held and the loop leaves when the cycle is closed (stopCheck). One that
+// comes after the not-flat alarm is a person taking over; one before the
+// alarm changes nothing.
 func (m *ExecManager) onSignal(sig os.Signal, now time.Time) {
 	log := logger.GlobalLogger
 	switch {
@@ -147,24 +155,79 @@ func (m *ExecManager) onSignal(sig os.Signal, now time.Time) {
 	case sig == syscall.SIGUSR1:
 		log.Info("exec: no new entries already asked for", "signal", sig.String())
 	case !m.stop.stopping:
-		m.stop.stopping, m.stop.at = true, now
+		m.stop.stopping, m.stop.at, m.stop.nextAlarm = true, now, now.Add(m.cfg.StopAlarmAfter)
 		dir, hold := m.inv.Holdings()
 		log.Info("exec: stop requested", "signal", sig.String(), "direction", dir, "hold_bull", hold[cex.Bull], "hold_bear", hold[cex.Bear])
+	case m.stop.alarmed:
+		m.stop.takeover = true
+		log.Info("exec: takeover requested", "signal", sig.String(), "stop_asked", showTime(m.stop.at))
 	default:
-		log.Info("exec: stop already requested", "signal", sig.String(), "since", showTime(m.stop.at))
+		log.Info("exec: stop already requested; a repeat before the alarm is not a takeover", "signal", sig.String(), "since", showTime(m.stop.at))
 	}
 }
 
-// stopCheck reports whether the process may leave: a stop was asked for,
-// no cycle is open (it closes only once its orders are settled and the
-// venue's positions agree, closeIfFlat) and no order of any cycle is without
-// a final state.
-func (m *ExecManager) stopCheck(c *inventory.Cycle, now time.Time) bool {
-	if !m.stop.stopping || c != nil || len(m.cex.UnresolvedOrders()) > 0 {
+// stopCheck reports whether the process may leave after a stop signal: no
+// cycle is open (it closes only once its orders are settled and the venue's
+// positions agree, closeIfFlat) and no order of any cycle is without a
+// final state - a read of zero positions alone is not enough. While that is
+// not so, the stop's alarm is given stop_alarm_after after it and again at
+// every interval (PRD 10.3); a takeover asked for after the alarm leaves at
+// once, with the cycle kept as it is.
+func (m *ExecManager) stopCheck(r *round, now time.Time) bool {
+	log := logger.GlobalLogger
+	if !m.stop.stopping {
 		return false
 	}
-	logger.GlobalLogger.Info("exec: flat after the stop; leaving", "stop_asked", showTime(m.stop.at), "took", now.Sub(m.stop.at).Round(time.Millisecond))
-	return true
+	unresolved := m.cex.UnresolvedOrders()
+	if m.stop.takeover {
+		m.takeOver(r, unresolved, now)
+		return true
+	}
+	if r.cycle == nil && len(unresolved) == 0 {
+		log.Info("exec: flat after the stop; leaving", "stop_asked", showTime(m.stop.at), "took", now.Sub(m.stop.at).Round(time.Millisecond))
+		return true
+	}
+	if !now.Before(m.stop.nextAlarm) {
+		m.stop.alarmed, m.stop.nextAlarm = true, now.Add(m.cfg.StopAlarmAfter)
+		dir, hold := m.inv.Holdings()
+		bull, bear := r.books.ByLeg[cex.Bull], r.books.ByLeg[cex.Bear]
+		log.Error("exec: not flat 60 s after stop", "since", now.Sub(m.stop.at).Round(time.Second), "direction", dir, "hold_bull", hold[cex.Bull], "hold_bear", hold[cex.Bear],
+			"unresolved_orders", len(unresolved), "best_bid_bull", bull.BestBid.Price, "best_ask_bull", bull.BestAsk.Price, "best_bid_bear", bear.BestBid.Price, "best_ask_bear", bear.BestAsk.Price)
+		m.event(now, "error", "stop_not_flat", "not flat after the stop signal: still closing; a further stop signal takes the positions over by hand",
+			map[string]any{"since_ms": m.stop.at.UnixMilli(), "direction": dir, "hold_bull": hold[cex.Bull], "hold_bear": hold[cex.Bear], "unresolved_orders": orderIDs(unresolved),
+				"best_bid_bull": bull.BestBid.Price, "best_ask_bull": bull.BestAsk.Price, "best_bid_bear": bear.BestBid.Price, "best_ask_bear": bear.BestAsk.Price})
+	}
+	return false
+}
+
+// takeOver leaves the cycle to a person (PRD 10.3): it is not closed but
+// marked takeover, with what it holds and the orders without an outcome
+// recorded; a later start reads it back.
+func (m *ExecManager) takeOver(r *round, unresolved []cex.OrderRecord, now time.Time) {
+	dir, hold := m.inv.Holdings()
+	if r.cycle != nil {
+		m.inv.MarkTakeover(now)
+	}
+	logger.GlobalLogger.Info("exec: taken over", "cycle", cycleOf(r.cycle), "direction", dir, "hold_bull", hold[cex.Bull], "hold_bear", hold[cex.Bear], "unresolved_orders", len(unresolved))
+	m.event(now, "warn", "taken_over", "a person took the positions over after the stop alarm; the cycle is kept as it is",
+		map[string]any{"cycle_id": cycleOf(r.cycle), "direction": dir, "hold_bull": hold[cex.Bull], "hold_bear": hold[cex.Bear], "unresolved_orders": orderIDs(unresolved)})
+}
+
+// cycleOf is the cycle's id, empty without one.
+func cycleOf(c *inventory.Cycle) string {
+	if c == nil {
+		return ""
+	}
+	return string(c.ID)
+}
+
+// orderIDs lists the orders' client ids.
+func orderIDs(orders []cex.OrderRecord) []cex.ClientOrderID {
+	out := make([]cex.ClientOrderID, len(orders))
+	for i, o := range orders {
+		out[i] = o.Request.ClientOrderID
+	}
+	return out
 }
 
 // logStatus writes the periodic status line: the phase, the anchors, the

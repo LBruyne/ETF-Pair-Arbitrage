@@ -96,7 +96,7 @@ func (m *ExecManager) settle(r *round) {
 // first in first out (PRD 8.7). The order joins the batch: the next
 // decision waits for its result, and the completion window keeps the
 // batch's first send as its start. A trim is reduce-only.
-func (m *ExecManager) sendGap(r *round, a strategy.GapAction) {
+func (m *ExecManager) sendGap(r *round, a strategy.GapAction, byPositions bool) {
 	c, b := r.cycle, m.batch
 	purpose, lot := cex.PurposeExit, inventory.LotID("")
 	if b != nil && b.kind == cex.PurposeEntry && !b.settled {
@@ -118,11 +118,11 @@ func (m *ExecManager) sendGap(r *round, a strategy.GapAction) {
 	}
 	hold := c.Hold()
 	_, _, left := m.inv.Quota()
-	logger.GlobalLogger.Info("exec: gap", "cycle", c.ID, "lot", lot, "order", string(a.Kind), "purpose", string(purpose), "leg", a.Leg.String(), "side", string(a.Side),
+	logger.GlobalLogger.Info("exec: gap", "by_positions", byPositions, "cycle", c.ID, "lot", lot, "order", string(a.Kind), "purpose", string(purpose), "leg", a.Leg.String(), "side", string(a.Side),
 		"price", a.Price, "qty", a.Qty, "loss_complete_usdt", a.LossComplete, "loss_trim_usdt", a.LossTrim, "hold_bull", hold[cex.Bull], "hold_bear", hold[cex.Bear],
 		"quota_left_usdt", left, "since_batch_sent", r.now.Sub(m.batch.sentAt).Round(time.Millisecond))
 	m.recordDecision(r.now, string(a.Kind), c, lot, c.Direction, "", map[string]any{
-		"purpose": purpose, "leg": a.Leg.String(), "side": a.Side, "price": a.Price, "qty": a.Qty, "quota_price": a.QuotaPrice,
+		"purpose": purpose, "by_positions": byPositions, "leg": a.Leg.String(), "side": a.Side, "price": a.Price, "qty": a.Qty, "quota_price": a.QuotaPrice,
 		"loss_complete_usdt": a.LossComplete, "loss_trim_usdt": a.LossTrim, "hold_bull": hold[cex.Bull], "hold_bear": hold[cex.Bear],
 		"quota_left": left, "batch_sent_ms": m.batch.sentAt.UnixMilli(), "pair_anchor_bull": c.PairAnchors.Bull, "pair_anchor_bear": c.PairAnchors.Bear,
 		"depth_seq_bull": r.books.ByLeg[cex.Bull].DepthSeq, "depth_seq_bear": r.books.ByLeg[cex.Bear].DepthSeq, "client_order_id": req.ClientOrderID})
@@ -166,13 +166,13 @@ func (m *ExecManager) sendExit(r *round, plan *strategy.ExitPlan, in strategy.Ex
 // when the cycle belongs to a Session that has ended, or after a stop
 // signal. Once it holds it holds until the cycle is closed (PRD 10.5); the
 // first cause is kept as the cycle's end reason. A cycle that holds nothing
-// any more only waits to be confirmed flat: it does not begin a forced exit
-// and keeps the end reason of what closed it.
-func (m *ExecManager) forcedDue(c *inventory.Cycle, now time.Time) bool {
+// any more only waits to be confirmed flat (holding is false): it does not
+// begin a forced exit and keeps the end reason of what closed it.
+func (m *ExecManager) forcedDue(c *inventory.Cycle, now time.Time, holding bool) bool {
 	if m.forced != "" {
 		return true
 	}
-	if c.Flat() {
+	if !holding {
 		return false
 	}
 	switch {
@@ -196,10 +196,12 @@ func (m *ExecManager) forcedDue(c *inventory.Cycle, now time.Time) bool {
 // and of the book's depth (PRD 10.2, 10.4); a conflict does not hold it up.
 // While a leg that holds something has no price, neither leg is sent, so the
 // pair stays hedged (PRD 10.4, 13.6). A leg is sent again on the new book
-// once its last order has a result, at least resend after the last one.
-// What cannot be sent at all is dust, and the cycle then closes with it
-// (PRD 8.1).
-func (m *ExecManager) forcedExit(r *round) (done bool) {
+// once its last order has a result, at least resend after the last one,
+// and not at a price the venue refused it for. What cannot be sent at all
+// is dust, and the cycle then closes with it (PRD 8.1). byPositions sizes
+// the orders by the venue's positions instead of the ledger: an order's
+// outcome is unknown and the ledger may lack its fill (PRD 13.3).
+func (m *ExecManager) forcedExit(r *round, byPositions bool) (done bool) {
 	log := logger.GlobalLogger
 	c := r.cycle
 	if c.SessionID != m.session.ID && !m.lateLogged {
@@ -209,14 +211,22 @@ func (m *ExecManager) forcedExit(r *round) (done bool) {
 		m.event(r.now, "error", "late_exit", "the cycle of an ended Session is still open: it is being closed, entries wait until it is",
 			map[string]any{"cycle_id": c.ID, "cycle_session": c.SessionID, "session_id": m.session.ID, "hold_bull": hold[cex.Bull], "hold_bear": hold[cex.Bear]})
 	}
-	if c.Flat() {
-		m.closeIfFlat(r) // closed this round or not, nothing is left to send
-		return m.idle(strategy.ReasonAwaitClose)
-	}
 	if !r.rulesOK {
 		return m.idle(strategy.ReasonNotReady)
 	}
 	hold := c.Hold()
+	if byPositions {
+		pos := m.venuePositions(r)
+		if !pos.Loaded {
+			return m.idle(strategy.ReasonNotReady)
+		}
+		if hold = m.positionHold(r, c.Direction, pos); hold[cex.Bull].IsZero() && hold[cex.Bear].IsZero() {
+			return m.idle(strategy.ReasonOrderUnknown) // nothing at the venue to reduce: the outcome decides
+		}
+	} else if c.Flat() {
+		m.closeIfFlat(r) // closed this round or not, nothing is left to send
+		return m.idle(strategy.ReasonAwaitClose)
+	}
 	for _, leg := range cex.Legs {
 		if hold[leg].IsPositive() && !r.books.HasPrice(leg, r.now) {
 			return m.idle(strategy.ReasonNoPrice)
@@ -231,7 +241,7 @@ func (m *ExecManager) forcedExit(r *round) (done bool) {
 	var reqs []cex.OrderRequest
 	for _, leg := range cex.Legs {
 		o := orders[leg]
-		if o == nil || r.now.Sub(m.lastReduceAt[leg]) < m.timing.resend {
+		if o == nil || !m.mayReduce(r, leg, o.Price) {
 			continue
 		}
 		req := m.orderRequest(c, r.orders, leg, cex.PurposeForced, o.Side, o.Price, o.Qty, r.rules[leg].Symbol)
@@ -240,15 +250,16 @@ func (m *ExecManager) forcedExit(r *round) (done bool) {
 		m.lastReduceAt[leg] = r.now
 	}
 	if len(reqs) == 0 {
-		return m.idle(strategy.ReasonAwaitOrders) // resend after the interval
+		return false // mayReduce recorded why
 	}
+	m.idleReason = ""
 	if m.batch == nil || m.batch.kind != cex.PurposeForced {
 		m.batch = &batchState{kind: cex.PurposeForced, sentAt: r.now}
 	}
 	bull, bear := r.books.ByLeg[cex.Bull], r.books.ByLeg[cex.Bear]
-	log.Info("exec: forced exit", "cycle", c.ID, "cause", m.forced, "orders", len(reqs), "hold_bull", hold[cex.Bull], "hold_bear", hold[cex.Bear],
+	log.Info("exec: forced exit", "cycle", c.ID, "cause", m.forced, "by_positions", byPositions, "orders", len(reqs), "hold_bull", hold[cex.Bull], "hold_bear", hold[cex.Bear],
 		"best_bid_bull", bull.BestBid.Price, "best_ask_bull", bull.BestAsk.Price, "best_bid_bear", bear.BestBid.Price, "best_ask_bear", bear.BestAsk.Price)
-	detail := map[string]any{"cause": m.forced, "hold_bull": hold[cex.Bull], "hold_bear": hold[cex.Bear], "slip_bps": m.scfg.ForcedSlipBps,
+	detail := map[string]any{"cause": m.forced, "by_positions": byPositions, "hold_bull": hold[cex.Bull], "hold_bear": hold[cex.Bear], "slip_bps": m.scfg.ForcedSlipBps,
 		"best_bid_bull": bull.BestBid.Price, "best_ask_bull": bull.BestAsk.Price, "best_bid_bear": bear.BestBid.Price, "best_ask_bear": bear.BestAsk.Price,
 		"conflict_bull": bull.Conflict, "conflict_bear": bear.Conflict, "client_order_ids": ids(reqs)}
 	for _, req := range reqs {
@@ -257,6 +268,124 @@ func (m *ExecManager) forcedExit(r *round) (done bool) {
 	m.recordDecision(r.now, "forced", c, "", c.Direction, "", detail)
 	m.send(r, reqs...)
 	return false
+}
+
+// --- outcomes unknown ---
+
+// whileUnknown is the round while an order's outcome is unknown (PRD 13.3):
+// no entry and no exit at the line. cex queries the order; the loop alarms
+// after unknownAlarm and gives the verdict "never arrived" once the venue
+// has no such order, no fill carries its id (cex's NotFound) and the leg's
+// position at the venue is the ledger's. A forced exit due meanwhile is
+// sized by the venue's positions; past unknownAlarm the other leg's gap is
+// trimmed by the venue's positions too. What the positions show is never
+// booked: the ledger follows the order reports alone.
+func (m *ExecManager) whileUnknown(r *round, unknown []cex.OrderRecord) bool {
+	m.chase(r, unknown)
+	if c := r.cycle; c != nil && m.forcedDue(c, r.now, true) {
+		return m.forcedExit(r, true)
+	}
+	if m.unknownFor(r.now) >= m.timing.unknownAlarm && m.gapByPositions(r) {
+		return false
+	}
+	return m.idle(strategy.ReasonOrderUnknown)
+}
+
+// chase follows each order of unknown outcome: the 30 s alarm, once, and
+// the verdict of PRD 13.3 when its three evidences are in.
+func (m *ExecManager) chase(r *round, unknown []cex.OrderRecord) {
+	log := logger.GlobalLogger
+	held := map[cex.ClientOrderID]bool{}
+	for _, o := range unknown {
+		id := o.Request.ClientOrderID
+		held[id] = true
+		u := m.unknown[id]
+		if u == nil {
+			u = &unknownOrder{since: r.now}
+			m.unknown[id] = u
+		}
+		if !u.alarmed && r.now.Sub(u.since) >= m.timing.unknownAlarm {
+			u.alarmed = true
+			log.Error("exec: order outcome unknown for 30 s; using positions", "client_order_id", id, "leg", o.Request.Leg.String(), "purpose", string(o.Request.Purpose),
+				"qty", o.Request.Qty, "price", o.Request.Price, "unknown_since", showTime(u.since), "err", o.ErrorMessage)
+			m.event(r.now, "error", "order_unknown_30s", "an order's outcome has been unknown for 30 s: it is queried on and never sent again; the other leg follows the venue's positions",
+				map[string]any{"client_order_id": id, "leg": o.Request.Leg.String(), "purpose": o.Request.Purpose, "qty": o.Request.Qty, "price": o.Request.Price})
+		}
+		if !o.NotFound {
+			continue
+		}
+		pos := m.venuePositions(r)
+		venue, ledger := pos.BySymbol[o.Request.Symbol].Qty, m.inv.LedgerPositions()[o.Request.Leg]
+		if !pos.Loaded || !venue.Equal(ledger) {
+			continue // the position may hold its fill: no verdict
+		}
+		m.cex.MarkNeverArrived(id)
+		log.Error("exec: order taken as never arrived", "client_order_id", id, "leg", o.Request.Leg.String(), "position", venue)
+		m.event(r.now, "error", "order_never_arrived", "the venue has no such order, no fill carries its id and the position did not move: it never arrived; a fill of it later is a mismatch",
+			map[string]any{"client_order_id": id, "leg": o.Request.Leg.String(), "purpose": o.Request.Purpose, "qty": o.Request.Qty, "position": venue})
+	}
+	for id := range m.unknown {
+		if !held[id] {
+			delete(m.unknown, id)
+		}
+	}
+}
+
+// unknownFor is how long the oldest unknown outcome has been unknown.
+func (m *ExecManager) unknownFor(now time.Time) (longest time.Duration) {
+	for _, u := range m.unknown {
+		longest = max(longest, now.Sub(u.since))
+	}
+	return longest
+}
+
+// gapByPositions trims the gap the venue's positions show, as strategy
+// decides it for a gap that is only reduced; it reports whether an order
+// was sent.
+func (m *ExecManager) gapByPositions(r *round) bool {
+	if !r.rulesOK {
+		return false
+	}
+	pos := m.venuePositions(r)
+	if !pos.Loaded {
+		return false
+	}
+	in := m.gapInput(r)
+	in.Hold, in.Batch = m.positionHold(r, r.cycle.Direction, pos), nil
+	a := m.strat.EvaluateGap(in)
+	if a.Kind != strategy.GapTrim || !m.mayReduce(r, a.Leg, a.Price) {
+		return false
+	}
+	m.sendGap(r, a, true)
+	return true
+}
+
+// venuePositions is the venue's positions of the two legs, read again when
+// the last read is positionsRead old; between reads the published snapshot
+// serves (pushes keep it current).
+func (m *ExecManager) venuePositions(r *round) cex.PositionSet {
+	if !r.now.Before(m.nextPositionsRead) {
+		m.nextPositionsRead = r.now.Add(m.timing.positionsRead)
+		ctx, cancel := context.WithTimeout(m.ctx, m.timing.readTimeout)
+		if _, err := m.cex.ReadPositions(ctx); err != nil {
+			logger.GlobalLogger.Debug("exec: positions not read", "err", err)
+		}
+		cancel()
+	}
+	return m.cex.Positions()
+}
+
+// positionHold is what the venue's positions hold of a cycle in direction
+// dir, per leg: a short cycle holds negative positions.
+func (m *ExecManager) positionHold(r *round, dir strategy.Direction, pos cex.PositionSet) (hold [2]decimal.Decimal) {
+	for _, leg := range cex.Legs {
+		q := pos.BySymbol[r.rules[leg].Symbol].Qty
+		if dir == strategy.Short {
+			q = q.Neg()
+		}
+		hold[leg] = decimal.Max(q, decimal.Zero)
+	}
+	return hold
 }
 
 // --- closing the cycle ---

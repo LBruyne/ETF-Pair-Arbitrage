@@ -1,7 +1,11 @@
 package exec
 
 import (
+	"context"
+	"errors"
 	"time"
+
+	"github.com/shopspring/decimal"
 
 	"etf-pair-arbitrage/core/cex"
 	"etf-pair-arbitrage/core/inventory"
@@ -26,27 +30,30 @@ func (m *ExecManager) step(now time.Time) (done bool) {
 
 	// One snapshot of the cycle's orders, booked; every check below reads it.
 	m.syncOrders(r)
-	if m.stopCheck(r.cycle, now) {
+	if m.stopCheck(r, now) {
 		return true
 	}
 	if m.inv.Mismatch() {
-		return m.idle(strategy.ReasonPositionMismatch) // no order at all until a person checks
+		return m.mismatched(r) // no order at all until a person checks
 	}
 	if anyInFlight(r.orders) {
 		return m.idle(strategy.ReasonAwaitOrders) // neither final nor unknown: its result is due within about two seconds
 	}
-	if anyUnknown(r.orders) {
-		// Nothing is decided until the outcome is known. cex queries the
-		// order; the forced exit sized by the venue's positions and the
-		// verdicts after 30 s are not taken here.
-		return m.idle(strategy.ReasonOrderUnknown)
+	if u := unknownOf(r.orders); len(u) > 0 {
+		return m.whileUnknown(r, u)
 	}
-	m.noteBatchDone(r)
+	clear(m.unknown)
+	if m.noteBatchDone(r) || !now.Before(m.nextReconcile) {
+		m.reconcile(r)
+		if m.inv.Mismatch() {
+			return m.mismatched(r)
+		}
+	}
 
 	// Holding: the forced exit, the gap, the line exit, then a new entry.
 	if c := r.cycle; c != nil {
-		if m.forcedDue(c, now) {
-			return m.forcedExit(r)
+		if m.forcedDue(c, now, !c.Flat()) {
+			return m.forcedExit(r, false)
 		}
 		if m.workGap(r) {
 			return false
@@ -116,15 +123,15 @@ func anyInFlight(orders []cex.OrderRecord) bool {
 	return false
 }
 
-// anyUnknown reports whether an order's outcome is not known: cex queries
-// it and never sends it again.
-func anyUnknown(orders []cex.OrderRecord) bool {
+// unknownOf returns the orders whose outcome is not known: cex queries them
+// and never sends them again.
+func unknownOf(orders []cex.OrderRecord) (unknown []cex.OrderRecord) {
 	for _, o := range orders {
 		if !o.Status.Terminal() && o.Unknown {
-			return true
+			unknown = append(unknown, o)
 		}
 	}
-	return false
+	return unknown
 }
 
 // noteBatchDone marks the batch done in the first round whose snapshot holds
@@ -132,22 +139,59 @@ func anyUnknown(orders []cex.OrderRecord) bool {
 // refused one. The next entry and line exit wait for depth that arrived
 // after this round's time (PRD 5.9), on the loop's clock. That time is read
 // before the snapshot, so a result may have arrived up to the length of the
-// round's reads after it: a depth frame of that instant counts as new.
-func (m *ExecManager) noteBatchDone(r *round) {
+// round's reads after it: a depth frame of that instant counts as new. It
+// reports whether the batch became done in this round.
+func (m *ExecManager) noteBatchDone(r *round) bool {
 	b := m.batch
 	if b == nil || !b.doneAt.IsZero() || len(b.orders) == 0 {
-		return
+		return false
 	}
 	rejected := false
 	for _, id := range b.orders {
 		o, found := orderIn(r.orders, id)
 		if !found || !o.Status.Terminal() {
-			return
+			return false
 		}
 		rejected = rejected || o.Status == cex.StatusRejected
 	}
 	b.doneAt, b.rejected = r.now, rejected
 	logger.GlobalLogger.Debug("exec: batch results in", "kind", string(b.kind), "orders", len(b.orders), "rejected", rejected, "took", r.now.Sub(b.sentAt).Round(time.Millisecond))
+	return true
+}
+
+// reconcile compares the venue's positions with the ledger (PRD 13.4,
+// 13.7), after every batch's results and otherwise every reconcileEvery
+// while nothing is in flight. A comparison that differs is repeated
+// reconcileAgain later: inventory takes two that differ, that far apart, for
+// a mismatch.
+func (m *ExecManager) reconcile(r *round) {
+	ctx, cancel := context.WithTimeout(m.ctx, m.timing.readTimeout)
+	err := m.inv.Reconcile(ctx)
+	cancel()
+	m.nextReconcile = r.now.Add(m.timing.reconcileEvery)
+	if errors.Is(err, inventory.ErrPositionsDiffer) && !m.inv.Mismatch() {
+		m.nextReconcile = r.now.Add(m.timing.reconcileAgain)
+	}
+	if err != nil {
+		logger.GlobalLogger.Debug("exec: positions compared", "err", err, "next", showTime(m.nextReconcile))
+	}
+}
+
+// mismatched is the round while the venue's positions do not match the
+// ledger: no order of any kind until a person has checked and restarted
+// the process (PRD 13.7); the alarm is repeated every mismatchAlarm.
+func (m *ExecManager) mismatched(r *round) bool {
+	if m.nextMismatchAlarm.IsZero() {
+		m.nextMismatchAlarm = r.now.Add(m.timing.mismatchAlarm) // inventory gave the first alarm
+	}
+	if !r.now.Before(m.nextMismatchAlarm) {
+		m.nextMismatchAlarm = r.now.Add(m.timing.mismatchAlarm)
+		pos := m.cex.Positions()
+		ledger := m.inv.LedgerPositions()
+		logger.GlobalLogger.Error("exec: positions do not match the ledger; no orders until a person checks",
+			"venue_bull", pos.BySymbol[r.rules[cex.Bull].Symbol].Qty, "venue_bear", pos.BySymbol[r.rules[cex.Bear].Symbol].Qty, "ledger_bull", ledger[cex.Bull], "ledger_bear", ledger[cex.Bear])
+	}
+	return m.idle(strategy.ReasonPositionMismatch)
 }
 
 // orderIn finds an order of the snapshot by its id.
@@ -201,13 +245,40 @@ func (m *ExecManager) workGap(r *round) (decided bool) {
 		m.idle(strategy.ReasonNoPrice)
 		return true
 	case strategy.GapTrim:
-		if r.now.Sub(m.lastReduceAt[a.Leg]) < m.timing.resend {
-			m.idle(strategy.ReasonAwaitOrders) // two reducing orders of one leg are resend apart
+		if !m.mayReduce(r, a.Leg, a.Price) {
 			return true
 		}
 	}
-	m.sendGap(r, a)
+	m.sendGap(r, a, false)
 	return true
+}
+
+// mayReduce reports whether a reducing order of leg at price may go now;
+// otherwise it records why not. Two of one leg are resend apart (PRD 8.4,
+// 10.4). One the venue refused for its price is not sent again at the same
+// price, only once the book gives another; a refusal of another kind, such
+// as a rate limit, does not hold the price back.
+func (m *ExecManager) mayReduce(r *round, leg cex.Leg, price decimal.Decimal) bool {
+	if r.now.Sub(m.lastReduceAt[leg]) < m.timing.resend {
+		m.idle(strategy.ReasonAwaitOrders)
+		return false
+	}
+	if refusedAt(r.orders, leg, price) {
+		m.idle(strategy.ReasonAwaitDepth) // a new book gives a new price
+		return false
+	}
+	return true
+}
+
+// refusedAt reports whether the last reducing order of leg in the snapshot
+// was refused by the venue for its price, and at this price.
+func refusedAt(orders []cex.OrderRecord, leg cex.Leg, price decimal.Decimal) bool {
+	for i := len(orders) - 1; i >= 0; i-- {
+		if o := orders[i]; o.Request.Leg == leg && o.Request.ReduceOnly {
+			return o.Status == cex.StatusRejected && o.ErrorKind == cex.ErrorPriceLimit && o.Request.Price.Equal(price)
+		}
+	}
+	return false
 }
 
 // gapInput gathers the facts of one gap decision. The entry batch that is
