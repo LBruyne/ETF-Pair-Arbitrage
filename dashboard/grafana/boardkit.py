@@ -285,9 +285,10 @@ def query_var(name, label, q, description, hide=0):
 
 def custom_var(name, label, values, default, description, allow_custom=False):
     """values is a list of (text, value); a comma in a text is escaped in the query. allow_custom lets the viewer type a
-    value that is not in the list."""
+    value that is not in the list; the default may then be one that is not."""
     opts = [{"text": t, "value": v, "selected": v == default} for t, v in values]
-    text = next(t for t, v in values if v == default)
+    text = next((t for t, v in values if v == default), default)
+    assert allow_custom or text != default or any(v == default for _, v in values), default
     return {"name": name, "label": label, "description": description, "type": "custom",
             "query": ",".join("%s : %s" % (t.replace(",", "\\,"), v) for t, v in values),
             "options": opts, "current": {"text": text, "value": default, "selected": True}, "multi": False, "includeAll": False, "hide": 0,

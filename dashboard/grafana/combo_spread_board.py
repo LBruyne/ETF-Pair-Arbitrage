@@ -23,11 +23,13 @@ from boardkit import (BAD, BLUE, BPS, GREY, LIGHT_GREY, NO_FIGURE, ORANGE, PHASE
                       copy_field, custom_var, group_by, keep_fields, marks, named, organize, query_var, reset_ids, reset_link, row, rows_with, series, sort_by, sql,
                       stat_strip, table, textbox_var, timeseries, tooltip_only)
 
-# The spacing of the drawn points: the finest of 1, 5, 10, 30 seconds and
-# whole minutes that keeps a line under about 5000 points. Every step reads the
-# recorder's per-second rows at its multiples.
+# The spacing of the drawn points: the finest of 1, 5, 10, 30 seconds and whole minutes that keeps a line under about 2000
+# points, about 1.6 a pixel of a full-width chart at 1680 px (3.5, owner item 63: 5000 until 3.4, which made a 6-hour page
+# 1.5 MB and slow to draw): every second up to about 33 minutes, 5 s to about 2.8 h, 10 s to about 5.6 h, 30 s to about 16.7 h,
+# then every minute or more. Every step reads the recorder's per-second rows at its multiples.
+POINTS = 2000
 STEP_MS = ("(SELECT CASE WHEN r <= 1000 THEN 1000 WHEN r <= 5000 THEN 5000 WHEN r <= 10000 THEN 10000 "
-           "WHEN r <= 30000 THEN 30000 ELSE ceil(r / 60000) * 60000 END::bigint FROM (SELECT ($__to - $__from) / 5000.0 AS r) x)")
+           "WHEN r <= 30000 THEN 30000 ELSE ceil(r / 60000) * 60000 END::bigint FROM (SELECT ($__to - $__from) / %d.0 AS r) x)" % POINTS)
 # The notional N of the real spreads, USDT of both legs together, as typed: full-width characters read as their plain forms
 # (NFKC); a number, its thousands grouped by commas (in threes) or not, spaces and underscores ignored, a decimal part, k for
 # thousands or w / 万 for ten thousands, a trailing U or USDT; anything else is NULL, for which the Signal reads No Notional.
@@ -52,14 +54,19 @@ ENTRY = "(SELECT CASE WHEN m[1]::numeric > 0 THEN m[1]::numeric END FROM regexp_
 # 60m); NULL for anything else and for 0, for which the board has no mean (No Mean).
 MEAN_SCALE = "(SELECT CASE WHEN m[1]::integer > 0 THEN m[1]::integer END FROM regexp_match(%s, '^([0-9]{1,6})(?:min|m)?$') m)" % typed("ma_minutes")
 # Entry and Mean Scale as the titles show them, whatever was typed (10bps, 30min): the value in use, ? when there is none.
-D_TEXT = "SELECT coalesce(rtrim(rtrim(to_char(%s, 'FM999,999,990.999999'), '0'), '.'), '?')" % ENTRY
+# Entry as a multiple k of sigma (3.5, owner item 64): a positive number with σ or sigma after it (2σ, 0.5σ, 2sigma); the Entry
+# of each point is then k × that point's sigma (the Sigma Scale's, per minute as the sigma lines), none where sigma is not
+# ready. NULL for anything else, when Entry (bps) above reads the typed text.
+ENTRY_K = "(SELECT CASE WHEN m[1]::numeric > 0 THEN m[1]::numeric END FROM regexp_match(%s, '^([0-9]+(?:[.][0-9]+)?)(?:σ|sigma)$') m)" % typed("d")
+D_TEXT = ("SELECT coalesce(rtrim(rtrim(to_char(%s, 'FM999,999,990.999999'), '0'), '.') || ' bps', "
+          "rtrim(rtrim(to_char(%s, 'FM999,990.999999'), '0'), '.') || 'σ', '?')" % (ENTRY, ENTRY_K))
 MA_TEXT = "SELECT coalesce((%s)::text, '?')" % MEAN_SCALE
 # Sigma Scale, sigma's minutes, as typed: as Mean Scale; NULL for anything else, for which the board has no sigma (No Sigma).
 SIGMA_SCALE = "(SELECT CASE WHEN m[1]::integer > 0 THEN m[1]::integer END FROM regexp_match(%s, '^([0-9]{1,6})(?:min|m)?$') m)" % typed("sigma_minutes")
 SIGMA_TEXT = "SELECT coalesce((%s)::text, '?')" % SIGMA_SCALE
 # The typed settings, read once per query (one row v): N, Entry, Mean Scale and Sigma Scale; every figure of a query takes them
 # from it.
-SETTINGS = "(SELECT %s AS n, %s AS d, %s AS ma_n, %s AS sig_n) v" % (NOTIONAL, ENTRY, MEAN_SCALE, SIGMA_SCALE)
+SETTINGS = "(SELECT %s AS n, %s AS d, %s AS k, %s AS ma_n, %s AS sig_n) v" % (NOTIONAL, ENTRY, ENTRY_K, MEAN_SCALE, SIGMA_SCALE)
 # The sigma multiples drawn around the Mean (Spread chart) and zero (Deviation chart, + only on Entry Points), owner item 61.
 SIGMAS = (1, 1.5, 2, 2.5, 3)
 # The end of the range, or now when the range runs into the future.
@@ -67,7 +74,20 @@ END_MS = "least($__to, (extract(epoch FROM now()) * 1000)::bigint)"
 NOW_MS = "(extract(epoch FROM now()) * 1000)::bigint"
 # What the Spread row draws (etfpair.combo_range, LATERAL to v): each point at the time its value was known, and a row with
 # only its time where the lines break: at missing data and at the start of a session.
-RANGE = "etfpair.combo_range('$combo', '$venue', '$ma', v.ma_n, v.sig_n, $__from, $__to, %s, v.n, v.d) r" % STEP_MS
+# A point's Entry in bps: the typed bps, or k × its sigma; and its Signal on that Entry (combo_signal, the one definition,
+# called per point: combo_range's own Signal takes a single Entry), No Sigma where the Entry is k σ and sigma is not ready.
+def entry_at(x):
+    return "coalesce(v.d, v.k * %s.sigma_bps)" % x
+
+
+def signal_at(x):
+    return ("CASE WHEN v.d IS NULL AND v.k IS NOT NULL AND {x}.sigma_bps IS NULL AND {x}.s_bps IS NOT NULL AND NOT {x}.past_t AND {x}.mu_bps IS NOT NULL "
+            "AND coalesce(v.n > 0, false) THEN 'No Sigma' ELSE etfpair.combo_signal({x}.s_bps, {x}.past_t, {x}.mu_bps, v.n, {x}.basis = 'mid', "
+            "{x}.s_long_bps, {x}.s_short_bps, {x}.partial_long, {x}.partial_short, %s) END" % entry_at("{x}")).format(x=x)
+
+
+RANGE_CALL = "etfpair.combo_range('$combo', '$venue', '$ma', v.ma_n, v.sig_n, $__from, $__to, %s, v.n, v.d) x" % STEP_MS
+RANGE = "(SELECT x.*, %s AS entry, %s AS sig FROM %s) r" % (entry_at("x"), signal_at("x"), RANGE_CALL)
 # What the Prices row draws (etfpair.combo_prices): trade prices only, no mean and no book.
 PRICES = "etfpair.combo_prices('$combo', '$venue', $__from, $__to, %s) p" % STEP_MS
 # The snapshot strips' two newest seconds, whatever the time range (etfpair.combo_last, LATERAL to v, ten minutes back at
@@ -132,11 +152,11 @@ def depth_why(leg):
 # The Signal of each point as a number, for the charts' tooltips, and its text and colour there (those of the Signal figure).
 SIGNALS = dict({"None": 0, "Long": 1, "Short": 2, "Long · Partial": 3, "Short · Partial": 4}, **{t: CODE[t] for t in
                                                                                                ("No Book", "No Notional", "No Anchor", "Past T", "No Mean",
-                                                                                                "No Entry")})
+                                                                                                "No Entry", "No Sigma")})
 
 
 def signal_code(x):
-    return "CASE WHEN {x}.basis IS NOT NULL THEN CASE {x}.signal {whens} END END".format(
+    return "CASE WHEN {x}.basis IS NOT NULL THEN CASE {x}.sig {whens} END END".format(
         x=x, whens=" ".join("WHEN '%s' THEN %d" % (text, code) for text, code in SIGNALS.items()))
 
 
@@ -156,7 +176,6 @@ LEGS = (("Bid", "bid", "Bull", "bull"), ("Bid", "bid", "Bear", "bear"), ("Ask", 
 # 0.001), in contracts (ct) and in USDT. (frame column, shown name, combo_range column, leg).
 DEPTHS = [("%s %s %s" % (side, leg, unit), "%s 1–${%s_levels} · ${%s} · %s" % (side, low_leg, low_leg, unit), "%s_%s_%s" % (low_side, unit.lower(), low_leg), low_leg)
           for unit in ("ct", "USDT") for side, low_side, leg, low_leg in LEGS]
-CONTRACTS = "suffix: ct"
 
 # The newest seconds (combo_last, called once; p its prices second, b its basis second), in two rows. Row 1 holds the strips'
 # figures: the US market phase now; the trade prices with their anchors and the reference's return; the basis second's
@@ -173,7 +192,8 @@ LAST_COLUMNS = [
     ("Deviation", coded("b", "abs(b.s_bps - b.mu_bps)", 2, **MEAN_WHY)), ("Anchor Status", "b.anchor_status"), ("USD/USDT", "b.fx"),
     ("Real Long Deviation", coded("b", "abs(b.s_long_bps - b.mu_bps)", 2, side="b.s_long_bps < b.mu_bps", **REAL_DEV_WHY)),
     ("Real Short Deviation", coded("b", "abs(b.s_short_bps - b.mu_bps)", 2, side="b.s_short_bps > b.mu_bps", **REAL_DEV_WHY)),
-    ("Long Fill", fill("b", "long")), ("Short Fill", fill("b", "short")), ("Signal", "b.signal")]
+    ("Long Fill", fill("b", "long")), ("Short Fill", fill("b", "short")),
+    ("Signal", "CASE WHEN b.kind IS NOT NULL THEN %s END" % signal_at("b"))]
 BOOK_COLUMNS = [("Leg", "k.ticker"), ("Tick", "trim_scale(k.tick)::text"), ("Levels", "'1–' || etfpair.pricing_levels(k.tick)")] + [
     ("%s · %s" % (side, unit), "CASE g.i WHEN 1 THEN %s ELSE %s END" % (
         coded("b", "b.%s_%s_bull" % (low_side, unit.lower()), 2 if unit == "ct" else 0, **depth_why("bull")),
@@ -274,8 +294,8 @@ def phase_marks(name):
 #   Entry Points by Phase: the place in the table (PHASE_PLACES) of the phase of each point with a Deviation, the table showing
 #   its name (a number in the frame is a fifth of the bytes of the name); 0 or 1 per kind of point; the absolute real deviation of
 #   a point on the favourable side of the mean (not past T), whose largest is the phase's Best.
-SPREAD_CHART = [("Spread", shown("r.s_bps", 1)), ("Mean", shown("r.mu_bps", 1)), ("Mean + Entry", shown("r.mu_bps + v.d", 1)),
-                ("Mean − Entry", shown("r.mu_bps - v.d", 1)), ("Sigma", shown("r.sigma_bps", 2)),
+SPREAD_CHART = [("Spread", shown("r.s_bps", 1)), ("Mean", shown("r.mu_bps", 1)), ("Mean + Entry", shown("r.mu_bps + r.entry", 1)),
+                ("Mean − Entry", shown("r.mu_bps - r.entry", 1)), ("Sigma", shown("r.sigma_bps", 2)),
                 ("Spread · Tooltip", coded("r", "r.s_bps", 1, **SPREAD_WHY)), ("Real Long Spread", coded("r", "r.s_long_bps", 1, **REAL_WHY)),
                 ("Real Short Spread", coded("r", "r.s_short_bps", 1, **REAL_WHY)), ("Mean · Tooltip", coded("r", "r.mu_bps", 1, **MEAN_WHY)),
                 ("Sigma · Tooltip", coded("r", "r.sigma_bps", 2, **SIGMA_WHY)),
@@ -288,25 +308,25 @@ DEVIATION_CHART = [("Signed Deviation", "CASE WHEN NOT r.past_t THEN %s END" % s
                    ("Signed Real Long Deviation", "CASE WHEN NOT r.past_t THEN %s END" % shown("r.s_long_bps - r.mu_bps", 1)),
                    ("Signed Real Short Deviation", "CASE WHEN NOT r.past_t THEN %s END" % shown("r.s_short_bps - r.mu_bps", 1)),
                    ("Signed Past T", "CASE WHEN r.past_t THEN %s END" % shown("r.s_bps - r.mu_bps", 1)),
-                   ("−Entry", "-v.d"),
+                   ("−Entry", "-trim_scale(round(r.entry, 6))"),
                    ("Signed Deviation · Tooltip", coded("r", "r.s_bps - r.mu_bps", 1, **MEAN_WHY)),
                    ("Signed Real Long Deviation · Tooltip", coded("r", "r.s_long_bps - r.mu_bps", 1, **REAL_DEV_WHY)),
                    ("Signed Real Short Deviation · Tooltip", coded("r", "r.s_short_bps - r.mu_bps", 1, **REAL_DEV_WHY))]
-ENTRY_CHART = [("Long Points", "count(*) FILTER (WHERE r.signal LIKE 'Long%') OVER w"),
-               ("Short Points", "count(*) FILTER (WHERE r.signal LIKE 'Short%') OVER w"),
+ENTRY_CHART = [("Long Points", "count(*) FILTER (WHERE r.sig LIKE 'Long%') OVER w"),
+               ("Short Points", "count(*) FILTER (WHERE r.sig LIKE 'Short%') OVER w"),
                ("Deviation · Line", "CASE WHEN NOT r.past_t THEN %s END" % shown("abs(r.s_bps - r.mu_bps)", 1)),
                ("Real Long Deviation · Faded", "CASE WHEN NOT r.past_t THEN %s END" % shown("abs(r.s_long_bps - r.mu_bps)", 1)),
                ("Real Short Deviation · Faded", "CASE WHEN NOT r.past_t THEN %s END" % shown("abs(r.s_short_bps - r.mu_bps)", 1)),
                ("Real Long Deviation", "CASE WHEN NOT r.past_t AND r.s_long_bps < r.mu_bps THEN %s END" % shown("abs(r.s_long_bps - r.mu_bps)", 1)),
                ("Real Short Deviation", "CASE WHEN NOT r.past_t AND r.s_short_bps > r.mu_bps THEN %s END" % shown("abs(r.s_short_bps - r.mu_bps)", 1)),
                ("Past T", "CASE WHEN r.past_t THEN %s END" % shown("abs(r.s_bps - r.mu_bps)", 1)),
-               ("+Entry", "v.d"),
-               ("Long Dots", "CASE WHEN r.signal LIKE 'Long%%' THEN %s END" % shown("abs(r.s_long_bps - r.mu_bps)", 1)),
-               ("Short Dots", "CASE WHEN r.signal LIKE 'Short%%' THEN %s END" % shown("abs(r.s_short_bps - r.mu_bps)", 1))]
+               ("+Entry", "trim_scale(round(r.entry, 6))"),
+               ("Long Dots", "CASE WHEN r.sig LIKE 'Long%%' THEN %s END" % shown("abs(r.s_long_bps - r.mu_bps)", 1)),
+               ("Short Dots", "CASE WHEN r.sig LIKE 'Short%%' THEN %s END" % shown("abs(r.s_short_bps - r.mu_bps)", 1))]
 ENTRY_COLUMNS = [("Phase", "r.phase_sort")] + [
     (name, "CASE WHEN r.phase IS NOT NULL THEN (%s)::integer END" % test) for name, test in (
-        ("Long Point", "r.signal LIKE 'Long%'"), ("Short Point", "r.signal LIKE 'Short%'"), ("Partial Point", "r.signal LIKE '% · Partial'"),
-        ("Past T Point", "r.signal = 'Past T'"), ("No Book Point", "r.signal = 'No Book'"))] + [
+        ("Long Point", "r.sig LIKE 'Long%'"), ("Short Point", "r.sig LIKE 'Short%'"), ("Partial Point", "r.sig LIKE '% · Partial'"),
+        ("Past T Point", "r.sig = 'Past T'"), ("No Book Point", "r.sig = 'No Book'"))] + [
     ("Best Long", "CASE WHEN r.phase IS NOT NULL AND NOT r.past_t AND r.s_long_bps < r.mu_bps THEN %s END" % shown("r.mu_bps - r.s_long_bps", 1)),
     ("Best Short", "CASE WHEN r.phase IS NOT NULL AND NOT r.past_t AND r.s_short_bps > r.mu_bps THEN %s END" % shown("r.s_short_bps - r.mu_bps", 1))]
 Q_SPREAD = sql("""
@@ -380,7 +400,8 @@ WHERE cs.close_ms <= extract(epoch FROM now()) * 1000
 ORDER BY cs.close_ms DESC LIMIT 6""", ACTION=ACTION)
 
 # One mark on the Spread chart at each instant at which actions take effect
-# on this exchange, naming each of them: what it is; the step it should make
+# on this exchange that do not change an anchor (a dividend past T without its amount, a date only; a Known action is an
+# Anchor Changes mark on every chart, 3.5), naming each of them: what it is; the step it should make
 # (combo_actions: a dividend in bps of its ETF, a split's log ratio), none
 # without an amount or an anchor; once it is Known the step measured and the
 # issuer's next-day check of a leg's dividend; and its status. An action
@@ -393,7 +414,76 @@ Q_MARKS = sql("""
 SELECT a.effective_ms AS time, string_agg(@MARK@, '; ' ORDER BY a.ticker, a.kind) AS text
 FROM etfpair.combo_actions('$combo', '$venue') a
 WHERE a.status <> 'None' AND a.effective_ms > $__from AND a.effective_ms <= $__to
+  AND a.status <> 'Known'
 GROUP BY a.effective_ms""", MARK=MARK, ACTION=ACTION)
+
+# Owner item 62: a mark on every chart where an anchor in use changes, with the reason and the anchors before and after, in
+# USD and in USDT (A ÷ F, F the USD per USDT of that minute, as the price charts' Anchor (USDT)): both legs', and the
+# reference's (its bell) where it changes too. The board draws each session on the anchor it has now, so the moments the
+# drawn lines switch are: a session's start (its close), on the anchors in use (the bell, or the NAV once confirmed); a Known
+# dividend or split of the combo's ETFs taking effect on this exchange (combo_anchors' cut, A − D or A ÷ r; the Corporate
+# Actions words of combo_actions, whose own marks then keep only the dividends past T without their amount and the dates
+# only); and the moment both legs' NAV is confirmed (combo_sessions' known_ms, within four days of the close; a NAV loaded
+# from the issuers' history, confirmed when first read, says so), from which the whole session is drawn on the NAV in
+# place of the bell, the spread moving by about 10⁴ × Σ (bell ÷ NAV − 1).
+USD2 = "to_char(%s, 'FM999,990.00')"
+# Grafana 13 shows a mark's text as sanitized HTML on one line as wide as it is: <br> keeps each part on a line of its own.
+ANCHOR_PAIR = ("'<br>' || @BULL@ || ' ' || @B0@ || ' → ' || @B1@ || ' USD · ' || @U0@ || ' → ' || @U1@ || ' USDT<br>' || "
+               "@BEAR@ || ' ' || @E0@ || ' → ' || @E1@ || ' USD · ' || @V0@ || ' → ' || @V1@ || ' USDT' || "
+               "CASE WHEN ch.why <> 'nav' THEN '<br>' || @REF@ || ' ' || @R0@ || ' → ' || @R1@ || ' USD · ' || @W0@ || ' → ' || @W1@ || ' USDT (reference, "
+               "bell only)' ELSE '' END || '<br>USDT = USD ÷ F, F = ' || coalesce(trim_scale(f.fx)::text, '–') || ' USD/USDT of that minute'")
+ANCHOR_PAIR = sql(ANCHOR_PAIR, BULL="k.bull_ticker", BEAR="k.bear_ticker", REF="k.ref_ticker",
+                  R0="coalesce(%s, '–')" % (USD2 % "ch.r0"), R1="coalesce(%s, '–')" % (USD2 % "ch.r1"),
+                  W0="coalesce(%s, '–')" % (USD2 % "ch.r0 / f.fx"), W1="coalesce(%s, '–')" % (USD2 % "ch.r1 / f.fx"),
+                  B0="coalesce(%s, '–')" % (USD2 % "ch.b0"), B1="coalesce(%s, '–')" % (USD2 % "ch.b1"),
+                  U0="coalesce(%s, '–')" % (USD2 % "ch.b0 / f.fx"), U1="coalesce(%s, '–')" % (USD2 % "ch.b1 / f.fx"),
+                  E0="coalesce(%s, '–')" % (USD2 % "ch.e0"), E1="coalesce(%s, '–')" % (USD2 % "ch.e1"),
+                  V0="coalesce(%s, '–')" % (USD2 % "ch.e0 / f.fx"), V1="coalesce(%s, '–')" % (USD2 % "ch.e1 / f.fx"))
+Q_ANCHOR_CHANGES = sql("""
+WITH k AS (SELECT bull_ticker, bear_ticker, ref_ticker FROM etfpair.combo WHERE combo_id = '$combo'),
+cs AS (
+    -- Each session's anchors in use; loaded: its NAV came from the issuer's history (confirmed when first read, not after an
+    -- hour of the same figure), so its time is the load's, not a publication's.
+    SELECT c.*, c.basis = 'NAV' AND EXISTS (
+               SELECT 1 FROM etfpair.etf_nav n JOIN etfpair.etf_nav_obs o ON o.ticker = n.ticker AND o.session_date = n.session_date AND o.nav = n.nav
+               WHERE n.ticker IN (k.bull_ticker, k.bear_ticker) AND n.session_date = c.session_date AND n.confirmed_ms = c.known_ms
+                 AND n.confirmed_ms - o.received_ms < 60000) AS loaded
+    FROM etfpair.combo_sessions('$combo') c CROSS JOIN k
+), s AS (
+    SELECT a.from_ms, a.session_date, a.a_bull, a.a_bear, a.a_ref, lag(a.a_bull) OVER w AS pb, lag(a.a_bear) OVER w AS pe, lag(a.a_ref) OVER w AS pr,
+           lag(a.session_date) OVER w AS ps
+    FROM etfpair.combo_anchors('$combo', '$venue') a WINDOW w AS (ORDER BY a.from_ms)
+), ch AS (
+    SELECT s.from_ms AS t, CASE WHEN s.session_date IS DISTINCT FROM s.ps THEN 'session' ELSE 'action' END AS why, s.session_date,
+           s.pb AS b0, s.a_bull AS b1, s.pe AS e0, s.a_bear AS e1, s.pr AS r0, s.a_ref AS r1
+    FROM s WHERE s.session_date IS DISTINCT FROM s.ps OR s.a_bull IS DISTINCT FROM s.pb OR s.a_bear IS DISTINCT FROM s.pe OR s.a_ref IS DISTINCT FROM s.pr
+    UNION ALL
+    SELECT cs.known_ms, 'nav', cs.session_date, cs.bell_bull, cs.a_bull, cs.bell_bear, cs.a_bear, NULL, NULL FROM cs
+    WHERE cs.basis = 'NAV' AND cs.known_ms > cs.close_ms AND cs.known_ms < cs.close_ms + 4 * 86400000
+)
+SELECT ch.t AS time,
+       CASE ch.why
+            WHEN 'session' THEN 'Anchor change · new session ' || to_char(ch.session_date, 'MM-DD') || ' (the close)<br>' ||
+                 coalesce(CASE WHEN cs.loaded THEN 'NAV (loaded from the issuer''s history), the whole session drawn on it'
+                               WHEN cs.basis = 'NAV' THEN 'NAV (confirmed ' || to_char(to_timestamp(cs.known_ms / 1000.0) AT TIME ZONE 'Etc/GMT-8', 'MM-DD HH24:MI')
+                                                          || '), the whole session drawn on it'
+                               WHEN cs.basis = 'Bell' THEN 'bell anchor (F × Binance''s index at the close; the NAV to follow)' END,
+                          'no anchor yet (Missing)')
+            WHEN 'nav' THEN 'Anchor change · NAV ' || CASE WHEN cs.loaded THEN 'of session ' || to_char(ch.session_date, 'MM-DD') || ' loaded from the '
+                 || 'issuer''s history<br>(the load time, not a publication): ' ELSE 'confirmed for session ' || to_char(ch.session_date, 'MM-DD')
+                 || '<br>both legs'' NAV the same for 1 h: ' END || 'the whole session redrawn on it in place of the bell, spread '
+                 || to_char(10000 * (ch.b0 / ch.b1 + ch.e0 / ch.e1 - 2), 'FMSG990.0') || ' bps'
+            ELSE 'Anchor change · a dividend or split takes effect (anchor − D, or ÷ r)<br>' ||
+                 coalesce((SELECT string_agg(@MARK@, '<br>' ORDER BY a.ticker, a.kind) FROM etfpair.combo_actions('$combo', '$venue') a
+                           WHERE a.effective_ms = ch.t AND a.status = 'Known'), 'anchor cut')
+       END || @PAIR@ AS text
+FROM ch
+CROSS JOIN k
+LEFT JOIN cs ON cs.session_date = ch.session_date
+LEFT JOIN LATERAL (SELECT q.price AS fx FROM etfpair.fx_minute q WHERE q.pair = 'USDT-USD' AND q.minute_ms <= ch.t AND q.minute_ms >= ch.t - 300000
+                   ORDER BY q.minute_ms DESC LIMIT 1) f ON true
+WHERE ch.t > $__from AND ch.t <= $__to
+ORDER BY ch.t""", MARK=MARK, ACTION=ACTION, PAIR=ANCHOR_PAIR)
 
 # Per contract: the finished minutes of the range that have a candle close
 # and those that have none; the recorder's seconds in the range that have a
@@ -432,7 +522,7 @@ SIGNAL = {"type": "value", "options": {"Long": {"color": BLUE, "index": 0}, "Sho
                                        "No Anchor": {"color": GREY, "index": 3}, "No Mean": {"color": GREY, "index": 4}, "Past T": {"color": WARN, "index": 5},
                                        "No Book": {"color": GREY, "index": 6}, "Long · Partial": {"color": BLUE, "index": 7},
                                        "Short · Partial": {"color": ORANGE, "index": 8}, "No Notional": {"color": WARN, "index": 9},
-                                       "No Entry": {"color": WARN, "index": 10}}}
+                                       "No Entry": {"color": WARN, "index": 10}, "No Sigma": {"color": GREY, "index": 11}}}
 STATUS = {"type": "value", "options": {"NAV": {"color": "text", "index": 0}, "Bell": {"color": GREY, "index": 1}, "Missing": {"color": WARN, "index": 2}}}
 # An action that needs a look: a check that did not agree, or a dividend that took effect before its amount was known.
 ACTION_WARN = {"type": "regex", "options": {"pattern": ".*(Mismatch|Past T).*", "result": {"color": WARN, "index": 0}}}
@@ -511,6 +601,10 @@ def price_fields(name):
     return [keep_fields(["time"] + columns), organize(["time"] + columns, rename={c: c[len(name) + 1:] for c in columns})]
 
 
+# Entry's options (3.5, owner item 64): multiples of sigma; a typed number is bps. The halves are written ½ in the picker (their
+# values, the URL and the titles keep 0.5σ, 1.5σ, 2.5σ): Enter picks the first option whose text contains what is typed, so a
+# typed 5, 0.5, 1.5 or 2.5 would otherwise pick a sigma option instead of bps; only 1, 2 and 3 still do.
+ENTRY_OPTIONS = [(t, v + "σ") for t, v in (("½σ", "0.5"), ("1σ", "1"), ("1½σ", "1.5"), ("2σ", "2"), ("2½σ", "2.5"), ("3σ", "3"))]
 # The Notional's options, fixed sizes from 100 U (item 61) to 100k: written in k from 1,000 on, so that a typed amount (Grafana
 # picks the first option whose text contains what is typed, on Enter) never picks one unless it is 1 to 99.
 NOTIONAL_OPTIONS = [("100", "100"), ("500", "500")] + [("%dk" % (v // 1000), str(v)) for v in (1000, 5000, 10000, 50000, 100000)]
@@ -531,8 +625,11 @@ def build():
         textbox_var("sigma_minutes", "Sigma Scale (min)", "60", "Minutes sigma covers: the population standard deviation of the "
                     "minute bars' spread over that many minutes, a whole number from 1 to 999,999 (60, 60min); it restarts with the mean · "
                     "anything else: no sigma lines, Sigma reads No Sigma."),
-        textbox_var("d", "Entry (bps)", "10", "Long: Real Long Spread ≤ Mean − Entry · Short: Real Short Spread ≥ Mean + Entry · a positive "
-                    "number (10, 7.5, 10bps); anything else: the Signal reads No Entry and Mean ± Entry is not drawn."),
+        custom_var("d", "Entry", ENTRY_OPTIONS, "10",
+                   "Long: Real Long Spread ≤ Mean − Entry · Short: Real Short Spread ≥ Mean + Entry · pick a multiple of sigma (0.5σ to 3σ: "
+                   "each point's Entry is k × its sigma, the Sigma Scale's, as the sigma lines; none until sigma is ready: No Sigma) or type a "
+                   "number of bps and press Enter (10, 7.5, 10bps) · Enter picks the first option whose text contains what is typed, so 1, 2 "
+                   "and 3 need bps after them (2bps) · anything else: No Entry, no Entry lines.", allow_custom=True),
         custom_var("notional", "Notional (USDT)", NOTIONAL_OPTIONS, "10000",
                    "N, both legs together: the Real spreads and the Signal fill N through both legs' pricing levels (2 at a 0.01 tick, 5 "
                    "at 0.001), on their totals where they hold less (Partial) · pick one or type any amount and press Enter: 2000, "
@@ -602,7 +699,8 @@ def build():
         ("Signal", "Long: Real Long Spread ≤ Mean − Entry · Short: Real Short Spread ≥ Mean + Entry · Partial: that side filled less "
          "than N (its pricing levels hold less) · None: inside · No Anchor: not ready · No Mean: not ready, or Mean Scale is not a whole number of minutes from 1 to 999,999 · No Book: "
          "not on both legs' books (trade prices, as before the recorder) · No Notional: the typed notional is not a positive number "
-         "(the title shows ? or 0), amber · No Entry: Entry is not a positive number, amber · Past T: a leg's dividend took effect "
+         "(the title shows ? or 0), amber · No Entry: Entry is not a positive number, amber · No Sigma: Entry is a multiple of sigma and "
+         "sigma is not ready (or Sigma Scale is not valid) · Past T: a leg's dividend took effect "
          "without its amount, amber, no signal until the amount is known.", {"mappings": [SIGNAL]}),
     ], 0, y, 24, 3, intro="The same second, at the notional N (USDT, both legs together); the deviations are absolute, each shown on "
                           "the side of the Mean its real spread can fill on, as the bright lines of Entry Points · Bps (Other Side on the "
@@ -652,7 +750,7 @@ def build():
         col("Result", 104, custom_cellOptions={"type": "color-text"}, mappings=[CALENDAR]),
         col("Detail", custom_minWidth=120, custom_wrapText=True)])); y += 6
 
-    panels.append(row("Spread · ${ma:text} ${ma_text} min · σ ${sigma_text} min · Entry ${d_text} bps · Notional ${n_text} USDT (Both Legs)", y)); y += 1
+    panels.append(row("Spread · ${ma:text} ${ma_text} min · σ ${sigma_text} min · Entry ${d_text} · Notional ${n_text} USDT (Both Legs)", y)); y += 1
     # The tooltips show only twins, each point's value or the reason it has none (tooltip_only), as Grafana would show a nearby
     # point's value in place of a NULL: the drawn lines and the legend's figures are kept out of them.
     no_value = code_texts(NO_VALUE)
@@ -679,7 +777,7 @@ def build():
         "Spread = 10⁴ × (F·P_bull ÷ A_bull + F·P_bear ÷ A_bear − 2) · P: both legs' mid prices, else both last trades · Real Long, Real "
         "Short Spread: the same on the average prices of buying, selling both legs for the notional N through their pricing levels' "
         "asks, bids · σ: the population standard deviation of the minute bars' spread over the Sigma Scale · Long: Real Long Spread ≤ "
-        "Mean − Entry · Short: Real Short Spread ≥ Mean + Entry\n\n"
+        "Mean − Entry · Short: Real Short Spread ≥ Mean + Entry · Entry: the bps typed, or k × σ (0.5σ … 3σ) at each point\n\n"
         "Drawn: Spread, Mean, the band Mean ± Entry (teal, dashed; not drawn when Entry is not a positive number: the Signal reads No "
         "Entry) and Mean ± 1, 1.5, 2, 2.5, 3 σ (grey: whole σ dashed, half σ dotted; none until sigma is ready); the drawn Spread "
         "crossing a line is not a signal (see Deviation · Bps and Entry Points · Bps) · legend Sigma: σ's last, lowest and highest · "
@@ -836,13 +934,14 @@ def build():
         "= 1 bps), right axis; the drawn Spread is on mid prices, apart from it by the trades against the mids · Reference: ${ref}'s own "
         "return · each on its anchor less a dividend, or over a split's ratio, from the instant it takes effect."))); y += 10
 
-    panels.append(row("Costs · Entry ${d_text} bps", y)); y += 1
+    panels.append(row("Costs · Entry ${d_text}", y)); y += 1
     num = dict(custom_align="right", unit="none", decimals=2)
     panels.append(table("Fee Levels · ${venue:text} · Bps", Q_FEES, 0, y, 24, 5, description=(
         "Breakeven Entry = 2 × Taker · Net at Entry = Entry − Breakeven Entry\n\n"
         "One round trip across the band, bps of both legs' notional: four taker fills; the Signal is on the real spreads of the notional, so "
         "crossing the spread and going down the levels are inside it · Half Spreads: both legs' half spreads in the newest second with a book "
-        "of both, what crossing the best levels costs now · Net at Entry: – when Entry is not a positive number · funding not included."),
+        "of both, what crossing the best levels costs now · Net at Entry: – when Entry is not a positive number of bps (also when it is a "
+        "multiple of sigma: compare k × Sigma of Spread · Latest Second with Breakeven Entry) · funding not included."),
         overrides=[
         col("Level", 150), col("Taker", 76, **num), col("Half Spreads", 116, **num), col("Breakeven Entry", 136, **num),
         col("Net at Entry", 116, custom_cellOptions={"type": "color-text"}, color={"mode": "thresholds"}, thresholds=SIGNED, **num),
@@ -882,7 +981,8 @@ def build():
 
     return {"panels": panels, "templating": {"list": templating},
             "annotations": {"list": [bands(name, phase_marks(name), color) for name, color in PHASES.items()] +
-                                    [marks("Corporate Actions", Q_MARKS, PURPLE, [spread["id"]])]},
+                                    [marks("Corporate Actions", Q_MARKS, PURPLE, [spread["id"]]),
+                                     marks("Anchor Changes", Q_ANCHOR_CHANGES, PURPLE, [p["id"] for p in panels if p["type"] == "timeseries"])]},
             "links": [reset_link("combo-spread", templating, "now-6h", "30s", keep=("combo", "venue"),
                                  tooltip="Settings, time range and refresh back to defaults; Combo and CEX stay.")],
             "time": {"from": "now-6h", "to": "now"}, "refresh": "30s", "timepicker": {"refresh_intervals": ["10s", "30s", "1m", "5m"]}, "tags": [],

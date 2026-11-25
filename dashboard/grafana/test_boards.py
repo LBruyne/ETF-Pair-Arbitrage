@@ -82,6 +82,11 @@ def rows_of(q):
     return list(csv.DictReader(io.StringIO(psql(q, "--csv"))))
 
 
+# How far before the newest second a test that compares runs pins its "now": by then the recorder's rows, the minute's
+# USD/USDT and its candle closes are final.
+SETTLED_MS = 300_000
+
+
 def newest_ms():
     """The newest second the database holds: "now" for the queries that read the newest seconds."""
     return int(psql("SELECT max(second_ms) FROM etfpair.perp_second WHERE venue = 'bitget' AND symbol = 'SOXLUSDT' "
@@ -272,7 +277,7 @@ class Boards(unittest.TestCase):
         codes = {str(k): v for k, v in board.NO_VALUE.items()}
         signals = {str(v): k for k, v in board.SIGNALS.items()}
         self.assertEqual(set(signals.values()), {"Long", "Short", "Long · Partial", "Short · Partial", "None", "No Anchor", "Past T", "No Mean",
-                                                 "No Notional", "No Entry", "No Book"})
+                                                 "No Notional", "No Entry", "No Book", "No Sigma"})
         # Every code is a value of its own, and every Signal text has a colour (No Entry amber, as No Notional).
         self.assertEqual(len(set(board.NO_VALUE) | {board.FULL} | {v for v in board.SIGNALS.values() if v >= 0}), len(board.NO_VALUE) + 1 + 5)
         self.assertEqual(set(board.SIGNAL["options"]), set(board.SIGNALS))
@@ -479,7 +484,8 @@ class Boards(unittest.TestCase):
             self.assertIn("WITH v AS MATERIALIZED (SELECT * FROM %s)" % board.SETTINGS, q)
             self.assertEqual((q.count(board.NOTIONAL), q.count(board.ENTRY), q.count(board.MEAN_SCALE), q.count(board.SIGMA_SCALE)), (1, 1, 1, 1))
         self.assertEqual((board.Q_FEES.count(board.ENTRY), board.Q_FEES.count(board.NOTIONAL)), (1, 0))
-        self.assertIn("v.ma_n, v.sig_n, $__from, $__to, %s, v.n, v.d) r" % board.STEP_MS, board.RANGE)
+        self.assertIn("v.ma_n, v.sig_n, $__from, $__to, %s, v.n, v.d) x" % board.STEP_MS, board.RANGE)
+        self.assertIn(board.RANGE_CALL, board.RANGE)
         self.assertIn("v.ma_n, v.sig_n, v.n, v.d, %s) x" % board.NOW_MS, board.LAST)
         self.assertNotIn(board.NOTIONAL, board.Q_PRICES)
 
@@ -524,9 +530,11 @@ class Boards(unittest.TestCase):
         # mean (No Mean) and the same spreads, real spreads and depths; "30min" is 30.
         # The range: the US open hour of Friday 11-20 (signals on both sides at Entry 10); the strips at the newest second.
         b = board.build()
-        # now 15 s before the newest second: on a live database the recorder writes a second's parts up to about 7 s late, and
-        # the runs below must all see the same newest seconds.
-        now_ms, end_ms = newest_ms() - 15_000, utc8_ms("2026-11-20 23:30")
+        # "now" pinned once for every run of the test, five minutes before the newest second: on a live database the recorder
+        # writes a second's parts up to about 7 s late, and a minute's USD/USDT and candle closes are rewritten for up to about
+        # 61 s after it ends (SPEC section 3), so a "now" only 15 s back let two runs see different minute bars (US hours,
+        # 2026-11-25: Mean -8.02 against -8.22). Five minutes back every input of the strips' newest seconds is final.
+        now_ms, end_ms = newest_ms() - SETTLED_MS, utc8_ms("2026-11-20 23:30")
         base = dict(SOXL, venue="bitget", ma="sma", ma_minutes="30", d="10", notional="10000", hours=1)
         runs = {}
 
@@ -596,6 +604,24 @@ class Boards(unittest.TestCase):
                                                                                               mean[last][0]["Bid · ct"]), value)
             self.assertEqual(got[fees], mean[fees], value)
 
+        # Entry as a multiple of sigma (3.5, owner item 64): "2σ" and "2sigma" read the same; every point's Entry (+Entry) is 2 ×
+        # its Sigma as drawn (to the rounding of the two decimals); with no Sigma Scale the Signal reads No Sigma where it would
+        # have had a side or None, and no Entry line is drawn.
+        two = run_all(dict(base, d="2σ"))
+        self.assertEqual(run_all(dict(base, d="2sigma")), two)
+        checked_entries = 0
+        for r in two[spread]:
+            if r["Sigma"] and r["+Entry"]:
+                self.assertLessEqual(abs(float(r["+Entry"]) - 2 * float(r["Sigma"])), 0.0101, r)
+                checked_entries += 1
+        self.assertGreater(checked_entries, 100)
+        self.assertTrue(any(r["Signal"] in ("1", "2", "3", "4") for r in two[spread]))
+        nosig = run_all(dict(base, d="2σ", sigma_minutes="abc"))
+        self.assertEqual({r["+Entry"] for r in nosig[spread]}, {""})
+        for a, w in zip(nosig[spread], two[spread]):
+            if w["Signal"] in ("0", "1", "2", "3", "4", str(board.CODE["No Book"])):
+                self.assertEqual(a["Signal"], str(board.CODE["No Sigma"]), a)
+        self.assertIn(nosig[last][0]["Signal"], ("No Sigma", "No Mean", "No Anchor", "Past T"))
         # Sigma Scale (3.4): "60min" is 60; anything else no sigma (Sigma empty, its tooltip and strip No Sigma where there is a
         # spread and no Past T), every other figure as with a valid one.
         sig = runs["sigma_minutes", "60"]
@@ -678,43 +704,102 @@ class Boards(unittest.TestCase):
 
     @unittest.skipUnless(PSQL, "set ETFPAIR_BOARD_PSQL to run the queries")
     def test_action_marks(self):
-        # Each instant at which actions take effect on a venue has one mark on the Spread chart, which names every one of them
-        # but those without a distribution (None); an instant with None only has no mark.
+        # Each instant at which actions take effect on a venue is marked once on the Spread chart for the actions that leave the
+        # anchors (a dividend past T without its amount, a date only; not None), and once on every chart, as an Anchor Changes
+        # mark, for the Known ones (3.5): its text names each of them after the reason.
         instants = {}
-        for combo, venue, at, ticker, status in [r.split("|") for r in psql(
-                "SELECT c.combo_id, m.venue, a.effective_ms, a.ticker, a.status FROM etfpair.combo c JOIN etfpair.combo_market m USING (combo_id), "
+        for combo, venue, at, ticker, status, leg in [r.split("|") for r in psql(
+                "SELECT c.combo_id, m.venue, a.effective_ms, a.ticker, a.status, a.leg FROM etfpair.combo c JOIN etfpair.combo_market m USING (combo_id), "
                 "LATERAL etfpair.combo_actions(c.combo_id, m.venue) a WHERE a.effective_ms IS NOT NULL", "-At").split()]:
-            instants.setdefault((combo, venue, at), []).extend([ticker] if status != "None" else [])
-        self.assertTrue(instants)
-        for (combo, venue, at), tickers in instants.items():
+            kinds = instants.setdefault((combo, venue, at), ([], []))
+            if status == "Known":
+                kinds[1].append(ticker)
+            elif status != "None":
+                kinds[0].append(ticker)
+        self.assertTrue(any(legs for _, legs in instants.values()))
+        for (combo, venue, at), (others, legs) in instants.items():
             sel = dict(SOXL if combo == "SOXL-SOXS" else TQQQ, venue=venue, ma="sma", ma_minutes="60", d="10", hours=2)
-            texts = [m[1] for m in (r.split("|", 1) for r in psql(substitute(board.Q_MARKS, sel, int(at) + 3600_000), "-At").splitlines())
-                     if m[0] == at]
-            self.assertEqual(len(texts), 1 if tickers else 0, (combo, venue, at, texts))
-            for ticker in tickers:
-                self.assertIn(ticker + " ", texts[0])
+            for q, tickers in ((board.Q_MARKS, others), (board.Q_ANCHOR_CHANGES, legs)):
+                texts = [m[1] for m in (r.split("|", 1) for r in psql(substitute(q, sel, int(at) + 3600_000), "-At").splitlines()) if m[0] == at]
+                self.assertEqual(len(texts), 1 if tickers else 0, (combo, venue, at, texts))
+                for ticker in tickers:
+                    self.assertIn(ticker + " ", texts[0])
+                if q is board.Q_ANCHOR_CHANGES and tickers:
+                    self.assertTrue(texts[0].startswith("Anchor change · a dividend or split takes effect"), texts[0])
+
+    @unittest.skipUnless(PSQL, "set ETFPAIR_BOARD_PSQL to run the queries")
+    def test_anchor_change_marks(self):
+        # 3.5 (owner item 62): on every chart, a mark at each change of the legs' anchor in use: a session's close, a leg's Known
+        # action, both legs' NAV confirmed (within four days of the close); each text the reason, then each leg's anchor before ->
+        # after in USD and in USDT (A ÷ F) and the F, on lines of their own (<br>). Recomputed here from combo_sessions,
+        # combo_actions and fx_minute for the last 30 days of SOXL / SOXS on Bitget.
+        b = board.build()
+        ann = next(a for a in b["annotations"]["list"] if a["name"] == "Anchor Changes")
+        self.assertEqual(sorted(ann["filter"]["ids"]), sorted(p["id"] for p in b["panels"] if p["type"] == "timeseries"))
+        self.assertEqual(len(ann["filter"]["ids"]), 7)
+        now_ms = newest_ms()
+        sel = dict(SOXL, venue="bitget", ma="sma", ma_minutes="60", d="10", hours=24 * 30)
+        rows = [r.split("|", 1) for r in psql(substitute(board.Q_ANCHOR_CHANGES, sel, now_ms, now_ms), "-At").splitlines()]
+        self.assertTrue(rows)
+        sessions = {r["session_date"]: r for r in rows_of("SELECT * FROM etfpair.combo_sessions('SOXL-SOXS') WHERE close_ms <= %d" % now_ms)}
+        closes = {int(r["close_ms"]): r for r in sessions.values() if int(r["close_ms"]) > now_ms - 30 * 86400_000}
+        navs = {int(r["known_ms"]) for r in sessions.values() if r["basis"] == "NAV" and int(r["close_ms"]) < int(r["known_ms"]) < int(r["close_ms"]) + 4 * 86400_000
+                and int(r["known_ms"]) > now_ms - 30 * 86400_000}
+        got = {}
+        for t, text in rows:
+            got.setdefault(int(t), []).append(text)
+            parts = text.split("<br>")
+            if not text.startswith("Anchor change · NAV"):
+                self.assertRegex(parts.pop(-2), r"^SOXX [0-9.,–]+ → [0-9.,–]+ USD · [0-9.,–]+ → [0-9.,–]+ USDT \(reference, bell only\)$")
+            self.assertRegex(parts[-3], r"^SOXL [0-9.,–]+ → [0-9.,–]+ USD · [0-9.,–]+ → [0-9.,–]+ USDT$")
+            self.assertRegex(parts[-2], r"^SOXS [0-9.,–]+ → [0-9.,–]+ USD · [0-9.,–]+ → [0-9.,–]+ USDT$")
+            self.assertRegex(parts[-1], r"^USDT = USD ÷ F, F = [0-9.]+ USD/USDT of that minute$")
+        # Every close in the range and every NAV confirmation is marked, and nothing else but the legs' actions.
+        self.assertTrue(set(closes) <= set(got), sorted(set(closes) - set(got)))
+        self.assertTrue(navs <= set(got), sorted(navs - set(got)))
+        for t, texts in got.items():
+            for text in texts:
+                if t in closes and "new session" in text:
+                    r = closes[t]
+                    fx = float(psql("SELECT price FROM etfpair.fx_minute WHERE pair = 'USDT-USD' AND minute_ms <= %d AND minute_ms >= %d - 300000 "
+                                    "ORDER BY minute_ms DESC LIMIT 1" % (t, t), "-At"))
+                    bull = text.split("<br>")[-4]
+                    self.assertEqual(bull.split(" → ")[1].split(" ")[0], "%.2f" % float(r["a_bull"]), text)
+                    self.assertIn("· %s → %s USDT" % (bull.split("· ")[1].split(" → ")[0], "{:,.2f}".format(float(r["a_bull"]) / fx)), text)
+                    self.assertIn("F = %s " % ("%g" % fx), text.replace("F = %s " % text.split("F = ")[1].split(" ")[0], "F = %g " % float(text.split("F = ")[1].split(" ")[0])))
+                elif t in navs:
+                    self.assertRegex(text, r"^Anchor change · NAV (confirmed for|of) session")
+                else:
+                    self.assertRegex(text, r"^Anchor change · a dividend or split takes effect")
 
     @unittest.skipUnless(PSQL, "set ETFPAIR_BOARD_PSQL to run the queries")
     def test_mark_texts(self):
         # The marks' text on made-up actions in combo_actions' shape: an amount not yet known after T (no expected step) next to a
         # Known one at the same instant, one mark for both; a date only, beside a None that has no mark; a split; a Known
         # dividend of a session without anchors (no expected step) and a checked one.
-        made_up = ("(VALUES (1000, 'SOXL', 'dividend', NULL::numeric, 'Scheduled', NULL::numeric, NULL::numeric, NULL::numeric, 'Scheduled · Past T'), "
-                   "(1000, 'SOXS', 'dividend', 0.5, 'Known', -79.24, NULL, NULL, 'Applied'), "
-                   "(2000, 'TQQQ', 'dividend', NULL, 'None', NULL, NULL, NULL, 'None'), "
-                   "(2000, 'SQQQ', 'dividend', NULL, 'Scheduled', NULL, NULL, NULL, 'Scheduled'), "
-                   "(3000, 'SOXX', 'split', 3, 'Known', -1.0986, -1.0996, NULL, 'Verified'), "
-                   "(4000, 'SOXL', 'dividend', 0.0929, 'Known', NULL, NULL, NULL, 'Applied'), "
-                   "(4000, 'SOXS', 'dividend', 0.43641, 'Known', -130.13, -96.49, 2.15, 'Verified')) "
-                   "a(effective_ms, ticker, kind, value, status, expected, observed, nav_bps, shown)")
-        call = "etfpair.combo_actions('$combo', '$venue') a"
-        self.assertIn(call, board.Q_MARKS)
-        q = substitute(board.Q_MARKS.replace(call, made_up), dict(SOXL, venue="binance", hours=1), 10_000)
-        self.assertEqual(psql("SELECT * FROM (%s) m ORDER BY 1" % q, "-At").splitlines(), [
+        made_up = ("(VALUES (1000, 'SOXL', 'dividend', NULL::numeric, 'Scheduled', NULL::numeric, NULL::numeric, NULL::numeric, 'Scheduled · Past T', 'bull'), "
+                   "(1000, 'SOXS', 'dividend', 0.5, 'Known', -79.24, NULL, NULL, 'Applied', 'bear'), "
+                   "(2000, 'TQQQ', 'dividend', NULL, 'None', NULL, NULL, NULL, 'None', 'bull'), "
+                   "(2000, 'SQQQ', 'dividend', NULL, 'Scheduled', NULL, NULL, NULL, 'Scheduled', 'bear'), "
+                   "(3000, 'SOXX', 'split', 3, 'Known', -1.0986, -1.0996, NULL, 'Verified', 'ref'), "
+                   "(4000, 'SOXL', 'dividend', 0.0929, 'Known', NULL, NULL, NULL, 'Applied', 'bull'), "
+                   "(4000, 'SOXS', 'dividend', 0.43641, 'Known', -130.13, -96.49, 2.15, 'Verified', 'bear')) "
+                   "a(effective_ms, ticker, kind, value, status, expected, observed, nav_bps, shown, leg)")
+        # Each action's words (MARK), as both kinds of mark write them.
+        words = boardkit.sql("SELECT a.effective_ms, string_agg(@MARK@, '; ' ORDER BY a.ticker, a.kind) FROM @A@ WHERE a.status <> 'None' "
+                             "GROUP BY 1 ORDER BY 1", MARK=board.MARK, ACTION=board.ACTION, A=made_up)
+        self.assertEqual(psql(words, "-At").splitlines(), [
             "1000|SOXL ex ? · Scheduled · Past T; SOXS ex 0.5 · expected -79.2 bps · measured – · Applied",
             "2000|SQQQ ex ? · Scheduled",
             "3000|SOXX split 3:1 · expected -1.0986 log · measured -1.0996 log · Verified",
             "4000|SOXL ex 0.0929 · measured – · Applied; SOXS ex 0.43641 · expected -130.1 bps · measured -96.5 bps · NAV check 2.2 bps · Verified"])
+        # The Corporate Actions marks (Spread chart) leave out the Known actions: those are Anchor Changes marks (3.5).
+        call = "etfpair.combo_actions('$combo', '$venue') a"
+        self.assertIn(call, board.Q_MARKS)
+        q = substitute(board.Q_MARKS.replace(call, made_up), dict(SOXL, venue="binance", hours=1), 10_000)
+        self.assertEqual(psql("SELECT * FROM (%s) m ORDER BY 1" % q, "-At").splitlines(), [
+            "1000|SOXL ex ? · Scheduled · Past T",
+            "2000|SQQQ ex ? · Scheduled"])
 
     @unittest.skipUnless(PSQL, "set ETFPAIR_BOARD_PSQL to run the queries")
     def test_calendar_texts(self):
@@ -766,10 +851,10 @@ class Boards(unittest.TestCase):
             "(11001, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL)",
             "(12000, NULL, 'Regular', 2, 'mid', false, -5.0, 0.0, 2.5, -3.0, -8.0, false, false, %s, true, 'None')" % book,
             "(13000, NULL, 'Regular', 2, 'mid', false, 2.0, 0.0, 2.5, 4.0, -1.0, false, false, %s, true, 'No Entry')" % book]
-        made_up = "(VALUES %s) r(%s)" % (", ".join(points), cols)
-        self.assertIn(board.RANGE, board.Q_SPREAD)
+        made_up = "(VALUES %s) x(%s)" % (", ".join(points), cols)
+        self.assertIn(board.RANGE_CALL, board.Q_SPREAD)
         sel = dict(SOXL, venue="binance", ma="sma", ma_minutes="60", d="10", notional="10000", hours=1)
-        q = substitute(board.Q_SPREAD.replace(board.RANGE, made_up), sel, 20_000).replace("to_timestamp(r.ts_ms / 1000.0) AS time", "r.ts_ms AS time")
+        q = substitute(board.Q_SPREAD.replace(board.RANGE_CALL, made_up), sel, 20_000).replace("to_timestamp(r.ts_ms / 1000.0) AS time", "r.ts_ms AS time")
         got = list(csv.reader(io.StringIO(psql(q, "--csv"))))
         header = got[0]
         self.assertEqual(header, columns(board.Q_SPREAD))
@@ -792,8 +877,15 @@ class Boards(unittest.TestCase):
             10000: [na, na, na, na, na, na, na, na] + depths,
             11000: ["1", "3", "-2", "0", "1", "3", "2", "0", "7", nr, "8", nr, "280", nr, "320", nr],
             12000: ["-5", "-3", "-8", "0", "5", "3", "8", "0"] + depths,
-            13000: ["2", "4", "-1", "0", "2", "4", "1", ne] + depths}
+            13000: ["2", "4", "-1", "0", "2", "4", "1", "0"] + depths}
         self.assertEqual({t: [table[t][c] for c in spread_rows] for t in want}, want)
+        # 3.5 (owner item 64): the Signal is the board's, on each point's Entry (combo_range's own Signal column is not read: the
+        # made-up 13000 says No Entry, the board None). Entry 2σ: each point's Entry is 2 × its sigma of 2.5, 5 bps: 9000's
+        # Real Short Spread 8 above the Mean of 0 is then a Short, 12000's Real Long Spread −3 still none; ±Entry 5.
+        sig2 = {int(r["time"]): r for r in rows_of(substitute(board.Q_SPREAD.replace(board.RANGE_CALL, made_up), dict(sel, d="2σ"), 20_000)
+                                                    .replace("to_timestamp(r.ts_ms / 1000.0) AS time", "r.ts_ms AS time"))}
+        self.assertEqual([(sig2[t]["Signal"], sig2[t]["+Entry"], sig2[t]["−Entry"]) for t in (9000, 12000, 2000)],
+                         [("2", "5", "-5"), ("0", "5", "-5"), ("1", "5", "-5")])
         # 3.4: Sigma, the drawn column and the tooltip's (its value, else No Anchor, Past T, No Sigma).
         self.assertEqual({t: (table[t]["Sigma"], table[t]["Sigma · Tooltip"]) for t in (1000, 3000, 4000, 5000, 10000, 11001)},
                          {1000: ("2.5", "2.5"), 3000: ("", pt), 4000: ("", ns), 5000: ("2.5", "2.5"), 10000: ("", na), 11001: ("", "")})
@@ -846,23 +938,32 @@ class Boards(unittest.TestCase):
         for t, r in table.items():
             self.assertEqual((r["Real Long Deviation"], r["Real Short Deviation"]), (r["Best Long"], r["Best Short"]), t)
         # A typed notional that is not a positive number: the real spreads (NULL then in combo_range) and the real deviations
-        # read No Notional, after No Anchor, Past T and No Mean.
-        q = substitute(board.Q_SPREAD.replace(board.RANGE, made_up.replace("-119.0, -121.0", "NULL, NULL")), dict(sel, notional="abc"), 20_000)
+        # read No Notional, after No Anchor, Past T and No Mean; so does the Signal (the board's, 3.5).
+        q = substitute(board.Q_SPREAD.replace(board.RANGE_CALL, made_up.replace("-119.0, -121.0", "NULL, NULL")), dict(sel, notional="abc"), 20_000)
         row = rows_of(q.replace("to_timestamp(r.ts_ms / 1000.0) AS time", "r.ts_ms AS time"))[1]
-        self.assertEqual([row[c] for c in spread_rows[:8]], ["-120", nn, nn, "-53", "67", nn, nn, "1"])
-        # An Entry that is not a positive number: no Mean ± Entry and no +Entry line; every other column as with Entry 10.
+        self.assertEqual([row[c] for c in spread_rows[:8]], ["-120", nn, nn, "-53", "67", nn, nn, nn])
+        # An Entry that is not a positive number: no Mean ± Entry and no +Entry line, the Signal No Entry where it had a side or
+        # None (no Long or Short point, no dot); every other column as with Entry 10.
+        signal_cols = ("Signal", "Long Points", "Short Points", "Long Dots", "Short Dots", "Long Point", "Short Point", "Partial Point", "No Book Point")
         for d in ("abc", "", "0", "-5", "1'; SELECT 1; --"):
-            q = substitute(board.Q_SPREAD.replace(board.RANGE, made_up), dict(sel, d=d), 20_000)
+            q = substitute(board.Q_SPREAD.replace(board.RANGE_CALL, made_up), dict(sel, d=d), 20_000)
             got = {int(r["time"]): r for r in rows_of(q.replace("to_timestamp(r.ts_ms / 1000.0) AS time", "r.ts_ms AS time"))}
             band = ("Mean + Entry", "Mean − Entry", "+Entry", "−Entry")
             self.assertEqual({r[c] for r in got.values() for c in band}, {""}, d)
-            self.assertEqual({t: {c: v for c, v in r.items() if c not in band} for t, r in got.items()},
-                             {t: {c: v for c, v in r.items() if c not in band} for t, r in table.items()}, d)
+            self.assertEqual({t: {c: v for c, v in r.items() if c not in band + signal_cols} for t, r in got.items()},
+                             {t: {c: v for c, v in r.items() if c not in band + signal_cols} for t, r in table.items()}, d)
+            for t, r in got.items():
+                if table[t]["Signal"] in ("0", "1", "2", "3", "4", nb):  # No Entry comes before No Book
+                    self.assertEqual(r["Signal"], ne, (d, t))
+                else:
+                    self.assertEqual(r["Signal"], table[t]["Signal"], (d, t))
+                self.assertEqual((r["Long Dots"], r["Short Dots"]), ("", ""), (d, t))
         self.assertEqual((table[2000]["Mean + Entry"], table[2000]["Mean − Entry"], table[2000]["+Entry"], table[2000]["−Entry"]), ("-43", "-63", "10", "-10"))
         # The strips' query on a made-up pair of newest seconds (combo_last's shape): the anchors and the reference's return
         # rounded once; the basis second's absolute deviations, a real one only on the side its real spread can fill on (Real
         # Short Spread here below the Mean: Other Side), a capped side's fill in USDT and Full for the other, the Signal's text and
-        # each leg's depths or their reasons. Without those seconds every figure is empty (–) but the Phase.
+        # each leg's depths or their reasons. The Signal is the board's on Entry 10 (3.5): Real Long Spread 9.59 under the Mean is
+        # None. Without those seconds every figure is empty (–) but the Phase.
         last_cols = ("kind, ts_ms, session_date, basis, past_t, fx, a_bull, a_bear, a_ref, p_bull, p_bear, p_ref, s_bps, mu_bps, sigma_bps, s_long_bps, "
                      "s_short_bps, partial_long, partial_short, filled_long, filled_short, book_bull, book_bear, bid_ct_bull, bid_ct_bear, ask_ct_bull, "
                      "ask_ct_bear, bid_usdt_bull, bid_usdt_bear, ask_usdt_bull, ask_usdt_bear, anchor_status, signal")
@@ -883,7 +984,7 @@ class Boards(unittest.TestCase):
                          {"Phase": "", "Bull Price": "33.74", "Bull Anchor": "30.76", "Bear Price": "75.599", "Bear Anchor": "83.51",
                           "Ref Price": "127.56", "Ref Return": "3.56", "Spread": "-7.36", "Mean": "-2.41", "Sigma": "3.46", "Deviation": "4.96",
                           "Anchor Status": "Bell", "USD/USDT": "0.998525", "Real Long Deviation": "9.59", "Real Short Deviation": other,
-                          "Long Fill": "6234", "Short Fill": str(board.FULL), "Signal": "Long · Partial"})
+                          "Long Fill": "6234", "Short Fill": str(board.FULL), "Signal": "None"})
         # The Book table's two rows (sel is Binance SOXL / SOXS: both ticks 0.01, levels 1-2); the strips' figures only in row 1.
         self.assertEqual([[r[c] for c in book] for r in rows], [["SOXL", "0.01", "1–2", "2415.33", "81482", "2094.72", "70654"],
                                                                  ["SOXS", "0.01", "1–2", nr, nr, "54.93", "4153"]])
@@ -903,11 +1004,13 @@ class Boards(unittest.TestCase):
 
     @unittest.skipUnless(PSQL, "set ETFPAIR_BOARD_PSQL to run the queries")
     def test_steps(self):
-        # The spacing of the drawn points: the finest of 1, 5, 10, 30 s and whole minutes with at most about 5000 points a line.
+        # The spacing of the drawn points: the finest of 1, 5, 10, 30 s and whole minutes with at most about 2000 points a line
+        # (3.5, owner item 63; 5000 until 3.4): every second to 33 min, 5 s to 2 h 46 min, 10 s to 5 h 33 min, 30 s to 16 h 40 min.
         got = {}
-        for minutes in (60, 83, 84, 360, 420, 840, 2460, 2520, 10080):
+        for minutes in (30, 33, 34, 60, 166, 167, 333, 334, 360, 1000, 1001, 1440, 10080):
             got[minutes] = int(psql("SELECT " + substitute(board.STEP_MS, dict(SOXL, hours=minutes / 60), 10 ** 12), "-At"))
-        self.assertEqual(got, {60: 1000, 83: 1000, 84: 5000, 360: 5000, 420: 10000, 840: 30000, 2460: 30000, 2520: 60000, 10080: 180000})
+        self.assertEqual(got, {30: 1000, 33: 1000, 34: 5000, 60: 5000, 166: 5000, 167: 10000, 333: 10000, 334: 30000, 360: 30000, 1000: 30000,
+                               1001: 60000, 1440: 60000, 10080: 360000})
 
     @unittest.skipUnless(PSQL, "set ETFPAIR_BOARD_PSQL to run the queries")
     def test_next_actions(self):
@@ -1031,7 +1134,7 @@ GROUP BY ph.phase ORDER BY array_position(ARRAY['Pre-Market', 'Regular', 'After-
         # Each rounded figure shows exactly as its unrounded value would (Grafana's toFixed of either), in every frame the board
         # rounds: the Spread row's, the Prices row's and the strips'.
         raw = unrounded_module()
-        now_ms = newest_ms()
+        now_ms = newest_ms() - SETTLED_MS  # the same inputs for both runs
         checked = 0
         for sel, end_ms in ((dict(SOXL, venue="bitget", ma="sma", ma_minutes="30", d="7.25", notional="100000", hours=1), now_ms),
                             (dict(TQQQ, venue="binance", ma="ema", ma_minutes="60", d="10", notional="10000", hours=6), utc8_ms("2026-11-21 08:00")),
@@ -1061,7 +1164,7 @@ GROUP BY ph.phase ORDER BY array_position(ARRAY['Pre-Market', 'Regular', 'After-
         # On real ranges: wherever both legs' books give the point, Real Long Spread >= Spread >= Real Short Spread on the signed
         # values, also as the tooltip shows them; the three deviations the board draws are |x - Mean| >= 0; a Long point has its
         # Real Long Spread at least Entry below the Mean and a Short point its Real Short Spread at least Entry above it.
-        now_ms = newest_ms()
+        now_ms = newest_ms() - SETTLED_MS  # the same inputs for both runs
         for sel, end_ms in ((dict(SOXL, venue="bitget", ma="sma", ma_minutes="30", d="5", notional="100000", hours=6), now_ms),
                             (dict(SOXL, venue="binance", ma="ema", ma_minutes="60", d="3", notional="10000", hours=6), utc8_ms("2026-11-21 08:00")),
                             (dict(TQQQ, venue="bitget", ma="sma", ma_minutes="30", d="3", notional="50000", hours=24), utc8_ms("2026-11-22 00:00"))):
