@@ -8,8 +8,8 @@ The board's shape needs nothing: every query reads schema trade only, through th
 of the execution charts have a value at every point. Running the queries needs the trade database: set ETFPAIR_TRADE_DSN to
 a DSN of the read-only role (core/.env.reader holds one; psql gets it through libpq's environment, never on its command
 line, and it is never printed); without
-it those tests are skipped. They run every query over several ranges, both modes and every scope, and compare the Summary
-and the Cycles table with a recomputation from the fills (PRD V19)."""
+it those tests are skipped. They run every query over several ranges, both modes and every scope, and compare Net, P&L and
+the Round Trips table with a recomputation from the fills (PRD V19)."""
 import json, os, re, subprocess, sys, time, unittest, urllib.parse
 from datetime import datetime
 from decimal import Decimal
@@ -120,41 +120,51 @@ class Shape(unittest.TestCase):
         self.assertEqual(self.b["refresh"], "10s")
         self.assertEqual(self.b["time"], {"from": "now-24h", "to": "now"})
         names = [v["name"] for v in self.b["templating"]["list"]]
-        self.assertEqual(names[:4], ["mode", "scope", "cycle", "nofill"])
+        self.assertEqual(names[:3], ["mode", "scope", "cycle"])
         for p in self.b["panels"] + [q for r in self.b["panels"] for q in r.get("panels", [])]:
             if p["type"] != "row":
                 self.assertTrue(p["description"], p["title"])
         titles = [p["title"] for p in self.b["panels"] if p["type"] == "row"]
-        self.assertEqual([t.split(" · ")[0] for t in titles], ["Status", "Live Execution", "Summary", "Inventory & Account", "Funding", "Cycles",
-                                                               "Cycle Detail", "Execution Statistics", "System"])
-        self.assertEqual([p.get("collapsed") for p in self.b["panels"] if p["type"] == "row"][-2:], [True, True])
+        self.assertEqual([t.split(" · ")[0] for t in titles], ["Live Execution", "Round Trips", "Round Trip", "Risk & Account", "Diagnostics",
+                                                               "Diagnostics"])
+        self.assertEqual([p.get("collapsed") for p in self.b["panels"] if p["type"] == "row"], [False] * 4 + [True, True])
+
+    def test_the_four_questions_on_top(self):
+        """Health, Position, Entry, Net and P&L sit above the first row, in the top ten grid units (no scrolling at 1680 px)."""
+        top = []
+        for p in self.b["panels"]:
+            if p["type"] == "row":
+                break
+            top.append(p)
+        self.assertEqual([p["title"].split(" · ")[0] for p in top], ["", "Health", "Position", "Net", "P&L", "Entry"])
+        self.assertLessEqual(max(p["gridPos"]["y"] + p["gridPos"]["h"] for p in top), 10)
 
     def test_execution_charts(self):
-        """One frame for both charts; the deviation chart shows the Spread chart's result; every tooltip row is a tooltip-only
-        series (named with a zero-width space where it stands for a drawn line) and the tooltip hides zeros, the value of the
-        marker rows on rows without a decision near them."""
+        """One frame for both charts; the Spread chart shows the Deviation chart's result; every tooltip row is a tooltip-only
+        series (a drawn line is never in the tooltip) and the Deviation chart's tooltip hides zeros, the value of the marker
+        rows on rows without a decision near them."""
+        dev = next(p for p in self.b["panels"] if p["title"] == "Deviation from the Mean · σ")
         spread = next(p for p in self.b["panels"] if p["title"] == "Spread · D")
-        dev = next(p for p in self.b["panels"] if p["title"] == "Executable Deviation · D")
-        self.assertEqual(len(spread["targets"]), 1)
-        self.assertEqual(dev["targets"][0]["panelId"], spread["id"])
-        for p in (spread, dev):
-            self.assertTrue(p["options"]["tooltip"]["hideZeros"], p["title"])
-            shown_in_tooltip = []
+        self.assertEqual(len(dev["targets"]), 1)
+        self.assertEqual(spread["targets"][0]["panelId"], dev["id"])
+        self.assertTrue(dev["options"]["tooltip"]["hideZeros"])
+        for p in (dev, spread):
             for o in p["fieldConfig"]["overrides"]:
                 props = {x["id"]: x["value"] for x in o["properties"]}
                 hide = props.get("custom.hideFrom", {})
-                if hide.get("viz"):
-                    shown_in_tooltip.append(props.get("displayName", o["matcher"]["options"]))
-                elif hide.get("tooltip") is False or not hide:
+                if not hide.get("viz") and hide.get("tooltip") is not True:
                     self.fail("%s: drawn series %s in the tooltip" % (p["title"], o["matcher"]["options"]))
-            self.assertIn("Action", shown_in_tooltip)
-            self.assertIn("Decided", shown_in_tooltip)
-        self.assertIn("Spread​", [o["properties"][-1]["value"] for o in spread["fieldConfig"]["overrides"]
-                                       if o["properties"][-1]["id"] == "displayName"])
-        # Every column of the frame is kept by one chart or the other.
+        tips = [o["matcher"]["options"] for o in dev["fieldConfig"]["overrides"]
+                if any(x["id"] == "custom.hideFrom" and x["value"].get("viz") for x in o["properties"])]
+        self.assertEqual(tips[-len(board.MARKER_INFO):], [n for n, _ in board.MARKER_INFO])
+        # Every column of the frame is kept by one chart or the other; the legend holds at most eight series.
         frame = [n for n, _ in board.ALL_COLUMNS]
-        kept = set(spread["transformations"][0]["options"]["include"]["names"]) | set(dev["transformations"][0]["options"]["include"]["names"])
+        kept = set(dev["transformations"][0]["options"]["include"]["names"]) | set(spread["transformations"][0]["options"]["include"]["names"])
         self.assertEqual(set(frame) - kept, set())
+        in_legend = [n for n in dev["transformations"][1]["options"]["indexByName"] if n != "time" and not any(
+            o["matcher"]["options"] == n and any(x["id"] == "custom.hideFrom" and x["value"].get("legend") for x in o["properties"])
+            for o in dev["fieldConfig"]["overrides"])]
+        self.assertLessEqual(len(in_legend), 8, in_legend)
 
     def test_anchor_marks_on_every_chart(self):
         charts = [p["id"] for p in self.b["panels"] if p["type"] == "timeseries"]
@@ -164,16 +174,15 @@ class Shape(unittest.TestCase):
 
 @unittest.skipUnless(DSN, "ETFPAIR_TRADE_DSN not set: queries not run")
 class Queries(unittest.TestCase):
-    def values(self, hours, mode="Paper", scope="range", cycle="none"):
+    def values(self, hours, mode="Paper", scope="session", cycle="none"):
         end = int(time.time() * 1000)
-        return {"mode": mode, "scope": scope, "nofill": "Hide", "cycle": cycle, "bull": "SOXL", "bear": "SOXS",
-                "__from": int(end - hours * 3600000), "__to": end}
+        return {"mode": mode, "scope": scope, "cycle": cycle, "bull": "SOXL", "bear": "SOXS", "__from": int(end - hours * 3600000), "__to": end}
 
     def test_every_query_runs(self):
         b = board.build()
         for hours in (0.25, 6, 24, 168):
             for mode in ("Paper", "Live"):
-                for scope in ("range", "run", "session"):
+                for scope in ("session", "run", "range"):
                     v = self.values(hours, mode, scope)
                     opts = psql_json(fill(board.Q_CYCLE_OPTIONS, v))
                     v["cycle"] = opts[0]["__value"]
@@ -181,16 +190,24 @@ class Queries(unittest.TestCase):
                         with self.subTest(where=where, hours=hours, mode=mode, scope=scope):
                             psql_json(fill(q, v))
 
+    def test_plain_words(self):
+        """End and idle reasons in words; a code the board does not list (a new end reason such as dust_only, before the board
+        knows it) reads as its own words."""
+        got = psql_json("SELECT %s AS listed, %s AS other, %s AS open, %s AS idle, %s AS sent FROM (SELECT 'dust_only' AS a, "
+                        "'brand_new_reason' AS b, NULL::text AS n, 'regular_hours' AS i) t" % (
+                            board.end_reason("t.a"), board.end_reason("t.b"), board.end_reason("t.n"), board.idle_why("t.i"), board.idle_state("t.n")))[0]
+        self.assertEqual(got, {"listed": "Trimmed to Dust", "other": "Brand New Reason", "open": "Open", "idle": "Regular Hours", "sent": "Order Sent"})
+
     def test_execution_frame(self):
         """The execution charts' frame: a row is a break row (every column NULL) or has a value, possibly a hidden 0 or a code,
         in every tooltip row; a break row sits right before the point it separates from what came before, after a run's last
         decisions (none of which may follow it); each decision of the range is one dot."""
-        tips = [n for n, _ in board.TOOLTIP_COLUMNS + board.STATE_COLUMNS] + ["Action", "Decided", "Bull Filled", "Bear Filled", "Notional",
-                                                                              "Fees", "Cycle Net", "At"]
+        tips = [n for n, _ in board.TOOLTIP_COLUMNS + board.STATE_COLUMNS + board.MARKER_INFO]
+        dots = [n for n, _, _, _, _ in board.DOTS]
         for hours in (0.25, 6, 24, 168):
             v = self.values(hours)
-            rows = psql_json(fill(board.Q_SPREAD, v))
-            dots = 0
+            rows = psql_json(fill(board.Q_EXECUTION, v))
+            drawn = 0
             for i, r in enumerate(rows):
                 values = [r[n] for n, _ in board.ALL_COLUMNS]
                 if all(x is None for x in values):
@@ -202,36 +219,40 @@ class Queries(unittest.TestCase):
                     continue
                 for n in tips:
                     self.assertIsNotNone(r[n], "%s h, %s: %s NULL" % (hours, r["time"], n))
-                dots += sum(r[name] is not None for name in board.ACTIONS.values())
+                drawn += sum(r[name] is not None for name in dots)
             decisions = psql_json(fill("SELECT count(*) AS n FROM trade.decision d WHERE d.live = ('$mode' = 'Live') AND d.kind IN "
                                        "('entry', 'exit', 'complete', 'trim', 'forced') AND d.ts_ms >= $__from AND d.ts_ms <= $__to", v))[0]["n"]
-            self.assertEqual(dots, decisions, "%s h" % hours)
+            self.assertEqual(drawn, decisions, "%s h" % hours)
 
-    def test_summary_and_cycles_from_the_fills(self):
-        """PRD V19: the Results strip and the Cycles table against the fills (sells' value - buys' value of a flat cycle, fees,
-        notional), recomputed here without cycle or lot."""
-        v = self.values(24 * 30)
+    def test_pnl_and_round_trips_from_the_fills(self):
+        """PRD V19: the Net and P&L figures and the Round Trips table against the fills (sells' value - buys' value of a flat
+        cycle, fees, entry notional), recomputed here without cycle or lot."""
+        v = self.values(24 * 30, scope="range")
         fills = {r["cycle_id"]: r for r in psql_json(
-            "SELECT o.cycle_id, sum(CASE f.side WHEN 'sell' THEN f.value ELSE -f.value END) AS gross, sum(f.fee) AS fees, sum(f.value) AS notional "
+            "SELECT o.cycle_id, sum(CASE f.side WHEN 'sell' THEN f.value ELSE -f.value END) AS gross, sum(f.fee) AS fees, "
+            "sum(f.value) FILTER (WHERE o.purpose IN ('entry', 'complete')) AS entry_value "
             "FROM trade.cex_fill f JOIN trade.cex_order o ON o.live = f.live AND o.client_order_id = f.client_order_id WHERE f.live = false "
             "GROUP BY o.cycle_id")}
         cycles = {r["cycle_id"]: r for r in psql_json("SELECT * FROM trade.cycle WHERE live = false")}
-        rows = psql_json(fill(board.Q_CYCLES, v))
+        rows = psql_json(fill(board.Q_BLOTTER, v))
+        self.assertTrue(all(cycles[r["cycle_id"]]["end_reason"] != "no_fill" for r in rows))
+        checked = 0
         for row in rows:
             c, f = cycles[row["cycle_id"]], fills.get(row["cycle_id"])
             if f is None:
                 continue
-            self.assertEqual(row["Notional"], f["notional"], row["cycle_id"])
-            self.assertEqual(-row["Fees"], f["fees"], row["cycle_id"])
-            if c["status"] != "open" and c["dust_bull"] == 0 and c["dust_bear"] == 0:
-                self.assertEqual(row["Gross"], f["gross"], row["cycle_id"])
-        s = psql_json(fill(board.Q_SUMMARY, v))[0]
+            self.assertEqual(row["Notional"], f["entry_value"] or 0, row["cycle_id"])
+            if c["status"] != "open" and c["funding_known"] and c["dust_bull"] == 0 and c["dust_bear"] == 0:
+                self.assertEqual(row["Net"], f["gross"] - f["fees"] + c["funding"], row["cycle_id"])
+                self.assertAlmostEqual(float(row["Net bps"]), float(row["Net"] / row["Notional"] * 10000), places=6)
+                checked += 1
+        self.assertGreater(checked, 0, "no flat closed round trip to check")
         known = [c for c in cycles.values() if c["status"] != "open" and c["funding_known"] and c["end_reason"] != "no_fill"
                  and int(v["__from"]) <= c["closed_ms"] <= int(v["__to"]) and c["cycle_id"] in fills]
-        if known:
-            self.assertEqual(s["Gross"], sum(fills[c["cycle_id"]]["gross"] for c in known))
-            self.assertEqual(-s["Fees"], sum(fills[c["cycle_id"]]["fees"] for c in known))
-            self.assertEqual(s["Net"], sum(fills[c["cycle_id"]]["gross"] - fills[c["cycle_id"]]["fees"] + c["funding"] for c in known))
+        p = psql_json(fill(board.Q_PNL, v))[0]
+        net = psql_json(fill(board.Q_NET, v))
+        self.assertEqual(-p["Fees"], sum(fills[c["cycle_id"]]["fees"] for c in known))
+        self.assertEqual(net[-1]["Net"], sum(fills[c["cycle_id"]]["gross"] - fills[c["cycle_id"]]["fees"] + c["funding"] for c in known))
 
 
 if __name__ == "__main__":
