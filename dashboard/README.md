@@ -10,7 +10,8 @@ ETF-Pair 看板的生成、检查、发布和预览。设计与口径见 [SPEC.m
 - 3.0 的说明：图上一分钟以下的点改读录制服务的每秒表 `perp_second`（放大看 1 秒、缩小看 30 秒），带两腿的买一 / 卖一，Spread 图多了 Buy Both / Sell Both 两条线，Signal 按可成交价判断，采集器的 5 秒 REST 采样（`perp_tick`、配置 `book_poll`）删除。**3.0 已于 2026-11-21 19:29:44 部署**，3.0.1 看板 20:00:03 发布（md5 `2bc76fa6…`，只修了 Deviation 图例被截断）。
 - 现在运行的：采集器 `dashboard/run/pairscan`（sha256 `a5bce562…`，2026-11-23 11:44:18 启动，3.2：嵌着 3.2 的 schema，每分钟刷新 `perp_second_minute`；两腿 NAV 确认之后不再读 Direxion，ProShares 照旧每小时复核；上一版 `122b40ae…` 留作 `pairscan.v31`，再上一版 `1e84a79c…` 留作 `pairscan.v30`；已发布的 3.1、3.2 看板留作 `experiments/board32_20261122/deploy/combo-spread.published.v31.json`、`experiments/board33_20261123/deploy/combo-spread.published.v32.json`），看板 3.3（2026-11-23 13:54:51 发布，md5 `dc8f4a12…`），录制服务 `dashboard/run/booktape`（`6ea03ca4…`，2026-11-22 12:20:14 启动：5 秒心跳、10 秒读超时，Bitget SOXS 存 `books50` 全部 50 档；上一版 `a2e10f5f…` 留作 `booktape.v32`）。各版本和改动见 SPEC 第 10 节，部署步骤在 SPEC 第 9 节末。
 
-- **ETF-Pair Live Monitor**（设计，未实现）：读交易程序写的 `trade` schema，设计在 [SPEC.md](SPEC.md) 第 7 节（2026-11-24 按 [../core/SPEC.md](../core/SPEC.md) 的表重写），实现是 `core/SPEC.md` 第 9 节的第 7 步。现在没有它的代码、数据源或角色，本文件的命令都只涉及 Combo Spread。
+- **TODO：与交易程序的取价同步**（用户第 58 条）：Combo Spread 的 Real Spread 仍按 0.01 归档、SOXS 用 `books50`；交易程序从 PRD 3.9 起用 `books5` 的原始价位（SOXL 第 2 个、SOXS 第 5 个）。同步什么以后讨论，见 [SPEC.md](SPEC.md) 第 6 节末尾；在那之前看板不改。
+- **ETF-Pair Live Monitor**（设计，未实现）：读交易程序写的 `trade` schema，设计在 [SPEC.md](SPEC.md) 第 7 节（2026-11-24 按 [../core/SPEC.md](../core/SPEC.md) 的表重写；2026-11-25 `decision` 表多了纸面模式的 `paper_match` 行，Decisions 一行按 `kind` 取数不受影响），实现是 `core/SPEC.md` 第 9 节的第 7 步。现在没有它的代码、数据源或角色，本文件的命令都只涉及 Combo Spread。
 
 | 项 | 值 |
 |---|---|
@@ -111,7 +112,15 @@ tail -f dashboard/run/booktape.log                  # one status line per connec
   - 还要补的归档日：Bitget 11-21 已在 3.2 部署的 `load` 一步载入（2026-11-23 11:42；其中 130 秒录到的每秒最后一笔早于归档，按只补空列的规则保留录到的值，SPEC 第 9 节末）；Binance UTC 11-22 的 41 秒已于 11-23 16:17 补上（插入 9 行、补 32 格，SPEC 第 9 节末）；Bitget 11-22 的 406 秒已于 11-24 14:07 补上（插入 19 行、补 387 格），到 11-24 13:07 为止缺成交价的秒数为 0；之后每天录制服务重连留下的几秒照此补；命令在 RUNBOOK 第 7 节，2026-11-23 起用 `experiments/board33_20261123/maint/archives.sh`（`fetch`、`predict`、`load`、`check`）。
   - 改回补脚本之后跑 `.venv/bin/python -I -m unittest discover -s dashboard/backfill -p 'test_*.py'`（33 项；写库的几项要 `PERP_SECOND_TEST_DSN`，只指向临时库，其中 `test_refresh_with_the_real_summary` 用真的 schema）。
 - **改程序**：`go vet ./dashboard/... && go test -race ./dashboard/internal/booktape/`，`dashboard/deploy/install.sh` 编译并在程序变化时重启它（停顿约 1 秒，那一秒没有行）；表结构在 `internal/booktape/schema.sql`，录制服务启动后第一次写库之前应用。改推送、档数或每秒行的规则时同时更新 SPEC 附录 A 和本节。
-- **磁盘**：原始文件美股交易日约 3.0 GiB、周末约 1.1 GB；`perp_second` 在 2026-11-21 20:06 设表级自动清理之后稳态约每天 0.6 GB（[../DATA.md](../DATA.md) 第 4 节），没有清理规则；剩余空间和全部数据的清单见 [../DATA.md](../DATA.md)。
+- **SOXS 另录 `books5`（2026-11-25 实现，未部署，SPEC 第 10 节）**：细刻度的 Bitget 合约在 `books50` 之后另订 `books5`，只进文件（`experiments/book_tape/bitget/<日>/SOXSUSDT.books5.*.jsonl.gz`），每秒行和看板不变。部署要用户同意，先把 `research/booktape.py` 的 `BOOK_TOPICS['bitget']` 改成 `('books50', 'books5')`（SPEC 附录 A“读取”），再只换录制服务（不用 `install.sh`，它还会重编、可能重启采集器）：
+  ```bash
+  cd /home/ubuntu/code/etf-pair-arbitrage
+  go build -buildvcs=false -o dashboard/run/booktape.new ./dashboard/cmd/booktape && sha256sum dashboard/run/booktape.new  # afbb0c17… unless the code changed again
+  cp -p dashboard/run/booktape dashboard/run/booktape.v33   # the running 6ea03ca4…, kept for a rollback
+  mv dashboard/run/booktape.new dashboard/run/booktape && sudo systemctl restart etf-pair-booktape
+  ```
+  部署后看：日志里 `booktape: connected feed=bitget-soxl-soxs streams=16`（之前 15），当天目录出现 `SOXSUSDT.books5.*.jsonl.gz`，5 分钟一行的状态 `silent_streams` 为空，`audit/booktape.py` 通过。回退：`mv dashboard/run/booktape.v33 dashboard/run/booktape && sudo systemctl restart etf-pair-booktape`。
+- **磁盘**：原始文件美股交易日约 3.0 GiB、周末约 1.1 GB（另录 SOXS `books5` 之后每天约多 0.14 GB，SPEC 附录 A“规模”）；`perp_second` 在 2026-11-21 20:06 设表级自动清理之后稳态约每天 0.6 GB（[../DATA.md](../DATA.md) 第 4 节），没有清理规则；剩余空间和全部数据的清单见 [../DATA.md](../DATA.md)。
 
 ## 分红、拆股和临时停市（运维）
 
