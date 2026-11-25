@@ -18,8 +18,8 @@ ETF Pair Arbitrage 的交易进程（Go）：读 Bitget 上 SOXLUSDT / SOXSUSDT 
 - **第 4 步 `inventory` 已实现**：账本由一轮的订单快照整份重算（逐笔更新、只收到最终状态、重启重放得到同一个账本），额度 `L × (M + min(0, R))`、在途订单按额度价预留、零头只记录不处理、与交易所持仓的核对、资金费的归属与入账、改本金等旧的一轮结清才生效。
 - **第 5.1 步 `cex` 的订单表和纸面交易所也已实现**：
   - 订单表（`cex/orders.go`）：`PlaceOrders` 先把 `cex_order` 行同步写库再发单（写不了时，含非只减仓单的一组整组不发，只减仓的照发）；回报、推送、查询按“累计成交量只增不减、最终状态之后只补成交量和手续费”合并；受理后 1 秒没有结果、超时或断线的单是“结果未知”，每秒按编号查询、不重发；交易所答“没有这张单”满 30 秒且成交记录里也没有，才标 `NotFound`；每次变化写 `cex_order`，成交照到达的写 `cex_fill`（重复的由表的主键 `exec_id` 去掉）；手续费只对报它时的那个成交量算“已知”，成交量变大而新的手续费还没到时回到“未知”继续查；拒单和因价格超限被撤的单在记录上带错误种类（`ErrorKind`，只在内存里，`cex_order` 没有这一列）；重启时读回的订单进表，没有最终状态的变成未知继续查；`RecoverOrders(cycleID)` 只在有未结束的一轮时调用，从交易所认回这一轮里本地没记下的单（两个合约都读到才开始认；别的轮次的单一律不动，它们在库里的行是完整的），`SetOrderLot` 把账本定下的仓位号存进 `cex_order.lot_id`。
-  - 纸面交易所（`cex/paper.go`）：纸面模式（`exec.live: false`）下 `main` 用它包住 Bitget 客户端。行情、合约规则、结算费率照常读真实的公开接口；账户侧全在本地——订单过了这条腿的 `sim_order_latency` 后，在那一刻这条腿的盘口上按限价逐档成交（IOC，只减仓单不超过纸面持仓），手续费 = 成交额 × `taker_fee_bps`；纸面持仓、纸面资金费流水；每次撮合写一行 `decision`（`kind = paper_match`，带这一轮和仓位的编号、发单时和成交时的两份盘口；不进 `event`，那里只放报警）；两张单同时撮合时事件按撮合的先后逐张送出；纸面资金费流水在真实交易所公布结算费率之后入账，读取时不按时间过滤。**真实交易所收不到任何订单和账户请求。**
-- **第 3 步 `strategy` 也已实现**：纯计算，不联网、不读时钟、不持有状态、不打日志。有效档位（`EffectiveLevels`）、价差（`Spread`）、按每条腿美元价存的均线和 σ（`ComputeStats`、`Stats.Mu` / `Sigma`，同一份数据可按任意一组锚点表达）、开仓的检查顺序与数量（`EvaluateEntry`，不开仓的原因是成组的 `Reason` 常量）、平仓线与数量（`EvaluateExit`）、成交不齐时补齐还是回吐（`EvaluateGap`）、强制平仓的限价（`ForcedOrders`）。测试用 PRD 附录 A 的四个算例和手算的数逐数核对。它现在还没有调用方：等 `inventory`（第 4 步）和 `exec`（第 6 步）。
+  - 纸面交易所（`cex/paper.go`）：纸面模式（`exec.live: false`）下 `main` 用它包住 Bitget 客户端。行情、合约规则、结算费率照常读真实的公开接口；账户侧全在本地——订单过了这条腿的 `sim_order_latency` 后按到单规则成交（`cex/arrival.go`，IOC，只减仓单不超过纸面持仓）：深度有效、没被更新的 `books1` 否定、也没比最优价晚到超过 `depth_max_age` 时用原始档位，否则只用最优价一档，没有连接时零成交（撤单原因 `book_unobservable`）；先到的纸面单已吃掉的数量从后到的单能吃的数量里扣掉，手续费 = 成交额 × `taker_fee_bps`；纸面持仓、纸面资金费流水；每次撮合写一行 `decision`（`kind = paper_match`，带这一轮和仓位的编号、发单时和成交时的两份盘口和到单规则所用的盘口源、序号、余量；不进 `event`，那里只放报警）；两张单同时撮合时事件按撮合的先后逐张送出；纸面资金费流水在真实交易所公布结算费率之后入账，读取时不按时间过滤。**真实交易所收不到任何订单和账户请求。**
+- **第 3 步 `strategy` 也已实现**：纯计算，不联网、不读时钟、不持有状态、不打日志。取价档（`pricingLevel`：吃单一侧第 N 个原始价位，SOXL 第 2、SOXS 第 5，PRD 3.2）、价差（`Spread`）、按每条腿美元价存的均线和 σ（`ComputeStats`、`Stats.Mu` / `Sigma`，同一份数据可按任意一组锚点表达）、开仓的检查顺序与数量（`EvaluateEntry`，不开仓的原因是成组的 `Reason` 常量）、平仓线与数量（`EvaluateExit`）、成交不齐时补齐还是回吐（`EvaluateGap`）、强制平仓的限价（`ForcedOrders`）。测试用 PRD 附录 A 的四个算例和手算的数逐数核对。调用方是 `exec`（第 6 步）。
 - 进程能启动、连上行情、读出锚点、读回上次的账本和订单并恢复未结束的一轮，按 PRD 开仓、平仓、补齐 / 回吐、收盘前强制平仓，处理结果未知、持仓不符、停止信号和人工接管。纸面模式（`exec.live: false`）只撮合在本地；实盘模式（`exec.live: true`）还没有运行过，需要用户另行授权。
 
 ## 构建与检查
@@ -98,7 +98,7 @@ go run . -config config.yaml -env .env
 
 启动后日志里依次能看到：`cex: session`（当前 Session 的起止，UTC+8）、`cex: market rule`、两条腿的 `cex: book live`、`cex: bell anchor read` 和 `cex: anchor changed`，之后每 30 秒一行 `cex: status`（两条腿的深度年龄和冲突、F 及其年龄、锚点）。没配 `direxion.site_api_key` 时会有一条 Error `cex: issuer not readable`，这个 Session 一直用铃锚点。
 
-真正的纸面交易和实盘（`exec.live: true`）都要等第 6 步的执行循环；实盘还要用户另行授权。
+纸面模式（`exec.live: false`）用真实公开行情和纸面交易所跑完整的执行循环（第 6.5 步，下文“纸面长跑”）；实盘（`exec.live: true`）要用户另行授权，2026-11-25 的审计（用户第 65 条）在修复通过验收之前不放行。
 
 ## 目录
 
@@ -113,7 +113,7 @@ go run . -config config.yaml -env .env
 | `cex/binance/`、`cex/coinbase/`、`cex/direxion/` | 三个只读来源：指数 K 线与时段表；USDT-USD 行情与分钟 K 线；NAV 与分红 |
 | `strategy/` | 纯计算：`types.go`（参数、`Direction`、`Reason`、各输入和计划）、`levels.go`（有效档位、原始盘口上的逐档计算、限价）、`spread.go`、`stats.go`（均线和 σ）、`entry.go`、`exit.go`（按线平仓、强制平仓）、`gap.go`（补齐还是回吐） |
 | `inventory/` | 库存：`ledger.go`（由订单重算的账本）、`quota.go`、`reconcile.go`、`manager.go`（恢复、资金费、关轮）、`store.go` |
-| `exec/` | 执行循环：`manager.go`（Run、信号、状态行）、`step.go`（每一拍的判断顺序、开仓阻挡）、`bars.go`（分钟 bar、均线重新开始、换锚）、`orders.go`（开仓、按线平仓、强制平仓、结清、关轮）、`store.go`（落库行）。6.1 已实现；补齐 / 回吐（6.2）、结果未知与停止的其余部分（6.3）、重启恢复（6.4）待做 |
+| `exec/` | 执行循环：`manager.go`（Run、信号、状态行）、`step.go`（每一拍的判断顺序、开仓阻挡）、`bars.go`（分钟 bar、均线重新开始、换锚）、`orders.go`（开仓、按线平仓、强制平仓、结清、关轮）、`store.go`（落库行）。6.1–6.4 已实现（主流程、补齐 / 回吐、结果未知与停止、重启恢复），`recover.go` 是重启恢复 |
 | `scripts/dev_db.sh` | 开发和测试用的私有数据库：`start` / `stop` / `status` |
 
 ## 纸面长跑（第 6.5 步）
