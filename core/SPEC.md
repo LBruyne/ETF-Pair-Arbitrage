@@ -1468,6 +1468,16 @@ func (m *ExecManager) forcedExit(now time.Time, unknown bool) (done bool) {
 - 测试（`exec/gap_test.go`；测试用的纸面延迟 250 毫秒，留时间在撮合前换盘口；`gateVenue` 可以扣住一个合约的私有推送）：`TestAppendixExample3`（回吐损失 0.539464995 对补齐 0.0204 → 补齐 10.20 @ 59.418；盘口变差时补齐 1.224 → 回吐 15.30）、`TestAppendixExample4`（回吐 0.98649405 对补齐 0.496 → 补齐）、`TestCompletionWithinTheQuota`（V7：补齐被额度截到 67.90，已用 8,189.43 ≤ 8,190，超出部分随后回吐）、`TestHeldNotificationSendsNothingExtra`（第二条腿的通知被扣住时只有原来 2 张单；放行后只记一次）、`TestCompletionWindowFromTheFirstSend`（第 0 秒发出、第 4 秒才到结果、第 6 秒少的那条腿才恢复 → 只回吐）、`TestOneLegBatchIsTrimmedAndVoid`、`TestOneLegCycles`、`TestRegularHoursOnlyTrim`、`TestExitGapReducesTheLargerLeg`。
 - 顺带修的测试：`TestRunKeepsTheRESTConnectionWarm` 在高负载下偶发失败——最后那个请求可能撞上正在途中的保温请求、或调度停顿超过测试服务器的空闲时限。改为先停保温循环再发请求，空闲时限放宽到 600 毫秒；产品代码不变。
 
+#### 第 6.3 步实现时定下的（2026-11-25）
+
+例外与停止（PRD 10.3、13.3、13.6–13.8）在 `exec/step.go`、`orders.go`、`manager.go`：
+
+- **结果未知**：期间不开仓、不按线平仓；强制平仓按交易所持仓定数量。从循环第一次看到这张单未知起满 30 秒（循环自己的时钟）记 Error 和 `order_unknown_30s` 事件，另一条腿按持仓的差额回吐；按持仓推出的数量不入账。三样证据齐了（cex 的 `NotFound`、这条腿交易所持仓等于账本）才 `MarkNeverArrived`，记 `order_never_arrived` 事件。期间交易所持仓最多每秒用 REST 读一次，其余时候用推送的快照。
+- **持仓核对**：每批出结果后、以及平时每 10 秒核对一次；第一次不符隔 1 秒再读，两次都不符才认定。**认定后什么单都不发**（PRD 13.7：只报警、等人处理），每 60 秒重报一次 Error。
+- **被拒的减仓单**：同一条腿相隔 200 毫秒；因价格超限被拒的同价不重发、价格变了再发（只看这条腿最近一张只减仓单，跳过时原因记 `await_depth`）；限频被拒不卡价格，解除后同价可以再发。
+- **停止信号**：不开仓、减仓并结清，没有未结束的一轮、也没有未出结果的订单时才退出；没平完每 60 秒一次 Error（`stop_not_flat`）。报警之前重复的停止信号不算，报警之后再来才算人工接管（`MarkTakeover`、`taken_over` 事件，级别 warn），留下这一轮直接退出。
+- 测试（`exec/exceptions_test.go`；九个关键机制逐一撤掉过，对应测试都会失败）：`TestStopWithAnUnknownEntryOrder`（停止时先读到零持仓、那张结果未知的开仓单随后成交：继续减仓、结清后才退出，全程不开仓，那张单只交给交易所一次）、`TestUnknownOrderNeverArrived`、`TestUnknownOrderPartlyFilled`、`TestRefusedReducingOrders`、`TestStopAlarmAndTakeover`、`TestNoNewEntriesKeepsExits`、`TestPositionMismatchStopsAllOrders`、`TestAccountSettings`（V17）。
+
 ### 5.4a 审计第四次意见之后的修改（2026-11-25）
 
 审计在第 2–4 步的代码上复现了六个问题，另提了两处口径；都已修并有回归测试（审计的数字原样用作断言）。上文与这里不同的地方以这里和代码为准。
@@ -1788,7 +1798,7 @@ func (s *Store) LoadState(ctx context.Context, sessionID string) (State, error) 
 | 5.3（已实现，2026-11-25，用户第 53、56 条；WSS 下单是默认通道，已用真实仓位验证） | 延迟相关的改动与 WSS 下单 | L1 每条腿 3 条公共行情连接；L2 下单连接保温；L3 私有连接按 ping 选；L4 订单计时落库、状态行带各连接的延迟 | L1：三条连接里一条晚 40 ms、一条断线时，盘口取最先到的帧、不失效（假 `Venue` 多路投递）；L2：空闲 120 秒后的请求不新建连接（httptest 数连接数）；L3：慢连接被重拨；L4：六个时刻都有值 |
 | 6.1（已实现，2026-11-25，经审查修订；见 5.4 末尾“第 6.1 步实现时定下的”） | exec 主流程 | `manager.go`、`step.go`、`bars.go`、`orders.go` 的发单与结清：开仓、建成、再开仓、按线平仓、收盘前强制平仓 | 假时钟 + 假 `Venue` 的整段剧本：V3 的执行部分（冲突时不开仓不平仓、强制平仓不受影响）、V4（原因顺序）、V6（新深度）、V10、V11、V12（换锚不停开仓、配比不变）、V13 |
 | 6.2（已实现，2026-11-25；见 5.4 末尾“第 6.2 步实现时定下的”） | exec 成交不齐 | `gapInput`、补齐 / 回吐的发单、等新帧、`void`、零头 | V9 全部；V7 的“补齐不超过额度”；**两条腿都已有最终状态、第二条腿的通知被扣住时，额外的订单为零；放行后持仓和金额只记一次**；订单在第 0 秒发出并成交、订单的最终状态在第 4 秒才到、另一条腿第 6 秒才恢复时不发补齐单；附录 A 例三、例四走完整流程 |
-| 6.3 | exec 例外与停止 | 结果未知的 30 秒和三样证据；持仓不符；停止信号、60 秒报警、人工接管 | **停止时先读到零持仓、随后那张结果未知的开仓单成交：程序继续减仓、结清后才退出，全程不开新仓**；同一盘口下两种拒单：价格超限的同价不重发、价格变了才发；临时限频解除后同价可以再发；V14 其余、V16（末句“平仓单已成交、本地还没记下就重启”在 6.4）、V17 |
+| 6.3（已实现，2026-11-25；见 5.4 末尾“第 6.3 步实现时定下的”） | exec 例外与停止 | 结果未知的 30 秒和三样证据；持仓不符；停止信号、60 秒报警、人工接管 | **停止时先读到零持仓、随后那张结果未知的开仓单成交：程序继续减仓、结清后才退出，全程不开新仓**；同一盘口下两种拒单：价格超限的同价不重发、价格变了才发；临时限频解除后同价可以再发；V14 其余、V16（末句“平仓单已成交、本地还没记下就重启”在 6.4）、V17 |
 | 6.4 | exec 恢复 | `main` 的读回顺序、`recover.go`；纸面持仓回填 | **旧进程带仓 → 恢复时读取失败 → 收到停止 → 读取恢复 → 减仓并核对后才退出**；V15、V16 末句；“第二条腿的通知被扣住”在重启时再跑一次：发单前后各一个崩溃点；按 `ClientOrderID` 认回本地没记下的单；补分钟优先用自己的；接管后重启接回仓位 |
 | 6.5 | 纸面联调 | 正式库上建角色和 schema（`install.sh` 的新段；用户第 60 条已授权：“两个都同意，不用等我，直接进行测试和调试”）；对真实行情跑纸面：先 1 小时，再跨一个真实收盘 | 1 小时内状态行、`signal_sample`、`minute_bar` 连续；跨收盘那次收盘前确实持有仓位并在收盘前结清（PRD 第 17 节末段）；从 `cex_order` 重算的每轮合计与 `cycle` 一致（PRD 14.3） |
 | 7 | Live Monitor 看板 | `dashboard/grafana/live_monitor_board.py`、`boardkit`（数据源改为传入、`BOARDS` 加一项）、`gen_dashboard.py`、数据源的 provisioning；`dashboard/SPEC.md` 第 7 节、`dashboard/README.md` | V19：`test_boards.py` 的结构检查；私有 Grafana 上截图几轮审阅；页面数字与表逐项对照。发布另行授权 |
