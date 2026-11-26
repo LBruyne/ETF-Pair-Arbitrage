@@ -112,7 +112,7 @@ tail -f dashboard/run/booktape.log                  # one status line per connec
 .venv/bin/python -I dashboard/audit/booktape.py --from 2026-11-21T00:00+08:00 --to 2026-11-21T01:00+08:00 --rest experiments/booktape_audit_20261121/rest
 ```
 
-- **先看哪里**：看板 Data Coverage 的 Book Age s（60 秒起黄、300 秒起红）。日志里 `disconnected` 是 Warn，1 秒后自动重连；断线那几秒每秒行没有数据或那几列为空（不前填），原始文件的 `events.jsonl` 记着断开和重连的毫秒。
+- **先看哪里**：看板 Data Coverage 的 Book Age s（60 秒起黄、300 秒起红）。日志里 `disconnected` 是 Warn（带 feed 和连接号），1 秒后自动重连。Bitget 的盘口 feed（`bitget-<组合>-books`）有 3 条连接，断一条不丢数据（状态行 `connections_up` 少一），3 条都断了那几秒每秒行才没有数据或那几列为空（不前填）；成交 feed 和 Binance 是一条连接，断线即丢那几秒。原始文件的 `events.jsonl` 记着 feed 的断开和重连（`disconnected` / `connected`），每条连接的另记 `link_disconnected` / `link_connected`。盘口 feed 的状态行另有 `copies_dropped`（丢弃的副本，正常约是存下的帧数的两倍）和 `first_by_connection`（各连接最先送到的帧数）。
 - **`audit/booktape.py`**：每个合约每个应有的流都有记录；盘口帧档数不超、买卖价有序、不交叉，Bitget 每帧是快照；Bitget 成交号不重复（`--rest DIR` 另与公开 REST 历史逐笔对照，答复存在 DIR，每秒最多 2 个请求）；Binance aggTrade 的 `a` 在一条连接里连续、markPrice 每秒一次。断线列为 gaps，不算失败。Binance 偶尔少推（SPEC 附录 A“已知的局限”）会让 aggTrade 或 depth 一项在那个小时不通过，对照官方日归档即可确认是上游少推。
 - **补每秒行**（正式库上的整套步骤和期望的数在 `experiments/board32_20261122/data/RUNBOOK.md`；先要有 3.2 的 schema，`load` 要用它的刷新函数）：
   - 从录制重建 `.venv/bin/python -I dashboard/backfill/perp_second_recordings.py --root experiments/book_tape --from <首日> --to <末日的下一天> --rows <目录> --source live`，再 `set -a && . dashboard/.env && set +a && .venv/bin/python -I dashboard/backfill/perp_second.py load --dsn-env ETFPAIR_BOARD_DSN --rows <目录>`。
@@ -124,14 +124,15 @@ tail -f dashboard/run/booktape.log                  # one status line per connec
   - 还要补的归档日：Bitget 11-21 已在 3.2 部署的 `load` 一步载入（2026-11-23 11:42；其中 130 秒录到的每秒最后一笔早于归档，按只补空列的规则保留录到的值，SPEC 第 9 节末）；Binance UTC 11-22 的 41 秒已于 11-23 16:17 补上（插入 9 行、补 32 格，SPEC 第 9 节末）；Bitget 11-22 的 406 秒已于 11-24 14:07 补上（插入 19 行、补 387 格），到 11-24 13:07 为止缺成交价的秒数为 0；之后每天录制服务重连留下的几秒照此补；命令在 RUNBOOK 第 7 节，2026-11-23 起用 `experiments/board33_20261123/maint/archives.sh`（`fetch`、`predict`、`load`、`check`）。
   - 改回补脚本之后跑 `.venv/bin/python -I -m unittest discover -s dashboard/backfill -p 'test_*.py'`（33 项；写库的几项要 `PERP_SECOND_TEST_DSN`，只指向临时库，其中 `test_refresh_with_the_real_summary` 用真的 schema）。
 - **改程序**：`go vet ./dashboard/... && go test -race ./dashboard/internal/booktape/`，`dashboard/deploy/install.sh` 编译并在程序变化时重启它（停顿约 1 秒，那一秒没有行）；表结构在 `internal/booktape/schema.sql`，录制服务启动后第一次写库之前应用。改推送、档数或每秒行的规则时同时更新 SPEC 附录 A 和本节。
-- **SOXS 另录 `books5`（2026-11-25 实现，未部署，SPEC 第 10 节）**：细刻度的 Bitget 合约在 `books50` 之后另订 `books5`，只进文件（`experiments/book_tape/bitget/<日>/SOXSUSDT.books5.*.jsonl.gz`），每秒行和看板不变。部署要用户同意，先把 `research/booktape.py` 的 `BOOK_TOPICS['bitget']` 改成 `('books50', 'books5')`（SPEC 附录 A“读取”），再只换录制服务（不用 `install.sh`，它还会重编、可能重启采集器）：
+- **SOXS 另录 `books5`**（2026-11-25 18:00:07 部署，`afbb0c17…`，SPEC 第 10 节）：细刻度的 Bitget 合约在 `books50` 之后另订 `books5`，只进文件（`experiments/book_tape/bitget/<日>/SOXSUSDT.books5.*.jsonl.gz`），每秒行和看板不变。
+- **盘口 3 条连接**（2026-11-26 13:17:55 部署，`bed60b89…`，用户第 72 条，SPEC 附录 A 和第 10 节）。部署只换录制服务（不用 `install.sh`，它还会重编、可能重启采集器）；systemd 先停后启，新旧两个进程不会同时写：
   ```bash
   cd /home/ubuntu/code/etf-pair-arbitrage
-  go build -buildvcs=false -o dashboard/run/booktape.new ./dashboard/cmd/booktape && sha256sum dashboard/run/booktape.new  # afbb0c17… unless the code changed again
-  cp -p dashboard/run/booktape dashboard/run/booktape.v33   # the running 6ea03ca4…, kept for a rollback
+  go build -buildvcs=false -o dashboard/run/booktape.new ./dashboard/cmd/booktape && sha256sum dashboard/run/booktape.new  # bed60b89… unless the code changed again
+  cp -p dashboard/run/booktape dashboard/run/booktape.v34   # the previous afbb0c17…, kept for a rollback
   mv dashboard/run/booktape.new dashboard/run/booktape && sudo systemctl restart etf-pair-booktape
   ```
-  部署后看：日志里 `booktape: connected feed=bitget-soxl-soxs streams=16`（之前 15），当天目录出现 `SOXSUSDT.books5.*.jsonl.gz`，5 分钟一行的状态 `silent_streams` 为空，`audit/booktape.py` 通过。回退：`mv dashboard/run/booktape.v33 dashboard/run/booktape && sudo systemctl restart etf-pair-booktape`。
+  部署后看：日志 `booktape: recording feeds=bitget-soxl-soxs-books,bitget-soxl-soxs,bitget-tqqq-sqqq-books,bitget-tqqq-sqqq,binance-public,binance-market`，每个 `-books` feed 有 `connections_up=3`，5 分钟一行的状态 `silent_streams` 为空，`audit/booktape.py` 通过。回退：`mv dashboard/run/booktape.v34 dashboard/run/booktape && sudo systemctl restart etf-pair-booktape`（回退后又是每个组合一条连接；回放按 `connected` 帧里的订阅判断哪条腿断了，两种录制都能读）。
 - **磁盘**：原始文件美股交易日约 3.0 GiB、周末约 1.1 GB（另录 SOXS `books5` 之后每天约多 0.14 GB，SPEC 附录 A“规模”）；`perp_second` 在 2026-11-21 20:06 设表级自动清理之后稳态约每天 0.6 GB（[../DATA.md](../DATA.md) 第 4 节），没有清理规则；剩余空间和全部数据的清单见 [../DATA.md](../DATA.md)。
 
 ## 分红、拆股和临时停市（运维）
