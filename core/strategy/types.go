@@ -46,7 +46,12 @@ type Config struct {
 
 	ForcedSlipBps         float64       `yaml:"forced_slip_bps"`          // forced exits and trims price this far past the best price, of each leg's price
 	ForcedExitBeforeClose time.Duration `yaml:"forced_exit_before_close"` // positions are closed this long before the regular close
-	RewarmOnAnchorChange  bool          `yaml:"rewarm_on_anchor_change"`  // true: entries wait for a new warm-up after the anchor changes from bell to NAV
+	// RewarmOnAnchorChange true: when the NAV replaces the bell anchor (as
+	// soon as both legs' NAV are read, PRD 11.3) entries wait for a new
+	// warm-up. A later NAV-to-NAV change within cex.nav_watch is a hot switch
+	// when the spread jump at the current mids is below cex.nav_hot_switch_d,
+	// and a warm-up again otherwise.
+	RewarmOnAnchorChange bool `yaml:"rewarm_on_anchor_change"`
 }
 
 // DefaultConfig holds the values a key left out of config.yaml keeps. The
@@ -261,6 +266,22 @@ const (
 	ReasonDepth      Reason = "depth"       // a leg's depth is not usable or in conflict: no exit at the line
 	ReasonNoPrice    Reason = "no_price"    // a leg to reduce has no best price: no reducing order can be priced
 	ReasonAwaitClose Reason = "await_close" // nothing is left to trade; the cycle waits for the venue's positions to confirm
+
+	// Thin leg first: a batch in pairing (SPEC 12.4) and a line exit batch
+	// (SPEC 12.6, 12.7). ReasonStopping and ReasonTooSmall above serve too.
+	ReasonForced     Reason = "forced"      // the forced exit before the close takes the round over
+	ReasonWindow     Reason = "window"      // pair_window has passed since the thin leg's first fill: the unpaired thin leg is unwound
+	ReasonStopD      Reason = "stop_d"      // the ideally paired spread is pair_stop_d worse than at the decision: the unpaired thin leg is unwound
+	ReasonProfit     Reason = "profit"      // the unpaired thin leg is closed on its own at or above break-even
+	ReasonPairBound  Reason = "pair_bound"  // waits: no level of the thick leg is within the batch's bound p*
+	ReasonValuation  Reason = "valuation"   // the ledger could not value the close (CloseNet failed)
+	ReasonNoProfit   Reason = "no_profit"   // exit1: closing the whole round now would not make a profit, so no half target is set
+	ReasonPrecheck   Reason = "precheck"    // exit1: this batch's pre-check does not reach the margin
+	ReasonHalfDone   Reason = "half_done"   // exit1: the half target is closed; the rest waits for exit2
+	ReasonD1Loss     Reason = "d1_loss"     // exit2 or the one line: the pre-check failed and the batch exits all the same (D1)
+	ReasonExitWindow Reason = "exit_window" // exit_pair_window has passed since the batch's first thin closing fill (D2)
+	ReasonExitStopD  Reason = "exit_stop_d" // the ideal closing spread is pair_stop_d worse than at the exit decision (D2)
+	ReasonExitBound  Reason = "exit_bound"  // waits: no level of the thick leg is within its break-even bound
 )
 
 // --- mean and sigma ---
@@ -305,7 +326,9 @@ type EntryInput struct {
 }
 
 // LastEntry is the last entry batch that was built, kept across cycles for
-// the spacing rule.
+// the spacing rule. With a thin leg first it is the last batch whose thin
+// order was sent, however that batch ended, entry_failed included (PRD 5.8,
+// SPEC 12.3); a top-up inside a batch does not change it.
 type LastEntry struct {
 	At        time.Time // when the batch's orders were sent
 	E         float64   // the executable deviation x at that decision, in spread units
@@ -336,15 +359,63 @@ type ExitInput struct {
 	Anchors     cex.Anchors // the current anchors: the exit line
 	PairAnchors cex.Anchors // the cycle's pairing anchors: the sizes
 	Stats       Stats       // of the current run; the last ready one while the mean warms up again
+
+	// The two-stage exit and the thin leg first (SPEC 12.6, 12.7). Without
+	// exit2 and without a thin leg none of them is read.
+	Pairing   Pairing     // the thin-leg-first keys; the zero value sends both legs together
+	Stage     ExitStage   // the half target of exit1 as stored; the zero value is none set
+	BuiltLots int         // how many batches of the cycle are built now: a stage set at another count is void
+	Value     CloseValuer // the open cycle's CloseNet; read with exit2 set or a thin leg first
 }
 
 // ExitPlan is one pair of reduce-only exit orders, one per leg. A leg whose
 // quantity is zero gets no order: it holds nothing, or less than the venue
-// takes.
+// takes. With a thin leg first the thin leg's order goes alone and the
+// thick leg follows its fills (ExitPairStep).
 type ExitPlan struct {
 	Side         cex.Side           // of both orders
 	Price, Qty   [2]decimal.Decimal // per leg: the limit (the price of the leg's pricing level) and the size
 	X, Mu, Sigma float64            // the executable deviation, the mean and sigma, in spread units under the current anchors
+
+	Line ExitLine // the line reached
+	D    float64  // the spread at the decision, X + Mu: the reference of the exit's spread stop
+	// ExpectedNet is the batch's pre-check (SPEC 12.7 step 0): the round's
+	// expected net in USDT were this batch closed at these limits. It is
+	// computed at exit1 and with a thin leg first; zero otherwise.
+	ExpectedNet decimal.Decimal
+	// D1 says the pre-check failed and the batch exits all the same (exit2
+	// or the one line, thin leg first): the thick leg is then limited by
+	// Protect, its pricing-level price at this decision, and not by its
+	// break-even bound.
+	D1      bool
+	Protect decimal.Decimal
+}
+
+// ExitLine names the exit line a decision reached (SPEC 12.6).
+type ExitLine string
+
+const (
+	ExitLineOne ExitLine = "exit"  // the one line, entry_out, without exit2
+	ExitLine1   ExitLine = "exit1" // entry_out with exit2 set: the half close
+	ExitLine2   ExitLine = "exit2" // all that is left closes
+)
+
+// ExitStage is the half target of exit1 (SPEC 12.6), as exec stores it in
+// trade.exit_stage.
+type ExitStage struct {
+	Set       bool
+	Target    [2]decimal.Decimal // H per leg: half the thin leg's holding, the other leg by the pairing anchors
+	Closed    [2]decimal.Decimal // what the line exit batches closed towards H so far
+	BuiltLots int                // ExitInput.BuiltLots when H was set: a batch built after it voids H
+}
+
+// ExitDecision is the outcome of one exit decision at the line. Stage is a
+// half target set at this decision, which exec stores even when Plan is nil
+// (the batch's pre-check may fail in the same frame).
+type ExitDecision struct {
+	Plan   *ExitPlan
+	Reason Reason
+	Stage  *ExitStage
 }
 
 // LegOrder is one reduce-only order of a forced exit.
@@ -403,4 +474,183 @@ type GapAction struct {
 	// The two expected losses in USDT, for the same share of the gap. They
 	// are set only when both orders could be sent and were compared.
 	LossComplete, LossTrim decimal.Decimal
+}
+
+// --- thin leg first (SPEC 12) ---
+
+// CloseLeg is one leg of a close a CloseValuer values: Qty at Price, in
+// USDT a share. A zero Qty closes nothing on that leg.
+type CloseLeg struct {
+	Qty, Price decimal.Decimal
+}
+
+// CloseValuer values a close not sent yet as the ledger would book it now
+// and returns the net in USDT (SPEC 12.2 CloseNet): inventory's CloseNet with
+// the batch's lot bound by the caller. With cex.PurposeExit it is the round's
+// expected net (first in, first out over the cycle, what the cycle has
+// realised included); with cex.PurposeTrim the increment of this close of
+// the lot alone. feeRate is the taker fee as a fraction of the traded value.
+// It reads the ledger and changes nothing; fills already booked count once.
+type CloseValuer func(purpose cex.OrderPurpose, close [2]CloseLeg, feeRate decimal.Decimal) (decimal.Decimal, error)
+
+// Pairing is what the thin-leg-first decisions read of the exec section
+// (SPEC 12.8). The zero value sends both legs together, as before.
+type Pairing struct {
+	ThinFirst  bool            // exec.thin_leg is set
+	Thin       cex.Leg         // the leg taken first: its order goes alone and the other leg follows its fills
+	Window     time.Duration   // pair_window: how long the thick leg of an entry batch may be chased
+	StopD      float64         // pair_stop_d: the ideally paired spread this many spread units worse than at the decision ends the chase
+	TopupMax   decimal.Decimal // thin_topup_max: the thin leg's fills of one batch stay within this multiple of its planned quantity
+	ExitWindow time.Duration   // exit_pair_window: how long the thick leg of an exit batch may wait for its break-even bound
+}
+
+// Fills is what one batch's two legs have filled so far: an entry batch's
+// opening fills, or an exit batch's closing fills.
+type Fills struct {
+	ThinQty, ThinVWAP   decimal.Decimal // S and v_S
+	ThickQty, ThickVWAP decimal.Decimal // L and v_L
+}
+
+// --- thin leg first: entry (SPEC 12.4) ---
+
+// PairBatch is the state of one entry batch in pairing, as exec keeps it
+// from the batch's orders. It starts at NewPairBatch.
+type PairBatch struct {
+	Dir       Direction
+	DecisionD float64         // D_dec: the spread at both legs' pricing levels at the decision, under the anchors of that moment
+	XRef      float64         // the top-up reference: x_dec, then the x of the last top-up that filled
+	FeeD      float64         // C: the round-trip fee at the decision's limits, in spread units (EntryPlan.FeeD)
+	PlanThin  decimal.Decimal // qS: the planned thin quantity
+	Fills                     // the opening fills of both legs so far: S, v_S, L, v_L
+	// ThinClosed is the thin quantity the batch closed again: profit closes
+	// and unwinds of the unpaired part.
+	ThinClosed decimal.Decimal
+	FirstFill  time.Time // local arrival of the thin leg's first fill report: the pair window runs from here
+	Unwind     Reason    // set by exec when PairStep starts an unwind (window, stop_d, too_small): from then on only the unpaired part is reduced
+}
+
+// PairInput is every fact one step of a batch in pairing reads: one
+// snapshot of both books and of the ledger per round.
+type PairInput struct {
+	Batch       PairBatch
+	Pairing     Pairing
+	Books       [2]*cex.Book
+	DepthOK     [2]bool // per leg: the depth is usable and has no conflict
+	Rules       [2]cex.MarketRule
+	F           float64
+	Anchors     cex.Anchors // the current anchors: the spread
+	PairAnchors cex.Anchors // the cycle's pairing anchors: the thick target
+	Stats       Stats
+	// QuotaLeft is the quota left without the unpaired thin leg (inventory
+	// Quota with WithThinLeg), in USDT.
+	QuotaLeft decimal.Decimal
+	Value     CloseValuer // CloseNet bound to this batch's lot; a profit close values cex.PurposeTrim
+
+	OrderPending bool // an order of the batch has no result yet, or its outcome is unknown
+	Stopping     bool // a stop signal: the round is taken over
+	Forced       bool // inside the forced exit before the close: the round is taken over
+	NoNewEntries bool // the signal that stops new entries: no top-up, the pairing goes on
+	Now          time.Time
+}
+
+// PairKind is what one step of a batch in pairing does.
+type PairKind string
+
+const (
+	PairWait      PairKind = "wait"       // nothing to send this round
+	PairHandOver  PairKind = "hand_over"  // the stop or the forced exit flattens the whole round
+	PairDone      PairKind = "done"       // the batch has ended: End is its end state
+	PairSendThick PairKind = "send_thick" // an IOC on the thick leg that pairs the thin fills
+	PairSendThin  PairKind = "send_thin"  // a top-up IOC on the thin leg
+	PairCloseThin PairKind = "close_thin" // a reduce-only IOC closing part of the unpaired thin leg at or above break-even
+	PairUnwind    PairKind = "unwind"     // a reduce-only IOC unwinding the unpaired thin leg at PRD 10.4's price
+)
+
+// PairEnd is the end state of a batch (SPEC 12.4); the values are
+// inventory's LotEnd strings.
+type PairEnd string
+
+const (
+	PairEndBuilt         PairEnd = "built"          // the unpaired part was paired, or only dust of it is left
+	PairEndBuiltPartial  PairEnd = "built_partial"  // part was paired; the rest was unwound or closed at a profit
+	PairEndUnwoundProfit PairEnd = "unwound_profit" // nothing was paired; the thin leg was closed at a profit
+	PairEndUnwoundStop   PairEnd = "unwound_stop"   // nothing was paired; the thin leg was unwound
+)
+
+// PairAction is one step's decision. Leg, Side, Price and Qty describe the
+// order to send and are zero without one; the rest is the decision's detail
+// for the record.
+type PairAction struct {
+	Kind       PairKind
+	Why        Reason // the reason of an unwind, a hand-over, a profit close or a wait
+	Leg        cex.Leg
+	Side       cex.Side
+	Price, Qty decimal.Decimal
+	QuotaPrice decimal.Decimal // a thick order or a top-up: the price its notional counts against the quota at
+	End        PairEnd         // PairDone only
+
+	X, XRef   float64         // x at both legs' pricing levels now, and the top-up reference; NaN when x has no number
+	DIdeal    float64         // the ideally paired spread; NaN when the thick leg has no pricing level
+	VWAPCap   decimal.Decimal // P*: the bound of the batch's thick VWAP; zero without a mean
+	PStar     decimal.Decimal // the bound of one thick order for what is left to pair (PairBound); zero without a mean
+	BreakEven decimal.Decimal // b*: the break-even price of a profit close, rounded to the tick
+	Err       error           // the valuation's error with ReasonValuation
+}
+
+// --- thin leg first: exit (SPEC 12.7) ---
+
+// ExitBatch is the state of one line exit batch with a thin leg first, as
+// exec keeps it from the batch's orders. It starts at NewExitBatch.
+type ExitBatch struct {
+	Dir         Direction // of the cycle; the orders close it
+	Line        ExitLine
+	DecisionD   float64         // the spread at the exit decision: the reference of the spread stop
+	ExpectedNet decimal.Decimal // the pre-check at the decision, for the record
+	D1          bool            // the pre-check failed and the batch exits all the same
+	Protect     decimal.Decimal // with D1: the thick leg's pricing-level price at the decision, the limit of every thick order of the batch
+	Fills                       // the batch's closing fills: thin closed and its VWAP, thick closed and its VWAP
+	FirstFill   time.Time       // local arrival of the batch's first thin closing fill: exit_pair_window runs from here and is not reset
+	HardEnd     Reason          // set by exec when ExitPairStep starts the hard close (exit_window, exit_stop_d)
+}
+
+// ExitPairInput is every fact one step of an exit batch's thick leg reads.
+type ExitPairInput struct {
+	Batch       ExitBatch
+	Pairing     Pairing
+	Hold        [2]decimal.Decimal // the cycle's quantity left per leg
+	Books       [2]*cex.Book
+	DepthOK     [2]bool
+	Rules       [2]cex.MarketRule
+	F           float64
+	Anchors     cex.Anchors
+	PairAnchors cex.Anchors
+	Value       CloseValuer // the open cycle's CloseNet, read with cex.PurposeExit
+
+	OrderPending bool
+	Stopping     bool
+	Forced       bool
+	Now          time.Time
+}
+
+// ExitPairKind is what one step of an exit batch's thick leg does.
+type ExitPairKind string
+
+const (
+	ExitPairWait      ExitPairKind = "wait"       // nothing to send this round
+	ExitPairHandOver  ExitPairKind = "hand_over"  // the stop or the forced exit flattens the whole round
+	ExitPairDone      ExitPairKind = "done"       // the thick leg matches the thin leg's closing fills, or only dust is left
+	ExitPairSendThick ExitPairKind = "send_thick" // a reduce-only IOC on the thick leg within its bound
+	ExitPairHardClose ExitPairKind = "hard_close" // a reduce-only IOC at PRD 10.4's price, whatever the bound (D2)
+)
+
+// ExitPairAction is one step's decision about an exit batch's thick leg.
+type ExitPairAction struct {
+	Kind       ExitPairKind
+	Why        Reason
+	Leg        cex.Leg
+	Side       cex.Side
+	Price, Qty decimal.Decimal
+	Bound      decimal.Decimal // the limit the thick leg is held to: its break-even bound or, with D1, Protect
+	DIdeal     float64         // the ideal closing spread; NaN when the thick leg has no pricing level
+	Err        error           // the valuation's error with ReasonValuation
 }
