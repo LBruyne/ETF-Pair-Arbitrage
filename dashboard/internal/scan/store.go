@@ -122,22 +122,12 @@ func (s *store) writeCalendar(ctx context.Context, sessions []session, phases []
 	return s.pool.SendBatch(ctx, batch).Close()
 }
 
-// bellDue is a session without a valid bell anchor of a ticker; HasFX says
-// whether USD per USDT of the minute before its close is there.
-type bellDue struct {
-	session
-	HasFX bool
-}
-
 // bellsDue lists the sessions that closed at least bellDelay before nowMs
 // and have no valid bell anchor of the ticker yet, the newest first: no row,
 // or a row read at another close (its kline is not the minute before this
-// close: the close moved after it was read). USD per USDT is the one the
-// board's functions use: the minute's own or the newest of the five minutes
-// before it.
-func (s *store) bellsDue(ctx context.Context, ticker string, nowMs int64) ([]bellDue, error) {
-	rows, err := s.pool.Query(ctx, `SELECT to_char(ss.session_date, 'YYYY-MM-DD'), ss.close_ms,
-		  EXISTS (SELECT 1 FROM etfpair.fx_minute f WHERE f.pair = 'USDT-USD' AND f.minute_ms <= ss.close_ms - 60000 AND f.minute_ms >= ss.close_ms - 360000)
+// close: the close moved after it was read).
+func (s *store) bellsDue(ctx context.Context, ticker string, nowMs int64) ([]session, error) {
+	rows, err := s.pool.Query(ctx, `SELECT to_char(ss.session_date, 'YYYY-MM-DD'), ss.close_ms
 		FROM etfpair.etf_session ss
 		WHERE ss.close_ms + $3 <= $2
 		  AND NOT EXISTS (SELECT 1 FROM etfpair.etf_bell b WHERE b.ticker = $1 AND b.session_date = ss.session_date AND b.kline_ms = ss.close_ms - 60000)
@@ -145,28 +135,26 @@ func (s *store) bellsDue(ctx context.Context, ticker string, nowMs int64) ([]bel
 	if err != nil {
 		return nil, err
 	}
-	return pgx.CollectRows(rows, func(row pgx.CollectableRow) (bellDue, error) {
-		var b bellDue
-		err := row.Scan(&b.Date, &b.CloseMs, &b.HasFX)
+	return pgx.CollectRows(rows, func(row pgx.CollectableRow) (session, error) {
+		var b session
+		err := row.Scan(&b.Date, &b.CloseMs)
 		return b, err
 	})
 }
 
 // insertBell stores a session's bell anchor of a ticker: the close of the
-// venue's index kline k times USD per USDT of its minute (as bellsDue finds
-// it), known at knownMs; it replaces a row read at another close (the close
-// moved after it was read), and the replacement is known at nowMs, when it
-// is written. It returns the anchor, or "" when the row was there.
-func (s *store) insertBell(ctx context.Context, ticker, sessionDate, venue string, k Candle, knownMs, nowMs int64) (string, error) {
+// venue's index kline k times F, the close of Coinbase's candle of the same
+// minute, known at knownMs; it replaces a row read at another close (the
+// close moved after it was read), and the replacement is known at nowMs,
+// when it is written. It returns the anchor, or "" when the row was there.
+func (s *store) insertBell(ctx context.Context, ticker, sessionDate, venue string, k Candle, fx string, knownMs, nowMs int64) (string, error) {
 	var price string
 	err := s.pool.QueryRow(ctx, `INSERT INTO etfpair.etf_bell AS b (ticker, session_date, price, index_usdt, venue, fx, kline_ms, known_ms)
-		SELECT $1, $2::date, trim_scale(f.price * $3::numeric), $3::numeric, $6, trim_scale(f.price), $4, $5
-		FROM (SELECT price FROM etfpair.fx_minute WHERE pair = 'USDT-USD' AND minute_ms <= $4 AND minute_ms >= $4 - 300000
-		      ORDER BY minute_ms DESC LIMIT 1) f
+		VALUES ($1, $2::date, trim_scale($8::numeric * $3::numeric), $3::numeric, $6, trim_scale($8::numeric), $4, $5)
 		ON CONFLICT (ticker, session_date) DO UPDATE SET price = EXCLUDED.price, index_usdt = EXCLUDED.index_usdt, venue = EXCLUDED.venue,
 		  fx = EXCLUDED.fx, kline_ms = EXCLUDED.kline_ms, known_ms = $7
 		WHERE b.kline_ms <> EXCLUDED.kline_ms
-		RETURNING price::text`, ticker, sessionDate, k.Close, k.MinuteMs, knownMs, venue, nowMs).Scan(&price)
+		RETURNING price::text`, ticker, sessionDate, k.Close, k.MinuteMs, knownMs, venue, nowMs, fx).Scan(&price)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return "", nil
 	}

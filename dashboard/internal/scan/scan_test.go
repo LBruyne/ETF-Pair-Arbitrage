@@ -535,6 +535,26 @@ func (f *fakeIndex) IndexKline(_ context.Context, symbol string, minuteMs int64)
 	return &Candle{MinuteMs: opens[0], Close: f.klines[symbol][opens[0]]}, nil
 }
 
+// fakeFX serves Coinbase's USDT-USD one-minute candles from a table and records the first minute of each request.
+type fakeFX struct {
+	candles map[int64]string // open time -> close
+	asked   []int64
+}
+
+func (f *fakeFX) Pair() string                         { return "USDT-USD" }
+func (f *fakeFX) Quote(context.Context) (Quote, error) { return Quote{}, fmt.Errorf("no quotes here") }
+func (f *fakeFX) Candles(_ context.Context, startMs, endMs int64) ([]Candle, error) {
+	f.asked = append(f.asked, startMs)
+	var out []Candle
+	for open, price := range f.candles {
+		if open >= startMs && open < endMs {
+			out = append(out, Candle{MinuteMs: open, Close: price})
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].MinuteMs < out[j].MinuteMs })
+	return out, nil
+}
+
 // fakeNAVs answers Latest with the figures it holds.
 type fakeNAVs struct{ latest []NAV }
 
@@ -597,7 +617,9 @@ func scratchStore(t *testing.T) *store {
 }
 
 // The anchors on a scratch database: the bell anchors (the minute before
-// each close, 16:00 and 13:00, USD per USDT of that minute, a missing
+// each close, 16:00 and 13:00, F the close of Coinbase's one-minute candle of
+// that minute (owner item 69), never the ticker's mid of fx_minute nor another
+// minute's candle; a missing
 // kline, a contract Binance lists later: Bitget's index before it, none
 // without a Bitget contract; the time a row became known), then the
 // precedence of combo_sessions (both legs' confirmed NAVs over both bells,
@@ -641,7 +663,8 @@ func TestAnchorsOnDatabase(t *testing.T) {
 		t.Fatal(err)
 	}
 	idx, bg := &fakeIndex{klines: map[string]map[int64]string{}}, &fakeIndex{klines: map[string]map[int64]string{}}
-	m := &Manager{cfg: cfg, store: st, index: map[string]IndexSource{"binance": idx, "bitget": bg}, log: slog.New(slog.NewTextHandler(&logged, nil)),
+	fxs := &fakeFX{candles: map[int64]string{}}
+	m := &Manager{cfg: cfg, store: st, index: map[string]IndexSource{"binance": idx, "bitget": bg}, fx: fxs, log: slog.New(slog.NewTextHandler(&logged, nil)),
 		failing: map[string]bool{},
 		navs:    map[string]NAVSource{}, navRead: map[string]time.Time{}, indexFrom: map[string]int64{}, told: map[string]bool{}}
 	// The collector started between the fourth session's close and the fifth's.
@@ -655,15 +678,22 @@ func TestAnchorsOnDatabase(t *testing.T) {
 		exec(`INSERT INTO etfpair.etf_session (session_date, close_ms) VALUES ($1::date, $2)`, date, closeAt[date])
 	}
 	bell := func(date string) int64 { return closeAt[date] - minuteMs } // the minute before the close
+	// F: Coinbase's candle close of the bell minute. The board's own USD/USDT of that minute (fx_minute, the ticker's mid)
+	// is another figure and is not used.
+	candle := func(minute int64, price string) { fxs.candles[minute] = price }
 	fx := func(minute int64, price string) {
 		exec(`INSERT INTO etfpair.fx_minute (pair, minute_ms, price, source, sampled_ms) VALUES ('USDT-USD', $1, $2::numeric, 'candle', 0)`, minute, price)
 	}
-	fx(bell("2001-01-02")-minuteMs, "0.9980") // the minute before is not the bell's
-	fx(bell("2001-01-02"), "0.9990")
-	fx(bell("2001-01-03"), "1.0001")
-	fx(bell("2001-01-04"), "0.9995")
-	fx(bell("2001-01-05")-6*minuteMs, "0.9999") // too old: 01-05 has no USD per USDT and waits for it
-	fx(bell("2001-11-23")-3*minuteMs, "0.9985") // the newest of the five minutes before
+	for _, date := range []string{"2001-01-02", "2001-01-03", "2001-01-04", "2001-01-05", "2001-11-23"} {
+		fx(bell(date), "0.9")
+	}
+	candle(bell("2001-01-02")-minuteMs, "0.9980") // the minute before is not the bell's
+	candle(bell("2001-01-02"), "0.9990")
+	candle(bell("2001-01-03"), "1.0001")
+	candle(bell("2001-01-04"), "0.9995")
+	candle(bell("2001-01-05")-minuteMs, "0.9999") // only the minute before: 01-05 has no F, no other minute stands in, it waits
+	candle(bell("2001-11-23")-3*minuteMs, "0.9970")
+	candle(bell("2001-11-23"), "0.9985")
 	idx.klines["BULLUSDT"] = map[int64]string{}
 	idx.klines["BEARUSDT"] = map[int64]string{}
 	for i, date := range []string{"2001-01-02", "2001-01-03", "2001-01-04", "2001-01-05", "2001-11-23"} {
@@ -680,6 +710,10 @@ func TestAnchorsOnDatabase(t *testing.T) {
 	bg.klines["REFUSDT"] = map[int64]string{bell("2001-01-02"): "29.01", bell("2001-01-04"): "99"}
 
 	m.loadBells(ctx)
+	// One Coinbase request per close minute and pass, whatever the number of ETFs closing then.
+	asked := slices.Clone(fxs.asked)
+	slices.Sort(asked)
+	expect("Coinbase requests", []string{fmt.Sprint(asked)}, fmt.Sprint([]int64{bell("2001-01-02"), bell("2001-01-03"), bell("2001-01-04"), bell("2001-01-05"), bell("2001-11-23")}))
 	bells := `SELECT b.ticker || ' ' || b.session_date || ' ' || b.venue || ' ' || b.price || ' = ' || b.fx || ' x ' || b.index_usdt || ' kline close-' ||
 		(s.close_ms - b.kline_ms) / 1000 || 's known ' ||
 		CASE WHEN b.known_ms = s.close_ms + 120000 THEN 'close+2min' WHEN b.known_ms >= $1 THEN 'at store' ELSE b.known_ms::text END
@@ -719,9 +753,13 @@ func TestAnchorsOnDatabase(t *testing.T) {
 	if n := strings.Count(logged.String(), "sessions before Binance lists the contract have no bell anchor"); n != 1 || !strings.Contains(logged.String(), "sessions=2") {
 		t.Fatalf("sessions before the reference's Binance index logged %d times:\n%s", n, logged.String())
 	}
-	// 01-05 without USD per USDT before its close: logged once per ETF, not skipped silently.
-	if n := strings.Count(logged.String(), "no USD per USDT in the five minutes before the close"); n != 3 || !strings.Contains(logged.String(), "ticker=BULL session=2001-01-05") {
-		t.Fatalf("a session without USD per USDT logged %d times:\n%s", n, logged.String())
+	// 01-05 without Coinbase's candle of the bell minute: logged once per ETF, not skipped silently, asked again at each pass;
+	// once the candle is there, 01-05's bells are stored with it.
+	if n := strings.Count(logged.String(), "no Coinbase candle of the minute before the close"); n != 3 || !strings.Contains(logged.String(), "ticker=BULL session=2001-01-05") {
+		t.Fatalf("a session without F logged %d times:\n%s", n, logged.String())
+	}
+	if !slices.Contains(fxs.asked[len(asked):], bell("2001-01-05")) {
+		t.Fatalf("F of 01-05 not asked again: %v", fxs.asked[len(asked):])
 	}
 
 	// Bitget lists the reference: the sessions before Binance's first index kline take Bitget's index of

@@ -23,7 +23,7 @@ type Manager struct {
 	store   *store
 	perps   map[string]PerpSource
 	index   map[string]IndexSource // by venue: binance, bitget
-	fx      Coinbase
+	fx      FXSource               // Coinbase
 	log     *slog.Logger
 	started time.Time
 	failing map[string]bool // reads that failed last time, so a failure is logged once
@@ -63,7 +63,7 @@ func NewManager(ctx context.Context, cfg Config, dsn string, log *slog.Logger) (
 		}
 	}
 	return &Manager{cfg: cfg, cal: cal, store: st, log: log, failing: map[string]bool{},
-		perps: map[string]PerpSource{"binance": Binance{}, "bitget": Bitget{}}, index: map[string]IndexSource{"binance": Binance{}, "bitget": Bitget{}},
+		perps: map[string]PerpSource{"binance": Binance{}, "bitget": Bitget{}}, index: map[string]IndexSource{"binance": Binance{}, "bitget": Bitget{}}, fx: Coinbase{},
 		navs: navs, navRead: map[string]time.Time{}, indexFrom: map[string]int64{}, told: map[string]bool{}}, nil
 }
 
@@ -329,15 +329,18 @@ func (m *Manager) writeCalendar(ctx context.Context) {
 
 // loadBells stores the bell anchor of every ETF of the combos for every
 // session that has closed and lacks a valid one (none, or one read at a
-// close that has moved since): USD per USDT times the index price of the
-// ETF's perpetual at the close, the close of the index kline that opens one
-// minute before it. The index is Binance's; a session before the contract's
-// first Binance index kline takes Bitget's, and without a Bitget contract it
-// has none and is not asked for. The newest session goes first. A session
-// whose kline at the close is missing, or without USD per USDT in the five
-// minutes before the close, has no bell anchor (no other substitute): it is
+// close that has moved since): F times the index price of the ETF's
+// perpetual at the close, the close of the index kline that opens one minute
+// before it. F is the close of Coinbase's USDT-USD one-minute candle of that
+// same minute (owner item 69, as the trading program), read once a pass for
+// all the ETFs closing then. The index is Binance's; a session before the
+// contract's first Binance index kline takes Bitget's, and without a Bitget
+// contract it has none and is not asked for. The newest session goes first.
+// A session whose kline at the close or whose candle of that minute is
+// missing has no bell anchor (no other minute or source stands in): it is
 // logged once and asked again at the next tick.
 func (m *Manager) loadBells(ctx context.Context) {
+	fxOf := map[int64]string{} // F by bell minute, this pass ("" when Coinbase has no candle of it)
 	for ticker, symbols := range m.cfg.bellSymbols() {
 		due, err := m.store.bellsDue(ctx, ticker, time.Now().UnixMilli())
 		if err != nil {
@@ -370,13 +373,27 @@ func (m *Manager) loadBells(ctx context.Context) {
 			if ctx.Err() != nil {
 				return
 			}
-			if !s.HasFX {
+			kline, venue := s.CloseMs-minuteMs, "binance"
+			f, read := fxOf[kline]
+			if !read {
+				candles, err := m.fx.Candles(ctx, kline, kline+minuteMs)
+				m.note("candle "+m.fx.Pair(), err)
+				time.Sleep(bellPause)
+				if err != nil {
+					continue // asked again at the next tick
+				}
+				if len(candles) == 1 && candles[0].MinuteMs == kline {
+					f = candles[0].Close
+				}
+				fxOf[kline] = f
+			}
+			if f == "" {
 				if m.once("bell fx " + ticker + " " + s.Date) {
-					m.log.Info("scan: no USD per USDT in the five minutes before the close: no bell anchor yet", "ticker", ticker, "session", s.Date)
+					m.log.Info("scan: no Coinbase candle of the minute before the close: no bell anchor yet", "ticker", ticker, "session", s.Date,
+						"minute", time.UnixMilli(kline).Format(time.DateTime))
 				}
 				continue
 			}
-			kline, venue := s.CloseMs-minuteMs, "binance"
 			if kline < from {
 				venue = "bitget"
 			}
@@ -406,7 +423,7 @@ func (m *Manager) loadBells(ctx context.Context) {
 			if !time.UnixMilli(s.CloseMs).After(m.started) {
 				known = time.UnixMilli(s.CloseMs).Add(bellBackfillKnown)
 			}
-			price, err := m.store.insertBell(ctx, ticker, s.Date, venue, *k, known.UnixMilli(), time.Now().UnixMilli())
+			price, err := m.store.insertBell(ctx, ticker, s.Date, venue, *k, f, known.UnixMilli(), time.Now().UnixMilli())
 			if err != nil {
 				m.log.Warn("scan: bell anchor not stored", "ticker", ticker, "session", s.Date, "err", err)
 				continue

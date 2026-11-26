@@ -541,9 +541,6 @@ func TestReplacedBellKnownOnDatabase(t *testing.T) {
 	if err := st.writeCalendar(ctx, []session{{"2026-11-19", c}}, nil); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := st.pool.Exec(ctx, `INSERT INTO etfpair.fx_minute (pair, minute_ms, price, source, sampled_ms) VALUES ('USDT-USD', $1, 1, 'candle', 0)`, c-minuteMs); err != nil {
-		t.Fatal(err)
-	}
 	// Read at a close three hours earlier, before an override moved it to 16:00.
 	if _, err := st.pool.Exec(ctx, `INSERT INTO etfpair.etf_bell VALUES ('QQQ', '2026-11-19', 600, 600, 'binance', 1, $1, $2)`, c-3*3600_000-minuteMs, c-3*3600_000+2*minuteMs); err != nil {
 		t.Fatal(err)
@@ -552,7 +549,7 @@ func TestReplacedBellKnownOnDatabase(t *testing.T) {
 	cfg.Combos[0].BullTicker, cfg.Combos[0].BearTicker = "", "" // the reference only
 	cfg.Combos[0].Markets = []Market{{Venue: "binance", RefSymbol: "QQQUSDT"}}
 	m := &Manager{cfg: cfg, store: st, log: slog.New(slog.NewTextHandler(&bytes.Buffer{}, nil)), told: map[string]bool{}, failing: map[string]bool{},
-		started: time.UnixMilli(c).Add(24 * time.Hour), indexFrom: map[string]int64{"QQQUSDT": 0},
+		started: time.UnixMilli(c).Add(24 * time.Hour), indexFrom: map[string]int64{"QQQUSDT": 0}, fx: &fakeFX{candles: map[int64]string{c - minuteMs: "1"}},
 		index: map[string]IndexSource{"binance": &fakeIndex{klines: map[string]map[int64]string{"QQQUSDT": {c - minuteMs: "601"}}}}}
 	before := time.Now().UnixMilli()
 	m.loadBells(ctx)
@@ -844,11 +841,10 @@ func TestActionsOnDatabase(t *testing.T) {
 	exec(`UPDATE etfpair.etf_bell SET kline_ms = kline_ms - 3 * 3600000 WHERE ticker = 'REF'`)
 	expect("ignored bell", lines(`SELECT coalesce(a_ref::text, 'none') FROM etfpair.combo_sessions('T') WHERE session_date = '2026-09-21'`), "none")
 	due, err := st.bellsDue(ctx, "REF", c21+time.Hour.Milliseconds())
-	if err != nil || len(due) == 0 || due[0].Date != "2026-09-21" || due[0].HasFX {
+	if err != nil || len(due) == 0 || due[0].Date != "2026-09-21" {
 		t.Fatalf("bells due: %+v %v", due, err)
 	}
-	exec(`INSERT INTO etfpair.fx_minute (pair, minute_ms, price, source, sampled_ms) VALUES ('USDT-USD', $1, 1, 'candle', 0)`, c21-minuteMs)
-	if price, err := st.insertBell(ctx, "REF", "2026-09-21", "binance", Candle{MinuteMs: c21 - minuteMs, Close: "301"}, 9000, 9500); err != nil || price != "301" {
+	if price, err := st.insertBell(ctx, "REF", "2026-09-21", "binance", Candle{MinuteMs: c21 - minuteMs, Close: "301"}, "1", 9000, 9500); err != nil || price != "301" {
 		t.Fatalf("replaced bell: %q %v", price, err)
 	}
 	expect("replaced bell", lines(`SELECT a_ref::text FROM etfpair.combo_sessions('T') WHERE session_date = '2026-09-21'`), "301")

@@ -297,6 +297,16 @@ type IndexSource interface {
 	IndexKline(ctx context.Context, symbol string, minuteMs int64) (*Candle, error)
 }
 
+// FXSource reads USD per USDT (Coinbase's USDT-USD): the pair's name, its
+// best bid and ask now, and its one-minute candles starting in [startMs,
+// endMs), oldest first, the minutes without a trade left out. A bell
+// anchor's F is the close of the candle of the minute before the close.
+type FXSource interface {
+	Pair() string
+	Quote(ctx context.Context) (Quote, error)
+	Candles(ctx context.Context, startMs, endMs int64) ([]Candle, error)
+}
+
 // NAVSource reads one issuer's official NAVs.
 type NAVSource interface {
 	// Latest reads, one request per ticker, the NAV of each ticker the
