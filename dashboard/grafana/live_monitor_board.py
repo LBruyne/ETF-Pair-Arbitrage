@@ -139,6 +139,7 @@ OPEN = -9200000000       # an open cycle's net
 NO_FILL = -9300000000    # a marker's average price without a fill
 ZERO = -9400000000       # a real zero in a tooltip row of the execution charts (a 0 is hidden there)
 NO_SAMPLE = -9500000000  # a completion's, trim's or forced exit's place: no sample with sigma in the minute before it
+NOT_IN = -9600000000     # a marker's leg that its step sent no order on (a one-leg trim, completion or exit of the remaining leg)
 
 
 def nonzero(x, decimals):
@@ -493,14 +494,18 @@ WITH @LATEST@
 SELECT @MID_BULL@ AS "Bull Price", s.anchor_bull AS "Bull Anchor", @MID_BEAR@ AS "Bear Price", s.anchor_bear AS "Bear Anchor",
        CASE WHEN s.ts_ms IS NULL THEN NULL WHEN s.anchor_kind = 'nav' THEN 'NAV' WHEN s.anchor_kind = 'bell' THEN 'Bell' ELSE 'Missing' END AS "Anchor",
        s.f AS "F",
-       CASE WHEN s.stats_ready THEN 'Long@S@' || coalesce(@LONG@, '–') || ' / Short@S@' || coalesce(@SHORT@, '–') END AS "Real Spread",
+       CASE WHEN NOT s.stats_ready THEN NULL WHEN NOT @EXEC@ THEN '—' ELSE coalesce(@LONG@, '–') ||
+            CASE WHEN s.x_long_d / @SIGMA@ <= -@D_IN@ THEN ' · Entry' ELSE '' END END AS "Real Long",
+       CASE WHEN NOT s.stats_ready THEN NULL WHEN NOT @EXEC@ THEN '—' ELSE coalesce(@SHORT@, '–') ||
+            CASE WHEN s.x_short_d / @SIGMA@ >= @D_IN@ THEN ' · Entry' ELSE '' END END AS "Real Short",
        @MEAN@ AS "Mean", @SIGMA_BPS@ AS "Volatility",
        CASE WHEN s.stats_ready AND @SIGMA@ IS NOT NULL THEN @DEV_BPS@ || ' · ' || replace(to_char(round(((s.mid_d - s.mu_d) / @SIGMA@)::numeric, 2), 'FM990.00'), '-', '−') || '@S@σ' END AS "Deviation",
        @SIGNAL@ AS "Signal"
 FROM (SELECT 1) one LEFT JOIN r ON true LEFT JOIN s ON true LEFT JOIN sr ON true""",
-               LATEST=LATEST, MID_BULL=shown("s.mid_bull", 3), MID_BEAR=shown("s.mid_bear", 3), MEAN=shown("s.mu_d", 1), SIGMA_BPS=shown("s.sigma_d", 1),
+               LATEST=LATEST, MID_BULL=shown("s.mid_bull", 3), MID_BEAR=shown("s.mid_bear", 3), MEAN=bps_text("s.mu_d"), SIGMA_BPS=shown("s.sigma_d", 1),
                SIGMA=SIGMA, LONG=bps_text("s.mu_d + s.x_long_d"), SHORT=bps_text("s.mu_d + s.x_short_d"), DEV_BPS=bps_text("s.mid_d - s.mu_d"),
-               SIGNAL=market_signal("s", "(sr.config -> 'strategy' ->> 'd_in')::float8"), S=NBSP)
+               SIGNAL=market_signal("s", "(sr.config -> 'strategy' ->> 'd_in')::float8"), S=NBSP, EXEC=EXECUTABLE.format(s="s"),
+               D_IN="(sr.config -> 'strategy' ->> 'd_in')::float8")
 # Under the Summary (owner item 80): the Run's parameters a trader reads with its results, from process_run.config: the mean
 # model and its scale, the volatility's scale, the entry and exit points in σ and in spread bps at the newest second's σ, the
 # real capital M, the leverage L and the notional N = M × L (USDT). The Settings row keeps the rest.
@@ -510,8 +515,10 @@ SELECT upper(r.config #>> '{strategy,mean_model}') || ' · ' || (r.config #>> '{
        (r.config #>> '{strategy,sigma_minutes}') || '@S@min' AS "Volatility Scale",
        replace(@D_IN@ || 'σ · ' || coalesce(@IN_BPS@, '–@S@bps'), '-', '−') AS "Entry",
        replace(@D_OUT@ || 'σ · ' || coalesce(@OUT_BPS@, '–@S@bps'), '-', '−') AS "Exit",
-       (r.config #>> '{inventory,capital}')::numeric AS "Capital M", (r.config #>> '{inventory,leverage}')::numeric AS "Leverage L",
-       (r.config #>> '{inventory,capital}')::numeric * (r.config #>> '{inventory,leverage}')::numeric AS "Notional N"
+       (r.config #>> '{inventory,capital}')::numeric AS "Capital M",
+       (r.config #>> '{inventory,capital}')::numeric * (r.config #>> '{inventory,leverage}')::numeric AS "Notional N",
+       to_char(round((r.config #>> '{inventory,capital}')::numeric), 'FM999,999,990') || ' U' AS "Capital M Text", (r.config #>> '{inventory,leverage}')::numeric AS "Leverage L",
+       to_char(round((r.config #>> '{inventory,capital}')::numeric * (r.config #>> '{inventory,leverage}')::numeric), 'FM999,999,990') || ' U' AS "Notional N Text"
 FROM r LEFT JOIN s ON true""", LATEST=LATEST, D_IN="trim_scale((r.config #>> '{strategy,d_in}')::numeric)::text",
                 D_OUT="trim_scale((r.config #>> '{strategy,d_out}')::numeric)::text",
                 IN_BPS=bps_text("(r.config #>> '{strategy,d_in}')::float8 * s.sigma_d"), OUT_BPS=bps_text("(r.config #>> '{strategy,d_out}')::float8 * s.sigma_d"),
@@ -654,9 +661,10 @@ WITH @LATEST@, c AS MATERIALIZED (
 k AS (SELECT * FROM c WHERE c.funding_known), @HELD@,
 pk AS (SELECT max(p.quota_used) AS used FROM trade.inventory_sample p WHERE @RUN_P@ AND @RANGE_P@)
 SELECT (SELECT coalesce(sum(k.net), 0) FROM k) AS "PnL", (SELECT coalesce(sum(k.gross), 0) FROM k) AS "Gross",
-       (SELECT -coalesce(sum(k.fees), 0) FROM k) AS "Fee", (SELECT coalesce(sum(k.funding), 0) FROM k) AS "Funding",
+       (SELECT coalesce(sum(k.fees), 0) FROM k) AS "Fee", (SELECT coalesce(sum(k.funding), 0) FROM k) AS "Funding",
        (SELECT @UNREALISED@ FROM (SELECT 1) one LEFT JOIN s ON true LEFT JOIN h ON true) AS "Open PnL",
        (SELECT coalesce(sum(c.traded), 0) FROM c) AS "Notional", (SELECT pk.used FROM pk) AS "Peak Used",
+       (SELECT to_char(round(coalesce(sum(c.traded), 0)), 'FM999,999,990') || ' U' FROM c) AS "Notional Text", (SELECT to_char(round(pk.used), 'FM999,999,990') || ' U' FROM pk) AS "Peak Used Text",
        (SELECT 100.0 * count(*) FILTER (WHERE k.net > 0) / nullif(count(*), 0) FROM k) AS "Win Rate",
        (SELECT 10000 * coalesce(sum(k.net), 0) / nullif((SELECT pk.used FROM pk), 0) FROM k) AS "Return" """,
             CLOSED=CLOSED, LATEST=LATEST, HELD=HELD, UNREALISED=shown(UNREALISED, 2), RUN_P=of_run("p"), RANGE_P=in_range("p.ts_ms"))
@@ -696,22 +704,30 @@ STEP_MS = ("(SELECT CASE WHEN r <= 1000 THEN 1000 WHEN r <= 5000 THEN 5000 WHEN 
            "WHEN r <= 30000 THEN 30000 ELSE ceil(r / 60000) * 60000 END::bigint FROM (SELECT ($__to - $__from) / 1500.0 AS r) x)")
 
 # The decisions drawn as markers (owner item 81): every entry, exit, completion, trim and forced exit, at its instant; an
-# entry whose lot became void (no fill, one leg) is a Void Entry. Each with its orders' fills: both legs' filled contracts
-# and average price, the notional (USDT, both legs) and the fees (a cost, negative), and its round trip's net (Pending, or
-# Open while open). Its place: on the Spread chart its executable spread at the decision (mu_d + x_d, the Real Long Spread
+# entry whose lot became void (no fill, one leg) is a Void Entry. Each with the fills of its step (4.2.1): an entry, exit or
+# forced exit with its own orders and those of the completions and exits of the remaining leg sent for it (decisions whose
+# detail.batch_sent_ms is its instant; not the trims, which undo part of an entry and have their own marker), so an exit
+# whose two legs were closed by separate orders shows both; a trim, completion or exit of the remaining leg ("· One Leg")
+# with its own order only, its other leg "—" (no order there), never 0 / No Fill. Both legs' filled contracts and average
+# price, the notional (USDT, both legs), the fees paid (a cost, positive, as in Summary and Orders), and its round trip's
+# net (Pending, or Open while open). Its place: on the Spread chart its executable spread at the decision (mu_d + x_d, the Real Long Spread
 # of an entry Long or exit Short, the Real Short Spread of the others), on the Deviation chart x_d; a completion's, trim's
 # or forced exit's the spread and deviation on the mids of the newest sample in the minute before it.
-DECISION_KINDS = ("entry", "exit", "complete", "trim", "forced")
-ACTIONS = {1: "Long Entry", 2: "Short Entry", 3: "Long Exit", 4: "Short Exit", 5: "Forced Exit", 6: "Trim", 7: "Complete", 8: "Void Entry"}
-ACTION_COLORS = {"Long Entry": GOOD, "Short Entry": BAD, "Long Exit": TEXT, "Short Exit": TEXT, "Forced Exit": WARN}
+DECISION_KINDS = ("entry", "exit", "forced")   # 4.3: completions, trims and remaining-leg exits are in their step's marker
+ACTIONS = {1: "Long Entry", 2: "Short Entry", 3: "Long Exit", 4: "Short Exit", 5: "Forced Long Exit", 11: "Forced Short Exit",
+           8: "Undone Long Entry", 10: "Undone Short Entry"}
+ACTION_COLORS = {"Long Entry": GOOD, "Short Entry": BAD, "Long Exit": GOOD, "Short Exit": BAD, "Forced Long Exit": GOOD, "Forced Short Exit": BAD,
+                 "Undone Long Entry": GREY, "Undone Short Entry": GREY}
 MARKERS = sql("""
 m0 AS (
   SELECT d.ts_ms, d.run_id, (d.detail ->> 'x_d')::float8 AS x, (d.detail ->> 'mu_d')::float8 AS mu,
-         CASE WHEN d.kind = 'entry' AND l.status = 'void' THEN 8 WHEN d.kind = 'entry' THEN CASE d.direction WHEN 'short' THEN 2 ELSE 1 END
-              WHEN d.kind = 'exit' THEN CASE d.direction WHEN 'short' THEN 4 ELSE 3 END WHEN d.kind = 'forced' THEN 5 WHEN d.kind = 'trim' THEN 6
-              ELSE 7 END AS action,
+         CASE WHEN d.kind = 'entry' AND l.status = 'void' THEN CASE d.direction WHEN 'short' THEN 10 ELSE 8 END
+              WHEN d.kind = 'entry' THEN CASE d.direction WHEN 'short' THEN 2 ELSE 1 END
+              WHEN d.kind = 'exit' THEN CASE d.direction WHEN 'short' THEN 4 ELSE 3 END
+              ELSE CASE d.direction WHEN 'short' THEN 11 ELSE 5 END END AS action,
          CASE WHEN c.status = 'open' THEN @OPEN@ WHEN NOT c.funding_known THEN @PENDING@ ELSE c.net END AS cycle_net, c.opened_ms AS exec_ms,
-         coalesce(d.detail -> 'client_order_ids', jsonb_build_array(d.detail ->> 'client_order_id')) AS ids
+         coalesce(d.detail -> 'client_order_ids', jsonb_build_array(d.detail ->> 'client_order_id')) AS ids,
+         d.live, d.cycle_id
   FROM trade.decision d
   LEFT JOIN trade.lot l ON l.live = d.live AND l.lot_id = d.lot_id
   LEFT JOIN trade.cycle c ON c.live = d.live AND c.cycle_id = d.cycle_id
@@ -722,10 +738,15 @@ m AS (
   LEFT JOIN LATERAL (SELECT s.mid_d AS mid, s.mid_d - s.mu_d AS dev FROM trade.signal_sample s
                      WHERE s.ts_ms <= m0.ts_ms AND s.ts_ms > m0.ts_ms - 60000 AND @RUN_S@ ORDER BY s.ts_ms DESC LIMIT 1) n ON m0.x IS NULL OR m0.mu IS NULL
   CROSS JOIN LATERAL (
-    SELECT sum(o.cum_exec_qty) FILTER (WHERE o.leg = 'bull') AS q_bull, sum(o.cum_exec_value) FILTER (WHERE o.leg = 'bull') AS v_bull,
-           sum(o.cum_exec_qty) FILTER (WHERE o.leg = 'bear') AS q_bear, sum(o.cum_exec_value) FILTER (WHERE o.leg = 'bear') AS v_bear,
+    SELECT sum(o.cum_exec_qty) FILTER (WHERE o.leg = 'bull' AND NOT o.undo) AS q_bull, sum(o.cum_exec_value) FILTER (WHERE o.leg = 'bull' AND NOT o.undo) AS v_bull,
+           sum(o.cum_exec_qty) FILTER (WHERE o.leg = 'bear' AND NOT o.undo) AS q_bear, sum(o.cum_exec_value) FILTER (WHERE o.leg = 'bear' AND NOT o.undo) AS v_bear,
+           count(*) FILTER (WHERE o.leg = 'bull' AND NOT o.undo) AS n_bull, count(*) FILTER (WHERE o.leg = 'bear' AND NOT o.undo) AS n_bear,
+           sum(o.cum_exec_qty) FILTER (WHERE o.leg = 'bull' AND o.undo) AS t_bull, sum(o.cum_exec_qty) FILTER (WHERE o.leg = 'bear' AND o.undo) AS t_bear,
            sum(o.fee) AS fee, bool_or(o.cum_exec_qty > 0 AND NOT o.fee_known) AS fee_pending
-    FROM trade.cex_order o WHERE @RUN_O@ AND o.client_order_id IN (SELECT jsonb_array_elements_text(m0.ids))) o)""",
+    FROM (SELECT o.*, o.purpose = 'trim' AS undo FROM trade.cex_order o WHERE @RUN_O@ AND (o.client_order_id IN (SELECT jsonb_array_elements_text(m0.ids))
+      OR o.client_order_id IN (
+        SELECT f.detail ->> 'client_order_id' FROM trade.decision f
+        WHERE f.live = m0.live AND f.cycle_id = m0.cycle_id AND f.kind IN ('trim', 'complete') AND (f.detail ->> 'batch_sent_ms')::bigint = m0.ts_ms))) o) o)""",
               RUN_D=of_run("d"), RUN_S=of_run("s"), RUN_O=of_mode("o"), CHART_FROM=CHART_FROM, CHART_TO=CHART_TO, KINDS="(%s)" % ", ".join("'%s'" % k for k in DECISION_KINDS), OPEN=str(OPEN), PENDING=str(PENDING))
 
 
@@ -736,15 +757,22 @@ def near(x):
     return "CASE WHEN c.n IS NULL THEN 0 ELSE %s END" % x
 
 
+def filled(leg):
+    """A leg's filled contracts in the marker's step; NOT_IN where the step sent no order on that leg (a one-leg trim, completion
+    or exit of the remaining leg): never a 0 for a leg another order filled."""
+    return near("CASE WHEN c.n_{l} = 0 THEN {no} ELSE {q} END".format(l=leg, no=NOT_IN, q=nonzero("coalesce(c.q_%s, 0)" % leg, 2)))
+
+
 def avg_price(leg):
-    return near("CASE WHEN c.q_{l} > 0 THEN {p} ELSE {no} END".format(l=leg, p=shown("c.v_%s / c.q_%s" % (leg, leg), TICK_DECIMALS[leg]), no=NO_FILL))
+    return near("CASE WHEN c.n_{l} = 0 THEN {ni} WHEN c.q_{l} > 0 THEN {p} ELSE {no} END".format(
+        l=leg, p=shown("c.v_%s / c.q_%s" % (leg, leg), TICK_DECIMALS[leg]), no=NO_FILL, ni=NOT_IN))
 
 
 MARKER_INFO = [("Execution", near("coalesce(c.exec_ms, %d)" % NO_SAMPLE)), ("Action", near("c.action")), ("Decided", near("c.ts_ms")),
-               ("Bull Filled", near(nonzero("coalesce(c.q_bull, 0)", 2))), ("Bull Avg", avg_price("bull")),
-               ("Bear Filled", near(nonzero("coalesce(c.q_bear, 0)", 2))), ("Bear Avg", avg_price("bear")),
+               ("Bull Filled", filled("bull")), ("Bull Avg", avg_price("bull")), ("Bear Filled", filled("bear")), ("Bear Avg", avg_price("bear")),
+               ("Bull Trimmed", near(shown("coalesce(c.t_bull, 0)", 2))), ("Bear Trimmed", near(shown("coalesce(c.t_bear, 0)", 2))),   # 0: hidden
                ("Notional", near(nonzero("coalesce(c.v_bull, 0) + coalesce(c.v_bear, 0)", 2))),
-               ("Fees", near("CASE WHEN c.fee_pending THEN %d ELSE %s END" % (FEE_PENDING, nonzero("-coalesce(c.fee, 0)", 2)))),
+               ("Fees", near("CASE WHEN c.fee_pending THEN %d ELSE %s END" % (FEE_PENDING, nonzero("coalesce(c.fee, 0)", 2)))),
                ("Cycle Net", near("CASE WHEN c.cycle_net <= %d THEN c.cycle_net ELSE %s END" % (PENDING, nonzero("c.cycle_net", 2)))),
                ("At Spread", near("CASE WHEN c.ys IS NULL THEN %d ELSE %s END" % (NO_SAMPLE, nonzero("c.ys", 1)))),
                ("At Deviation", near("CASE WHEN c.yd IS NULL THEN %d ELSE %s END" % (NO_SAMPLE, nonzero("c.yd", 1))))]
@@ -757,7 +785,8 @@ WINDOW_MS = "greatest(x.step, ($__to - $__from) / 90)"
 # an 18th of the chart's span in the window (x.hs on Spread, x.hd on Deviation), so it reads alike at every zoom. The rows at
 # the decision's instant ± half a width carry its corners. Triangles never overlap (one series cannot draw two at once): an
 # entry within a triangle's width (2 × x.half) after the start of the one before it is drawn by that one (tri), its own
-# tooltip there as for every decision; zooming in separates them.
+# tooltip there as for every decision; zooming in separates them. Entries come first: an undone entry (grey) is drawn only
+# where no entry's triangle is within a width of it (4.3: an undone one hid the real entry 5 s after it).
 def triangle(y, h, up):
     """The peak of the triangle e at y (its height h) on a row p: y ∓ h/2 at its corners, y ± h/2 at its apex."""
     sign = "+" if up else "-"
@@ -770,16 +799,21 @@ def base(y, h, up):
 
 
 def glyphs(chart, y, h):
-    """The marker columns of one chart: the two triangles (peak and base) and the three kinds of circle."""
+    """The marker columns of one chart (owner items 81, 84): four triangles (peak and base) and two circles."""
     out = []
-    for name, act, up in (("Long Entry", 1, True), ("Short Entry", 2, False)):
+    for name, act, up in TRIANGLES:
         out += [("%s%s" % (name, chart), "CASE WHEN e.action = %d THEN %s END" % (act, shown(triangle(y, h, up), 2))),
                 ("%s · Base%s" % (name, chart), "CASE WHEN e.action = %d THEN %s END" % (act, shown(base(y, h, up), 2)))]
-    for name, acts in (("Exit", (3, 4)), ("Forced Exit", (5,)), ("Other", (6, 7, 8))):
+    for name, acts in CIRCLES:
         out.append(("%s%s" % (name, chart), "CASE WHEN p.mark AND p.kk = 0 AND c.action IN (%s) THEN %s END" % (", ".join(map(str, acts)), shown(y.replace("e.", "c."), 2))))
     return out
 
 
+# The triangles: entries (green ▲ Long, red ▼ Short) and entries undone (grey, the same direction: a lot voided, one leg filled
+# and trimmed back); the circles: exits in the colour of the position they close (owner item 84: closing a Short red, closing
+# a Long green; a forced exit too, its tooltip says Forced).
+TRIANGLES = (("Long Entry", 1, True), ("Short Entry", 2, False), ("Undone Long Entry", 8, True), ("Undone Short Entry", 10, False))
+CIRCLES = (("Long Exit", (3, 5)), ("Short Exit", (4, 11)))
 SPREAD_GLYPHS, DEVIATION_GLYPHS = glyphs("", "e.ys", "x.hs"), glyphs(" · Dev", "e.yd", "x.hd")
 # The drawn lines, in bps (owner items 80, 81; after Combo Spread's Spread and Deviation charts). Spread: the Real Long Spread
 # (buying both at their pricing levels, blue) and the Real Short Spread (selling both, orange), the Mean, and the program's
@@ -787,22 +821,31 @@ SPREAD_GLYPHS, DEVIATION_GLYPHS = glyphs("", "e.ys", "x.hs"), glyphs(" · Dev", 
 # rises to Mean − d_out σ (blue dotted); a Short the mirror (orange). Deviation: the same less the Mean, the deviation on the
 # mids (purple), ±1 σ and ±3 σ (grey). The lines need sigma; they are computed here, not in the browser (Grafana's binary
 # calculation reads a NULL as 0). Real spreads only where the executor trades (EXECUTABLE, owner item 70).
-SIGMA_LINES = (1, 3)
+SIGMAS = (0.5, 1, 1.5, 2, 2.5, 3)   # owner item 84: the volatility lines as Combo Spread draws them
 LINES = {"Long In": ("-p.d_in", BLUE, [6, 4]), "Long Out": ("-p.d_out", BLUE, [2, 3]),
          "Short In": ("p.d_in", ORANGE, [6, 4]), "Short Out": ("p.d_out", ORANGE, [2, 3])}
 SIG = "nullif(p.sigma, 0)"
+spread_sigma = lambda sg, k: "Mean %s %gσ" % (sg, k)
+dev_sigma = lambda sg, k: "%s%gσ" % (sg, k)
 LINE_COLUMNS = ([("Real Long Spread", shown("p.rl", 1)), ("Real Short Spread", shown("p.rs", 1)), ("Mean", shown("p.mu", 1))] +
                 [(name, "CASE WHEN %s IS NOT NULL THEN %s END" % (SIG, shown("p.mu + %s * p.sigma" % k, 1))) for name, (k, _, _) in LINES.items()] +
-                [("Deviation", shown("p.mid - p.mu", 1)), ("Real Long Deviation", shown("p.xl", 1)), ("Real Short Deviation", shown("p.xs", 1))] +
+                [("Real Long Deviation", shown("p.xl", 1)), ("Real Short Deviation", shown("p.xs", 1))] +
                 [(name + " · Dev", "CASE WHEN %s IS NOT NULL THEN %s END" % (SIG, shown("%s * p.sigma" % k, 1))) for name, (k, _, _) in LINES.items()] +
-                [("%s%dσ" % (sg, n), "CASE WHEN %s IS NOT NULL THEN %s END" % (SIG, shown("%s%d * p.sigma" % ("" if sg == "+" else "-", n), 1)))
-                 for n in SIGMA_LINES for sg in ("+", "−")])
+                # owner item 84: the stretch of a real spread at or past its entry line, drawn over it brighter
+                [("Real Long at Entry", "CASE WHEN p.xl <= -p.d_in * %s THEN %s END" % (SIG, shown("p.rl", 1))),
+                 ("Real Short at Entry", "CASE WHEN p.xs >= p.d_in * %s THEN %s END" % (SIG, shown("p.rs", 1))),
+                 ("Real Long Deviation at Entry", "CASE WHEN p.xl <= -p.d_in * %s THEN %s END" % (SIG, shown("p.xl", 1))),
+                 ("Real Short Deviation at Entry", "CASE WHEN p.xs >= p.d_in * %s THEN %s END" % (SIG, shown("p.xs", 1)))] +
+                [(spread_sigma(sg, k), "CASE WHEN %s IS NOT NULL THEN %s END" % (SIG, shown("p.mu %s %g * p.sigma" % ("+" if sg == "+" else "-", k), 1)))
+                 for k in SIGMAS for sg in ("+", "−")] +
+                [(dev_sigma(sg, k), "CASE WHEN %s IS NOT NULL THEN %s END" % (SIG, shown("%s%g * p.sigma" % ("" if sg == "+" else "-", k), 1)))
+                 for k in SIGMAS for sg in ("+", "−")])
 MU_WHY = (("NOT p.anchored", "No Anchor"), ("true", "Warmup"))
 X_WHY = (("NOT p.anchored", "No Anchor"), (SIG + " IS NULL", "Warmup"), ("NOT p.booked", "Book Not OK"), ("true", "No Levels"))
 TOOLTIP_COLUMNS = [
     ("Real Long Spread · Tooltip", coded("p.rl", 1, X_WHY)), ("Real Short Spread · Tooltip", coded("p.rs", 1, X_WHY)),
     ("Mean · Tooltip", coded("p.mu", 1, MU_WHY)), ("Sigma · Tooltip", coded("p.sigma", 1, MU_WHY)),
-    ("Deviation · Tooltip", coded("p.mid - p.mu", 1, MU_WHY)), ("Real Long Deviation · Tooltip", coded("p.xl", 1, X_WHY)),
+    ("Real Long Deviation · Tooltip", coded("p.xl", 1, X_WHY)),
     ("Real Short Deviation · Tooltip", coded("p.xs", 1, X_WHY))]
 # The program's answer in the bucket's last second as a code for the tooltip (never 0: hidden there).
 # (Grafana does not fill variables in a mapping's text: the legs are Bull and Bear here.)
@@ -850,7 +893,16 @@ gl AS (
   SELECT t0.i, t0.ts_ms AS start FROM t0 WHERE t0.i = 1
   UNION ALL
   SELECT t0.i, CASE WHEN t0.ts_ms > gl.start + 2 * x.half THEN t0.ts_ms ELSE gl.start END FROM gl JOIN t0 ON t0.i = gl.i + 1 CROSS JOIN x),
-tri AS (SELECT DISTINCT ON (gl.start) t0.ts_ms, t0.action, t0.ys, t0.yd FROM gl JOIN t0 ON t0.i = gl.i AND t0.ts_ms = gl.start ORDER BY gl.start, t0.i),
+tr AS (SELECT DISTINCT ON (gl.start) t0.ts_ms, t0.action, t0.ys, t0.yd FROM gl JOIN t0 ON t0.i = gl.i AND t0.ts_ms = gl.start ORDER BY gl.start, t0.i),
+u0 AS (SELECT mm.ts_ms, mm.action, mm.ys, mm.yd, row_number() OVER (ORDER BY mm.ts_ms, mm.n) AS i FROM mm CROSS JOIN x
+       WHERE mm.action IN (8, 10) AND NOT EXISTS (SELECT 1 FROM tr WHERE abs(tr.ts_ms - mm.ts_ms) <= 2 * x.half)),
+ul AS (
+  SELECT u0.i, u0.ts_ms AS start FROM u0 WHERE u0.i = 1
+  UNION ALL
+  SELECT u0.i, CASE WHEN u0.ts_ms > ul.start + 2 * x.half THEN u0.ts_ms ELSE ul.start END FROM ul JOIN u0 ON u0.i = ul.i + 1 CROSS JOIN x),
+tri AS (SELECT * FROM tr UNION ALL
+        SELECT * FROM (SELECT DISTINCT ON (ul.start) u0.ts_ms, u0.action, u0.ys, u0.yd FROM ul JOIN u0 ON u0.i = ul.i AND u0.ts_ms = ul.start
+                       ORDER BY ul.start, u0.i) ug),
 u AS (
   SELECT k.ts, false AS mark, 0 AS kk, NULL::bigint AS n, k.run_id AS run, @RAW_K@ FROM k
   UNION ALL
@@ -1055,7 +1107,7 @@ Q_ORDERS = or_say(sql("""
 WITH @SEL@
 SELECT to_timestamp(o.submitted_ms / 1000.0) AS "Time", initcap(o.purpose) AS "Purpose", CASE o.leg WHEN 'bull' THEN '$bull' ELSE '$bear' END AS "Leg",
        initcap(o.side) || CASE WHEN o.reduce_only THEN ' · RO' ELSE '' END AS "Side", o.qty AS "Qty", o.cum_exec_qty AS "Filled",
-       @LIMIT@ AS "Limit", @AVG@ AS "Avg", CASE WHEN o.cum_exec_qty = 0 THEN NULL WHEN NOT o.fee_known THEN @FEE_PENDING@ ELSE -o.fee END AS "Fee",
+       @LIMIT@ AS "Limit", @AVG@ AS "Avg", CASE WHEN o.cum_exec_qty = 0 THEN NULL WHEN NOT o.fee_known THEN @FEE_PENDING@ ELSE o.fee END AS "Fee",
        o.final_ms - o.sent_ms AS "Latency",
        CASE WHEN o.unknown THEN 'Unknown' WHEN o.status = 'filled' THEN 'Filled' WHEN o.status = 'cancelled' AND o.cum_exec_qty > 0 THEN 'Partial'
             WHEN o.status = 'cancelled' THEN 'No Fill' WHEN o.status IN ('pending', 'acked') THEN 'Working'
@@ -1314,13 +1366,15 @@ def build():
     price = {"unit": "none", "decimals": 3, "mappings": [NO_FIGURE]}
     usd = {"unit": "currencyUSD", "decimals": 2, "mappings": [NO_FIGURE]}   # as Combo Spread's anchors: $32.03
     bps1 = {"unit": "suffix: bps", "decimals": 1, "mappings": [NO_FIGURE]}
+    hit = lambda c: {"mappings": [NO_FIGURE, {"type": "regex", "options": {"pattern": ".* · Entry$", "result": {"color": c, "index": 0}}}]}
+    ENTRY_HIT, ENTRY_HIT_SHORT = hit(BLUE), hit(ORANGE)   # owner item 84: the side at or past its entry line lit
     value_map = lambda colors: {"mappings": [NO_FIGURE, {"type": "value", "options": {k: {"color": c, "index": i} for i, (k, c) in enumerate(colors.items())}}]}
     market = stat_strip("Market · Prices", Q_MARKET, [
-        ("Bull Price", "Each leg's mid on the program's book, USDT.", dict(price, displayName="${bull} Price")),
+        ("Bull Price", "Each leg's mid on the program's book, USDT.", dict(price, displayName="${bull} Price · USDT")),
         ("Bull Anchor", "Each leg's anchor, USD per share: the bell (F × Binance's index at the close), then the issuer's NAV once confirmed.",
-         dict(usd, displayName="${bull} Anchor")),
-        ("Bear Price", "", dict(price, displayName="${bear} Price")),
-        ("Bear Anchor", "", dict(usd, displayName="${bear} Anchor")),
+         dict(usd, displayName="${bull} Anchor · USD")),
+        ("Bear Price", "", dict(price, displayName="${bear} Price · USDT")),
+        ("Bear Anchor", "", dict(usd, displayName="${bear} Anchor · USD")),
         ("Anchor", "As Combo Spread's Anchor Status: NAV, Bell (provisional, grey) or Missing (amber: no entries).", value_map(ANCHOR_COLORS)),
         ("F", "USD per USDT (Coinbase USDT-USD), the rate the program converts with: a price in USDT × F is in USD; an anchor in USD ÷ F "
               "is in USDT (owner item 80; Combo Spread's USD/USDT).", {"unit": "none", "decimals": 5, "mappings": [NO_FIGURE], "displayName": "F · USD/USDT"}),
@@ -1329,17 +1383,21 @@ def build():
     panels.append(market)
     y += 3
     panels.append(stat_strip("Market · Real Spread and Signal", None, [
-        ("Real Spread", "Owner item 80: the spread at both legs' pricing levels, buying both (Long: where a Long enters and a Short exits) and "
-                        "selling both (Short), in spread bps: 10⁴ × (F × (P_bull ÷ A_bull + P_bear ÷ A_bear) − 2), the two legs' deviations "
-                        "added, as Combo Spread writes it (1 bps of spread is 0.5 bps of the two legs' notional).", None),
-        ("Mean", "The program's mean of the spread (on the mids), bps.", bps1),
-        ("Volatility", "波动率 (σ): the standard deviation of the spread, bps.", dict(bps1, displayName="波动率 (σ)")),
+        ("Real Long", "Owner item 80: the spread at both legs' pricing levels buying both (where a Long enters and a Short exits), in "
+                      "spread bps: 10⁴ × (F × (P_bull ÷ A_bull + P_bear ÷ A_bear) − 2), the two legs' deviations added, as Combo Spread "
+                      "writes it (1 bps of spread is 0.5 bps of the two legs' notional); owner item 84: blue with · Entry when it is at or "
+                      "past its entry line (Mean − d_in σ); — while a leg's book conflicts or its depth is unusable (owner item 70).",
+         dict(ENTRY_HIT, displayName="Real Spread · Long")),
+        ("Real Short", "Selling both (where a Short enters and a Long exits): orange with · Entry at or past Mean + d_in σ.",
+         dict(ENTRY_HIT_SHORT, displayName="Real Spread · Short")),
+        ("Mean", "The program's mean of the spread (on the mids), bps (a minus sign, as in the real spreads).", None),
+        ("Volatility", "Volatility (σ): the standard deviation of the spread, bps.", dict(bps1, displayName="Volatility (σ)")),
         ("Deviation", "Spread on the mids − Mean, in bps and in σ.", None),
         ("Signal", "In Combo Spread's words, on the program's executable deviations: Long (Buy Both at or past −d_in σ), Short (Sell Both at "
                    "or past +d_in σ), None inside; No Anchor, No Mean (σ not ready), No Book (a leg's book conflicts or its depth is "
                    "unusable: the program enters on none).", value_map(SIGNAL_COLORS)),
     ], 0, y, 24, 3, intro="The same second, as Combo Spread's Spread and Signal · Latest Second; every spread figure in bps.", source=market,
-        columns=["Real Spread", "Mean", "Volatility", "Deviation", "Signal"], title_size=12, value_size=16))
+        columns=["Real Long", "Real Short", "Mean", "Volatility", "Deviation", "Signal"], title_size=12, value_size=16))
     y += 3
     panels.append(table("Alerts", Q_ALERTS, 0, y, 24, 8, description=bullets(
         "What stopped or held trading in the picked Run and what became of it: the unfinished first, each group newest first, at most 200.",
@@ -1365,35 +1423,37 @@ def build():
     panels.append(row("Execution Summary · ${span}", y)); y += 1
     money = dict(MONEY, unit="suffix: U")
     panels.append(stat_strip("Summary", Q_PNL, [
-        ("PnL", "Gross + Fee + Funding of the round trips closed in the Range, USDT: what the strategy earned (one whose funding is not known "
+        ("PnL", "Gross − Fee + Funding of the round trips closed in the Range, USDT: what the strategy earned (one whose funding is not known "
                 "yet left out until it is).", money),
         ("Gross", "Both legs' fills, sells less buys, before costs.", money),
-        ("Fee", "Trading fees, as a cost (negative).", money),
+        ("Fee", "Trading fees paid, a cost shown as a positive amount (as everywhere on this board: Orders, the chart markers).",
+         {"unit": "suffix: U", "decimals": 2, "color": {"mode": "fixed", "fixedColor": "text"}, "mappings": [NO_FIGURE]}),
         ("Funding", "Funding booked to them; + received.", money),
         ("Open PnL", "The open round trip at the newest second's mids after its entry fees, before exit fees and the half spread an exit "
                      "pays; green above zero, red below; not in PnL.", money),
-        ("Notional", "Traded: both legs' fills (entries, completions, trims, exits) of those round trips, USDT.",
-         {"unit": "locale", "decimals": 0, "mappings": [NO_FIGURE]}),
-        ("Peak Used", "The most of N = M × L in use in the Range (held at entry prices, open orders, dust), USDT, from the Run's inventory "
-                      "samples.", {"unit": "locale", "decimals": 0, "mappings": [NO_FIGURE]}),
+        ("Notional Text", "Traded: both legs' fills (entries, completions, trims, exits) of those round trips, USDT.",
+         {"displayName": "Notional"}),
+        ("Peak Used Text", "The most of N = M × L in use in the Range (held at entry prices, open orders, dust), USDT, from the Run's inventory "
+                      "samples.", {"displayName": "Peak Used"}),
         ("Win Rate", "Closed round trips with a positive PnL.", {"unit": "percent", "decimals": 0, "mappings": [NO_FIGURE]}),
         ("Return", "PnL over Peak Used, bps (owner item 69: a return on the largest notional actually used).", dict(MONEY, unit="suffix: bps", decimals=1)),
     ], 0, y, 24, 4, intro="The Run's round trips closed in the Range (row title), in the owner's order (item 76); money in USDT (U), "
-                         "Notional and Peak Used in USDT.", title_size=12, value_size=18))
+                         "Notional and Peak Used in USDT.", title_size=12, value_size=18,
+        columns=["PnL", "Gross", "Fee", "Funding", "Open PnL", "Notional Text", "Peak Used Text", "Win Rate", "Return"]))
     y += 4
     usdt0 = {"unit": "locale", "decimals": 0, "mappings": [NO_FIGURE]}
     panels.append(stat_strip("Parameters", Q_PARAMS, [
         ("Mean Model", "The mean of the spread: EMA or SMA, over its scale in minutes.", None),
-        ("Volatility Scale", "The window of 波动率 (σ), the spread's standard deviation, in minutes.", {"displayName": "波动率 Scale"}),
+        ("Volatility Scale", "The window of Volatility (σ), the spread's standard deviation, in minutes.", None),
         ("Entry", "d_in: a Long enters when Buy Both is d_in σ below the mean, a Short when Sell Both is d_in σ above it; in spread bps "
                   "at the newest second's σ.", None),
         ("Exit", "d_out: a Long exits when Sell Both reaches −d_out σ from the mean (past it, on the other side, when d_out is "
                  "negative), a Short the mirror; in spread bps at the newest second's σ.", None),
-        ("Capital M", "The real capital the Run may use, USDT.", usdt0),
+        ("Capital M Text", "The real capital the Run may use, USDT.", {"displayName": "Capital M"}),
         ("Leverage L", "The total leverage.", {"unit": "suffix:×", "decimals": 0, "mappings": [NO_FIGURE]}),
-        ("Notional N", "M × L: the notional the Run may hold, USDT.", usdt0),
+        ("Notional N Text", "M × L: the notional the Run may hold, USDT.", {"displayName": "Notional N"}),
     ], 0, y, 24, 3, intro="The Run's settings (process_run.config) that its results are read with (owner item 80); the rest in Settings below.",
-        title_size=12, value_size=16))
+        title_size=12, value_size=16, columns=["Mean Model", "Volatility Scale", "Entry", "Exit", "Capital M Text", "Leverage L", "Notional N Text"]))
     y += 3
     panels.append(xy("Cumulative Gross · USDT", [("A", Q_CUM_GROSS), ("Period", Q_PERIOD)], 0, y, 12, 8,
                      "The running Gross over the Range (both legs' fills, sells less buys), as the Summary counts it, stepping at each "
@@ -1412,9 +1472,10 @@ def build():
     position = stat_strip("Position · ct and USDT", Q_NOW, [
         ("Side", "Flat, or the open round trip's side: Long (both legs bought, blue), Short (both sold, orange).", side),
         ("Bull", "Contracts held on the leg as the program counts them, signed (+ long, − short); – when flat.",
-         {"unit": "none", "decimals": 2, "displayName": "${bull}", "mappings": [NO_FIGURE]}),
-        ("Bear", "", {"unit": "none", "decimals": 2, "displayName": "${bear}", "mappings": [NO_FIGURE]}),
-        ("Cost", "USDT: what the held contracts cost at entry, both legs (the notional held).", {"unit": "locale", "decimals": 0, "mappings": [NO_FIGURE]}),
+         {"unit": "none", "decimals": 2, "displayName": "${bull} · ct", "mappings": [NO_FIGURE]}),
+        ("Bear", "", {"unit": "none", "decimals": 2, "displayName": "${bear} · ct", "mappings": [NO_FIGURE]}),
+        ("Cost", "USDT: what the held contracts cost at entry, both legs (the notional held).",
+         {"unit": "locale", "decimals": 0, "mappings": [NO_FIGURE], "displayName": "Cost · USDT"}),
         ("Held", "Time since the round trip opened.", None),
         ("To Exit", "σ still to go to the exit line (a Long: Sell Both up to −d_out σ; a Short: Buy Both down to +d_out σ); 0 or less: at the "
                     "line, the exit is being sent · –: a leg's depth is unusable (the program sends no exit then; a book conflict does not stop "
@@ -1428,8 +1489,8 @@ def build():
     action = code_texts(ACTIONS, ACTION_COLORS)
     no_value1 = code_texts({**NO_VALUE, ZERO: "0.0"}, {"0.0": TEXT})
     entry_text = code_texts(IDLE_CODES, {t: STATE_COLORS[t.split(" · ")[0]] for t in IDLE_CODES.values()})
-    qty_text = code_texts({ZERO: "0"}, {"0": TEXT})
-    price_text = code_texts({NO_FILL: "No Fill"})
+    qty_text = code_texts({ZERO: "0", NOT_IN: "— (not in this order)"}, {"0": TEXT})
+    price_text = code_texts({NO_FILL: "No Fill", NOT_IN: "—"})
     money_text = code_texts({FEE_PENDING: "Pending", PENDING: "Pending", OPEN: "Open", ZERO: "0.00"}, {"Pending": WARN, "Open": TEXT, "0.00": TEXT})
     at_text = code_texts({ZERO: "0.0", NO_SAMPLE: "No Sample"}, {"0.0": TEXT})
     hidden = {"legend": True, "tooltip": True, "viz": False}
@@ -1442,39 +1503,57 @@ def build():
         return o
 
     def decision_marks(chart):
-        """The markers of one chart (owner item 81): triangles as filled bands between their peak and base, circles as points."""
+        """The markers of one chart (owner items 81, 84): triangles as filled bands between their peak and base, circles as points."""
         out = []
         # Grafana fills between two series only where the one with fillBelowTo is above the other: a ▲'s peak fills down to
-        # its base, a ▼'s base down to its peak.
-        for name, color, label, up in (("Long Entry", GOOD, "Long Entry ▲", True), ("Short Entry", BAD, "Short Entry ▼", False)):
+        # its base, a ▼'s base down to its peak. The two undone entries share one legend item (grey).
+        looks = {"Long Entry": (GOOD, "Long Entry ▲", True), "Short Entry": (BAD, "Short Entry ▼", True),
+                 "Undone Long Entry": (GREY, "Undone Entry ▲▼", True), "Undone Short Entry": (GREY, "Undone Entry ▼", False)}
+        for name, _, up in TRIANGLES:
+            color, label, legend = looks[name]
             peak_name, base_name = name + chart, "%s · Base%s" % (name, chart)
-            peak = series(peak_name, color, width=1, fill_to=base_name if up else None, fill=100 if up else 0, tooltip=False)
+            peak = series(peak_name, color, width=1, fill_to=base_name if up else None, fill=100 if up else 0, legend=legend, tooltip=False)
             peak["properties"] += [{"id": "displayName", "value": label}, {"id": "custom.showPoints", "value": "never"}]
             base_ = named(base_name, {"color": {"mode": "fixed", "fixedColor": color}, "custom.lineWidth": 1, "custom.showPoints": "never",
                                       "custom.hideFrom": hidden, **({} if up else {"custom.fillBelowTo": peak_name, "custom.fillOpacity": 100})})
             out += [peak, base_]
-        for name, color, size, legend, label in (("Exit", TEXT, 9, True, "Exit ●"), ("Forced Exit", WARN, 9, False, None),
-                                                 ("Other", GREY, 6, False, None)):
-            o = named(name + chart, {"color": {"mode": "fixed", "fixedColor": color}, "custom.drawStyle": "points", "custom.pointSize": size,
-                                     "custom.hideFrom": {"legend": not legend, "tooltip": True, "viz": False}})
-            if label:
-                o["properties"].append({"id": "displayName", "value": label})
-            out.append(o)
+        # Exits: a circle in the colour of the position it closes (owner item 84); larger than the line points.
+        for name, color, label in (("Long Exit", GOOD, "Long Exit ●"), ("Short Exit", BAD, "Short Exit ●")):
+            out.append(named(name + chart, {"color": {"mode": "fixed", "fixedColor": color}, "custom.drawStyle": "points", "custom.pointSize": 10,
+                                            "custom.hideFrom": {"legend": False, "tooltip": True, "viz": False}, "displayName": label}))
         return out
+
+    def at_entry(name, color):
+        """Owner item 84: the stretch of a real line at or past its entry line, drawn over it thick."""
+        return named(name, {"color": {"mode": "fixed", "fixedColor": color}, "custom.lineWidth": 4, "custom.showPoints": "always",
+                            "custom.pointSize": 5, "custom.hideFrom": {"legend": True, "tooltip": True, "viz": False}})
+
+    def sigma_line(name):
+        """As Combo Spread's: grey, whole multiples dashed, halves dotted, stronger further out; neither legend nor tooltip."""
+        k = float(name.rstrip("σ").split(" ")[-1].lstrip("+−"))
+        return named(name, {"color": {"mode": "fixed", "fixedColor": GREY + "%02X" % round(255 * (0.35 + 0.13 * k))}, "custom.lineWidth": 1,
+                            "custom.lineStyle": {"fill": "dash", "dash": [6, 4] if k == int(k) else [2, 3]}, "custom.hideFrom": hidden})
+    trimmed_text = code_texts({ZERO: "0"}, {"0": TEXT})
     marker_tooltip = [tooltip_only("Execution", TEXT, code_texts({NO_SAMPLE: "–"}), {"unit": "time:MM-DD HH:mm:ss"}, shown="Execution ID"),
                       tooltip_only("Action", TEXT, action), tooltip_only("Decided", TEXT, props={"unit": "time:HH:mm:ss.SSS"}),
                       tooltip_only("Bull Filled", TEXT, qty_text, {"unit": "none", "decimals": 2}, shown="${bull} ct"),
-                      tooltip_only("Bull Avg", TEXT, price_text, {"unit": "none", "decimals": TICK_DECIMALS["bull"]}, shown="${bull} Avg Price"),
+                      tooltip_only("Bull Avg", TEXT, price_text, {"unit": "none", "decimals": TICK_DECIMALS["bull"]}, shown="${bull} Avg Price USDT"),
                       tooltip_only("Bear Filled", TEXT, qty_text, {"unit": "none", "decimals": 2}, shown="${bear} ct"),
-                      tooltip_only("Bear Avg", TEXT, price_text, {"unit": "none", "decimals": TICK_DECIMALS["bear"]}, shown="${bear} Avg Price"),
+                      tooltip_only("Bear Avg", TEXT, price_text, {"unit": "none", "decimals": TICK_DECIMALS["bear"]}, shown="${bear} Avg Price USDT"),
+                      tooltip_only("Bull Trimmed", GREY, trimmed_text, {"unit": "none", "decimals": 2}, shown="${bull} Trimmed Back ct"),
+                      tooltip_only("Bear Trimmed", GREY, trimmed_text, {"unit": "none", "decimals": 2}, shown="${bear} Trimmed Back ct"),
                       tooltip_only("Notional", TEXT, qty_text, {"unit": "locale", "decimals": 0}, shown="Notional USDT"),
-                      tooltip_only("Fees", TEXT, money_text, {"unit": "none", "decimals": 2}, shown="Fees USDT"),
+                      tooltip_only("Fees", TEXT, money_text, {"unit": "none", "decimals": 2}, shown="Fees Paid USDT"),
                       tooltip_only("Cycle Net", TEXT, money_text, {"unit": "none", "decimals": 2}, shown="Round Trip PnL USDT")]
-    common_tips = [tooltip_only("Sigma · Tooltip", LIGHT_GREY, no_value1, {"decimals": 1}, shown="波动率 (σ) bps"),
+    common_tips = [tooltip_only("Sigma · Tooltip", LIGHT_GREY, no_value1, {"decimals": 1}, shown="Volatility (σ) bps"),
                    tooltip_only("Entry", TEXT, entry_text)]
-    spread_lines = ([series("Real Long Spread", BLUE, width=1.5, tooltip=False), series("Real Short Spread", ORANGE, width=1.5, tooltip=False),
+    spread_sigmas = [spread_sigma(sg, k) for k in SIGMAS for sg in ("+", "−")]
+    dev_sigmas = [dev_sigma(sg, k) for k in SIGMAS for sg in ("+", "−")]
+    spread_lines = ([sigma_line(n) for n in spread_sigmas] +
+                    [series("Real Long Spread", BLUE, width=1.5, tooltip=False), series("Real Short Spread", ORANGE, width=1.5, tooltip=False),
+                     at_entry("Real Long at Entry", BLUE), at_entry("Real Short at Entry", ORANGE),
                      series("Mean", TEXT, width=1, tooltip=False),
-                     line("Long In", shown_as="Long Lines"), line("Long Out", legend=False), line("Short In", shown_as="Short Lines"),
+                     line("Long In", shown_as="Long In / Out"), line("Long Out", legend=False), line("Short In", shown_as="Short In / Out"),
                      line("Short Out", legend=False)] + decision_marks("") +
                     [tooltip_only("Real Long Spread · Tooltip", BLUE, no_value1, {"decimals": 1}, shown="Real Long Spread bps"),
                      tooltip_only("Real Short Spread · Tooltip", ORANGE, no_value1, {"decimals": 1}, shown="Real Short Spread bps"),
@@ -1482,56 +1561,62 @@ def build():
                     [tooltip_only("At Spread", PURPLE, at_text, {"decimals": 1}, shown="At Spread bps")])
     spread_tips = ["Real Long Spread · Tooltip", "Real Short Spread · Tooltip", "Mean · Tooltip", "Sigma · Tooltip", "Entry"]
     info = [n for n, _ in MARKER_INFO if not n.startswith("At ")]
-    # The tooltip lists a decision first (its rows are hidden away from one), then the point's values.
-    spread_order = (["time", "Real Long Spread", "Real Short Spread", "Mean"] + list(LINES) + [n for n, _ in SPREAD_GLYPHS] + info +
-                    ["At Spread"] + spread_tips)
+    # The tooltip lists a decision first (its rows are hidden away from one), then the point's values. The σ lines first (under
+    # everything), the highlights over their lines.
+    spread_order = (["time"] + spread_sigmas + ["Real Long Spread", "Real Short Spread", "Real Long at Entry", "Real Short at Entry", "Mean"] +
+                    list(LINES) + [n for n, _ in SPREAD_GLYPHS] + info + ["At Spread"] + spread_tips)
     chart_note = ("Points: every second up to 25 min, then 5, 10, 30 s and whole minutes (a real spread is its bucket's extreme on its "
                   "entry side, of the seconds whose books the program enters on: none, and tooltip Book Not OK, where a leg's book "
                   "conflicts or its depth is unusable, owner item 70); a gap: no sample (process down), or a new session or run; shaded: "
                   "each round trip from entry to exit (blue Long, orange Short; its mark under the chart: times, end reason, PnL); purple "
                   "marks: a change of the anchors in use, with reason and both legs' anchors before → after (owner item 62).")
-    marker_note = ("Markers (owner item 81): a long entry a green triangle ▲, a short entry a red triangle ▼, an exit a circle ● "
-                   "(a forced exit amber, a trim, completion or void entry a small grey one), at the decision's executable spread; hover "
-                   "one for its Execution ID (the round trip's opening, UTC+8, owner item 83: every marker of one round trip — entries, "
-                   "completions, trims, exits — has the same, as its row in Round Trips), the action, each leg's filled contracts and "
-                   "average price, the notional, the fees and the round trip's PnL.")
+    marker_note = ("Markers (owner items 81, 84): a long entry a green triangle ▲, a short entry a red triangle ▼; an entry undone (its "
+                   "lot voided: one leg filled and was trimmed back) a grey triangle; an exit a circle in the colour of the position it "
+                   "closes (closing a Long green, closing a Short red; a forced exit too, its tooltip says Forced); at the decision's "
+                   "executable spread. Hover one for its Execution ID (the round trip's opening, UTC+8, owner item 83: every marker of "
+                   "one round trip has the same, as its row in Round Trips), the action, each leg's filled contracts and average price, "
+                   "what was trimmed back, the notional, the fees paid (a cost, positive) and the round trip's PnL. A marker counts its "
+                   "whole step: its orders and the completions, trims and exits of the remaining leg sent for it, so an exit whose legs "
+                   "were closed by separate orders shows both; a leg it sent no order on shows —.")
     spread = timeseries("Spread · bps", Q_EXECUTION, 0, y, 24, 13, spread_lines, decimals=0, calcs=(), description=bullets(
         "After Combo Spread's Spread chart (owner item 81), in spread bps: 10⁴ × (F × (P_bull ÷ A_bull + P_bear ÷ A_bear) − 2), the "
         "two legs' deviations added (1 bps of spread is 0.5 bps of the two legs' notional), on the time picker's axis.",
         [("Real Long Spread", "buying both legs at their pricing levels (blue): a Long enters when it falls to Mean − d_in σ (blue dashed), "
-                              "a Short exits when it falls to Mean + d_out σ (orange dotted)."),
+                              "a Short exits when it falls to Mean + d_out σ (orange dotted); thick where it is at or past its entry line "
+                              "(owner item 84)."),
          ("Real Short Spread", "selling both (orange): a Short enters when it rises to Mean + d_in σ (orange dashed), a Long exits when it "
-                               "rises to Mean − d_out σ (blue dotted)."),
-         ("Mean", "the program's mean of the spread on the mids."), ("Markers", marker_note), ("Points and marks", chart_note)]))
+                               "rises to Mean − d_out σ (blue dotted); thick at or past its entry line."),
+         ("Mean", "the program's mean of the spread on the mids."),
+         ("Volatility lines", "Mean ± 0.5, 1, 1.5, 2, 2.5 and 3 σ, grey, whole multiples dashed and halves dotted, stronger further out, "
+                              "as Combo Spread draws them (owner item 84); the Run's entry and exit lines in colour over them."),
+         ("Markers", marker_note), ("Points and marks", chart_note)]))
     spread["options"]["tooltip"]["hideZeros"] = True
     spread["options"]["legend"].update(displayMode="list", placement="bottom")
     spread["options"]["legend"].pop("width", None)
     spread["fieldConfig"]["defaults"]["noValue"] = "No second of the Run on this axis: Charts to the Range (top) moves it to the Run"
     spread["transformations"] = [keep_fields(spread_order), organize(spread_order)]
     panels.append(spread); y += 13
-    sigma_lines = [named(n, {"color": {"mode": "fixed", "fixedColor": GREY}, "custom.lineWidth": 1,
-                             "custom.lineStyle": {"fill": "dash", "dash": [2, 4] if n.endswith("1σ") else [8, 6]},
-                             "custom.hideFrom": hidden}) for n, _ in LINE_COLUMNS if n.endswith("σ")]
-    dev_lines = (sigma_lines + [series("Deviation", PURPLE, width=1.5, tooltip=False),
-                                series("Real Long Deviation", BLUE, width=1.5, tooltip=False),
-                                series("Real Short Deviation", ORANGE, width=1.5, tooltip=False),
-                                line("Long In · Dev", shown_as="Long Lines"), line("Long Out · Dev", legend=False),
-                                line("Short In · Dev", shown_as="Short Lines"), line("Short Out · Dev", legend=False)] + decision_marks(" · Dev") +
-                 [tooltip_only("Deviation · Tooltip", PURPLE, no_value1, {"decimals": 1}, shown="Deviation bps"),
-                  tooltip_only("Real Long Deviation · Tooltip", BLUE, no_value1, {"decimals": 1}, shown="Real Long Deviation bps"),
+    dev_lines = ([sigma_line(n) for n in dev_sigmas] +
+                 [series("Real Long Deviation", BLUE, width=1.5, tooltip=False), series("Real Short Deviation", ORANGE, width=1.5, tooltip=False),
+                  at_entry("Real Long Deviation at Entry", BLUE), at_entry("Real Short Deviation at Entry", ORANGE),
+                  line("Long In · Dev", shown_as="Long In / Out"), line("Long Out · Dev", legend=False),
+                  line("Short In · Dev", shown_as="Short In / Out"), line("Short Out · Dev", legend=False)] + decision_marks(" · Dev") +
+                 [tooltip_only("Real Long Deviation · Tooltip", BLUE, no_value1, {"decimals": 1}, shown="Real Long Deviation bps"),
                   tooltip_only("Real Short Deviation · Tooltip", ORANGE, no_value1, {"decimals": 1}, shown="Real Short Deviation bps")] +
                  common_tips + marker_tooltip + [tooltip_only("At Deviation", PURPLE, at_text, {"decimals": 1}, shown="At Deviation bps")])
-    dev_tips = ["Deviation · Tooltip", "Real Long Deviation · Tooltip", "Real Short Deviation · Tooltip", "Sigma · Tooltip", "Entry"]
-    dev_order = (["time"] + [n for n, _ in LINE_COLUMNS if n.endswith("σ")] + ["Deviation", "Real Long Deviation", "Real Short Deviation"] +
+    dev_tips = ["Real Long Deviation · Tooltip", "Real Short Deviation · Tooltip", "Sigma · Tooltip", "Entry"]
+    dev_order = (["time"] + dev_sigmas + ["Real Long Deviation", "Real Short Deviation", "Real Long Deviation at Entry",
+                                          "Real Short Deviation at Entry"] +
                  [n + " · Dev" for n in LINES] + [n for n, _ in DEVIATION_GLYPHS] + info + ["At Deviation"] + dev_tips)
     deviation = timeseries("Deviation · bps", None, 0, y, 24, 13, dev_lines, decimals=0, zero_line=True, calcs=(), source=spread,
                            description=bullets(
-        "After Combo Spread's Deviation chart (owner item 81): the Spread chart with its Mean at zero, in spread bps.",
-        [("Deviation", "spread on the mids − Mean (purple)."),
-         ("Real Long Deviation, Real Short Deviation", "the real spreads − Mean (blue, orange): a Long enters when blue falls to −d_in σ "
+        "After Combo Spread's Deviation chart (owner item 81): the Spread chart with its Mean at zero, in spread bps; no line on the "
+        "mids (owner item 84).",
+        [("Real Long Deviation, Real Short Deviation", "the real spreads − Mean (blue, orange): a Long enters when blue falls to −d_in σ "
                                                        "(blue dashed) and exits when orange rises to −d_out σ (blue dotted); a Short the "
-                                                       "mirror (orange lines)."),
-         ("σ lines", "±1 σ (dotted) and ±3 σ (dashed), grey."), ("Markers", marker_note.replace("executable spread", "executable deviation")),
+                                                       "mirror (orange lines); thick at or past the entry line."),
+         ("Volatility lines", "± 0.5, 1, 1.5, 2, 2.5 and 3 σ, grey, as on the Spread chart."),
+         ("Markers", marker_note.replace("executable spread", "executable deviation")),
          ("Points and marks", chart_note)]))
     deviation["options"]["tooltip"]["hideZeros"] = True
     deviation["options"]["legend"].update(displayMode="list", placement="bottom")
@@ -1552,14 +1637,14 @@ def build():
          ("Side", "Long: both legs bought; Short: both sold."),
          ("Notional", "both legs' entry value, USDT (a One Leg round trip: that leg's)."),
          ("In σ", "the executable deviation at its entries, weighted by their value."), ("Out σ", "at the exit decision (– for a forced exit or none)."),
-         ("Net", "Gross + Fees + Funding, USDT; Open while open, Pending (amber) while a funding settlement it held through has no record."),
-         ("Net Bps", "Net ÷ Notional × 10⁴ (bps of the notional, not of the spread)."), ("End Reason", "why it closed.")]), overrides=[
+         ("Net", "Gross − Fees + Funding, USDT; Open while open, Pending (amber) while a funding settlement it held through has no record."),
+         ("Net bps", "Net ÷ Notional × 10⁴ (bps of the notional, not of the spread)."), ("End Reason", "why it closed.")]), overrides=[
         col("cycle_id", custom_hidden=True),
         col("Opened", 116, displayName="Execution ID", unit="time:MM-DD HH:mm:ss", links=[{"title": "Show this round trip's orders", "url": link, "targetBlank": False}]),
-        col("Closed", 80, unit="time:HH:mm:ss"), col("Held", 72),
-        col("Side", 64, custom_cellOptions={"type": "color-text"}, mappings=SIDE_COLORS),
-        col("Notional", 94, custom_align="right", unit="none", decimals=2), col("In σ", 64, **sigma_col), col("Out σ", 64, **sigma_col),
-        col("Net", 80, **money_col), col("Net bps", 72, displayName="Net Bps", **dict(money_col, decimals=1)), col("End Reason", custom_minWidth=140)]))
+        col("Closed", 80, unit="time:HH:mm:ss"), col("Held", 68),
+        col("Side", 56, custom_cellOptions={"type": "color-text"}, mappings=SIDE_COLORS),
+        col("Notional", 88, displayName="Notional USDT", custom_align="right", unit="none", decimals=2), col("In σ", 56, **sigma_col), col("Out σ", 56, **sigma_col),
+        col("Net", 84, displayName="Net USDT", **money_col), col("Net bps", 64, displayName="Net bps", **dict(money_col, decimals=1)), col("End Reason", custom_minWidth=120)]))
     y += 7
 
     # ------------------------------------------------------------------ Round Trip Detail
@@ -1572,19 +1657,20 @@ def build():
         [("Purpose", "Entry, Complete (the leg that filled less), Trim (the leg that filled more), Exit, Forced."),
          ("Side", "Buy or Sell; RO: a reduce-only order."), ("Qty, Filled", "contracts ordered and filled."),
          ("Limit, Avg", "the limit and the fills' average price, USDT, to the leg's tick."),
-         ("Fee", "USDT, as a contribution (a cost negative); Pending while the venue has not reported it."),
+         ("Fee", "USDT paid, a cost shown as a positive amount (as in Summary); Pending while the venue has not reported it."),
          ("Latency", "sent → final state in hand, ms, this host's clock (paper: the configured simulation)."),
          ("Status", "Filled, Partial, No Fill (an IOC that met nothing), Rejected (with the venue's code), Working, Unknown (being queried).")]),
         overrides=[
-        col("Time", 104, unit="time:HH:mm:ss.SSS"), col("Purpose", 80), col("Leg", 64), col("Side", 72), col("Qty", 64, **num(2)),
-        col("Filled", 64, **num(2)), col("Limit", 80, custom_align="right"), col("Avg", 80, custom_align="right"),
-        col("Fee", 84, custom_align="right", unit="none", decimals=5, mappings=[NO_FIGURE, PENDING_TEXT], **SIGN_BAND), col("Latency", 72, **dict(num(0), unit="suffix: ms")),
-        col("Status", custom_minWidth=130, custom_cellOptions={"type": "color-text"},
+        col("Time", 100, unit="time:HH:mm:ss.SSS"), col("Purpose", 72), col("Leg", 56), col("Side", 64), col("Qty", 64, displayName="Qty ct", **num(2)),
+        col("Filled", 64, displayName="Filled ct", **num(2)), col("Limit", 80, displayName="Limit USDT", custom_align="right"),
+        col("Avg", 80, displayName="Avg USDT", custom_align="right"),
+        col("Fee", 84, displayName="Fee USDT", custom_align="right", unit="none", decimals=5, mappings=[NO_FIGURE, PENDING_TEXT]), col("Latency", 64, displayName="Latency ms", **num(0)),
+        col("Status", custom_minWidth=110, custom_cellOptions={"type": "color-text"},
             mappings=regex_colors([("Rejected", BAD), ("Unknown", WARN), ("Partial", WARN), ("No Fill", GREY)]))])); y += 7
 
     # ------------------------------------------------------------------ Inventory
     panels.append(row("Inventory · ${runtext}", y)); y += 1
-    positions = table("Positions Now · ct, USDT and Bps", Q_POSITIONS, 0, y, 24, 4, description=bullets(
+    positions = table("Positions Now · ct, USDT and Bps", Q_POSITIONS, 0, y, 24, 5, description=bullets(
         "Each leg at the Run's newest inventory sample (every 10 s), whatever the Range; the venue's figures live only (the paper venue reports "
         "positions alone).",
         [("Venue, Ledger", "the venue's position and the program's ledger (dust included), contracts, signed (+ long, − short); they must match."),
@@ -1594,17 +1680,17 @@ def build():
          ("Funding", "the newest settled funding rate × 10⁴ (bps of the position's value per settlement), as Bitget publishes it: "
                      "+ longs pay shorts."),
          ("Age", "seconds since the sample while the Run runs; amber past a minute.")]), overrides=[
-        col("Leg", 64), col("Venue", **num(2)), col("Ledger", **num(2)), col("Mark", **num(3)), col("Liq Price", **num(3)),
+        col("Leg", 64), col("Venue", displayName="Venue ct", **num(2)), col("Ledger", displayName="Ledger ct", **num(2)),
+        col("Mark", displayName="Mark USDT", **num(3)), col("Liq Price", displayName="Liq Price USDT", **num(3)),
         col("Liq Distance", custom_align="right", unit="percent", decimals=0, custom_cellOptions={"type": "color-text"}, color={"mode": "thresholds"},
             thresholds={"mode": "absolute", "steps": [{"color": BAD, "value": None}, {"color": WARN, "value": LIQ_NEAR * 100},
                                                       {"color": "text", "value": LIQ_WARN * 100}]}, mappings=[NO_FIGURE]),
-        col("Venue UPL", custom_align="right", unit="none", decimals=4, mappings=[NO_FIGURE], **SIGN_BAND),
-        col("Exposure", **num(2)), col("Funding", **num(2)),
+        col("Venue UPL", displayName="Venue UPL USDT", custom_align="right", unit="none", decimals=4, mappings=[NO_FIGURE], **SIGN_BAND),
+        col("Exposure", displayName="Exposure USDT", **num(2)), col("Funding", displayName="Funding bps", **num(2)),
         col("Age", custom_align="right", unit="suffix: s", decimals=0, custom_cellOptions={"type": "color-text"},
             color={"mode": "thresholds"}, thresholds={"mode": "absolute", "steps": [{"color": "text", "value": None}, {"color": WARN, "value": 60}]},
             mappings=[NO_FIGURE])])
-    positions["fieldConfig"]["defaults"]["custom"]["wrapHeaderText"] = False   # one header line: both legs fit 4 units
-    panels.append(positions); y += 4
+    panels.append(positions); y += 5   # 4.3: headers with units wrap to two lines, one unit taller
 
     # ------------------------------------------------------------------ Settings
     panels.append(row("Settings · ${runtext}", y)); y += 1
@@ -1650,13 +1736,13 @@ def build():
         table("End Reasons · USDT", Q_END_REASONS, 17, sy, 7, 8, description=bullets(
             "Why the Run's round trips of the Range that closed ended (no-fill ones included).",
             [("Cycles", "how many."), ("Net", "their net, USDT (Pending ones out of it)."), ("Pending", "those whose funding is not known yet.")]),
-            overrides=[col("End Reason", None), col("Cycles", 64, custom_align="right"), col("Net", 80, **money_col), col("Pending", 72, custom_align="right")]),
+            overrides=[col("End Reason", None), col("Cycles", 64, custom_align="right"), col("Net", 92, displayName="Net USDT", **money_col), col("Pending", 72, custom_align="right")]),
         table("Order Latency by Stage · ms", Q_LATENCY, 0, sy + 8, 24, 6, description=bullets(
             "Each stage over the Run's orders submitted in the Range; paper: the configured simulated latency, not a measurement.",
             [("Clock", "local: this host's clock; venue: Bitget's."), ("Orders", "orders measured."),
              ("Median, P90, Max", "the median, 90th percentile and largest, ms.")]), overrides=[
-            col("Stage", 180), col("Clock", 72), col("Orders", 80, custom_align="right"), col("Median", 96, **num(1)), col("P90", 96, **num(1)),
-            col("Max", None, **num(0))]),
+            col("Stage", 180), col("Clock", 72), col("Orders", 80, custom_align="right"), col("Median", 96, displayName="Median ms", **num(1)), col("P90", 96, displayName="P90 ms", **num(1)),
+            col("Max", None, displayName="Max ms", **num(0))]),
     ]
     panels.append(collapsed_row("Execution Statistics · ${span}", y, statistics)); y += 1
 
@@ -1674,7 +1760,7 @@ def build():
             col("from_ms", custom_hidden=True), col("to_ms", custom_hidden=True), col("Started", 116, unit="time:MM-DD HH:mm:ss"),
             col("Stopped", 116, unit="time:MM-DD HH:mm:ss"),
             col("State", 80, custom_cellOptions={"type": "color-text"}, mappings=regex_colors([("Running", GOOD), ("Lost", BAD), ("Stopped", GREY)])),
-            col("Ran", 84), col("N", 72, custom_align="right", unit="locale", decimals=0), col("Host", 140), col("Run ID", custom_minWidth=200)]),
+            col("Ran", 84), col("N", 88, displayName="N USDT", custom_align="right", unit="locale", decimals=0), col("Host", 140), col("Run ID", custom_minWidth=200)]),
         table("Program Events", Q_EVENTS, 0, sy + 6, 24, 5, description=bullets(
             "Every event a module of the Run recorded (trade.event) in the Range, newest first, at most 200; the errors are also in Alerts.",
             [("Level", "Error (a person is needed), Warn, or another level the program writes."), ("Module, Kind", "who wrote it and what it is."),
@@ -1687,8 +1773,8 @@ def build():
             "reading, apart from Combo Spread's Anchors table.",
             [("Kind", "bell_f (the F inside the bell), bell (F × Binance's index at the close), nav_seen (a NAV first seen), nav (confirmed "
                       "after 1 h unchanged), dividend."), ("Value", "USD per share."), ("Known", "when the program learned it, UTC+8.")]), overrides=[
-            col("Session", 96), col("Kind", 72), col("Leg", 56), col("Known", 116, unit="time:MM-DD HH:mm:ss"), col("Value", 88, **num(4)),
-            col("F", 80, **num(6)), col("Source", 72), col("Detail", custom_minWidth=160, custom_inspect=True)]),
+            col("Session", 96), col("Kind", 72), col("Leg", 56), col("Known", 116, unit="time:MM-DD HH:mm:ss"), col("Value", 96, displayName="Value USD", **num(4)),
+            col("F", 112, displayName="F USD/USDT", **num(6)), col("Source", 72), col("Detail", custom_minWidth=160, custom_inspect=True)]),
         table("Funding Records · USDT", Q_FUNDING, 14, sy + 11, 10, 7, description=bullets(
             "Each funding record of the Run's two contracts settled in the Range, and each settlement a finished round trip still waits for.",
             [("Status", "Booked (to the round trip whose interval holds the settlement) or Awaited (amber)."), ("Amount", "+ received."),
@@ -1696,7 +1782,7 @@ def build():
             overrides=[
             col("Settlement", 112, unit="time:MM-DD HH:mm"), col("Contract", 88),
             col("Status", 80, custom_cellOptions={"type": "color-text"}, mappings=regex_colors([("Awaited", WARN)])),
-            col("Amount", 80, custom_align="right", unit="none", decimals=4, mappings=[NO_FIGURE], **SIGN_BAND), col("Execution ID", None)]),
+            col("Amount", 104, displayName="Amount USDT", custom_align="right", unit="none", decimals=4, mappings=[NO_FIGURE], **SIGN_BAND), col("Execution ID", None)]),
     ]
     panels.append(collapsed_row("System · ${span}", y, system)); y += 1
 

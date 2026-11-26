@@ -399,7 +399,7 @@
    "id": 4,
    "type": "stat",
    "title": "Market · Prices",
-   "description": "The Run's newest second (its age: the Run tile above), as Combo Spread's Prices · Latest Second; whatever the Range.\n\n- **${bull} Price**: Each leg's mid on the program's book, USDT.\n- **${bull} Anchor**: Each leg's anchor, USD per share: the bell (F × Binance's index at the close), then the issuer's NAV once confirmed.\n- **Anchor**: As Combo Spread's Anchor Status: NAV, Bell (provisional, grey) or Missing (amber: no entries).\n- **F · USD/USDT**: USD per USDT (Coinbase USDT-USD), the rate the program converts with: a price in USDT × F is in USD; an anchor in USD ÷ F is in USDT (owner item 80; Combo Spread's USD/USDT).",
+   "description": "The Run's newest second (its age: the Run tile above), as Combo Spread's Prices · Latest Second; whatever the Range.\n\n- **${bull} Price · USDT**: Each leg's mid on the program's book, USDT.\n- **${bull} Anchor · USD**: Each leg's anchor, USD per share: the bell (F × Binance's index at the close), then the issuer's NAV once confirmed.\n- **Anchor**: As Combo Spread's Anchor Status: NAV, Bell (provisional, grey) or Missing (amber: no entries).\n- **F · USD/USDT**: USD per USDT (Coinbase USDT-USD), the rate the program converts with: a price in USDT × F is in USD; an anchor in USD ÷ F is in USDT (owner item 80; Combo Spread's USD/USDT).",
    "gridPos": {
     "x": 0,
     "y": 7,
@@ -420,7 +420,7 @@
      "format": "table",
      "rawQuery": true,
      "editorMode": "code",
-     "rawSql": "WITH sel AS MATERIALIZED (SELECT r.run_id, r.live, r.started_ms, r.stopped_ms, r.host, r.config, coalesce(r.stopped_ms, (extract(epoch FROM now()) * 1000)::bigint) AS end_ms\n                         FROM trade.process_run r WHERE r.run_id = (SELECT CASE '$run' WHEN '__live' THEN (SELECT x.run_id FROM trade.process_run x WHERE x.live ORDER BY x.started_ms DESC LIMIT 1) WHEN '__paper' THEN (SELECT x.run_id FROM trade.process_run x WHERE NOT x.live ORDER BY x.started_ms DESC LIMIT 1) ELSE '$run' END) AND coalesce(r.config #>> '{cex,pair,bull,ticker}', 'SOXL') || ' / ' || coalesce(r.config #>> '{cex,pair,bear,ticker}', 'SOXS') = '$combo'),\nrg AS MATERIALIZED (SELECT greatest(sel.started_ms, (CASE WHEN '${since}' ~ '^[0-9]{1,14}$' AND '${since}' <> '0' THEN '${since}'::bigint + CASE WHEN '${since_hour}' ~ '^[0-9]{1,2}$' THEN '${since_hour}'::int ELSE 0 END * 3600000 ELSE 0 END)) AS from_ms, least(sel.end_ms + 1, (CASE WHEN '${until}' ~ '^[0-9]{1,14}$' AND '${until}'::bigint < 99999999999999 THEN '${until}'::bigint + CASE WHEN '${until_hour}' ~ '^[0-9]{1,2}$' THEN '${until_hour}'::int ELSE 24 END * 3600000 ELSE 99999999999999 END)) AS to_ms FROM sel),\n     r AS (SELECT * FROM sel), sr AS (SELECT * FROM sel),\n     s AS (SELECT * FROM trade.signal_sample s WHERE s.run_id = (SELECT sel.run_id FROM sel) AND s.live = (SELECT sel.live FROM sel) AND s.ts_ms <= (SELECT sel.end_ms FROM sel)\n           AND s.ts_ms > (SELECT sel.end_ms FROM sel) - 172800000 ORDER BY s.ts_ms DESC LIMIT 1),\n     i AS (SELECT * FROM trade.inventory_sample i WHERE i.run_id = (SELECT sel.run_id FROM sel) AND i.live = (SELECT sel.live FROM sel) AND i.ts_ms <= (SELECT sel.end_ms FROM sel)\n           AND i.ts_ms > (SELECT sel.end_ms FROM sel) - 172800000 ORDER BY i.ts_ms DESC LIMIT 1)\nSELECT (floor((s.mid_bull)::float8 * 1e3::float8 + 0.5) / 1e3::float8) AS \"Bull Price\", s.anchor_bull AS \"Bull Anchor\", (floor((s.mid_bear)::float8 * 1e3::float8 + 0.5) / 1e3::float8) AS \"Bear Price\", s.anchor_bear AS \"Bear Anchor\",\n       CASE WHEN s.ts_ms IS NULL THEN NULL WHEN s.anchor_kind = 'nav' THEN 'NAV' WHEN s.anchor_kind = 'bell' THEN 'Bell' ELSE 'Missing' END AS \"Anchor\",\n       s.f AS \"F\",\n       CASE WHEN s.stats_ready THEN 'Long ' || coalesce(replace(to_char(round((s.mu_d + s.x_long_d)::numeric, 1), 'FM9,990.0'), '-', '−') || ' bps', '–') || ' / Short ' || coalesce(replace(to_char(round((s.mu_d + s.x_short_d)::numeric, 1), 'FM9,990.0'), '-', '−') || ' bps', '–') END AS \"Real Spread\",\n       (floor((s.mu_d)::float8 * 1e1::float8 + 0.5) / 1e1::float8) AS \"Mean\", (floor((s.sigma_d)::float8 * 1e1::float8 + 0.5) / 1e1::float8) AS \"Volatility\",\n       CASE WHEN s.stats_ready AND nullif(s.sigma_d, 0) IS NOT NULL THEN replace(to_char(round((s.mid_d - s.mu_d)::numeric, 1), 'FM9,990.0'), '-', '−') || ' bps' || ' · ' || replace(to_char(round(((s.mid_d - s.mu_d) / nullif(s.sigma_d, 0))::numeric, 2), 'FM990.00'), '-', '−') || ' σ' END AS \"Deviation\",\n       CASE WHEN s.ts_ms IS NULL THEN NULL WHEN s.anchor_kind IS NULL THEN 'No Anchor' WHEN NOT s.stats_ready OR nullif(s.sigma_d, 0) IS NULL THEN 'No Mean' WHEN NOT (s.stats_ready AND s.depth_ok_bull AND s.depth_ok_bear AND NOT (s.conflict_bull OR s.conflict_bear)) THEN 'No Book' WHEN s.x_long_d / nullif(s.sigma_d, 0) <= -(sr.config -> 'strategy' ->> 'd_in')::float8 THEN 'Long' WHEN s.x_short_d / nullif(s.sigma_d, 0) >= (sr.config -> 'strategy' ->> 'd_in')::float8 THEN 'Short' ELSE 'None' END AS \"Signal\"\nFROM (SELECT 1) one LEFT JOIN r ON true LEFT JOIN s ON true LEFT JOIN sr ON true"
+     "rawSql": "WITH sel AS MATERIALIZED (SELECT r.run_id, r.live, r.started_ms, r.stopped_ms, r.host, r.config, coalesce(r.stopped_ms, (extract(epoch FROM now()) * 1000)::bigint) AS end_ms\n                         FROM trade.process_run r WHERE r.run_id = (SELECT CASE '$run' WHEN '__live' THEN (SELECT x.run_id FROM trade.process_run x WHERE x.live ORDER BY x.started_ms DESC LIMIT 1) WHEN '__paper' THEN (SELECT x.run_id FROM trade.process_run x WHERE NOT x.live ORDER BY x.started_ms DESC LIMIT 1) ELSE '$run' END) AND coalesce(r.config #>> '{cex,pair,bull,ticker}', 'SOXL') || ' / ' || coalesce(r.config #>> '{cex,pair,bear,ticker}', 'SOXS') = '$combo'),\nrg AS MATERIALIZED (SELECT greatest(sel.started_ms, (CASE WHEN '${since}' ~ '^[0-9]{1,14}$' AND '${since}' <> '0' THEN '${since}'::bigint + CASE WHEN '${since_hour}' ~ '^[0-9]{1,2}$' THEN '${since_hour}'::int ELSE 0 END * 3600000 ELSE 0 END)) AS from_ms, least(sel.end_ms + 1, (CASE WHEN '${until}' ~ '^[0-9]{1,14}$' AND '${until}'::bigint < 99999999999999 THEN '${until}'::bigint + CASE WHEN '${until_hour}' ~ '^[0-9]{1,2}$' THEN '${until_hour}'::int ELSE 24 END * 3600000 ELSE 99999999999999 END)) AS to_ms FROM sel),\n     r AS (SELECT * FROM sel), sr AS (SELECT * FROM sel),\n     s AS (SELECT * FROM trade.signal_sample s WHERE s.run_id = (SELECT sel.run_id FROM sel) AND s.live = (SELECT sel.live FROM sel) AND s.ts_ms <= (SELECT sel.end_ms FROM sel)\n           AND s.ts_ms > (SELECT sel.end_ms FROM sel) - 172800000 ORDER BY s.ts_ms DESC LIMIT 1),\n     i AS (SELECT * FROM trade.inventory_sample i WHERE i.run_id = (SELECT sel.run_id FROM sel) AND i.live = (SELECT sel.live FROM sel) AND i.ts_ms <= (SELECT sel.end_ms FROM sel)\n           AND i.ts_ms > (SELECT sel.end_ms FROM sel) - 172800000 ORDER BY i.ts_ms DESC LIMIT 1)\nSELECT (floor((s.mid_bull)::float8 * 1e3::float8 + 0.5) / 1e3::float8) AS \"Bull Price\", s.anchor_bull AS \"Bull Anchor\", (floor((s.mid_bear)::float8 * 1e3::float8 + 0.5) / 1e3::float8) AS \"Bear Price\", s.anchor_bear AS \"Bear Anchor\",\n       CASE WHEN s.ts_ms IS NULL THEN NULL WHEN s.anchor_kind = 'nav' THEN 'NAV' WHEN s.anchor_kind = 'bell' THEN 'Bell' ELSE 'Missing' END AS \"Anchor\",\n       s.f AS \"F\",\n       CASE WHEN NOT s.stats_ready THEN NULL WHEN NOT (s.stats_ready AND s.depth_ok_bull AND s.depth_ok_bear AND NOT (s.conflict_bull OR s.conflict_bear)) THEN '—' ELSE coalesce(replace(to_char(round((s.mu_d + s.x_long_d)::numeric, 1), 'FM9,990.0'), '-', '−') || ' bps', '–') ||\n            CASE WHEN s.x_long_d / nullif(s.sigma_d, 0) <= -(sr.config -> 'strategy' ->> 'd_in')::float8 THEN ' · Entry' ELSE '' END END AS \"Real Long\",\n       CASE WHEN NOT s.stats_ready THEN NULL WHEN NOT (s.stats_ready AND s.depth_ok_bull AND s.depth_ok_bear AND NOT (s.conflict_bull OR s.conflict_bear)) THEN '—' ELSE coalesce(replace(to_char(round((s.mu_d + s.x_short_d)::numeric, 1), 'FM9,990.0'), '-', '−') || ' bps', '–') ||\n            CASE WHEN s.x_short_d / nullif(s.sigma_d, 0) >= (sr.config -> 'strategy' ->> 'd_in')::float8 THEN ' · Entry' ELSE '' END END AS \"Real Short\",\n       replace(to_char(round((s.mu_d)::numeric, 1), 'FM9,990.0'), '-', '−') || ' bps' AS \"Mean\", (floor((s.sigma_d)::float8 * 1e1::float8 + 0.5) / 1e1::float8) AS \"Volatility\",\n       CASE WHEN s.stats_ready AND nullif(s.sigma_d, 0) IS NOT NULL THEN replace(to_char(round((s.mid_d - s.mu_d)::numeric, 1), 'FM9,990.0'), '-', '−') || ' bps' || ' · ' || replace(to_char(round(((s.mid_d - s.mu_d) / nullif(s.sigma_d, 0))::numeric, 2), 'FM990.00'), '-', '−') || ' σ' END AS \"Deviation\",\n       CASE WHEN s.ts_ms IS NULL THEN NULL WHEN s.anchor_kind IS NULL THEN 'No Anchor' WHEN NOT s.stats_ready OR nullif(s.sigma_d, 0) IS NULL THEN 'No Mean' WHEN NOT (s.stats_ready AND s.depth_ok_bull AND s.depth_ok_bear AND NOT (s.conflict_bull OR s.conflict_bear)) THEN 'No Book' WHEN s.x_long_d / nullif(s.sigma_d, 0) <= -(sr.config -> 'strategy' ->> 'd_in')::float8 THEN 'Long' WHEN s.x_short_d / nullif(s.sigma_d, 0) >= (sr.config -> 'strategy' ->> 'd_in')::float8 THEN 'Short' ELSE 'None' END AS \"Signal\"\nFROM (SELECT 1) one LEFT JOIN r ON true LEFT JOIN s ON true LEFT JOIN sr ON true"
     }
    ],
    "fieldConfig": {
@@ -486,7 +486,7 @@
        },
        {
         "id": "displayName",
-        "value": "${bull} Price"
+        "value": "${bull} Price · USDT"
        }
       ]
      },
@@ -522,7 +522,7 @@
        },
        {
         "id": "displayName",
-        "value": "${bull} Anchor"
+        "value": "${bull} Anchor · USD"
        }
       ]
      },
@@ -558,7 +558,7 @@
        },
        {
         "id": "displayName",
-        "value": "${bear} Price"
+        "value": "${bear} Price · USDT"
        }
       ]
      },
@@ -594,7 +594,7 @@
        },
        {
         "id": "displayName",
-        "value": "${bear} Anchor"
+        "value": "${bear} Anchor · USD"
        }
       ]
      },
@@ -719,7 +719,7 @@
    "id": 5,
    "type": "stat",
    "title": "Market · Real Spread and Signal",
-   "description": "The same second, as Combo Spread's Spread and Signal · Latest Second; every spread figure in bps.\n\n- **Real Spread**: Owner item 80: the spread at both legs' pricing levels, buying both (Long: where a Long enters and a Short exits) and selling both (Short), in spread bps: 10⁴ × (F × (P_bull ÷ A_bull + P_bear ÷ A_bear) − 2), the two legs' deviations added, as Combo Spread writes it (1 bps of spread is 0.5 bps of the two legs' notional).\n- **Mean**: The program's mean of the spread (on the mids), bps.\n- **波动率 (σ)**: 波动率 (σ): the standard deviation of the spread, bps.\n- **Deviation**: Spread on the mids − Mean, in bps and in σ.\n- **Signal**: In Combo Spread's words, on the program's executable deviations: Long (Buy Both at or past −d_in σ), Short (Sell Both at or past +d_in σ), None inside; No Anchor, No Mean (σ not ready), No Book (a leg's book conflicts or its depth is unusable: the program enters on none).",
+   "description": "The same second, as Combo Spread's Spread and Signal · Latest Second; every spread figure in bps.\n\n- **Real Spread · Long**: Owner item 80: the spread at both legs' pricing levels buying both (where a Long enters and a Short exits), in spread bps: 10⁴ × (F × (P_bull ÷ A_bull + P_bear ÷ A_bear) − 2), the two legs' deviations added, as Combo Spread writes it (1 bps of spread is 0.5 bps of the two legs' notional); owner item 84: blue with · Entry when it is at or past its entry line (Mean − d_in σ); — while a leg's book conflicts or its depth is unusable (owner item 70).\n- **Real Spread · Short**: Selling both (where a Short enters and a Long exits): orange with · Entry at or past Mean + d_in σ.\n- **Mean**: The program's mean of the spread (on the mids), bps (a minus sign, as in the real spreads).\n- **Volatility (σ)**: Volatility (σ): the standard deviation of the spread, bps.\n- **Deviation**: Spread on the mids − Mean, in bps and in σ.\n- **Signal**: In Combo Spread's words, on the program's executable deviations: Long (Buy Both at or past −d_in σ), Short (Sell Both at or past +d_in σ), None inside; No Anchor, No Mean (σ not ready), No Book (a leg's book conflicts or its depth is unusable: the program enters on none).",
    "gridPos": {
     "x": 0,
     "y": 10,
@@ -775,17 +775,9 @@
      {
       "matcher": {
        "id": "byName",
-       "options": "Mean"
+       "options": "Real Long"
       },
       "properties": [
-       {
-        "id": "unit",
-        "value": "suffix: bps"
-       },
-       {
-        "id": "decimals",
-        "value": 1
-       },
        {
         "id": "mappings",
         "value": [
@@ -799,8 +791,60 @@
             "index": 0
            }
           }
+         },
+         {
+          "type": "regex",
+          "options": {
+           "pattern": ".* · Entry$",
+           "result": {
+            "color": "#2a78d6",
+            "index": 0
+           }
+          }
          }
         ]
+       },
+       {
+        "id": "displayName",
+        "value": "Real Spread · Long"
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "Real Short"
+      },
+      "properties": [
+       {
+        "id": "mappings",
+        "value": [
+         {
+          "type": "special",
+          "options": {
+           "match": "null",
+           "result": {
+            "text": "–",
+            "color": "#898781",
+            "index": 0
+           }
+          }
+         },
+         {
+          "type": "regex",
+          "options": {
+           "pattern": ".* · Entry$",
+           "result": {
+            "color": "#d95926",
+            "index": 0
+           }
+          }
+         }
+        ]
+       },
+       {
+        "id": "displayName",
+        "value": "Real Spread · Short"
        }
       ]
      },
@@ -836,7 +880,7 @@
        },
        {
         "id": "displayName",
-        "value": "波动率 (σ)"
+        "value": "Volatility (σ)"
        }
       ]
      },
@@ -921,7 +965,8 @@
      "options": {
       "include": {
        "names": [
-        "Real Spread",
+        "Real Long",
+        "Real Short",
         "Mean",
         "Volatility",
         "Deviation",
@@ -1206,7 +1251,7 @@
    "id": 8,
    "type": "stat",
    "title": "Summary",
-   "description": "The Run's round trips closed in the Range (row title), in the owner's order (item 76); money in USDT (U), Notional and Peak Used in USDT.\n\n- **PnL**: Gross + Fee + Funding of the round trips closed in the Range, USDT: what the strategy earned (one whose funding is not known yet left out until it is).\n- **Gross**: Both legs' fills, sells less buys, before costs.\n- **Fee**: Trading fees, as a cost (negative).\n- **Funding**: Funding booked to them; + received.\n- **Open PnL**: The open round trip at the newest second's mids after its entry fees, before exit fees and the half spread an exit pays; green above zero, red below; not in PnL.\n- **Notional**: Traded: both legs' fills (entries, completions, trims, exits) of those round trips, USDT.\n- **Peak Used**: The most of N = M × L in use in the Range (held at entry prices, open orders, dust), USDT, from the Run's inventory samples.\n- **Win Rate**: Closed round trips with a positive PnL.\n- **Return**: PnL over Peak Used, bps (owner item 69: a return on the largest notional actually used).",
+   "description": "The Run's round trips closed in the Range (row title), in the owner's order (item 76); money in USDT (U), Notional and Peak Used in USDT.\n\n- **PnL**: Gross − Fee + Funding of the round trips closed in the Range, USDT: what the strategy earned (one whose funding is not known yet left out until it is).\n- **Gross**: Both legs' fills, sells less buys, before costs.\n- **Fee**: Trading fees paid, a cost shown as a positive amount (as everywhere on this board: Orders, the chart markers).\n- **Funding**: Funding booked to them; + received.\n- **Open PnL**: The open round trip at the newest second's mids after its entry fees, before exit fees and the half spread an exit pays; green above zero, red below; not in PnL.\n- **Notional**: Traded: both legs' fills (entries, completions, trims, exits) of those round trips, USDT.\n- **Peak Used**: The most of N = M × L in use in the Range (held at entry prices, open orders, dust), USDT, from the Run's inventory samples.\n- **Win Rate**: Closed round trips with a positive PnL.\n- **Return**: PnL over Peak Used, bps (owner item 69: a return on the largest notional actually used).",
    "gridPos": {
     "x": 0,
     "y": 22,
@@ -1227,7 +1272,7 @@
      "format": "table",
      "rawQuery": true,
      "editorMode": "code",
-     "rawSql": "WITH sel AS MATERIALIZED (SELECT r.run_id, r.live, r.started_ms, r.stopped_ms, r.host, r.config, coalesce(r.stopped_ms, (extract(epoch FROM now()) * 1000)::bigint) AS end_ms\n                         FROM trade.process_run r WHERE r.run_id = (SELECT CASE '$run' WHEN '__live' THEN (SELECT x.run_id FROM trade.process_run x WHERE x.live ORDER BY x.started_ms DESC LIMIT 1) WHEN '__paper' THEN (SELECT x.run_id FROM trade.process_run x WHERE NOT x.live ORDER BY x.started_ms DESC LIMIT 1) ELSE '$run' END) AND coalesce(r.config #>> '{cex,pair,bull,ticker}', 'SOXL') || ' / ' || coalesce(r.config #>> '{cex,pair,bear,ticker}', 'SOXS') = '$combo'),\nrg AS MATERIALIZED (SELECT greatest(sel.started_ms, (CASE WHEN '${since}' ~ '^[0-9]{1,14}$' AND '${since}' <> '0' THEN '${since}'::bigint + CASE WHEN '${since_hour}' ~ '^[0-9]{1,2}$' THEN '${since_hour}'::int ELSE 0 END * 3600000 ELSE 0 END)) AS from_ms, least(sel.end_ms + 1, (CASE WHEN '${until}' ~ '^[0-9]{1,14}$' AND '${until}'::bigint < 99999999999999 THEN '${until}'::bigint + CASE WHEN '${until_hour}' ~ '^[0-9]{1,2}$' THEN '${until_hour}'::int ELSE 24 END * 3600000 ELSE 99999999999999 END)) AS to_ms FROM sel),\n     r AS (SELECT * FROM sel), sr AS (SELECT * FROM sel),\n     s AS (SELECT * FROM trade.signal_sample s WHERE s.run_id = (SELECT sel.run_id FROM sel) AND s.live = (SELECT sel.live FROM sel) AND s.ts_ms <= (SELECT sel.end_ms FROM sel)\n           AND s.ts_ms > (SELECT sel.end_ms FROM sel) - 172800000 ORDER BY s.ts_ms DESC LIMIT 1),\n     i AS (SELECT * FROM trade.inventory_sample i WHERE i.run_id = (SELECT sel.run_id FROM sel) AND i.live = (SELECT sel.live FROM sel) AND i.ts_ms <= (SELECT sel.end_ms FROM sel)\n           AND i.ts_ms > (SELECT sel.end_ms FROM sel) - 172800000 ORDER BY i.ts_ms DESC LIMIT 1), c AS MATERIALIZED (\n  SELECT c.*, (SELECT sum(x.entry_value_bull + x.entry_value_bear + x.exit_value_bull + x.exit_value_bear) FROM trade.lot x\n               WHERE x.live = c.live AND x.cycle_id = c.cycle_id) AS traded\n  FROM trade.cycle c WHERE c.live = (SELECT sel.live FROM sel) AND (c.run_id = (SELECT sel.run_id FROM sel) OR c.cycle_id IN (SELECT dr.cycle_id FROM trade.decision dr WHERE dr.run_id = (SELECT sel.run_id FROM sel) AND dr.live = (SELECT sel.live FROM sel) AND dr.cycle_id IS NOT NULL)) AND c.status <> 'open' AND c.closed_ms >= (SELECT rg.from_ms FROM rg) AND c.closed_ms < (SELECT rg.to_ms FROM rg) AND c.end_reason IS DISTINCT FROM 'no_fill'),\nk AS (SELECT * FROM c WHERE c.funding_known), h AS (SELECT sum(l.entry_qty_bull - l.exit_qty_bull) AS q_bull,\n             sum(CASE WHEN l.entry_qty_bull > 0 THEN l.entry_value_bull * (l.entry_qty_bull - l.exit_qty_bull) / l.entry_qty_bull END) AS v_bull,\n             sum(l.entry_qty_bear - l.exit_qty_bear) AS q_bear,\n             sum(CASE WHEN l.entry_qty_bear > 0 THEN l.entry_value_bear * (l.entry_qty_bear - l.exit_qty_bear) / l.entry_qty_bear END) AS v_bear,\n             sum(CASE WHEN l.entry_qty_bull > 0 THEN l.entry_fee_bull * (l.entry_qty_bull - l.exit_qty_bull) / l.entry_qty_bull ELSE 0 END\n                 + CASE WHEN l.entry_qty_bear > 0 THEN l.entry_fee_bear * (l.entry_qty_bear - l.exit_qty_bear) / l.entry_qty_bear ELSE 0 END) AS fee,\n             max(c.direction) AS dir, min(c.opened_ms) AS opened_ms\n      FROM trade.cycle c JOIN trade.lot l ON l.live = c.live AND l.cycle_id = c.cycle_id\n      WHERE c.live = (SELECT sel.live FROM sel) AND (c.run_id = (SELECT sel.run_id FROM sel) OR c.cycle_id IN (SELECT dr.cycle_id FROM trade.decision dr WHERE dr.run_id = (SELECT sel.run_id FROM sel) AND dr.live = (SELECT sel.live FROM sel) AND dr.cycle_id IS NOT NULL)) AND c.status = 'open' AND l.status IN ('building', 'open')),\npk AS (SELECT max(p.quota_used) AS used FROM trade.inventory_sample p WHERE p.run_id = (SELECT sel.run_id FROM sel) AND p.live = (SELECT sel.live FROM sel) AND p.ts_ms >= (SELECT rg.from_ms FROM rg) AND p.ts_ms < (SELECT rg.to_ms FROM rg))\nSELECT (SELECT coalesce(sum(k.net), 0) FROM k) AS \"PnL\", (SELECT coalesce(sum(k.gross), 0) FROM k) AS \"Gross\",\n       (SELECT -coalesce(sum(k.fees), 0) FROM k) AS \"Fee\", (SELECT coalesce(sum(k.funding), 0) FROM k) AS \"Funding\",\n       (SELECT (floor((CASE WHEN h.dir IS NOT NULL THEN (CASE h.dir WHEN 'short' THEN -1 ELSE 1 END) * (s.mid_bull * h.q_bull - h.v_bull + s.mid_bear * h.q_bear - h.v_bear) - h.fee END)::float8 * 1e2::float8 + 0.5) / 1e2::float8) FROM (SELECT 1) one LEFT JOIN s ON true LEFT JOIN h ON true) AS \"Open PnL\",\n       (SELECT coalesce(sum(c.traded), 0) FROM c) AS \"Notional\", (SELECT pk.used FROM pk) AS \"Peak Used\",\n       (SELECT 100.0 * count(*) FILTER (WHERE k.net > 0) / nullif(count(*), 0) FROM k) AS \"Win Rate\",\n       (SELECT 10000 * coalesce(sum(k.net), 0) / nullif((SELECT pk.used FROM pk), 0) FROM k) AS \"Return\""
+     "rawSql": "WITH sel AS MATERIALIZED (SELECT r.run_id, r.live, r.started_ms, r.stopped_ms, r.host, r.config, coalesce(r.stopped_ms, (extract(epoch FROM now()) * 1000)::bigint) AS end_ms\n                         FROM trade.process_run r WHERE r.run_id = (SELECT CASE '$run' WHEN '__live' THEN (SELECT x.run_id FROM trade.process_run x WHERE x.live ORDER BY x.started_ms DESC LIMIT 1) WHEN '__paper' THEN (SELECT x.run_id FROM trade.process_run x WHERE NOT x.live ORDER BY x.started_ms DESC LIMIT 1) ELSE '$run' END) AND coalesce(r.config #>> '{cex,pair,bull,ticker}', 'SOXL') || ' / ' || coalesce(r.config #>> '{cex,pair,bear,ticker}', 'SOXS') = '$combo'),\nrg AS MATERIALIZED (SELECT greatest(sel.started_ms, (CASE WHEN '${since}' ~ '^[0-9]{1,14}$' AND '${since}' <> '0' THEN '${since}'::bigint + CASE WHEN '${since_hour}' ~ '^[0-9]{1,2}$' THEN '${since_hour}'::int ELSE 0 END * 3600000 ELSE 0 END)) AS from_ms, least(sel.end_ms + 1, (CASE WHEN '${until}' ~ '^[0-9]{1,14}$' AND '${until}'::bigint < 99999999999999 THEN '${until}'::bigint + CASE WHEN '${until_hour}' ~ '^[0-9]{1,2}$' THEN '${until_hour}'::int ELSE 24 END * 3600000 ELSE 99999999999999 END)) AS to_ms FROM sel),\n     r AS (SELECT * FROM sel), sr AS (SELECT * FROM sel),\n     s AS (SELECT * FROM trade.signal_sample s WHERE s.run_id = (SELECT sel.run_id FROM sel) AND s.live = (SELECT sel.live FROM sel) AND s.ts_ms <= (SELECT sel.end_ms FROM sel)\n           AND s.ts_ms > (SELECT sel.end_ms FROM sel) - 172800000 ORDER BY s.ts_ms DESC LIMIT 1),\n     i AS (SELECT * FROM trade.inventory_sample i WHERE i.run_id = (SELECT sel.run_id FROM sel) AND i.live = (SELECT sel.live FROM sel) AND i.ts_ms <= (SELECT sel.end_ms FROM sel)\n           AND i.ts_ms > (SELECT sel.end_ms FROM sel) - 172800000 ORDER BY i.ts_ms DESC LIMIT 1), c AS MATERIALIZED (\n  SELECT c.*, (SELECT sum(x.entry_value_bull + x.entry_value_bear + x.exit_value_bull + x.exit_value_bear) FROM trade.lot x\n               WHERE x.live = c.live AND x.cycle_id = c.cycle_id) AS traded\n  FROM trade.cycle c WHERE c.live = (SELECT sel.live FROM sel) AND (c.run_id = (SELECT sel.run_id FROM sel) OR c.cycle_id IN (SELECT dr.cycle_id FROM trade.decision dr WHERE dr.run_id = (SELECT sel.run_id FROM sel) AND dr.live = (SELECT sel.live FROM sel) AND dr.cycle_id IS NOT NULL)) AND c.status <> 'open' AND c.closed_ms >= (SELECT rg.from_ms FROM rg) AND c.closed_ms < (SELECT rg.to_ms FROM rg) AND c.end_reason IS DISTINCT FROM 'no_fill'),\nk AS (SELECT * FROM c WHERE c.funding_known), h AS (SELECT sum(l.entry_qty_bull - l.exit_qty_bull) AS q_bull,\n             sum(CASE WHEN l.entry_qty_bull > 0 THEN l.entry_value_bull * (l.entry_qty_bull - l.exit_qty_bull) / l.entry_qty_bull END) AS v_bull,\n             sum(l.entry_qty_bear - l.exit_qty_bear) AS q_bear,\n             sum(CASE WHEN l.entry_qty_bear > 0 THEN l.entry_value_bear * (l.entry_qty_bear - l.exit_qty_bear) / l.entry_qty_bear END) AS v_bear,\n             sum(CASE WHEN l.entry_qty_bull > 0 THEN l.entry_fee_bull * (l.entry_qty_bull - l.exit_qty_bull) / l.entry_qty_bull ELSE 0 END\n                 + CASE WHEN l.entry_qty_bear > 0 THEN l.entry_fee_bear * (l.entry_qty_bear - l.exit_qty_bear) / l.entry_qty_bear ELSE 0 END) AS fee,\n             max(c.direction) AS dir, min(c.opened_ms) AS opened_ms\n      FROM trade.cycle c JOIN trade.lot l ON l.live = c.live AND l.cycle_id = c.cycle_id\n      WHERE c.live = (SELECT sel.live FROM sel) AND (c.run_id = (SELECT sel.run_id FROM sel) OR c.cycle_id IN (SELECT dr.cycle_id FROM trade.decision dr WHERE dr.run_id = (SELECT sel.run_id FROM sel) AND dr.live = (SELECT sel.live FROM sel) AND dr.cycle_id IS NOT NULL)) AND c.status = 'open' AND l.status IN ('building', 'open')),\npk AS (SELECT max(p.quota_used) AS used FROM trade.inventory_sample p WHERE p.run_id = (SELECT sel.run_id FROM sel) AND p.live = (SELECT sel.live FROM sel) AND p.ts_ms >= (SELECT rg.from_ms FROM rg) AND p.ts_ms < (SELECT rg.to_ms FROM rg))\nSELECT (SELECT coalesce(sum(k.net), 0) FROM k) AS \"PnL\", (SELECT coalesce(sum(k.gross), 0) FROM k) AS \"Gross\",\n       (SELECT coalesce(sum(k.fees), 0) FROM k) AS \"Fee\", (SELECT coalesce(sum(k.funding), 0) FROM k) AS \"Funding\",\n       (SELECT (floor((CASE WHEN h.dir IS NOT NULL THEN (CASE h.dir WHEN 'short' THEN -1 ELSE 1 END) * (s.mid_bull * h.q_bull - h.v_bull + s.mid_bear * h.q_bear - h.v_bear) - h.fee END)::float8 * 1e2::float8 + 0.5) / 1e2::float8) FROM (SELECT 1) one LEFT JOIN s ON true LEFT JOIN h ON true) AS \"Open PnL\",\n       (SELECT coalesce(sum(c.traded), 0) FROM c) AS \"Notional\", (SELECT pk.used FROM pk) AS \"Peak Used\",\n       (SELECT to_char(round(coalesce(sum(c.traded), 0)), 'FM999,999,990') || ' U' FROM c) AS \"Notional Text\", (SELECT to_char(round(pk.used), 'FM999,999,990') || ' U' FROM pk) AS \"Peak Used Text\",\n       (SELECT 100.0 * count(*) FILTER (WHERE k.net > 0) / nullif(count(*), 0) FROM k) AS \"Win Rate\",\n       (SELECT 10000 * coalesce(sum(k.net), 0) / nullif((SELECT pk.used FROM pk), 0) FROM k) AS \"Return\""
     }
    ],
    "fieldConfig": {
@@ -1380,23 +1425,10 @@
         "value": 2
        },
        {
-        "id": "thresholds",
+        "id": "color",
         "value": {
-         "mode": "absolute",
-         "steps": [
-          {
-           "color": "#d03b3b",
-           "value": null
-          },
-          {
-           "color": "text",
-           "value": 0
-          },
-          {
-           "color": "#0ca30c",
-           "value": 1e-06
-          }
-         ]
+         "mode": "fixed",
+         "fixedColor": "text"
         }
        },
        {
@@ -1524,64 +1556,24 @@
      {
       "matcher": {
        "id": "byName",
-       "options": "Notional"
+       "options": "Notional Text"
       },
       "properties": [
        {
-        "id": "unit",
-        "value": "locale"
-       },
-       {
-        "id": "decimals",
-        "value": 0
-       },
-       {
-        "id": "mappings",
-        "value": [
-         {
-          "type": "special",
-          "options": {
-           "match": "null",
-           "result": {
-            "text": "–",
-            "color": "#898781",
-            "index": 0
-           }
-          }
-         }
-        ]
+        "id": "displayName",
+        "value": "Notional"
        }
       ]
      },
      {
       "matcher": {
        "id": "byName",
-       "options": "Peak Used"
+       "options": "Peak Used Text"
       },
       "properties": [
        {
-        "id": "unit",
-        "value": "locale"
-       },
-       {
-        "id": "decimals",
-        "value": 0
-       },
-       {
-        "id": "mappings",
-        "value": [
-         {
-          "type": "special",
-          "options": {
-           "match": "null",
-           "result": {
-            "text": "–",
-            "color": "#898781",
-            "index": 0
-           }
-          }
-         }
-        ]
+        "id": "displayName",
+        "value": "Peak Used"
        }
       ]
      },
@@ -1690,13 +1682,33 @@
     },
     "showPercentChange": false,
     "orientation": "vertical"
-   }
+   },
+   "transformations": [
+    {
+     "id": "filterFieldsByName",
+     "options": {
+      "include": {
+       "names": [
+        "PnL",
+        "Gross",
+        "Fee",
+        "Funding",
+        "Open PnL",
+        "Notional Text",
+        "Peak Used Text",
+        "Win Rate",
+        "Return"
+       ]
+      }
+     }
+    }
+   ]
   },
   {
    "id": 9,
    "type": "stat",
    "title": "Parameters",
-   "description": "The Run's settings (process_run.config) that its results are read with (owner item 80); the rest in Settings below.\n\n- **Mean Model**: The mean of the spread: EMA or SMA, over its scale in minutes.\n- **波动率 Scale**: The window of 波动率 (σ), the spread's standard deviation, in minutes.\n- **Entry**: d_in: a Long enters when Buy Both is d_in σ below the mean, a Short when Sell Both is d_in σ above it; in spread bps at the newest second's σ.\n- **Exit**: d_out: a Long exits when Sell Both reaches −d_out σ from the mean (past it, on the other side, when d_out is negative), a Short the mirror; in spread bps at the newest second's σ.\n- **Capital M**: The real capital the Run may use, USDT.\n- **Leverage L**: The total leverage.\n- **Notional N**: M × L: the notional the Run may hold, USDT.",
+   "description": "The Run's settings (process_run.config) that its results are read with (owner item 80); the rest in Settings below.\n\n- **Mean Model**: The mean of the spread: EMA or SMA, over its scale in minutes.\n- **Volatility Scale**: The window of Volatility (σ), the spread's standard deviation, in minutes.\n- **Entry**: d_in: a Long enters when Buy Both is d_in σ below the mean, a Short when Sell Both is d_in σ above it; in spread bps at the newest second's σ.\n- **Exit**: d_out: a Long exits when Sell Both reaches −d_out σ from the mean (past it, on the other side, when d_out is negative), a Short the mirror; in spread bps at the newest second's σ.\n- **Capital M**: The real capital the Run may use, USDT.\n- **Leverage L**: The total leverage.\n- **Notional N**: M × L: the notional the Run may hold, USDT.",
    "gridPos": {
     "x": 0,
     "y": 26,
@@ -1717,7 +1729,7 @@
      "format": "table",
      "rawQuery": true,
      "editorMode": "code",
-     "rawSql": "WITH sel AS MATERIALIZED (SELECT r.run_id, r.live, r.started_ms, r.stopped_ms, r.host, r.config, coalesce(r.stopped_ms, (extract(epoch FROM now()) * 1000)::bigint) AS end_ms\n                         FROM trade.process_run r WHERE r.run_id = (SELECT CASE '$run' WHEN '__live' THEN (SELECT x.run_id FROM trade.process_run x WHERE x.live ORDER BY x.started_ms DESC LIMIT 1) WHEN '__paper' THEN (SELECT x.run_id FROM trade.process_run x WHERE NOT x.live ORDER BY x.started_ms DESC LIMIT 1) ELSE '$run' END) AND coalesce(r.config #>> '{cex,pair,bull,ticker}', 'SOXL') || ' / ' || coalesce(r.config #>> '{cex,pair,bear,ticker}', 'SOXS') = '$combo'),\nrg AS MATERIALIZED (SELECT greatest(sel.started_ms, (CASE WHEN '${since}' ~ '^[0-9]{1,14}$' AND '${since}' <> '0' THEN '${since}'::bigint + CASE WHEN '${since_hour}' ~ '^[0-9]{1,2}$' THEN '${since_hour}'::int ELSE 0 END * 3600000 ELSE 0 END)) AS from_ms, least(sel.end_ms + 1, (CASE WHEN '${until}' ~ '^[0-9]{1,14}$' AND '${until}'::bigint < 99999999999999 THEN '${until}'::bigint + CASE WHEN '${until_hour}' ~ '^[0-9]{1,2}$' THEN '${until_hour}'::int ELSE 24 END * 3600000 ELSE 99999999999999 END)) AS to_ms FROM sel),\n     r AS (SELECT * FROM sel), sr AS (SELECT * FROM sel),\n     s AS (SELECT * FROM trade.signal_sample s WHERE s.run_id = (SELECT sel.run_id FROM sel) AND s.live = (SELECT sel.live FROM sel) AND s.ts_ms <= (SELECT sel.end_ms FROM sel)\n           AND s.ts_ms > (SELECT sel.end_ms FROM sel) - 172800000 ORDER BY s.ts_ms DESC LIMIT 1),\n     i AS (SELECT * FROM trade.inventory_sample i WHERE i.run_id = (SELECT sel.run_id FROM sel) AND i.live = (SELECT sel.live FROM sel) AND i.ts_ms <= (SELECT sel.end_ms FROM sel)\n           AND i.ts_ms > (SELECT sel.end_ms FROM sel) - 172800000 ORDER BY i.ts_ms DESC LIMIT 1)\nSELECT upper(r.config #>> '{strategy,mean_model}') || ' · ' || (r.config #>> '{strategy,mean_minutes}') || ' min' AS \"Mean Model\",\n       (r.config #>> '{strategy,sigma_minutes}') || ' min' AS \"Volatility Scale\",\n       replace(trim_scale((r.config #>> '{strategy,d_in}')::numeric)::text || 'σ · ' || coalesce(replace(to_char(round(((r.config #>> '{strategy,d_in}')::float8 * s.sigma_d)::numeric, 1), 'FM9,990.0'), '-', '−') || ' bps', '– bps'), '-', '−') AS \"Entry\",\n       replace(trim_scale((r.config #>> '{strategy,d_out}')::numeric)::text || 'σ · ' || coalesce(replace(to_char(round(((r.config #>> '{strategy,d_out}')::float8 * s.sigma_d)::numeric, 1), 'FM9,990.0'), '-', '−') || ' bps', '– bps'), '-', '−') AS \"Exit\",\n       (r.config #>> '{inventory,capital}')::numeric AS \"Capital M\", (r.config #>> '{inventory,leverage}')::numeric AS \"Leverage L\",\n       (r.config #>> '{inventory,capital}')::numeric * (r.config #>> '{inventory,leverage}')::numeric AS \"Notional N\"\nFROM r LEFT JOIN s ON true"
+     "rawSql": "WITH sel AS MATERIALIZED (SELECT r.run_id, r.live, r.started_ms, r.stopped_ms, r.host, r.config, coalesce(r.stopped_ms, (extract(epoch FROM now()) * 1000)::bigint) AS end_ms\n                         FROM trade.process_run r WHERE r.run_id = (SELECT CASE '$run' WHEN '__live' THEN (SELECT x.run_id FROM trade.process_run x WHERE x.live ORDER BY x.started_ms DESC LIMIT 1) WHEN '__paper' THEN (SELECT x.run_id FROM trade.process_run x WHERE NOT x.live ORDER BY x.started_ms DESC LIMIT 1) ELSE '$run' END) AND coalesce(r.config #>> '{cex,pair,bull,ticker}', 'SOXL') || ' / ' || coalesce(r.config #>> '{cex,pair,bear,ticker}', 'SOXS') = '$combo'),\nrg AS MATERIALIZED (SELECT greatest(sel.started_ms, (CASE WHEN '${since}' ~ '^[0-9]{1,14}$' AND '${since}' <> '0' THEN '${since}'::bigint + CASE WHEN '${since_hour}' ~ '^[0-9]{1,2}$' THEN '${since_hour}'::int ELSE 0 END * 3600000 ELSE 0 END)) AS from_ms, least(sel.end_ms + 1, (CASE WHEN '${until}' ~ '^[0-9]{1,14}$' AND '${until}'::bigint < 99999999999999 THEN '${until}'::bigint + CASE WHEN '${until_hour}' ~ '^[0-9]{1,2}$' THEN '${until_hour}'::int ELSE 24 END * 3600000 ELSE 99999999999999 END)) AS to_ms FROM sel),\n     r AS (SELECT * FROM sel), sr AS (SELECT * FROM sel),\n     s AS (SELECT * FROM trade.signal_sample s WHERE s.run_id = (SELECT sel.run_id FROM sel) AND s.live = (SELECT sel.live FROM sel) AND s.ts_ms <= (SELECT sel.end_ms FROM sel)\n           AND s.ts_ms > (SELECT sel.end_ms FROM sel) - 172800000 ORDER BY s.ts_ms DESC LIMIT 1),\n     i AS (SELECT * FROM trade.inventory_sample i WHERE i.run_id = (SELECT sel.run_id FROM sel) AND i.live = (SELECT sel.live FROM sel) AND i.ts_ms <= (SELECT sel.end_ms FROM sel)\n           AND i.ts_ms > (SELECT sel.end_ms FROM sel) - 172800000 ORDER BY i.ts_ms DESC LIMIT 1)\nSELECT upper(r.config #>> '{strategy,mean_model}') || ' · ' || (r.config #>> '{strategy,mean_minutes}') || ' min' AS \"Mean Model\",\n       (r.config #>> '{strategy,sigma_minutes}') || ' min' AS \"Volatility Scale\",\n       replace(trim_scale((r.config #>> '{strategy,d_in}')::numeric)::text || 'σ · ' || coalesce(replace(to_char(round(((r.config #>> '{strategy,d_in}')::float8 * s.sigma_d)::numeric, 1), 'FM9,990.0'), '-', '−') || ' bps', '– bps'), '-', '−') AS \"Entry\",\n       replace(trim_scale((r.config #>> '{strategy,d_out}')::numeric)::text || 'σ · ' || coalesce(replace(to_char(round(((r.config #>> '{strategy,d_out}')::float8 * s.sigma_d)::numeric, 1), 'FM9,990.0'), '-', '−') || ' bps', '– bps'), '-', '−') AS \"Exit\",\n       (r.config #>> '{inventory,capital}')::numeric AS \"Capital M\",\n       (r.config #>> '{inventory,capital}')::numeric * (r.config #>> '{inventory,leverage}')::numeric AS \"Notional N\",\n       to_char(round((r.config #>> '{inventory,capital}')::numeric), 'FM999,999,990') || ' U' AS \"Capital M Text\", (r.config #>> '{inventory,leverage}')::numeric AS \"Leverage L\",\n       to_char(round((r.config #>> '{inventory,capital}')::numeric * (r.config #>> '{inventory,leverage}')::numeric), 'FM999,999,990') || ' U' AS \"Notional N Text\"\nFROM r LEFT JOIN s ON true"
     }
    ],
    "fieldConfig": {
@@ -1754,44 +1766,12 @@
      {
       "matcher": {
        "id": "byName",
-       "options": "Volatility Scale"
+       "options": "Capital M Text"
       },
       "properties": [
        {
         "id": "displayName",
-        "value": "波动率 Scale"
-       }
-      ]
-     },
-     {
-      "matcher": {
-       "id": "byName",
-       "options": "Capital M"
-      },
-      "properties": [
-       {
-        "id": "unit",
-        "value": "locale"
-       },
-       {
-        "id": "decimals",
-        "value": 0
-       },
-       {
-        "id": "mappings",
-        "value": [
-         {
-          "type": "special",
-          "options": {
-           "match": "null",
-           "result": {
-            "text": "–",
-            "color": "#898781",
-            "index": 0
-           }
-          }
-         }
-        ]
+        "value": "Capital M"
        }
       ]
      },
@@ -1830,32 +1810,12 @@
      {
       "matcher": {
        "id": "byName",
-       "options": "Notional N"
+       "options": "Notional N Text"
       },
       "properties": [
        {
-        "id": "unit",
-        "value": "locale"
-       },
-       {
-        "id": "decimals",
-        "value": 0
-       },
-       {
-        "id": "mappings",
-        "value": [
-         {
-          "type": "special",
-          "options": {
-           "match": "null",
-           "result": {
-            "text": "–",
-            "color": "#898781",
-            "index": 0
-           }
-          }
-         }
-        ]
+        "id": "displayName",
+        "value": "Notional N"
        }
       ]
      }
@@ -1880,7 +1840,25 @@
     },
     "showPercentChange": false,
     "orientation": "vertical"
-   }
+   },
+   "transformations": [
+    {
+     "id": "filterFieldsByName",
+     "options": {
+      "include": {
+       "names": [
+        "Mean Model",
+        "Volatility Scale",
+        "Entry",
+        "Exit",
+        "Capital M Text",
+        "Leverage L",
+        "Notional N Text"
+       ]
+      }
+     }
+    }
+   ]
   },
   {
    "id": 10,
@@ -2295,7 +2273,7 @@
    "id": 13,
    "type": "stat",
    "title": "Position · ct and USDT",
-   "description": "The Run's newest second (a stopped Run's last), whatever the Range.\n\n- **Side**: Flat, or the open round trip's side: Long (both legs bought, blue), Short (both sold, orange).\n- **${bull}**: Contracts held on the leg as the program counts them, signed (+ long, − short); – when flat.\n- **Cost**: USDT: what the held contracts cost at entry, both legs (the notional held).\n- **Held**: Time since the round trip opened.\n- **To Exit**: σ still to go to the exit line (a Long: Sell Both up to −d_out σ; a Short: Buy Both down to +d_out σ); 0 or less: at the line, the exit is being sent · –: a leg's depth is unusable (the program sends no exit then; a book conflict does not stop an exit).",
+   "description": "The Run's newest second (a stopped Run's last), whatever the Range.\n\n- **Side**: Flat, or the open round trip's side: Long (both legs bought, blue), Short (both sold, orange).\n- **${bull} · ct**: Contracts held on the leg as the program counts them, signed (+ long, − short); – when flat.\n- **Cost · USDT**: USDT: what the held contracts cost at entry, both legs (the notional held).\n- **Held**: Time since the round trip opened.\n- **To Exit**: σ still to go to the exit line (a Long: Sell Both up to −d_out σ; a Short: Buy Both down to +d_out σ); 0 or less: at the line, the exit is being sent · –: a leg's depth is unusable (the program sends no exit then; a book conflict does not stop an exit).",
    "gridPos": {
     "x": 0,
     "y": 38,
@@ -2420,7 +2398,7 @@
        },
        {
         "id": "displayName",
-        "value": "${bull}"
+        "value": "${bull} · ct"
        },
        {
         "id": "mappings",
@@ -2456,7 +2434,7 @@
        },
        {
         "id": "displayName",
-        "value": "${bear}"
+        "value": "${bear} · ct"
        },
        {
         "id": "mappings",
@@ -2505,6 +2483,10 @@
           }
          }
         ]
+       },
+       {
+        "id": "displayName",
+        "value": "Cost · USDT"
        }
       ]
      },
@@ -2601,7 +2583,7 @@
    "id": 15,
    "type": "timeseries",
    "title": "Spread · bps",
-   "description": "After Combo Spread's Spread chart (owner item 81), in spread bps: 10⁴ × (F × (P_bull ÷ A_bull + P_bear ÷ A_bear) − 2), the two legs' deviations added (1 bps of spread is 0.5 bps of the two legs' notional), on the time picker's axis.\n\n- **Real Long Spread**: buying both legs at their pricing levels (blue): a Long enters when it falls to Mean − d_in σ (blue dashed), a Short exits when it falls to Mean + d_out σ (orange dotted).\n- **Real Short Spread**: selling both (orange): a Short enters when it rises to Mean + d_in σ (orange dashed), a Long exits when it rises to Mean − d_out σ (blue dotted).\n- **Mean**: the program's mean of the spread on the mids.\n- **Markers**: Markers (owner item 81): a long entry a green triangle ▲, a short entry a red triangle ▼, an exit a circle ● (a forced exit amber, a trim, completion or void entry a small grey one), at the decision's executable spread; hover one for its Execution ID (the round trip's opening, UTC+8, owner item 83: every marker of one round trip — entries, completions, trims, exits — has the same, as its row in Round Trips), the action, each leg's filled contracts and average price, the notional, the fees and the round trip's PnL.\n- **Points and marks**: Points: every second up to 25 min, then 5, 10, 30 s and whole minutes (a real spread is its bucket's extreme on its entry side, of the seconds whose books the program enters on: none, and tooltip Book Not OK, where a leg's book conflicts or its depth is unusable, owner item 70); a gap: no sample (process down), or a new session or run; shaded: each round trip from entry to exit (blue Long, orange Short; its mark under the chart: times, end reason, PnL); purple marks: a change of the anchors in use, with reason and both legs' anchors before → after (owner item 62).",
+   "description": "After Combo Spread's Spread chart (owner item 81), in spread bps: 10⁴ × (F × (P_bull ÷ A_bull + P_bear ÷ A_bear) − 2), the two legs' deviations added (1 bps of spread is 0.5 bps of the two legs' notional), on the time picker's axis.\n\n- **Real Long Spread**: buying both legs at their pricing levels (blue): a Long enters when it falls to Mean − d_in σ (blue dashed), a Short exits when it falls to Mean + d_out σ (orange dotted); thick where it is at or past its entry line (owner item 84).\n- **Real Short Spread**: selling both (orange): a Short enters when it rises to Mean + d_in σ (orange dashed), a Long exits when it rises to Mean − d_out σ (blue dotted); thick at or past its entry line.\n- **Mean**: the program's mean of the spread on the mids.\n- **Volatility lines**: Mean ± 0.5, 1, 1.5, 2, 2.5 and 3 σ, grey, whole multiples dashed and halves dotted, stronger further out, as Combo Spread draws them (owner item 84); the Run's entry and exit lines in colour over them.\n- **Markers**: Markers (owner items 81, 84): a long entry a green triangle ▲, a short entry a red triangle ▼; an entry undone (its lot voided: one leg filled and was trimmed back) a grey triangle; an exit a circle in the colour of the position it closes (closing a Long green, closing a Short red; a forced exit too, its tooltip says Forced); at the decision's executable spread. Hover one for its Execution ID (the round trip's opening, UTC+8, owner item 83: every marker of one round trip has the same, as its row in Round Trips), the action, each leg's filled contracts and average price, what was trimmed back, the notional, the fees paid (a cost, positive) and the round trip's PnL. A marker counts its whole step: its orders and the completions, trims and exits of the remaining leg sent for it, so an exit whose legs were closed by separate orders shows both; a leg it sent no order on shows —.\n- **Points and marks**: Points: every second up to 25 min, then 5, 10, 30 s and whole minutes (a real spread is its bucket's extreme on its entry side, of the seconds whose books the program enters on: none, and tooltip Book Not OK, where a leg's book conflicts or its depth is unusable, owner item 70); a gap: no sample (process down), or a new session or run; shaded: each round trip from entry to exit (blue Long, orange Short; its mark under the chart: times, end reason, PnL); purple marks: a change of the anchors in use, with reason and both legs' anchors before → after (owner item 62).",
    "gridPos": {
     "x": 0,
     "y": 42,
@@ -2622,7 +2604,7 @@
      "format": "table",
      "rawQuery": true,
      "editorMode": "code",
-     "rawSql": "WITH RECURSIVE sel AS MATERIALIZED (SELECT r.run_id, r.live, r.started_ms, r.stopped_ms, r.host, r.config, coalesce(r.stopped_ms, (extract(epoch FROM now()) * 1000)::bigint) AS end_ms\n                         FROM trade.process_run r WHERE r.run_id = (SELECT CASE '$run' WHEN '__live' THEN (SELECT x.run_id FROM trade.process_run x WHERE x.live ORDER BY x.started_ms DESC LIMIT 1) WHEN '__paper' THEN (SELECT x.run_id FROM trade.process_run x WHERE NOT x.live ORDER BY x.started_ms DESC LIMIT 1) ELSE '$run' END) AND coalesce(r.config #>> '{cex,pair,bull,ticker}', 'SOXL') || ' / ' || coalesce(r.config #>> '{cex,pair,bear,ticker}', 'SOXS') = '$combo'),\nrg AS MATERIALIZED (SELECT greatest(sel.started_ms, (CASE WHEN '${since}' ~ '^[0-9]{1,14}$' AND '${since}' <> '0' THEN '${since}'::bigint + CASE WHEN '${since_hour}' ~ '^[0-9]{1,2}$' THEN '${since_hour}'::int ELSE 0 END * 3600000 ELSE 0 END)) AS from_ms, least(sel.end_ms + 1, (CASE WHEN '${until}' ~ '^[0-9]{1,14}$' AND '${until}'::bigint < 99999999999999 THEN '${until}'::bigint + CASE WHEN '${until_hour}' ~ '^[0-9]{1,2}$' THEN '${until_hour}'::int ELSE 24 END * 3600000 ELSE 99999999999999 END)) AS to_ms FROM sel), x0 AS MATERIALIZED (SELECT (SELECT CASE WHEN r <= 1000 THEN 1000 WHEN r <= 5000 THEN 5000 WHEN r <= 10000 THEN 10000 WHEN r <= 30000 THEN 30000 ELSE ceil(r / 60000) * 60000 END::bigint FROM (SELECT ($__to - $__from) / 1500.0 AS r) x) AS step),\nb AS (\n  SELECT max(s.ts_ms) AS ts, s.run_id, s.session_id,\n         (array_agg(s.mid_d ORDER BY s.ts_ms DESC))[1] AS mid, (array_agg(s.mu_d ORDER BY s.ts_ms DESC))[1] AS mu,\n         (array_agg(s.sigma_d ORDER BY s.ts_ms DESC))[1] AS sigma,\n         min(CASE WHEN (s.stats_ready AND s.depth_ok_bull AND s.depth_ok_bear AND NOT (s.conflict_bull OR s.conflict_bear)) THEN s.mu_d + s.x_long_d END) AS rl, max(CASE WHEN (s.stats_ready AND s.depth_ok_bull AND s.depth_ok_bear AND NOT (s.conflict_bull OR s.conflict_bear)) THEN s.mu_d + s.x_short_d END) AS rs,\n         min(CASE WHEN (s.stats_ready AND s.depth_ok_bull AND s.depth_ok_bear AND NOT (s.conflict_bull OR s.conflict_bear)) THEN s.x_long_d END) AS xl, max(CASE WHEN (s.stats_ready AND s.depth_ok_bull AND s.depth_ok_bear AND NOT (s.conflict_bull OR s.conflict_bear)) THEN s.x_short_d END) AS xs,\n         coalesce(bool_or((s.stats_ready AND s.depth_ok_bull AND s.depth_ok_bear AND NOT (s.conflict_bull OR s.conflict_bear))), false) AS booked,\n         (array_agg(s.anchor_kind IS NOT NULL ORDER BY s.ts_ms DESC))[1] AS anchored, (array_agg(s.idle_reason ORDER BY s.ts_ms DESC))[1] AS idle\n  FROM trade.signal_sample s CROSS JOIN x0\n  WHERE s.ts_ms >= greatest($__from, (SELECT rg.from_ms FROM rg)) AND s.ts_ms <= least($__to, (SELECT rg.to_ms FROM rg) - 1) AND s.run_id = (SELECT sel.run_id FROM sel) AND s.live = (SELECT sel.live FROM sel)\n  GROUP BY s.ts_ms / x0.step, s.run_id, s.session_id),\nx AS MATERIALIZED (\n  SELECT x0.step, greatest(x0.step, ($__to - $__from) / 130)::bigint AS half,\n         greatest(coalesce(max(b.rl) - min(b.rs), 0), 2) / 18 AS hs,\n         greatest(coalesce(greatest(max(b.xl), 3 * max(b.sigma)) - least(min(b.xs), -3 * max(b.sigma)), 0), 2) / 18 AS hd\n  FROM x0 LEFT JOIN b ON true GROUP BY x0.step),\nk AS (\n  SELECT b.*, (r.config -> 'strategy' ->> 'd_in')::float8 AS d_in, (r.config -> 'strategy' ->> 'd_out')::float8 AS d_out,\n         lead(b.ts) OVER w AS next_ts, lead(b.run_id) OVER w AS next_run, lead(b.session_id) OVER w AS next_session\n  FROM b CROSS JOIN sel r\n  WINDOW w AS (ORDER BY b.ts)),\nm0 AS (\n  SELECT d.ts_ms, d.run_id, (d.detail ->> 'x_d')::float8 AS x, (d.detail ->> 'mu_d')::float8 AS mu,\n         CASE WHEN d.kind = 'entry' AND l.status = 'void' THEN 8 WHEN d.kind = 'entry' THEN CASE d.direction WHEN 'short' THEN 2 ELSE 1 END\n              WHEN d.kind = 'exit' THEN CASE d.direction WHEN 'short' THEN 4 ELSE 3 END WHEN d.kind = 'forced' THEN 5 WHEN d.kind = 'trim' THEN 6\n              ELSE 7 END AS action,\n         CASE WHEN c.status = 'open' THEN -9200000000 WHEN NOT c.funding_known THEN -9000000000 ELSE c.net END AS cycle_net, c.opened_ms AS exec_ms,\n         coalesce(d.detail -> 'client_order_ids', jsonb_build_array(d.detail ->> 'client_order_id')) AS ids\n  FROM trade.decision d\n  LEFT JOIN trade.lot l ON l.live = d.live AND l.lot_id = d.lot_id\n  LEFT JOIN trade.cycle c ON c.live = d.live AND c.cycle_id = d.cycle_id\n  WHERE d.run_id = (SELECT sel.run_id FROM sel) AND d.live = (SELECT sel.live FROM sel) AND d.kind IN ('entry', 'exit', 'complete', 'trim', 'forced') AND d.ts_ms >= greatest($__from, (SELECT rg.from_ms FROM rg)) AND d.ts_ms <= least($__to, (SELECT rg.to_ms FROM rg) - 1)),\nm AS (\n  SELECT m0.ts_ms, m0.run_id, m0.action, m0.cycle_net, m0.exec_ms, coalesce(m0.mu + m0.x, n.mid) AS ys, coalesce(m0.x, n.dev) AS yd, o.*\n  FROM m0\n  LEFT JOIN LATERAL (SELECT s.mid_d AS mid, s.mid_d - s.mu_d AS dev FROM trade.signal_sample s\n                     WHERE s.ts_ms <= m0.ts_ms AND s.ts_ms > m0.ts_ms - 60000 AND s.run_id = (SELECT sel.run_id FROM sel) AND s.live = (SELECT sel.live FROM sel) ORDER BY s.ts_ms DESC LIMIT 1) n ON m0.x IS NULL OR m0.mu IS NULL\n  CROSS JOIN LATERAL (\n    SELECT sum(o.cum_exec_qty) FILTER (WHERE o.leg = 'bull') AS q_bull, sum(o.cum_exec_value) FILTER (WHERE o.leg = 'bull') AS v_bull,\n           sum(o.cum_exec_qty) FILTER (WHERE o.leg = 'bear') AS q_bear, sum(o.cum_exec_value) FILTER (WHERE o.leg = 'bear') AS v_bear,\n           sum(o.fee) AS fee, bool_or(o.cum_exec_qty > 0 AND NOT o.fee_known) AS fee_pending\n    FROM trade.cex_order o WHERE o.live = (SELECT sel.live FROM sel) AND o.client_order_id IN (SELECT jsonb_array_elements_text(m0.ids))) o),\nmm AS (SELECT m.*, row_number() OVER (ORDER BY m.ts_ms) AS n FROM m),\nt0 AS (SELECT mm.ts_ms, mm.action, mm.ys, mm.yd, row_number() OVER (ORDER BY mm.ts_ms, mm.n) AS i FROM mm WHERE mm.action IN (1, 2)),\ngl AS (\n  SELECT t0.i, t0.ts_ms AS start FROM t0 WHERE t0.i = 1\n  UNION ALL\n  SELECT t0.i, CASE WHEN t0.ts_ms > gl.start + 2 * x.half THEN t0.ts_ms ELSE gl.start END FROM gl JOIN t0 ON t0.i = gl.i + 1 CROSS JOIN x),\ntri AS (SELECT DISTINCT ON (gl.start) t0.ts_ms, t0.action, t0.ys, t0.yd FROM gl JOIN t0 ON t0.i = gl.i AND t0.ts_ms = gl.start ORDER BY gl.start, t0.i),\nu AS (\n  SELECT k.ts, false AS mark, 0 AS kk, NULL::bigint AS n, k.run_id AS run, k.mid, k.mu, k.sigma, k.rl, k.rs, k.xl, k.xs, k.d_in, k.d_out, k.anchored, k.booked, k.idle FROM k\n  UNION ALL\n  SELECT mm.ts_ms + o.kk * x.half, true, o.kk, mm.n, mm.run_id, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL FROM mm CROSS JOIN x CROSS JOIN (VALUES (-1), (0), (1)) o(kk)),\ng AS (SELECT u.ts, u.mark, u.kk, u.n, CASE WHEN u.run IS DISTINCT FROM u.brun THEN NULL ELSE max(u.mid) OVER v END AS mid, CASE WHEN u.run IS DISTINCT FROM u.brun THEN NULL ELSE max(u.mu) OVER v END AS mu, CASE WHEN u.run IS DISTINCT FROM u.brun THEN NULL ELSE max(u.sigma) OVER v END AS sigma, CASE WHEN u.run IS DISTINCT FROM u.brun THEN NULL ELSE max(u.rl) OVER v END AS rl, CASE WHEN u.run IS DISTINCT FROM u.brun THEN NULL ELSE max(u.rs) OVER v END AS rs, CASE WHEN u.run IS DISTINCT FROM u.brun THEN NULL ELSE max(u.xl) OVER v END AS xl, CASE WHEN u.run IS DISTINCT FROM u.brun THEN NULL ELSE max(u.xs) OVER v END AS xs, CASE WHEN u.run IS DISTINCT FROM u.brun THEN NULL ELSE max(u.d_in) OVER v END AS d_in, CASE WHEN u.run IS DISTINCT FROM u.brun THEN NULL ELSE max(u.d_out) OVER v END AS d_out, CASE WHEN u.run IS DISTINCT FROM u.brun THEN NULL ELSE bool_or(u.anchored) OVER v END AS anchored, CASE WHEN u.run IS DISTINCT FROM u.brun THEN NULL ELSE bool_or(u.booked) OVER v END AS booked, CASE WHEN u.run IS DISTINCT FROM u.brun THEN NULL ELSE max(u.idle) OVER v END AS idle, max(u.n) FILTER (WHERE u.kk = 0) OVER (ORDER BY u.ts, u.mark ROWS UNBOUNDED PRECEDING) AS pn\n      FROM (SELECT u.*, max(u.run) FILTER (WHERE NOT u.mark) OVER v AS brun FROM\n              (SELECT u.*, count(*) FILTER (WHERE NOT u.mark) OVER (ORDER BY u.ts, u.mark) AS grp FROM u) u\n            WINDOW v AS (PARTITION BY u.grp)) u\n      WINDOW v AS (PARTITION BY u.grp)),\nh AS (SELECT g.*, CASE WHEN g.mark THEN g.n\n                       WHEN a.ts_ms IS NOT NULL AND g.ts - a.ts_ms <= greatest(x.step, ($__to - $__from) / 90) AND (b.ts_ms IS NULL OR g.ts - a.ts_ms <= b.ts_ms - g.ts) THEN a.n\n                       WHEN b.ts_ms IS NOT NULL AND b.ts_ms - g.ts <= greatest(x.step, ($__to - $__from) / 90) THEN b.n END AS cn\n      FROM g CROSS JOIN x LEFT JOIN mm a ON a.n = g.pn LEFT JOIN mm b ON b.n = coalesce(g.pn, 0) + 1)\nSELECT to_timestamp(t.ts / 1000.0) AS time, t.\"Real Long Spread\", t.\"Real Short Spread\", t.\"Mean\", t.\"Long In\", t.\"Long Out\", t.\"Short In\", t.\"Short Out\", t.\"Deviation\", t.\"Real Long Deviation\", t.\"Real Short Deviation\", t.\"Long In · Dev\", t.\"Long Out · Dev\", t.\"Short In · Dev\", t.\"Short Out · Dev\", t.\"+1σ\", t.\"−1σ\", t.\"+3σ\", t.\"−3σ\", t.\"Real Long Spread · Tooltip\", t.\"Real Short Spread · Tooltip\", t.\"Mean · Tooltip\", t.\"Sigma · Tooltip\", t.\"Deviation · Tooltip\", t.\"Real Long Deviation · Tooltip\", t.\"Real Short Deviation · Tooltip\", t.\"Entry\", t.\"Long Entry\", t.\"Long Entry · Base\", t.\"Short Entry\", t.\"Short Entry · Base\", t.\"Exit\", t.\"Forced Exit\", t.\"Other\", t.\"Long Entry · Dev\", t.\"Long Entry · Base · Dev\", t.\"Short Entry · Dev\", t.\"Short Entry · Base · Dev\", t.\"Exit · Dev\", t.\"Forced Exit · Dev\", t.\"Other · Dev\", t.\"Execution\", t.\"Action\", t.\"Decided\", t.\"Bull Filled\", t.\"Bull Avg\", t.\"Bear Filled\", t.\"Bear Avg\", t.\"Notional\", t.\"Fees\", t.\"Cycle Net\", t.\"At Spread\", t.\"At Deviation\" FROM (\n  SELECT p.ts, CASE WHEN p.mark THEN 2 ELSE 1 END AS ord, (floor((p.rl)::float8 * 1e1::float8 + 0.5) / 1e1::float8) AS \"Real Long Spread\", (floor((p.rs)::float8 * 1e1::float8 + 0.5) / 1e1::float8) AS \"Real Short Spread\", (floor((p.mu)::float8 * 1e1::float8 + 0.5) / 1e1::float8) AS \"Mean\", CASE WHEN nullif(p.sigma, 0) IS NOT NULL THEN (floor((p.mu + -p.d_in * p.sigma)::float8 * 1e1::float8 + 0.5) / 1e1::float8) END AS \"Long In\", CASE WHEN nullif(p.sigma, 0) IS NOT NULL THEN (floor((p.mu + -p.d_out * p.sigma)::float8 * 1e1::float8 + 0.5) / 1e1::float8) END AS \"Long Out\", CASE WHEN nullif(p.sigma, 0) IS NOT NULL THEN (floor((p.mu + p.d_in * p.sigma)::float8 * 1e1::float8 + 0.5) / 1e1::float8) END AS \"Short In\", CASE WHEN nullif(p.sigma, 0) IS NOT NULL THEN (floor((p.mu + p.d_out * p.sigma)::float8 * 1e1::float8 + 0.5) / 1e1::float8) END AS \"Short Out\", (floor((p.mid - p.mu)::float8 * 1e1::float8 + 0.5) / 1e1::float8) AS \"Deviation\", (floor((p.xl)::float8 * 1e1::float8 + 0.5) / 1e1::float8) AS \"Real Long Deviation\", (floor((p.xs)::float8 * 1e1::float8 + 0.5) / 1e1::float8) AS \"Real Short Deviation\", CASE WHEN nullif(p.sigma, 0) IS NOT NULL THEN (floor((-p.d_in * p.sigma)::float8 * 1e1::float8 + 0.5) / 1e1::float8) END AS \"Long In · Dev\", CASE WHEN nullif(p.sigma, 0) IS NOT NULL THEN (floor((-p.d_out * p.sigma)::float8 * 1e1::float8 + 0.5) / 1e1::float8) END AS \"Long Out · Dev\", CASE WHEN nullif(p.sigma, 0) IS NOT NULL THEN (floor((p.d_in * p.sigma)::float8 * 1e1::float8 + 0.5) / 1e1::float8) END AS \"Short In · Dev\", CASE WHEN nullif(p.sigma, 0) IS NOT NULL THEN (floor((p.d_out * p.sigma)::float8 * 1e1::float8 + 0.5) / 1e1::float8) END AS \"Short Out · Dev\", CASE WHEN nullif(p.sigma, 0) IS NOT NULL THEN (floor((1 * p.sigma)::float8 * 1e1::float8 + 0.5) / 1e1::float8) END AS \"+1σ\", CASE WHEN nullif(p.sigma, 0) IS NOT NULL THEN (floor((-1 * p.sigma)::float8 * 1e1::float8 + 0.5) / 1e1::float8) END AS \"−1σ\", CASE WHEN nullif(p.sigma, 0) IS NOT NULL THEN (floor((3 * p.sigma)::float8 * 1e1::float8 + 0.5) / 1e1::float8) END AS \"+3σ\", CASE WHEN nullif(p.sigma, 0) IS NOT NULL THEN (floor((-3 * p.sigma)::float8 * 1e1::float8 + 0.5) / 1e1::float8) END AS \"−3σ\", CASE WHEN p.anchored IS NULL OR c.n IS NOT NULL THEN 0 ELSE CASE WHEN p.rl IS NOT NULL THEN CASE WHEN (floor((p.rl)::float8 * 1e1::float8 + 0.5) / 1e1::float8) = 0 THEN -9400000000 ELSE (floor((p.rl)::float8 * 1e1::float8 + 0.5) / 1e1::float8) END WHEN NOT p.anchored THEN -2000000000 WHEN nullif(p.sigma, 0) IS NULL THEN -4000000000 WHEN NOT p.booked THEN -6000000000 ELSE -5000000000 END END AS \"Real Long Spread · Tooltip\", CASE WHEN p.anchored IS NULL OR c.n IS NOT NULL THEN 0 ELSE CASE WHEN p.rs IS NOT NULL THEN CASE WHEN (floor((p.rs)::float8 * 1e1::float8 + 0.5) / 1e1::float8) = 0 THEN -9400000000 ELSE (floor((p.rs)::float8 * 1e1::float8 + 0.5) / 1e1::float8) END WHEN NOT p.anchored THEN -2000000000 WHEN nullif(p.sigma, 0) IS NULL THEN -4000000000 WHEN NOT p.booked THEN -6000000000 ELSE -5000000000 END END AS \"Real Short Spread · Tooltip\", CASE WHEN p.anchored IS NULL OR c.n IS NOT NULL THEN 0 ELSE CASE WHEN p.mu IS NOT NULL THEN CASE WHEN (floor((p.mu)::float8 * 1e1::float8 + 0.5) / 1e1::float8) = 0 THEN -9400000000 ELSE (floor((p.mu)::float8 * 1e1::float8 + 0.5) / 1e1::float8) END WHEN NOT p.anchored THEN -2000000000 ELSE -4000000000 END END AS \"Mean · Tooltip\", CASE WHEN p.anchored IS NULL OR c.n IS NOT NULL THEN 0 ELSE CASE WHEN p.sigma IS NOT NULL THEN CASE WHEN (floor((p.sigma)::float8 * 1e1::float8 + 0.5) / 1e1::float8) = 0 THEN -9400000000 ELSE (floor((p.sigma)::float8 * 1e1::float8 + 0.5) / 1e1::float8) END WHEN NOT p.anchored THEN -2000000000 ELSE -4000000000 END END AS \"Sigma · Tooltip\", CASE WHEN p.anchored IS NULL OR c.n IS NOT NULL THEN 0 ELSE CASE WHEN p.mid - p.mu IS NOT NULL THEN CASE WHEN (floor((p.mid - p.mu)::float8 * 1e1::float8 + 0.5) / 1e1::float8) = 0 THEN -9400000000 ELSE (floor((p.mid - p.mu)::float8 * 1e1::float8 + 0.5) / 1e1::float8) END WHEN NOT p.anchored THEN -2000000000 ELSE -4000000000 END END AS \"Deviation · Tooltip\", CASE WHEN p.anchored IS NULL OR c.n IS NOT NULL THEN 0 ELSE CASE WHEN p.xl IS NOT NULL THEN CASE WHEN (floor((p.xl)::float8 * 1e1::float8 + 0.5) / 1e1::float8) = 0 THEN -9400000000 ELSE (floor((p.xl)::float8 * 1e1::float8 + 0.5) / 1e1::float8) END WHEN NOT p.anchored THEN -2000000000 WHEN nullif(p.sigma, 0) IS NULL THEN -4000000000 WHEN NOT p.booked THEN -6000000000 ELSE -5000000000 END END AS \"Real Long Deviation · Tooltip\", CASE WHEN p.anchored IS NULL OR c.n IS NOT NULL THEN 0 ELSE CASE WHEN p.xs IS NOT NULL THEN CASE WHEN (floor((p.xs)::float8 * 1e1::float8 + 0.5) / 1e1::float8) = 0 THEN -9400000000 ELSE (floor((p.xs)::float8 * 1e1::float8 + 0.5) / 1e1::float8) END WHEN NOT p.anchored THEN -2000000000 WHEN nullif(p.sigma, 0) IS NULL THEN -4000000000 WHEN NOT p.booked THEN -6000000000 ELSE -5000000000 END END AS \"Real Short Deviation · Tooltip\", CASE WHEN p.anchored IS NULL OR c.n IS NOT NULL THEN 0 ELSE CASE WHEN p.idle IS NULL THEN 100 WHEN p.idle = 'no_signal' THEN 1 WHEN p.idle = 'regular_hours' THEN 2 WHEN p.idle = 'spacing' THEN 3 WHEN p.idle = 'holding_other_side' THEN 4 WHEN p.idle = 'cost_not_covered' THEN 5 WHEN p.idle = 'quota_exhausted' THEN 6 WHEN p.idle = 'too_small' THEN 7 WHEN p.idle = 'warmup' THEN 8 WHEN p.idle = 'zero_sigma' THEN 9 WHEN p.idle = 'positions_read' THEN 10 WHEN p.idle = 'await_orders' THEN 11 WHEN p.idle = 'await_depth' THEN 12 WHEN p.idle = 'await_close' THEN 13 WHEN p.idle = 'action_window' THEN 14 WHEN p.idle = 'capital_pending' THEN 15 WHEN p.idle = 'no_levels' THEN 16 WHEN p.idle = 'depth_bull' THEN 17 WHEN p.idle = 'depth_bear' THEN 18 WHEN p.idle = 'conflict_bull' THEN 19 WHEN p.idle = 'conflict_bear' THEN 20 WHEN p.idle = 'fx_stale' THEN 21 WHEN p.idle = 'rejected_backoff' THEN 22 WHEN p.idle = 'no_anchor' THEN 23 WHEN p.idle = 'depth' THEN 24 WHEN p.idle = 'no_price' THEN 25 WHEN p.idle = 'order_unknown' THEN 26 WHEN p.idle = 'not_ready' THEN 27 WHEN p.idle = 'stopping' THEN 28 WHEN p.idle = 'no_new_entries' THEN 29 WHEN p.idle = 'settings' THEN 30 WHEN p.idle = 'store_error' THEN 31 WHEN p.idle = 'position_mismatch' THEN 32 ELSE 99 END END AS \"Entry\", CASE WHEN e.action = 1 THEN (floor((CASE WHEN abs(p.ts - e.ts_ms) <= x.half THEN e.ys - x.hs / 2 + x.hs * (1 - abs(p.ts - e.ts_ms)::float8 / x.half) END)::float8 * 1e2::float8 + 0.5) / 1e2::float8) END AS \"Long Entry\", CASE WHEN e.action = 1 THEN (floor((CASE WHEN abs(p.ts - e.ts_ms) <= x.half THEN e.ys - x.hs / 2 END)::float8 * 1e2::float8 + 0.5) / 1e2::float8) END AS \"Long Entry · Base\", CASE WHEN e.action = 2 THEN (floor((CASE WHEN abs(p.ts - e.ts_ms) <= x.half THEN e.ys + x.hs / 2 - x.hs * (1 - abs(p.ts - e.ts_ms)::float8 / x.half) END)::float8 * 1e2::float8 + 0.5) / 1e2::float8) END AS \"Short Entry\", CASE WHEN e.action = 2 THEN (floor((CASE WHEN abs(p.ts - e.ts_ms) <= x.half THEN e.ys + x.hs / 2 END)::float8 * 1e2::float8 + 0.5) / 1e2::float8) END AS \"Short Entry · Base\", CASE WHEN p.mark AND p.kk = 0 AND c.action IN (3, 4) THEN (floor((c.ys)::float8 * 1e2::float8 + 0.5) / 1e2::float8) END AS \"Exit\", CASE WHEN p.mark AND p.kk = 0 AND c.action IN (5) THEN (floor((c.ys)::float8 * 1e2::float8 + 0.5) / 1e2::float8) END AS \"Forced Exit\", CASE WHEN p.mark AND p.kk = 0 AND c.action IN (6, 7, 8) THEN (floor((c.ys)::float8 * 1e2::float8 + 0.5) / 1e2::float8) END AS \"Other\", CASE WHEN e.action = 1 THEN (floor((CASE WHEN abs(p.ts - e.ts_ms) <= x.half THEN e.yd - x.hd / 2 + x.hd * (1 - abs(p.ts - e.ts_ms)::float8 / x.half) END)::float8 * 1e2::float8 + 0.5) / 1e2::float8) END AS \"Long Entry · Dev\", CASE WHEN e.action = 1 THEN (floor((CASE WHEN abs(p.ts - e.ts_ms) <= x.half THEN e.yd - x.hd / 2 END)::float8 * 1e2::float8 + 0.5) / 1e2::float8) END AS \"Long Entry · Base · Dev\", CASE WHEN e.action = 2 THEN (floor((CASE WHEN abs(p.ts - e.ts_ms) <= x.half THEN e.yd + x.hd / 2 - x.hd * (1 - abs(p.ts - e.ts_ms)::float8 / x.half) END)::float8 * 1e2::float8 + 0.5) / 1e2::float8) END AS \"Short Entry · Dev\", CASE WHEN e.action = 2 THEN (floor((CASE WHEN abs(p.ts - e.ts_ms) <= x.half THEN e.yd + x.hd / 2 END)::float8 * 1e2::float8 + 0.5) / 1e2::float8) END AS \"Short Entry · Base · Dev\", CASE WHEN p.mark AND p.kk = 0 AND c.action IN (3, 4) THEN (floor((c.yd)::float8 * 1e2::float8 + 0.5) / 1e2::float8) END AS \"Exit · Dev\", CASE WHEN p.mark AND p.kk = 0 AND c.action IN (5) THEN (floor((c.yd)::float8 * 1e2::float8 + 0.5) / 1e2::float8) END AS \"Forced Exit · Dev\", CASE WHEN p.mark AND p.kk = 0 AND c.action IN (6, 7, 8) THEN (floor((c.yd)::float8 * 1e2::float8 + 0.5) / 1e2::float8) END AS \"Other · Dev\", CASE WHEN c.n IS NULL THEN 0 ELSE coalesce(c.exec_ms, -9500000000) END AS \"Execution\", CASE WHEN c.n IS NULL THEN 0 ELSE c.action END AS \"Action\", CASE WHEN c.n IS NULL THEN 0 ELSE c.ts_ms END AS \"Decided\", CASE WHEN c.n IS NULL THEN 0 ELSE CASE WHEN (floor((coalesce(c.q_bull, 0))::float8 * 1e2::float8 + 0.5) / 1e2::float8) = 0 THEN -9400000000 ELSE (floor((coalesce(c.q_bull, 0))::float8 * 1e2::float8 + 0.5) / 1e2::float8) END END AS \"Bull Filled\", CASE WHEN c.n IS NULL THEN 0 ELSE CASE WHEN c.q_bull > 0 THEN (floor((c.v_bull / c.q_bull)::float8 * 1e2::float8 + 0.5) / 1e2::float8) ELSE -9300000000 END END AS \"Bull Avg\", CASE WHEN c.n IS NULL THEN 0 ELSE CASE WHEN (floor((coalesce(c.q_bear, 0))::float8 * 1e2::float8 + 0.5) / 1e2::float8) = 0 THEN -9400000000 ELSE (floor((coalesce(c.q_bear, 0))::float8 * 1e2::float8 + 0.5) / 1e2::float8) END END AS \"Bear Filled\", CASE WHEN c.n IS NULL THEN 0 ELSE CASE WHEN c.q_bear > 0 THEN (floor((c.v_bear / c.q_bear)::float8 * 1e3::float8 + 0.5) / 1e3::float8) ELSE -9300000000 END END AS \"Bear Avg\", CASE WHEN c.n IS NULL THEN 0 ELSE CASE WHEN (floor((coalesce(c.v_bull, 0) + coalesce(c.v_bear, 0))::float8 * 1e2::float8 + 0.5) / 1e2::float8) = 0 THEN -9400000000 ELSE (floor((coalesce(c.v_bull, 0) + coalesce(c.v_bear, 0))::float8 * 1e2::float8 + 0.5) / 1e2::float8) END END AS \"Notional\", CASE WHEN c.n IS NULL THEN 0 ELSE CASE WHEN c.fee_pending THEN -9100000000 ELSE CASE WHEN (floor((-coalesce(c.fee, 0))::float8 * 1e2::float8 + 0.5) / 1e2::float8) = 0 THEN -9400000000 ELSE (floor((-coalesce(c.fee, 0))::float8 * 1e2::float8 + 0.5) / 1e2::float8) END END END AS \"Fees\", CASE WHEN c.n IS NULL THEN 0 ELSE CASE WHEN c.cycle_net <= -9000000000 THEN c.cycle_net ELSE CASE WHEN (floor((c.cycle_net)::float8 * 1e2::float8 + 0.5) / 1e2::float8) = 0 THEN -9400000000 ELSE (floor((c.cycle_net)::float8 * 1e2::float8 + 0.5) / 1e2::float8) END END END AS \"Cycle Net\", CASE WHEN c.n IS NULL THEN 0 ELSE CASE WHEN c.ys IS NULL THEN -9500000000 ELSE CASE WHEN (floor((c.ys)::float8 * 1e1::float8 + 0.5) / 1e1::float8) = 0 THEN -9400000000 ELSE (floor((c.ys)::float8 * 1e1::float8 + 0.5) / 1e1::float8) END END END AS \"At Spread\", CASE WHEN c.n IS NULL THEN 0 ELSE CASE WHEN c.yd IS NULL THEN -9500000000 ELSE CASE WHEN (floor((c.yd)::float8 * 1e1::float8 + 0.5) / 1e1::float8) = 0 THEN -9400000000 ELSE (floor((c.yd)::float8 * 1e1::float8 + 0.5) / 1e1::float8) END END END AS \"At Deviation\" FROM h p CROSS JOIN x LEFT JOIN mm c ON c.n = p.cn LEFT JOIN tri e ON abs(p.ts - e.ts_ms) <= x.half\n  UNION ALL\n  SELECT greatest(k.ts + 1, k.next_ts - 1), 0, NULL AS \"Real Long Spread\", NULL AS \"Real Short Spread\", NULL AS \"Mean\", NULL AS \"Long In\", NULL AS \"Long Out\", NULL AS \"Short In\", NULL AS \"Short Out\", NULL AS \"Deviation\", NULL AS \"Real Long Deviation\", NULL AS \"Real Short Deviation\", NULL AS \"Long In · Dev\", NULL AS \"Long Out · Dev\", NULL AS \"Short In · Dev\", NULL AS \"Short Out · Dev\", NULL AS \"+1σ\", NULL AS \"−1σ\", NULL AS \"+3σ\", NULL AS \"−3σ\", NULL AS \"Real Long Spread · Tooltip\", NULL AS \"Real Short Spread · Tooltip\", NULL AS \"Mean · Tooltip\", NULL AS \"Sigma · Tooltip\", NULL AS \"Deviation · Tooltip\", NULL AS \"Real Long Deviation · Tooltip\", NULL AS \"Real Short Deviation · Tooltip\", NULL AS \"Entry\", NULL AS \"Long Entry\", NULL AS \"Long Entry · Base\", NULL AS \"Short Entry\", NULL AS \"Short Entry · Base\", NULL AS \"Exit\", NULL AS \"Forced Exit\", NULL AS \"Other\", NULL AS \"Long Entry · Dev\", NULL AS \"Long Entry · Base · Dev\", NULL AS \"Short Entry · Dev\", NULL AS \"Short Entry · Base · Dev\", NULL AS \"Exit · Dev\", NULL AS \"Forced Exit · Dev\", NULL AS \"Other · Dev\", NULL AS \"Execution\", NULL AS \"Action\", NULL AS \"Decided\", NULL AS \"Bull Filled\", NULL AS \"Bull Avg\", NULL AS \"Bear Filled\", NULL AS \"Bear Avg\", NULL AS \"Notional\", NULL AS \"Fees\", NULL AS \"Cycle Net\", NULL AS \"At Spread\", NULL AS \"At Deviation\" FROM k CROSS JOIN x\n  WHERE k.next_ts IS NOT NULL AND (k.next_ts - k.ts > greatest(2 * x.step, 3000) OR k.next_run <> k.run_id OR k.next_session <> k.session_id)) t\nORDER BY t.ts, t.ord"
+     "rawSql": "WITH RECURSIVE sel AS MATERIALIZED (SELECT r.run_id, r.live, r.started_ms, r.stopped_ms, r.host, r.config, coalesce(r.stopped_ms, (extract(epoch FROM now()) * 1000)::bigint) AS end_ms\n                         FROM trade.process_run r WHERE r.run_id = (SELECT CASE '$run' WHEN '__live' THEN (SELECT x.run_id FROM trade.process_run x WHERE x.live ORDER BY x.started_ms DESC LIMIT 1) WHEN '__paper' THEN (SELECT x.run_id FROM trade.process_run x WHERE NOT x.live ORDER BY x.started_ms DESC LIMIT 1) ELSE '$run' END) AND coalesce(r.config #>> '{cex,pair,bull,ticker}', 'SOXL') || ' / ' || coalesce(r.config #>> '{cex,pair,bear,ticker}', 'SOXS') = '$combo'),\nrg AS MATERIALIZED (SELECT greatest(sel.started_ms, (CASE WHEN '${since}' ~ '^[0-9]{1,14}$' AND '${since}' <> '0' THEN '${since}'::bigint + CASE WHEN '${since_hour}' ~ '^[0-9]{1,2}$' THEN '${since_hour}'::int ELSE 0 END * 3600000 ELSE 0 END)) AS from_ms, least(sel.end_ms + 1, (CASE WHEN '${until}' ~ '^[0-9]{1,14}$' AND '${until}'::bigint < 99999999999999 THEN '${until}'::bigint + CASE WHEN '${until_hour}' ~ '^[0-9]{1,2}$' THEN '${until_hour}'::int ELSE 24 END * 3600000 ELSE 99999999999999 END)) AS to_ms FROM sel), x0 AS MATERIALIZED (SELECT (SELECT CASE WHEN r <= 1000 THEN 1000 WHEN r <= 5000 THEN 5000 WHEN r <= 10000 THEN 10000 WHEN r <= 30000 THEN 30000 ELSE ceil(r / 60000) * 60000 END::bigint FROM (SELECT ($__to - $__from) / 1500.0 AS r) x) AS step),\nb AS (\n  SELECT max(s.ts_ms) AS ts, s.run_id, s.session_id,\n         (array_agg(s.mid_d ORDER BY s.ts_ms DESC))[1] AS mid, (array_agg(s.mu_d ORDER BY s.ts_ms DESC))[1] AS mu,\n         (array_agg(s.sigma_d ORDER BY s.ts_ms DESC))[1] AS sigma,\n         min(CASE WHEN (s.stats_ready AND s.depth_ok_bull AND s.depth_ok_bear AND NOT (s.conflict_bull OR s.conflict_bear)) THEN s.mu_d + s.x_long_d END) AS rl, max(CASE WHEN (s.stats_ready AND s.depth_ok_bull AND s.depth_ok_bear AND NOT (s.conflict_bull OR s.conflict_bear)) THEN s.mu_d + s.x_short_d END) AS rs,\n         min(CASE WHEN (s.stats_ready AND s.depth_ok_bull AND s.depth_ok_bear AND NOT (s.conflict_bull OR s.conflict_bear)) THEN s.x_long_d END) AS xl, max(CASE WHEN (s.stats_ready AND s.depth_ok_bull AND s.depth_ok_bear AND NOT (s.conflict_bull OR s.conflict_bear)) THEN s.x_short_d END) AS xs,\n         coalesce(bool_or((s.stats_ready AND s.depth_ok_bull AND s.depth_ok_bear AND NOT (s.conflict_bull OR s.conflict_bear))), false) AS booked,\n         (array_agg(s.anchor_kind IS NOT NULL ORDER BY s.ts_ms DESC))[1] AS anchored, (array_agg(s.idle_reason ORDER BY s.ts_ms DESC))[1] AS idle\n  FROM trade.signal_sample s CROSS JOIN x0\n  WHERE s.ts_ms >= greatest($__from, (SELECT rg.from_ms FROM rg)) AND s.ts_ms <= least($__to, (SELECT rg.to_ms FROM rg) - 1) AND s.run_id = (SELECT sel.run_id FROM sel) AND s.live = (SELECT sel.live FROM sel)\n  GROUP BY s.ts_ms / x0.step, s.run_id, s.session_id),\nx AS MATERIALIZED (\n  SELECT x0.step, greatest(x0.step, ($__to - $__from) / 130)::bigint AS half,\n         greatest(coalesce(max(b.rl) - min(b.rs), 0), 2) / 18 AS hs,\n         greatest(coalesce(greatest(max(b.xl), 3 * max(b.sigma)) - least(min(b.xs), -3 * max(b.sigma)), 0), 2) / 18 AS hd\n  FROM x0 LEFT JOIN b ON true GROUP BY x0.step),\nk AS (\n  SELECT b.*, (r.config -> 'strategy' ->> 'd_in')::float8 AS d_in, (r.config -> 'strategy' ->> 'd_out')::float8 AS d_out,\n         lead(b.ts) OVER w AS next_ts, lead(b.run_id) OVER w AS next_run, lead(b.session_id) OVER w AS next_session\n  FROM b CROSS JOIN sel r\n  WINDOW w AS (ORDER BY b.ts)),\nm0 AS (\n  SELECT d.ts_ms, d.run_id, (d.detail ->> 'x_d')::float8 AS x, (d.detail ->> 'mu_d')::float8 AS mu,\n         CASE WHEN d.kind = 'entry' AND l.status = 'void' THEN CASE d.direction WHEN 'short' THEN 10 ELSE 8 END\n              WHEN d.kind = 'entry' THEN CASE d.direction WHEN 'short' THEN 2 ELSE 1 END\n              WHEN d.kind = 'exit' THEN CASE d.direction WHEN 'short' THEN 4 ELSE 3 END\n              ELSE CASE d.direction WHEN 'short' THEN 11 ELSE 5 END END AS action,\n         CASE WHEN c.status = 'open' THEN -9200000000 WHEN NOT c.funding_known THEN -9000000000 ELSE c.net END AS cycle_net, c.opened_ms AS exec_ms,\n         coalesce(d.detail -> 'client_order_ids', jsonb_build_array(d.detail ->> 'client_order_id')) AS ids,\n         d.live, d.cycle_id\n  FROM trade.decision d\n  LEFT JOIN trade.lot l ON l.live = d.live AND l.lot_id = d.lot_id\n  LEFT JOIN trade.cycle c ON c.live = d.live AND c.cycle_id = d.cycle_id\n  WHERE d.run_id = (SELECT sel.run_id FROM sel) AND d.live = (SELECT sel.live FROM sel) AND d.kind IN ('entry', 'exit', 'forced') AND d.ts_ms >= greatest($__from, (SELECT rg.from_ms FROM rg)) AND d.ts_ms <= least($__to, (SELECT rg.to_ms FROM rg) - 1)),\nm AS (\n  SELECT m0.ts_ms, m0.run_id, m0.action, m0.cycle_net, m0.exec_ms, coalesce(m0.mu + m0.x, n.mid) AS ys, coalesce(m0.x, n.dev) AS yd, o.*\n  FROM m0\n  LEFT JOIN LATERAL (SELECT s.mid_d AS mid, s.mid_d - s.mu_d AS dev FROM trade.signal_sample s\n                     WHERE s.ts_ms <= m0.ts_ms AND s.ts_ms > m0.ts_ms - 60000 AND s.run_id = (SELECT sel.run_id FROM sel) AND s.live = (SELECT sel.live FROM sel) ORDER BY s.ts_ms DESC LIMIT 1) n ON m0.x IS NULL OR m0.mu IS NULL\n  CROSS JOIN LATERAL (\n    SELECT sum(o.cum_exec_qty) FILTER (WHERE o.leg = 'bull' AND NOT o.undo) AS q_bull, sum(o.cum_exec_value) FILTER (WHERE o.leg = 'bull' AND NOT o.undo) AS v_bull,\n           sum(o.cum_exec_qty) FILTER (WHERE o.leg = 'bear' AND NOT o.undo) AS q_bear, sum(o.cum_exec_value) FILTER (WHERE o.leg = 'bear' AND NOT o.undo) AS v_bear,\n           count(*) FILTER (WHERE o.leg = 'bull' AND NOT o.undo) AS n_bull, count(*) FILTER (WHERE o.leg = 'bear' AND NOT o.undo) AS n_bear,\n           sum(o.cum_exec_qty) FILTER (WHERE o.leg = 'bull' AND o.undo) AS t_bull, sum(o.cum_exec_qty) FILTER (WHERE o.leg = 'bear' AND o.undo) AS t_bear,\n           sum(o.fee) AS fee, bool_or(o.cum_exec_qty > 0 AND NOT o.fee_known) AS fee_pending\n    FROM (SELECT o.*, o.purpose = 'trim' AS undo FROM trade.cex_order o WHERE o.live = (SELECT sel.live FROM sel) AND (o.client_order_id IN (SELECT jsonb_array_elements_text(m0.ids))\n      OR o.client_order_id IN (\n        SELECT f.detail ->> 'client_order_id' FROM trade.decision f\n        WHERE f.live = m0.live AND f.cycle_id = m0.cycle_id AND f.kind IN ('trim', 'complete') AND (f.detail ->> 'batch_sent_ms')::bigint = m0.ts_ms))) o) o),\nmm AS (SELECT m.*, row_number() OVER (ORDER BY m.ts_ms) AS n FROM m),\nt0 AS (SELECT mm.ts_ms, mm.action, mm.ys, mm.yd, row_number() OVER (ORDER BY mm.ts_ms, mm.n) AS i FROM mm WHERE mm.action IN (1, 2)),\ngl AS (\n  SELECT t0.i, t0.ts_ms AS start FROM t0 WHERE t0.i = 1\n  UNION ALL\n  SELECT t0.i, CASE WHEN t0.ts_ms > gl.start + 2 * x.half THEN t0.ts_ms ELSE gl.start END FROM gl JOIN t0 ON t0.i = gl.i + 1 CROSS JOIN x),\ntr AS (SELECT DISTINCT ON (gl.start) t0.ts_ms, t0.action, t0.ys, t0.yd FROM gl JOIN t0 ON t0.i = gl.i AND t0.ts_ms = gl.start ORDER BY gl.start, t0.i),\nu0 AS (SELECT mm.ts_ms, mm.action, mm.ys, mm.yd, row_number() OVER (ORDER BY mm.ts_ms, mm.n) AS i FROM mm CROSS JOIN x\n       WHERE mm.action IN (8, 10) AND NOT EXISTS (SELECT 1 FROM tr WHERE abs(tr.ts_ms - mm.ts_ms) <= 2 * x.half)),\nul AS (\n  SELECT u0.i, u0.ts_ms AS start FROM u0 WHERE u0.i = 1\n  UNION ALL\n  SELECT u0.i, CASE WHEN u0.ts_ms > ul.start + 2 * x.half THEN u0.ts_ms ELSE ul.start END FROM ul JOIN u0 ON u0.i = ul.i + 1 CROSS JOIN x),\ntri AS (SELECT * FROM tr UNION ALL\n        SELECT * FROM (SELECT DISTINCT ON (ul.start) u0.ts_ms, u0.action, u0.ys, u0.yd FROM ul JOIN u0 ON u0.i = ul.i AND u0.ts_ms = ul.start\n                       ORDER BY ul.start, u0.i) ug),\nu AS (\n  SELECT k.ts, false AS mark, 0 AS kk, NULL::bigint AS n, k.run_id AS run, k.mid, k.mu, k.sigma, k.rl, k.rs, k.xl, k.xs, k.d_in, k.d_out, k.anchored, k.booked, k.idle FROM k\n  UNION ALL\n  SELECT mm.ts_ms + o.kk * x.half, true, o.kk, mm.n, mm.run_id, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL FROM mm CROSS JOIN x CROSS JOIN (VALUES (-1), (0), (1)) o(kk)),\ng AS (SELECT u.ts, u.mark, u.kk, u.n, CASE WHEN u.run IS DISTINCT FROM u.brun THEN NULL ELSE max(u.mid) OVER v END AS mid, CASE WHEN u.run IS DISTINCT FROM u.brun THEN NULL ELSE max(u.mu) OVER v END AS mu, CASE WHEN u.run IS DISTINCT FROM u.brun THEN NULL ELSE max(u.sigma) OVER v END AS sigma, CASE WHEN u.run IS DISTINCT FROM u.brun THEN NULL ELSE max(u.rl) OVER v END AS rl, CASE WHEN u.run IS DISTINCT FROM u.brun THEN NULL ELSE max(u.rs) OVER v END AS rs, CASE WHEN u.run IS DISTINCT FROM u.brun THEN NULL ELSE max(u.xl) OVER v END AS xl, CASE WHEN u.run IS DISTINCT FROM u.brun THEN NULL ELSE max(u.xs) OVER v END AS xs, CASE WHEN u.run IS DISTINCT FROM u.brun THEN NULL ELSE max(u.d_in) OVER v END AS d_in, CASE WHEN u.run IS DISTINCT FROM u.brun THEN NULL ELSE max(u.d_out) OVER v END AS d_out, CASE WHEN u.run IS DISTINCT FROM u.brun THEN NULL ELSE bool_or(u.anchored) OVER v END AS anchored, CASE WHEN u.run IS DISTINCT FROM u.brun THEN NULL ELSE bool_or(u.booked) OVER v END AS booked, CASE WHEN u.run IS DISTINCT FROM u.brun THEN NULL ELSE max(u.idle) OVER v END AS idle, max(u.n) FILTER (WHERE u.kk = 0) OVER (ORDER BY u.ts, u.mark ROWS UNBOUNDED PRECEDING) AS pn\n      FROM (SELECT u.*, max(u.run) FILTER (WHERE NOT u.mark) OVER v AS brun FROM\n              (SELECT u.*, count(*) FILTER (WHERE NOT u.mark) OVER (ORDER BY u.ts, u.mark) AS grp FROM u) u\n            WINDOW v AS (PARTITION BY u.grp)) u\n      WINDOW v AS (PARTITION BY u.grp)),\nh AS (SELECT g.*, CASE WHEN g.mark THEN g.n\n                       WHEN a.ts_ms IS NOT NULL AND g.ts - a.ts_ms <= greatest(x.step, ($__to - $__from) / 90) AND (b.ts_ms IS NULL OR g.ts - a.ts_ms <= b.ts_ms - g.ts) THEN a.n\n                       WHEN b.ts_ms IS NOT NULL AND b.ts_ms - g.ts <= greatest(x.step, ($__to - $__from) / 90) THEN b.n END AS cn\n      FROM g CROSS JOIN x LEFT JOIN mm a ON a.n = g.pn LEFT JOIN mm b ON b.n = coalesce(g.pn, 0) + 1)\nSELECT to_timestamp(t.ts / 1000.0) AS time, t.\"Real Long Spread\", t.\"Real Short Spread\", t.\"Mean\", t.\"Long In\", t.\"Long Out\", t.\"Short In\", t.\"Short Out\", t.\"Real Long Deviation\", t.\"Real Short Deviation\", t.\"Long In · Dev\", t.\"Long Out · Dev\", t.\"Short In · Dev\", t.\"Short Out · Dev\", t.\"Real Long at Entry\", t.\"Real Short at Entry\", t.\"Real Long Deviation at Entry\", t.\"Real Short Deviation at Entry\", t.\"Mean + 0.5σ\", t.\"Mean − 0.5σ\", t.\"Mean + 1σ\", t.\"Mean − 1σ\", t.\"Mean + 1.5σ\", t.\"Mean − 1.5σ\", t.\"Mean + 2σ\", t.\"Mean − 2σ\", t.\"Mean + 2.5σ\", t.\"Mean − 2.5σ\", t.\"Mean + 3σ\", t.\"Mean − 3σ\", t.\"+0.5σ\", t.\"−0.5σ\", t.\"+1σ\", t.\"−1σ\", t.\"+1.5σ\", t.\"−1.5σ\", t.\"+2σ\", t.\"−2σ\", t.\"+2.5σ\", t.\"−2.5σ\", t.\"+3σ\", t.\"−3σ\", t.\"Real Long Spread · Tooltip\", t.\"Real Short Spread · Tooltip\", t.\"Mean · Tooltip\", t.\"Sigma · Tooltip\", t.\"Real Long Deviation · Tooltip\", t.\"Real Short Deviation · Tooltip\", t.\"Entry\", t.\"Long Entry\", t.\"Long Entry · Base\", t.\"Short Entry\", t.\"Short Entry · Base\", t.\"Undone Long Entry\", t.\"Undone Long Entry · Base\", t.\"Undone Short Entry\", t.\"Undone Short Entry · Base\", t.\"Long Exit\", t.\"Short Exit\", t.\"Long Entry · Dev\", t.\"Long Entry · Base · Dev\", t.\"Short Entry · Dev\", t.\"Short Entry · Base · Dev\", t.\"Undone Long Entry · Dev\", t.\"Undone Long Entry · Base · Dev\", t.\"Undone Short Entry · Dev\", t.\"Undone Short Entry · Base · Dev\", t.\"Long Exit · Dev\", t.\"Short Exit · Dev\", t.\"Execution\", t.\"Action\", t.\"Decided\", t.\"Bull Filled\", t.\"Bull Avg\", t.\"Bear Filled\", t.\"Bear Avg\", t.\"Bull Trimmed\", t.\"Bear Trimmed\", t.\"Notional\", t.\"Fees\", t.\"Cycle Net\", t.\"At Spread\", t.\"At Deviation\" FROM (\n  SELECT p.ts, CASE WHEN p.mark THEN 2 ELSE 1 END AS ord, (floor((p.rl)::float8 * 1e1::float8 + 0.5) / 1e1::float8) AS \"Real Long Spread\", (floor((p.rs)::float8 * 1e1::float8 + 0.5) / 1e1::float8) AS \"Real Short Spread\", (floor((p.mu)::float8 * 1e1::float8 + 0.5) / 1e1::float8) AS \"Mean\", CASE WHEN nullif(p.sigma, 0) IS NOT NULL THEN (floor((p.mu + -p.d_in * p.sigma)::float8 * 1e1::float8 + 0.5) / 1e1::float8) END AS \"Long In\", CASE WHEN nullif(p.sigma, 0) IS NOT NULL THEN (floor((p.mu + -p.d_out * p.sigma)::float8 * 1e1::float8 + 0.5) / 1e1::float8) END AS \"Long Out\", CASE WHEN nullif(p.sigma, 0) IS NOT NULL THEN (floor((p.mu + p.d_in * p.sigma)::float8 * 1e1::float8 + 0.5) / 1e1::float8) END AS \"Short In\", CASE WHEN nullif(p.sigma, 0) IS NOT NULL THEN (floor((p.mu + p.d_out * p.sigma)::float8 * 1e1::float8 + 0.5) / 1e1::float8) END AS \"Short Out\", (floor((p.xl)::float8 * 1e1::float8 + 0.5) / 1e1::float8) AS \"Real Long Deviation\", (floor((p.xs)::float8 * 1e1::float8 + 0.5) / 1e1::float8) AS \"Real Short Deviation\", CASE WHEN nullif(p.sigma, 0) IS NOT NULL THEN (floor((-p.d_in * p.sigma)::float8 * 1e1::float8 + 0.5) / 1e1::float8) END AS \"Long In · Dev\", CASE WHEN nullif(p.sigma, 0) IS NOT NULL THEN (floor((-p.d_out * p.sigma)::float8 * 1e1::float8 + 0.5) / 1e1::float8) END AS \"Long Out · Dev\", CASE WHEN nullif(p.sigma, 0) IS NOT NULL THEN (floor((p.d_in * p.sigma)::float8 * 1e1::float8 + 0.5) / 1e1::float8) END AS \"Short In · Dev\", CASE WHEN nullif(p.sigma, 0) IS NOT NULL THEN (floor((p.d_out * p.sigma)::float8 * 1e1::float8 + 0.5) / 1e1::float8) END AS \"Short Out · Dev\", CASE WHEN p.xl <= -p.d_in * nullif(p.sigma, 0) THEN (floor((p.rl)::float8 * 1e1::float8 + 0.5) / 1e1::float8) END AS \"Real Long at Entry\", CASE WHEN p.xs >= p.d_in * nullif(p.sigma, 0) THEN (floor((p.rs)::float8 * 1e1::float8 + 0.5) / 1e1::float8) END AS \"Real Short at Entry\", CASE WHEN p.xl <= -p.d_in * nullif(p.sigma, 0) THEN (floor((p.xl)::float8 * 1e1::float8 + 0.5) / 1e1::float8) END AS \"Real Long Deviation at Entry\", CASE WHEN p.xs >= p.d_in * nullif(p.sigma, 0) THEN (floor((p.xs)::float8 * 1e1::float8 + 0.5) / 1e1::float8) END AS \"Real Short Deviation at Entry\", CASE WHEN nullif(p.sigma, 0) IS NOT NULL THEN (floor((p.mu + 0.5 * p.sigma)::float8 * 1e1::float8 + 0.5) / 1e1::float8) END AS \"Mean + 0.5σ\", CASE WHEN nullif(p.sigma, 0) IS NOT NULL THEN (floor((p.mu - 0.5 * p.sigma)::float8 * 1e1::float8 + 0.5) / 1e1::float8) END AS \"Mean − 0.5σ\", CASE WHEN nullif(p.sigma, 0) IS NOT NULL THEN (floor((p.mu + 1 * p.sigma)::float8 * 1e1::float8 + 0.5) / 1e1::float8) END AS \"Mean + 1σ\", CASE WHEN nullif(p.sigma, 0) IS NOT NULL THEN (floor((p.mu - 1 * p.sigma)::float8 * 1e1::float8 + 0.5) / 1e1::float8) END AS \"Mean − 1σ\", CASE WHEN nullif(p.sigma, 0) IS NOT NULL THEN (floor((p.mu + 1.5 * p.sigma)::float8 * 1e1::float8 + 0.5) / 1e1::float8) END AS \"Mean + 1.5σ\", CASE WHEN nullif(p.sigma, 0) IS NOT NULL THEN (floor((p.mu - 1.5 * p.sigma)::float8 * 1e1::float8 + 0.5) / 1e1::float8) END AS \"Mean − 1.5σ\", CASE WHEN nullif(p.sigma, 0) IS NOT NULL THEN (floor((p.mu + 2 * p.sigma)::float8 * 1e1::float8 + 0.5) / 1e1::float8) END AS \"Mean + 2σ\", CASE WHEN nullif(p.sigma, 0) IS NOT NULL THEN (floor((p.mu - 2 * p.sigma)::float8 * 1e1::float8 + 0.5) / 1e1::float8) END AS \"Mean − 2σ\", CASE WHEN nullif(p.sigma, 0) IS NOT NULL THEN (floor((p.mu + 2.5 * p.sigma)::float8 * 1e1::float8 + 0.5) / 1e1::float8) END AS \"Mean + 2.5σ\", CASE WHEN nullif(p.sigma, 0) IS NOT NULL THEN (floor((p.mu - 2.5 * p.sigma)::float8 * 1e1::float8 + 0.5) / 1e1::float8) END AS \"Mean − 2.5σ\", CASE WHEN nullif(p.sigma, 0) IS NOT NULL THEN (floor((p.mu + 3 * p.sigma)::float8 * 1e1::float8 + 0.5) / 1e1::float8) END AS \"Mean + 3σ\", CASE WHEN nullif(p.sigma, 0) IS NOT NULL THEN (floor((p.mu - 3 * p.sigma)::float8 * 1e1::float8 + 0.5) / 1e1::float8) END AS \"Mean − 3σ\", CASE WHEN nullif(p.sigma, 0) IS NOT NULL THEN (floor((0.5 * p.sigma)::float8 * 1e1::float8 + 0.5) / 1e1::float8) END AS \"+0.5σ\", CASE WHEN nullif(p.sigma, 0) IS NOT NULL THEN (floor((-0.5 * p.sigma)::float8 * 1e1::float8 + 0.5) / 1e1::float8) END AS \"−0.5σ\", CASE WHEN nullif(p.sigma, 0) IS NOT NULL THEN (floor((1 * p.sigma)::float8 * 1e1::float8 + 0.5) / 1e1::float8) END AS \"+1σ\", CASE WHEN nullif(p.sigma, 0) IS NOT NULL THEN (floor((-1 * p.sigma)::float8 * 1e1::float8 + 0.5) / 1e1::float8) END AS \"−1σ\", CASE WHEN nullif(p.sigma, 0) IS NOT NULL THEN (floor((1.5 * p.sigma)::float8 * 1e1::float8 + 0.5) / 1e1::float8) END AS \"+1.5σ\", CASE WHEN nullif(p.sigma, 0) IS NOT NULL THEN (floor((-1.5 * p.sigma)::float8 * 1e1::float8 + 0.5) / 1e1::float8) END AS \"−1.5σ\", CASE WHEN nullif(p.sigma, 0) IS NOT NULL THEN (floor((2 * p.sigma)::float8 * 1e1::float8 + 0.5) / 1e1::float8) END AS \"+2σ\", CASE WHEN nullif(p.sigma, 0) IS NOT NULL THEN (floor((-2 * p.sigma)::float8 * 1e1::float8 + 0.5) / 1e1::float8) END AS \"−2σ\", CASE WHEN nullif(p.sigma, 0) IS NOT NULL THEN (floor((2.5 * p.sigma)::float8 * 1e1::float8 + 0.5) / 1e1::float8) END AS \"+2.5σ\", CASE WHEN nullif(p.sigma, 0) IS NOT NULL THEN (floor((-2.5 * p.sigma)::float8 * 1e1::float8 + 0.5) / 1e1::float8) END AS \"−2.5σ\", CASE WHEN nullif(p.sigma, 0) IS NOT NULL THEN (floor((3 * p.sigma)::float8 * 1e1::float8 + 0.5) / 1e1::float8) END AS \"+3σ\", CASE WHEN nullif(p.sigma, 0) IS NOT NULL THEN (floor((-3 * p.sigma)::float8 * 1e1::float8 + 0.5) / 1e1::float8) END AS \"−3σ\", CASE WHEN p.anchored IS NULL OR c.n IS NOT NULL THEN 0 ELSE CASE WHEN p.rl IS NOT NULL THEN CASE WHEN (floor((p.rl)::float8 * 1e1::float8 + 0.5) / 1e1::float8) = 0 THEN -9400000000 ELSE (floor((p.rl)::float8 * 1e1::float8 + 0.5) / 1e1::float8) END WHEN NOT p.anchored THEN -2000000000 WHEN nullif(p.sigma, 0) IS NULL THEN -4000000000 WHEN NOT p.booked THEN -6000000000 ELSE -5000000000 END END AS \"Real Long Spread · Tooltip\", CASE WHEN p.anchored IS NULL OR c.n IS NOT NULL THEN 0 ELSE CASE WHEN p.rs IS NOT NULL THEN CASE WHEN (floor((p.rs)::float8 * 1e1::float8 + 0.5) / 1e1::float8) = 0 THEN -9400000000 ELSE (floor((p.rs)::float8 * 1e1::float8 + 0.5) / 1e1::float8) END WHEN NOT p.anchored THEN -2000000000 WHEN nullif(p.sigma, 0) IS NULL THEN -4000000000 WHEN NOT p.booked THEN -6000000000 ELSE -5000000000 END END AS \"Real Short Spread · Tooltip\", CASE WHEN p.anchored IS NULL OR c.n IS NOT NULL THEN 0 ELSE CASE WHEN p.mu IS NOT NULL THEN CASE WHEN (floor((p.mu)::float8 * 1e1::float8 + 0.5) / 1e1::float8) = 0 THEN -9400000000 ELSE (floor((p.mu)::float8 * 1e1::float8 + 0.5) / 1e1::float8) END WHEN NOT p.anchored THEN -2000000000 ELSE -4000000000 END END AS \"Mean · Tooltip\", CASE WHEN p.anchored IS NULL OR c.n IS NOT NULL THEN 0 ELSE CASE WHEN p.sigma IS NOT NULL THEN CASE WHEN (floor((p.sigma)::float8 * 1e1::float8 + 0.5) / 1e1::float8) = 0 THEN -9400000000 ELSE (floor((p.sigma)::float8 * 1e1::float8 + 0.5) / 1e1::float8) END WHEN NOT p.anchored THEN -2000000000 ELSE -4000000000 END END AS \"Sigma · Tooltip\", CASE WHEN p.anchored IS NULL OR c.n IS NOT NULL THEN 0 ELSE CASE WHEN p.xl IS NOT NULL THEN CASE WHEN (floor((p.xl)::float8 * 1e1::float8 + 0.5) / 1e1::float8) = 0 THEN -9400000000 ELSE (floor((p.xl)::float8 * 1e1::float8 + 0.5) / 1e1::float8) END WHEN NOT p.anchored THEN -2000000000 WHEN nullif(p.sigma, 0) IS NULL THEN -4000000000 WHEN NOT p.booked THEN -6000000000 ELSE -5000000000 END END AS \"Real Long Deviation · Tooltip\", CASE WHEN p.anchored IS NULL OR c.n IS NOT NULL THEN 0 ELSE CASE WHEN p.xs IS NOT NULL THEN CASE WHEN (floor((p.xs)::float8 * 1e1::float8 + 0.5) / 1e1::float8) = 0 THEN -9400000000 ELSE (floor((p.xs)::float8 * 1e1::float8 + 0.5) / 1e1::float8) END WHEN NOT p.anchored THEN -2000000000 WHEN nullif(p.sigma, 0) IS NULL THEN -4000000000 WHEN NOT p.booked THEN -6000000000 ELSE -5000000000 END END AS \"Real Short Deviation · Tooltip\", CASE WHEN p.anchored IS NULL OR c.n IS NOT NULL THEN 0 ELSE CASE WHEN p.idle IS NULL THEN 100 WHEN p.idle = 'no_signal' THEN 1 WHEN p.idle = 'regular_hours' THEN 2 WHEN p.idle = 'spacing' THEN 3 WHEN p.idle = 'holding_other_side' THEN 4 WHEN p.idle = 'cost_not_covered' THEN 5 WHEN p.idle = 'quota_exhausted' THEN 6 WHEN p.idle = 'too_small' THEN 7 WHEN p.idle = 'warmup' THEN 8 WHEN p.idle = 'zero_sigma' THEN 9 WHEN p.idle = 'positions_read' THEN 10 WHEN p.idle = 'await_orders' THEN 11 WHEN p.idle = 'await_depth' THEN 12 WHEN p.idle = 'await_close' THEN 13 WHEN p.idle = 'action_window' THEN 14 WHEN p.idle = 'capital_pending' THEN 15 WHEN p.idle = 'no_levels' THEN 16 WHEN p.idle = 'depth_bull' THEN 17 WHEN p.idle = 'depth_bear' THEN 18 WHEN p.idle = 'conflict_bull' THEN 19 WHEN p.idle = 'conflict_bear' THEN 20 WHEN p.idle = 'fx_stale' THEN 21 WHEN p.idle = 'rejected_backoff' THEN 22 WHEN p.idle = 'no_anchor' THEN 23 WHEN p.idle = 'depth' THEN 24 WHEN p.idle = 'no_price' THEN 25 WHEN p.idle = 'order_unknown' THEN 26 WHEN p.idle = 'not_ready' THEN 27 WHEN p.idle = 'stopping' THEN 28 WHEN p.idle = 'no_new_entries' THEN 29 WHEN p.idle = 'settings' THEN 30 WHEN p.idle = 'store_error' THEN 31 WHEN p.idle = 'position_mismatch' THEN 32 ELSE 99 END END AS \"Entry\", CASE WHEN e.action = 1 THEN (floor((CASE WHEN abs(p.ts - e.ts_ms) <= x.half THEN e.ys - x.hs / 2 + x.hs * (1 - abs(p.ts - e.ts_ms)::float8 / x.half) END)::float8 * 1e2::float8 + 0.5) / 1e2::float8) END AS \"Long Entry\", CASE WHEN e.action = 1 THEN (floor((CASE WHEN abs(p.ts - e.ts_ms) <= x.half THEN e.ys - x.hs / 2 END)::float8 * 1e2::float8 + 0.5) / 1e2::float8) END AS \"Long Entry · Base\", CASE WHEN e.action = 2 THEN (floor((CASE WHEN abs(p.ts - e.ts_ms) <= x.half THEN e.ys + x.hs / 2 - x.hs * (1 - abs(p.ts - e.ts_ms)::float8 / x.half) END)::float8 * 1e2::float8 + 0.5) / 1e2::float8) END AS \"Short Entry\", CASE WHEN e.action = 2 THEN (floor((CASE WHEN abs(p.ts - e.ts_ms) <= x.half THEN e.ys + x.hs / 2 END)::float8 * 1e2::float8 + 0.5) / 1e2::float8) END AS \"Short Entry · Base\", CASE WHEN e.action = 8 THEN (floor((CASE WHEN abs(p.ts - e.ts_ms) <= x.half THEN e.ys - x.hs / 2 + x.hs * (1 - abs(p.ts - e.ts_ms)::float8 / x.half) END)::float8 * 1e2::float8 + 0.5) / 1e2::float8) END AS \"Undone Long Entry\", CASE WHEN e.action = 8 THEN (floor((CASE WHEN abs(p.ts - e.ts_ms) <= x.half THEN e.ys - x.hs / 2 END)::float8 * 1e2::float8 + 0.5) / 1e2::float8) END AS \"Undone Long Entry · Base\", CASE WHEN e.action = 10 THEN (floor((CASE WHEN abs(p.ts - e.ts_ms) <= x.half THEN e.ys + x.hs / 2 - x.hs * (1 - abs(p.ts - e.ts_ms)::float8 / x.half) END)::float8 * 1e2::float8 + 0.5) / 1e2::float8) END AS \"Undone Short Entry\", CASE WHEN e.action = 10 THEN (floor((CASE WHEN abs(p.ts - e.ts_ms) <= x.half THEN e.ys + x.hs / 2 END)::float8 * 1e2::float8 + 0.5) / 1e2::float8) END AS \"Undone Short Entry · Base\", CASE WHEN p.mark AND p.kk = 0 AND c.action IN (3, 5) THEN (floor((c.ys)::float8 * 1e2::float8 + 0.5) / 1e2::float8) END AS \"Long Exit\", CASE WHEN p.mark AND p.kk = 0 AND c.action IN (4, 11) THEN (floor((c.ys)::float8 * 1e2::float8 + 0.5) / 1e2::float8) END AS \"Short Exit\", CASE WHEN e.action = 1 THEN (floor((CASE WHEN abs(p.ts - e.ts_ms) <= x.half THEN e.yd - x.hd / 2 + x.hd * (1 - abs(p.ts - e.ts_ms)::float8 / x.half) END)::float8 * 1e2::float8 + 0.5) / 1e2::float8) END AS \"Long Entry · Dev\", CASE WHEN e.action = 1 THEN (floor((CASE WHEN abs(p.ts - e.ts_ms) <= x.half THEN e.yd - x.hd / 2 END)::float8 * 1e2::float8 + 0.5) / 1e2::float8) END AS \"Long Entry · Base · Dev\", CASE WHEN e.action = 2 THEN (floor((CASE WHEN abs(p.ts - e.ts_ms) <= x.half THEN e.yd + x.hd / 2 - x.hd * (1 - abs(p.ts - e.ts_ms)::float8 / x.half) END)::float8 * 1e2::float8 + 0.5) / 1e2::float8) END AS \"Short Entry · Dev\", CASE WHEN e.action = 2 THEN (floor((CASE WHEN abs(p.ts - e.ts_ms) <= x.half THEN e.yd + x.hd / 2 END)::float8 * 1e2::float8 + 0.5) / 1e2::float8) END AS \"Short Entry · Base · Dev\", CASE WHEN e.action = 8 THEN (floor((CASE WHEN abs(p.ts - e.ts_ms) <= x.half THEN e.yd - x.hd / 2 + x.hd * (1 - abs(p.ts - e.ts_ms)::float8 / x.half) END)::float8 * 1e2::float8 + 0.5) / 1e2::float8) END AS \"Undone Long Entry · Dev\", CASE WHEN e.action = 8 THEN (floor((CASE WHEN abs(p.ts - e.ts_ms) <= x.half THEN e.yd - x.hd / 2 END)::float8 * 1e2::float8 + 0.5) / 1e2::float8) END AS \"Undone Long Entry · Base · Dev\", CASE WHEN e.action = 10 THEN (floor((CASE WHEN abs(p.ts - e.ts_ms) <= x.half THEN e.yd + x.hd / 2 - x.hd * (1 - abs(p.ts - e.ts_ms)::float8 / x.half) END)::float8 * 1e2::float8 + 0.5) / 1e2::float8) END AS \"Undone Short Entry · Dev\", CASE WHEN e.action = 10 THEN (floor((CASE WHEN abs(p.ts - e.ts_ms) <= x.half THEN e.yd + x.hd / 2 END)::float8 * 1e2::float8 + 0.5) / 1e2::float8) END AS \"Undone Short Entry · Base · Dev\", CASE WHEN p.mark AND p.kk = 0 AND c.action IN (3, 5) THEN (floor((c.yd)::float8 * 1e2::float8 + 0.5) / 1e2::float8) END AS \"Long Exit · Dev\", CASE WHEN p.mark AND p.kk = 0 AND c.action IN (4, 11) THEN (floor((c.yd)::float8 * 1e2::float8 + 0.5) / 1e2::float8) END AS \"Short Exit · Dev\", CASE WHEN c.n IS NULL THEN 0 ELSE coalesce(c.exec_ms, -9500000000) END AS \"Execution\", CASE WHEN c.n IS NULL THEN 0 ELSE c.action END AS \"Action\", CASE WHEN c.n IS NULL THEN 0 ELSE c.ts_ms END AS \"Decided\", CASE WHEN c.n IS NULL THEN 0 ELSE CASE WHEN c.n_bull = 0 THEN -9600000000 ELSE CASE WHEN (floor((coalesce(c.q_bull, 0))::float8 * 1e2::float8 + 0.5) / 1e2::float8) = 0 THEN -9400000000 ELSE (floor((coalesce(c.q_bull, 0))::float8 * 1e2::float8 + 0.5) / 1e2::float8) END END END AS \"Bull Filled\", CASE WHEN c.n IS NULL THEN 0 ELSE CASE WHEN c.n_bull = 0 THEN -9600000000 WHEN c.q_bull > 0 THEN (floor((c.v_bull / c.q_bull)::float8 * 1e2::float8 + 0.5) / 1e2::float8) ELSE -9300000000 END END AS \"Bull Avg\", CASE WHEN c.n IS NULL THEN 0 ELSE CASE WHEN c.n_bear = 0 THEN -9600000000 ELSE CASE WHEN (floor((coalesce(c.q_bear, 0))::float8 * 1e2::float8 + 0.5) / 1e2::float8) = 0 THEN -9400000000 ELSE (floor((coalesce(c.q_bear, 0))::float8 * 1e2::float8 + 0.5) / 1e2::float8) END END END AS \"Bear Filled\", CASE WHEN c.n IS NULL THEN 0 ELSE CASE WHEN c.n_bear = 0 THEN -9600000000 WHEN c.q_bear > 0 THEN (floor((c.v_bear / c.q_bear)::float8 * 1e3::float8 + 0.5) / 1e3::float8) ELSE -9300000000 END END AS \"Bear Avg\", CASE WHEN c.n IS NULL THEN 0 ELSE (floor((coalesce(c.t_bull, 0))::float8 * 1e2::float8 + 0.5) / 1e2::float8) END AS \"Bull Trimmed\", CASE WHEN c.n IS NULL THEN 0 ELSE (floor((coalesce(c.t_bear, 0))::float8 * 1e2::float8 + 0.5) / 1e2::float8) END AS \"Bear Trimmed\", CASE WHEN c.n IS NULL THEN 0 ELSE CASE WHEN (floor((coalesce(c.v_bull, 0) + coalesce(c.v_bear, 0))::float8 * 1e2::float8 + 0.5) / 1e2::float8) = 0 THEN -9400000000 ELSE (floor((coalesce(c.v_bull, 0) + coalesce(c.v_bear, 0))::float8 * 1e2::float8 + 0.5) / 1e2::float8) END END AS \"Notional\", CASE WHEN c.n IS NULL THEN 0 ELSE CASE WHEN c.fee_pending THEN -9100000000 ELSE CASE WHEN (floor((coalesce(c.fee, 0))::float8 * 1e2::float8 + 0.5) / 1e2::float8) = 0 THEN -9400000000 ELSE (floor((coalesce(c.fee, 0))::float8 * 1e2::float8 + 0.5) / 1e2::float8) END END END AS \"Fees\", CASE WHEN c.n IS NULL THEN 0 ELSE CASE WHEN c.cycle_net <= -9000000000 THEN c.cycle_net ELSE CASE WHEN (floor((c.cycle_net)::float8 * 1e2::float8 + 0.5) / 1e2::float8) = 0 THEN -9400000000 ELSE (floor((c.cycle_net)::float8 * 1e2::float8 + 0.5) / 1e2::float8) END END END AS \"Cycle Net\", CASE WHEN c.n IS NULL THEN 0 ELSE CASE WHEN c.ys IS NULL THEN -9500000000 ELSE CASE WHEN (floor((c.ys)::float8 * 1e1::float8 + 0.5) / 1e1::float8) = 0 THEN -9400000000 ELSE (floor((c.ys)::float8 * 1e1::float8 + 0.5) / 1e1::float8) END END END AS \"At Spread\", CASE WHEN c.n IS NULL THEN 0 ELSE CASE WHEN c.yd IS NULL THEN -9500000000 ELSE CASE WHEN (floor((c.yd)::float8 * 1e1::float8 + 0.5) / 1e1::float8) = 0 THEN -9400000000 ELSE (floor((c.yd)::float8 * 1e1::float8 + 0.5) / 1e1::float8) END END END AS \"At Deviation\" FROM h p CROSS JOIN x LEFT JOIN mm c ON c.n = p.cn LEFT JOIN tri e ON abs(p.ts - e.ts_ms) <= x.half\n  UNION ALL\n  SELECT greatest(k.ts + 1, k.next_ts - 1), 0, NULL AS \"Real Long Spread\", NULL AS \"Real Short Spread\", NULL AS \"Mean\", NULL AS \"Long In\", NULL AS \"Long Out\", NULL AS \"Short In\", NULL AS \"Short Out\", NULL AS \"Real Long Deviation\", NULL AS \"Real Short Deviation\", NULL AS \"Long In · Dev\", NULL AS \"Long Out · Dev\", NULL AS \"Short In · Dev\", NULL AS \"Short Out · Dev\", NULL AS \"Real Long at Entry\", NULL AS \"Real Short at Entry\", NULL AS \"Real Long Deviation at Entry\", NULL AS \"Real Short Deviation at Entry\", NULL AS \"Mean + 0.5σ\", NULL AS \"Mean − 0.5σ\", NULL AS \"Mean + 1σ\", NULL AS \"Mean − 1σ\", NULL AS \"Mean + 1.5σ\", NULL AS \"Mean − 1.5σ\", NULL AS \"Mean + 2σ\", NULL AS \"Mean − 2σ\", NULL AS \"Mean + 2.5σ\", NULL AS \"Mean − 2.5σ\", NULL AS \"Mean + 3σ\", NULL AS \"Mean − 3σ\", NULL AS \"+0.5σ\", NULL AS \"−0.5σ\", NULL AS \"+1σ\", NULL AS \"−1σ\", NULL AS \"+1.5σ\", NULL AS \"−1.5σ\", NULL AS \"+2σ\", NULL AS \"−2σ\", NULL AS \"+2.5σ\", NULL AS \"−2.5σ\", NULL AS \"+3σ\", NULL AS \"−3σ\", NULL AS \"Real Long Spread · Tooltip\", NULL AS \"Real Short Spread · Tooltip\", NULL AS \"Mean · Tooltip\", NULL AS \"Sigma · Tooltip\", NULL AS \"Real Long Deviation · Tooltip\", NULL AS \"Real Short Deviation · Tooltip\", NULL AS \"Entry\", NULL AS \"Long Entry\", NULL AS \"Long Entry · Base\", NULL AS \"Short Entry\", NULL AS \"Short Entry · Base\", NULL AS \"Undone Long Entry\", NULL AS \"Undone Long Entry · Base\", NULL AS \"Undone Short Entry\", NULL AS \"Undone Short Entry · Base\", NULL AS \"Long Exit\", NULL AS \"Short Exit\", NULL AS \"Long Entry · Dev\", NULL AS \"Long Entry · Base · Dev\", NULL AS \"Short Entry · Dev\", NULL AS \"Short Entry · Base · Dev\", NULL AS \"Undone Long Entry · Dev\", NULL AS \"Undone Long Entry · Base · Dev\", NULL AS \"Undone Short Entry · Dev\", NULL AS \"Undone Short Entry · Base · Dev\", NULL AS \"Long Exit · Dev\", NULL AS \"Short Exit · Dev\", NULL AS \"Execution\", NULL AS \"Action\", NULL AS \"Decided\", NULL AS \"Bull Filled\", NULL AS \"Bull Avg\", NULL AS \"Bear Filled\", NULL AS \"Bear Avg\", NULL AS \"Bull Trimmed\", NULL AS \"Bear Trimmed\", NULL AS \"Notional\", NULL AS \"Fees\", NULL AS \"Cycle Net\", NULL AS \"At Spread\", NULL AS \"At Deviation\" FROM k CROSS JOIN x\n  WHERE k.next_ts IS NOT NULL AND (k.next_ts - k.ts > greatest(2 * x.step, 3000) OR k.next_run <> k.run_id OR k.next_session <> k.session_id)) t\nORDER BY t.ts, t.ord"
     }
    ],
    "fieldConfig": {
@@ -2656,6 +2638,450 @@
      "decimals": 0
     },
     "overrides": [
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "Mean + 0.5σ"
+      },
+      "properties": [
+       {
+        "id": "color",
+        "value": {
+         "mode": "fixed",
+         "fixedColor": "#8987816A"
+        }
+       },
+       {
+        "id": "custom.lineWidth",
+        "value": 1
+       },
+       {
+        "id": "custom.lineStyle",
+        "value": {
+         "fill": "dash",
+         "dash": [
+          2,
+          3
+         ]
+        }
+       },
+       {
+        "id": "custom.hideFrom",
+        "value": {
+         "legend": true,
+         "tooltip": true,
+         "viz": false
+        }
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "Mean − 0.5σ"
+      },
+      "properties": [
+       {
+        "id": "color",
+        "value": {
+         "mode": "fixed",
+         "fixedColor": "#8987816A"
+        }
+       },
+       {
+        "id": "custom.lineWidth",
+        "value": 1
+       },
+       {
+        "id": "custom.lineStyle",
+        "value": {
+         "fill": "dash",
+         "dash": [
+          2,
+          3
+         ]
+        }
+       },
+       {
+        "id": "custom.hideFrom",
+        "value": {
+         "legend": true,
+         "tooltip": true,
+         "viz": false
+        }
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "Mean + 1σ"
+      },
+      "properties": [
+       {
+        "id": "color",
+        "value": {
+         "mode": "fixed",
+         "fixedColor": "#8987817A"
+        }
+       },
+       {
+        "id": "custom.lineWidth",
+        "value": 1
+       },
+       {
+        "id": "custom.lineStyle",
+        "value": {
+         "fill": "dash",
+         "dash": [
+          6,
+          4
+         ]
+        }
+       },
+       {
+        "id": "custom.hideFrom",
+        "value": {
+         "legend": true,
+         "tooltip": true,
+         "viz": false
+        }
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "Mean − 1σ"
+      },
+      "properties": [
+       {
+        "id": "color",
+        "value": {
+         "mode": "fixed",
+         "fixedColor": "#8987817A"
+        }
+       },
+       {
+        "id": "custom.lineWidth",
+        "value": 1
+       },
+       {
+        "id": "custom.lineStyle",
+        "value": {
+         "fill": "dash",
+         "dash": [
+          6,
+          4
+         ]
+        }
+       },
+       {
+        "id": "custom.hideFrom",
+        "value": {
+         "legend": true,
+         "tooltip": true,
+         "viz": false
+        }
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "Mean + 1.5σ"
+      },
+      "properties": [
+       {
+        "id": "color",
+        "value": {
+         "mode": "fixed",
+         "fixedColor": "#8987818B"
+        }
+       },
+       {
+        "id": "custom.lineWidth",
+        "value": 1
+       },
+       {
+        "id": "custom.lineStyle",
+        "value": {
+         "fill": "dash",
+         "dash": [
+          2,
+          3
+         ]
+        }
+       },
+       {
+        "id": "custom.hideFrom",
+        "value": {
+         "legend": true,
+         "tooltip": true,
+         "viz": false
+        }
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "Mean − 1.5σ"
+      },
+      "properties": [
+       {
+        "id": "color",
+        "value": {
+         "mode": "fixed",
+         "fixedColor": "#8987818B"
+        }
+       },
+       {
+        "id": "custom.lineWidth",
+        "value": 1
+       },
+       {
+        "id": "custom.lineStyle",
+        "value": {
+         "fill": "dash",
+         "dash": [
+          2,
+          3
+         ]
+        }
+       },
+       {
+        "id": "custom.hideFrom",
+        "value": {
+         "legend": true,
+         "tooltip": true,
+         "viz": false
+        }
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "Mean + 2σ"
+      },
+      "properties": [
+       {
+        "id": "color",
+        "value": {
+         "mode": "fixed",
+         "fixedColor": "#8987819C"
+        }
+       },
+       {
+        "id": "custom.lineWidth",
+        "value": 1
+       },
+       {
+        "id": "custom.lineStyle",
+        "value": {
+         "fill": "dash",
+         "dash": [
+          6,
+          4
+         ]
+        }
+       },
+       {
+        "id": "custom.hideFrom",
+        "value": {
+         "legend": true,
+         "tooltip": true,
+         "viz": false
+        }
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "Mean − 2σ"
+      },
+      "properties": [
+       {
+        "id": "color",
+        "value": {
+         "mode": "fixed",
+         "fixedColor": "#8987819C"
+        }
+       },
+       {
+        "id": "custom.lineWidth",
+        "value": 1
+       },
+       {
+        "id": "custom.lineStyle",
+        "value": {
+         "fill": "dash",
+         "dash": [
+          6,
+          4
+         ]
+        }
+       },
+       {
+        "id": "custom.hideFrom",
+        "value": {
+         "legend": true,
+         "tooltip": true,
+         "viz": false
+        }
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "Mean + 2.5σ"
+      },
+      "properties": [
+       {
+        "id": "color",
+        "value": {
+         "mode": "fixed",
+         "fixedColor": "#898781AC"
+        }
+       },
+       {
+        "id": "custom.lineWidth",
+        "value": 1
+       },
+       {
+        "id": "custom.lineStyle",
+        "value": {
+         "fill": "dash",
+         "dash": [
+          2,
+          3
+         ]
+        }
+       },
+       {
+        "id": "custom.hideFrom",
+        "value": {
+         "legend": true,
+         "tooltip": true,
+         "viz": false
+        }
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "Mean − 2.5σ"
+      },
+      "properties": [
+       {
+        "id": "color",
+        "value": {
+         "mode": "fixed",
+         "fixedColor": "#898781AC"
+        }
+       },
+       {
+        "id": "custom.lineWidth",
+        "value": 1
+       },
+       {
+        "id": "custom.lineStyle",
+        "value": {
+         "fill": "dash",
+         "dash": [
+          2,
+          3
+         ]
+        }
+       },
+       {
+        "id": "custom.hideFrom",
+        "value": {
+         "legend": true,
+         "tooltip": true,
+         "viz": false
+        }
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "Mean + 3σ"
+      },
+      "properties": [
+       {
+        "id": "color",
+        "value": {
+         "mode": "fixed",
+         "fixedColor": "#898781BD"
+        }
+       },
+       {
+        "id": "custom.lineWidth",
+        "value": 1
+       },
+       {
+        "id": "custom.lineStyle",
+        "value": {
+         "fill": "dash",
+         "dash": [
+          6,
+          4
+         ]
+        }
+       },
+       {
+        "id": "custom.hideFrom",
+        "value": {
+         "legend": true,
+         "tooltip": true,
+         "viz": false
+        }
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "Mean − 3σ"
+      },
+      "properties": [
+       {
+        "id": "color",
+        "value": {
+         "mode": "fixed",
+         "fixedColor": "#898781BD"
+        }
+       },
+       {
+        "id": "custom.lineWidth",
+        "value": 1
+       },
+       {
+        "id": "custom.lineStyle",
+        "value": {
+         "fill": "dash",
+         "dash": [
+          6,
+          4
+         ]
+        }
+       },
+       {
+        "id": "custom.hideFrom",
+        "value": {
+         "legend": true,
+         "tooltip": true,
+         "viz": false
+        }
+       }
+      ]
+     },
      {
       "matcher": {
        "id": "byName",
@@ -2715,6 +3141,76 @@
        {
         "id": "noValue",
         "value": "–"
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "Real Long at Entry"
+      },
+      "properties": [
+       {
+        "id": "color",
+        "value": {
+         "mode": "fixed",
+         "fixedColor": "#2a78d6"
+        }
+       },
+       {
+        "id": "custom.lineWidth",
+        "value": 4
+       },
+       {
+        "id": "custom.showPoints",
+        "value": "always"
+       },
+       {
+        "id": "custom.pointSize",
+        "value": 5
+       },
+       {
+        "id": "custom.hideFrom",
+        "value": {
+         "legend": true,
+         "tooltip": true,
+         "viz": false
+        }
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "Real Short at Entry"
+      },
+      "properties": [
+       {
+        "id": "color",
+        "value": {
+         "mode": "fixed",
+         "fixedColor": "#d95926"
+        }
+       },
+       {
+        "id": "custom.lineWidth",
+        "value": 4
+       },
+       {
+        "id": "custom.showPoints",
+        "value": "always"
+       },
+       {
+        "id": "custom.pointSize",
+        "value": 5
+       },
+       {
+        "id": "custom.hideFrom",
+        "value": {
+         "legend": true,
+         "tooltip": true,
+         "viz": false
+        }
        }
       ]
      },
@@ -2786,7 +3282,7 @@
        },
        {
         "id": "displayName",
-        "value": "Long Lines"
+        "value": "Long In / Out"
        },
        {
         "id": "noValue",
@@ -2868,7 +3364,7 @@
        },
        {
         "id": "displayName",
-        "value": "Short Lines"
+        "value": "Short In / Out"
        },
        {
         "id": "noValue",
@@ -3072,23 +3568,27 @@
      {
       "matcher": {
        "id": "byName",
-       "options": "Exit"
+       "options": "Undone Long Entry"
       },
       "properties": [
        {
         "id": "color",
         "value": {
          "mode": "fixed",
-         "fixedColor": "text"
+         "fixedColor": "#898781"
         }
        },
        {
-        "id": "custom.drawStyle",
-        "value": "points"
+        "id": "custom.lineWidth",
+        "value": 1
        },
        {
-        "id": "custom.pointSize",
-        "value": 9
+        "id": "custom.fillBelowTo",
+        "value": "Undone Long Entry · Base"
+       },
+       {
+        "id": "custom.fillOpacity",
+        "value": 100
        },
        {
         "id": "custom.hideFrom",
@@ -3100,7 +3600,11 @@
        },
        {
         "id": "displayName",
-        "value": "Exit ●"
+        "value": "Undone Entry ▲▼"
+       },
+       {
+        "id": "custom.showPoints",
+        "value": "never"
        },
        {
         "id": "noValue",
@@ -3111,23 +3615,23 @@
      {
       "matcher": {
        "id": "byName",
-       "options": "Forced Exit"
+       "options": "Undone Long Entry · Base"
       },
       "properties": [
        {
         "id": "color",
         "value": {
          "mode": "fixed",
-         "fixedColor": "#fab219"
+         "fixedColor": "#898781"
         }
        },
        {
-        "id": "custom.drawStyle",
-        "value": "points"
+        "id": "custom.lineWidth",
+        "value": 1
        },
        {
-        "id": "custom.pointSize",
-        "value": 9
+        "id": "custom.showPoints",
+        "value": "never"
        },
        {
         "id": "custom.hideFrom",
@@ -3142,7 +3646,7 @@
      {
       "matcher": {
        "id": "byName",
-       "options": "Other"
+       "options": "Undone Short Entry"
       },
       "properties": [
        {
@@ -3153,12 +3657,8 @@
         }
        },
        {
-        "id": "custom.drawStyle",
-        "value": "points"
-       },
-       {
-        "id": "custom.pointSize",
-        "value": 6
+        "id": "custom.lineWidth",
+        "value": 1
        },
        {
         "id": "custom.hideFrom",
@@ -3167,6 +3667,131 @@
          "tooltip": true,
          "viz": false
         }
+       },
+       {
+        "id": "displayName",
+        "value": "Undone Entry ▼"
+       },
+       {
+        "id": "custom.showPoints",
+        "value": "never"
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "Undone Short Entry · Base"
+      },
+      "properties": [
+       {
+        "id": "color",
+        "value": {
+         "mode": "fixed",
+         "fixedColor": "#898781"
+        }
+       },
+       {
+        "id": "custom.lineWidth",
+        "value": 1
+       },
+       {
+        "id": "custom.showPoints",
+        "value": "never"
+       },
+       {
+        "id": "custom.hideFrom",
+        "value": {
+         "legend": true,
+         "tooltip": true,
+         "viz": false
+        }
+       },
+       {
+        "id": "custom.fillBelowTo",
+        "value": "Undone Short Entry"
+       },
+       {
+        "id": "custom.fillOpacity",
+        "value": 100
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "Long Exit"
+      },
+      "properties": [
+       {
+        "id": "color",
+        "value": {
+         "mode": "fixed",
+         "fixedColor": "#0ca30c"
+        }
+       },
+       {
+        "id": "custom.drawStyle",
+        "value": "points"
+       },
+       {
+        "id": "custom.pointSize",
+        "value": 10
+       },
+       {
+        "id": "custom.hideFrom",
+        "value": {
+         "legend": false,
+         "tooltip": true,
+         "viz": false
+        }
+       },
+       {
+        "id": "displayName",
+        "value": "Long Exit ●"
+       },
+       {
+        "id": "noValue",
+        "value": "–"
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "Short Exit"
+      },
+      "properties": [
+       {
+        "id": "color",
+        "value": {
+         "mode": "fixed",
+         "fixedColor": "#d03b3b"
+        }
+       },
+       {
+        "id": "custom.drawStyle",
+        "value": "points"
+       },
+       {
+        "id": "custom.pointSize",
+        "value": 10
+       },
+       {
+        "id": "custom.hideFrom",
+        "value": {
+         "legend": false,
+         "tooltip": true,
+         "viz": false
+        }
+       },
+       {
+        "id": "displayName",
+        "value": "Short Exit ●"
+       },
+       {
+        "id": "noValue",
+        "value": "–"
        }
       ]
      },
@@ -3450,7 +4075,7 @@
        },
        {
         "id": "displayName",
-        "value": "波动率 (σ) bps"
+        "value": "Volatility (σ) bps"
        }
       ]
      },
@@ -3742,31 +4367,31 @@
            },
            "3": {
             "text": "Long Exit",
-            "color": "text",
+            "color": "#0ca30c",
             "index": 2
            },
            "4": {
             "text": "Short Exit",
-            "color": "text",
+            "color": "#d03b3b",
             "index": 3
            },
            "5": {
-            "text": "Forced Exit",
-            "color": "#fab219",
+            "text": "Forced Long Exit",
+            "color": "#0ca30c",
             "index": 4
            },
-           "6": {
-            "text": "Trim",
-            "color": "#898781",
+           "11": {
+            "text": "Forced Short Exit",
+            "color": "#d03b3b",
             "index": 5
            },
-           "7": {
-            "text": "Complete",
+           "8": {
+            "text": "Undone Long Entry",
             "color": "#898781",
             "index": 6
            },
-           "8": {
-            "text": "Void Entry",
+           "10": {
+            "text": "Undone Short Entry",
             "color": "#898781",
             "index": 7
            }
@@ -3842,6 +4467,11 @@
             "text": "0",
             "color": "text",
             "index": 0
+           },
+           "-9600000000": {
+            "text": "— (not in this order)",
+            "color": "#898781",
+            "index": 1
            }
           }
          }
@@ -3892,6 +4522,11 @@
             "text": "No Fill",
             "color": "#898781",
             "index": 0
+           },
+           "-9600000000": {
+            "text": "—",
+            "color": "#898781",
+            "index": 1
            }
           }
          }
@@ -3899,7 +4534,7 @@
        },
        {
         "id": "displayName",
-        "value": "${bull} Avg Price"
+        "value": "${bull} Avg Price USDT"
        }
       ]
      },
@@ -3942,6 +4577,11 @@
             "text": "0",
             "color": "text",
             "index": 0
+           },
+           "-9600000000": {
+            "text": "— (not in this order)",
+            "color": "#898781",
+            "index": 1
            }
           }
          }
@@ -3992,6 +4632,11 @@
             "text": "No Fill",
             "color": "#898781",
             "index": 0
+           },
+           "-9600000000": {
+            "text": "—",
+            "color": "#898781",
+            "index": 1
            }
           }
          }
@@ -3999,7 +4644,107 @@
        },
        {
         "id": "displayName",
-        "value": "${bear} Avg Price"
+        "value": "${bear} Avg Price USDT"
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "Bull Trimmed"
+      },
+      "properties": [
+       {
+        "id": "unit",
+        "value": "none"
+       },
+       {
+        "id": "decimals",
+        "value": 2
+       },
+       {
+        "id": "color",
+        "value": {
+         "mode": "fixed",
+         "fixedColor": "#898781"
+        }
+       },
+       {
+        "id": "custom.hideFrom",
+        "value": {
+         "legend": true,
+         "tooltip": false,
+         "viz": true
+        }
+       },
+       {
+        "id": "mappings",
+        "value": [
+         {
+          "type": "value",
+          "options": {
+           "-9400000000": {
+            "text": "0",
+            "color": "text",
+            "index": 0
+           }
+          }
+         }
+        ]
+       },
+       {
+        "id": "displayName",
+        "value": "${bull} Trimmed Back ct"
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "Bear Trimmed"
+      },
+      "properties": [
+       {
+        "id": "unit",
+        "value": "none"
+       },
+       {
+        "id": "decimals",
+        "value": 2
+       },
+       {
+        "id": "color",
+        "value": {
+         "mode": "fixed",
+         "fixedColor": "#898781"
+        }
+       },
+       {
+        "id": "custom.hideFrom",
+        "value": {
+         "legend": true,
+         "tooltip": false,
+         "viz": true
+        }
+       },
+       {
+        "id": "mappings",
+        "value": [
+         {
+          "type": "value",
+          "options": {
+           "-9400000000": {
+            "text": "0",
+            "color": "text",
+            "index": 0
+           }
+          }
+         }
+        ]
+       },
+       {
+        "id": "displayName",
+        "value": "${bear} Trimmed Back ct"
        }
       ]
      },
@@ -4042,6 +4787,11 @@
             "text": "0",
             "color": "text",
             "index": 0
+           },
+           "-9600000000": {
+            "text": "— (not in this order)",
+            "color": "#898781",
+            "index": 1
            }
           }
          }
@@ -4114,7 +4864,7 @@
        },
        {
         "id": "displayName",
-        "value": "Fees USDT"
+        "value": "Fees Paid USDT"
        }
       ]
      },
@@ -4256,8 +5006,22 @@
       "include": {
        "names": [
         "time",
+        "Mean + 0.5σ",
+        "Mean − 0.5σ",
+        "Mean + 1σ",
+        "Mean − 1σ",
+        "Mean + 1.5σ",
+        "Mean − 1.5σ",
+        "Mean + 2σ",
+        "Mean − 2σ",
+        "Mean + 2.5σ",
+        "Mean − 2.5σ",
+        "Mean + 3σ",
+        "Mean − 3σ",
         "Real Long Spread",
         "Real Short Spread",
+        "Real Long at Entry",
+        "Real Short at Entry",
         "Mean",
         "Long In",
         "Long Out",
@@ -4267,9 +5031,12 @@
         "Long Entry · Base",
         "Short Entry",
         "Short Entry · Base",
-        "Exit",
-        "Forced Exit",
-        "Other",
+        "Undone Long Entry",
+        "Undone Long Entry · Base",
+        "Undone Short Entry",
+        "Undone Short Entry · Base",
+        "Long Exit",
+        "Short Exit",
         "Execution",
         "Action",
         "Decided",
@@ -4277,6 +5044,8 @@
         "Bull Avg",
         "Bear Filled",
         "Bear Avg",
+        "Bull Trimmed",
+        "Bear Trimmed",
         "Notional",
         "Fees",
         "Cycle Net",
@@ -4295,36 +5064,55 @@
      "options": {
       "indexByName": {
        "time": 0,
-       "Real Long Spread": 1,
-       "Real Short Spread": 2,
-       "Mean": 3,
-       "Long In": 4,
-       "Long Out": 5,
-       "Short In": 6,
-       "Short Out": 7,
-       "Long Entry": 8,
-       "Long Entry · Base": 9,
-       "Short Entry": 10,
-       "Short Entry · Base": 11,
-       "Exit": 12,
-       "Forced Exit": 13,
-       "Other": 14,
-       "Execution": 15,
-       "Action": 16,
-       "Decided": 17,
-       "Bull Filled": 18,
-       "Bull Avg": 19,
-       "Bear Filled": 20,
-       "Bear Avg": 21,
-       "Notional": 22,
-       "Fees": 23,
-       "Cycle Net": 24,
-       "At Spread": 25,
-       "Real Long Spread · Tooltip": 26,
-       "Real Short Spread · Tooltip": 27,
-       "Mean · Tooltip": 28,
-       "Sigma · Tooltip": 29,
-       "Entry": 30
+       "Mean + 0.5σ": 1,
+       "Mean − 0.5σ": 2,
+       "Mean + 1σ": 3,
+       "Mean − 1σ": 4,
+       "Mean + 1.5σ": 5,
+       "Mean − 1.5σ": 6,
+       "Mean + 2σ": 7,
+       "Mean − 2σ": 8,
+       "Mean + 2.5σ": 9,
+       "Mean − 2.5σ": 10,
+       "Mean + 3σ": 11,
+       "Mean − 3σ": 12,
+       "Real Long Spread": 13,
+       "Real Short Spread": 14,
+       "Real Long at Entry": 15,
+       "Real Short at Entry": 16,
+       "Mean": 17,
+       "Long In": 18,
+       "Long Out": 19,
+       "Short In": 20,
+       "Short Out": 21,
+       "Long Entry": 22,
+       "Long Entry · Base": 23,
+       "Short Entry": 24,
+       "Short Entry · Base": 25,
+       "Undone Long Entry": 26,
+       "Undone Long Entry · Base": 27,
+       "Undone Short Entry": 28,
+       "Undone Short Entry · Base": 29,
+       "Long Exit": 30,
+       "Short Exit": 31,
+       "Execution": 32,
+       "Action": 33,
+       "Decided": 34,
+       "Bull Filled": 35,
+       "Bull Avg": 36,
+       "Bear Filled": 37,
+       "Bear Avg": 38,
+       "Bull Trimmed": 39,
+       "Bear Trimmed": 40,
+       "Notional": 41,
+       "Fees": 42,
+       "Cycle Net": 43,
+       "At Spread": 44,
+       "Real Long Spread · Tooltip": 45,
+       "Real Short Spread · Tooltip": 46,
+       "Mean · Tooltip": 47,
+       "Sigma · Tooltip": 48,
+       "Entry": 49
       },
       "renameByName": {},
       "excludeByName": {}
@@ -4336,7 +5124,7 @@
    "id": 16,
    "type": "timeseries",
    "title": "Deviation · bps",
-   "description": "After Combo Spread's Deviation chart (owner item 81): the Spread chart with its Mean at zero, in spread bps.\n\n- **Deviation**: spread on the mids − Mean (purple).\n- **Real Long Deviation, Real Short Deviation**: the real spreads − Mean (blue, orange): a Long enters when blue falls to −d_in σ (blue dashed) and exits when orange rises to −d_out σ (blue dotted); a Short the mirror (orange lines).\n- **σ lines**: ±1 σ (dotted) and ±3 σ (dashed), grey.\n- **Markers**: Markers (owner item 81): a long entry a green triangle ▲, a short entry a red triangle ▼, an exit a circle ● (a forced exit amber, a trim, completion or void entry a small grey one), at the decision's executable deviation; hover one for its Execution ID (the round trip's opening, UTC+8, owner item 83: every marker of one round trip — entries, completions, trims, exits — has the same, as its row in Round Trips), the action, each leg's filled contracts and average price, the notional, the fees and the round trip's PnL.\n- **Points and marks**: Points: every second up to 25 min, then 5, 10, 30 s and whole minutes (a real spread is its bucket's extreme on its entry side, of the seconds whose books the program enters on: none, and tooltip Book Not OK, where a leg's book conflicts or its depth is unusable, owner item 70); a gap: no sample (process down), or a new session or run; shaded: each round trip from entry to exit (blue Long, orange Short; its mark under the chart: times, end reason, PnL); purple marks: a change of the anchors in use, with reason and both legs' anchors before → after (owner item 62).",
+   "description": "After Combo Spread's Deviation chart (owner item 81): the Spread chart with its Mean at zero, in spread bps; no line on the mids (owner item 84).\n\n- **Real Long Deviation, Real Short Deviation**: the real spreads − Mean (blue, orange): a Long enters when blue falls to −d_in σ (blue dashed) and exits when orange rises to −d_out σ (blue dotted); a Short the mirror (orange lines); thick at or past the entry line.\n- **Volatility lines**: ± 0.5, 1, 1.5, 2, 2.5 and 3 σ, grey, as on the Spread chart.\n- **Markers**: Markers (owner items 81, 84): a long entry a green triangle ▲, a short entry a red triangle ▼; an entry undone (its lot voided: one leg filled and was trimmed back) a grey triangle; an exit a circle in the colour of the position it closes (closing a Long green, closing a Short red; a forced exit too, its tooltip says Forced); at the decision's executable deviation. Hover one for its Execution ID (the round trip's opening, UTC+8, owner item 83: every marker of one round trip has the same, as its row in Round Trips), the action, each leg's filled contracts and average price, what was trimmed back, the notional, the fees paid (a cost, positive) and the round trip's PnL. A marker counts its whole step: its orders and the completions, trims and exits of the remaining leg sent for it, so an exit whose legs were closed by separate orders shows both; a leg it sent no order on shows —.\n- **Points and marks**: Points: every second up to 25 min, then 5, 10, 30 s and whole minutes (a real spread is its bucket's extreme on its entry side, of the seconds whose books the program enters on: none, and tooltip Book Not OK, where a leg's book conflicts or its depth is unusable, owner item 70); a gap: no sample (process down), or a new session or run; shaded: each round trip from entry to exit (blue Long, orange Short; its mark under the chart: times, end reason, PnL); purple marks: a change of the anchors in use, with reason and both legs' anchors before → after (owner item 62).",
    "gridPos": {
     "x": 0,
     "y": 55,
@@ -4409,14 +5197,14 @@
      {
       "matcher": {
        "id": "byName",
-       "options": "+1σ"
+       "options": "+0.5σ"
       },
       "properties": [
        {
         "id": "color",
         "value": {
          "mode": "fixed",
-         "fixedColor": "#898781"
+         "fixedColor": "#8987816A"
         }
        },
        {
@@ -4429,6 +5217,80 @@
          "fill": "dash",
          "dash": [
           2,
+          3
+         ]
+        }
+       },
+       {
+        "id": "custom.hideFrom",
+        "value": {
+         "legend": true,
+         "tooltip": true,
+         "viz": false
+        }
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "−0.5σ"
+      },
+      "properties": [
+       {
+        "id": "color",
+        "value": {
+         "mode": "fixed",
+         "fixedColor": "#8987816A"
+        }
+       },
+       {
+        "id": "custom.lineWidth",
+        "value": 1
+       },
+       {
+        "id": "custom.lineStyle",
+        "value": {
+         "fill": "dash",
+         "dash": [
+          2,
+          3
+         ]
+        }
+       },
+       {
+        "id": "custom.hideFrom",
+        "value": {
+         "legend": true,
+         "tooltip": true,
+         "viz": false
+        }
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "+1σ"
+      },
+      "properties": [
+       {
+        "id": "color",
+        "value": {
+         "mode": "fixed",
+         "fixedColor": "#8987817A"
+        }
+       },
+       {
+        "id": "custom.lineWidth",
+        "value": 1
+       },
+       {
+        "id": "custom.lineStyle",
+        "value": {
+         "fill": "dash",
+         "dash": [
+          6,
           4
          ]
         }
@@ -4453,7 +5315,44 @@
         "id": "color",
         "value": {
          "mode": "fixed",
-         "fixedColor": "#898781"
+         "fixedColor": "#8987817A"
+        }
+       },
+       {
+        "id": "custom.lineWidth",
+        "value": 1
+       },
+       {
+        "id": "custom.lineStyle",
+        "value": {
+         "fill": "dash",
+         "dash": [
+          6,
+          4
+         ]
+        }
+       },
+       {
+        "id": "custom.hideFrom",
+        "value": {
+         "legend": true,
+         "tooltip": true,
+         "viz": false
+        }
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "+1.5σ"
+      },
+      "properties": [
+       {
+        "id": "color",
+        "value": {
+         "mode": "fixed",
+         "fixedColor": "#8987818B"
         }
        },
        {
@@ -4466,7 +5365,192 @@
          "fill": "dash",
          "dash": [
           2,
+          3
+         ]
+        }
+       },
+       {
+        "id": "custom.hideFrom",
+        "value": {
+         "legend": true,
+         "tooltip": true,
+         "viz": false
+        }
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "−1.5σ"
+      },
+      "properties": [
+       {
+        "id": "color",
+        "value": {
+         "mode": "fixed",
+         "fixedColor": "#8987818B"
+        }
+       },
+       {
+        "id": "custom.lineWidth",
+        "value": 1
+       },
+       {
+        "id": "custom.lineStyle",
+        "value": {
+         "fill": "dash",
+         "dash": [
+          2,
+          3
+         ]
+        }
+       },
+       {
+        "id": "custom.hideFrom",
+        "value": {
+         "legend": true,
+         "tooltip": true,
+         "viz": false
+        }
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "+2σ"
+      },
+      "properties": [
+       {
+        "id": "color",
+        "value": {
+         "mode": "fixed",
+         "fixedColor": "#8987819C"
+        }
+       },
+       {
+        "id": "custom.lineWidth",
+        "value": 1
+       },
+       {
+        "id": "custom.lineStyle",
+        "value": {
+         "fill": "dash",
+         "dash": [
+          6,
           4
+         ]
+        }
+       },
+       {
+        "id": "custom.hideFrom",
+        "value": {
+         "legend": true,
+         "tooltip": true,
+         "viz": false
+        }
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "−2σ"
+      },
+      "properties": [
+       {
+        "id": "color",
+        "value": {
+         "mode": "fixed",
+         "fixedColor": "#8987819C"
+        }
+       },
+       {
+        "id": "custom.lineWidth",
+        "value": 1
+       },
+       {
+        "id": "custom.lineStyle",
+        "value": {
+         "fill": "dash",
+         "dash": [
+          6,
+          4
+         ]
+        }
+       },
+       {
+        "id": "custom.hideFrom",
+        "value": {
+         "legend": true,
+         "tooltip": true,
+         "viz": false
+        }
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "+2.5σ"
+      },
+      "properties": [
+       {
+        "id": "color",
+        "value": {
+         "mode": "fixed",
+         "fixedColor": "#898781AC"
+        }
+       },
+       {
+        "id": "custom.lineWidth",
+        "value": 1
+       },
+       {
+        "id": "custom.lineStyle",
+        "value": {
+         "fill": "dash",
+         "dash": [
+          2,
+          3
+         ]
+        }
+       },
+       {
+        "id": "custom.hideFrom",
+        "value": {
+         "legend": true,
+         "tooltip": true,
+         "viz": false
+        }
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "−2.5σ"
+      },
+      "properties": [
+       {
+        "id": "color",
+        "value": {
+         "mode": "fixed",
+         "fixedColor": "#898781AC"
+        }
+       },
+       {
+        "id": "custom.lineWidth",
+        "value": 1
+       },
+       {
+        "id": "custom.lineStyle",
+        "value": {
+         "fill": "dash",
+         "dash": [
+          2,
+          3
          ]
         }
        },
@@ -4490,7 +5574,7 @@
         "id": "color",
         "value": {
          "mode": "fixed",
-         "fixedColor": "#898781"
+         "fixedColor": "#898781BD"
         }
        },
        {
@@ -4502,8 +5586,8 @@
         "value": {
          "fill": "dash",
          "dash": [
-          8,
-          6
+          6,
+          4
          ]
         }
        },
@@ -4527,7 +5611,7 @@
         "id": "color",
         "value": {
          "mode": "fixed",
-         "fixedColor": "#898781"
+         "fixedColor": "#898781BD"
         }
        },
        {
@@ -4539,8 +5623,8 @@
         "value": {
          "fill": "dash",
          "dash": [
-          8,
-          6
+          6,
+          4
          ]
         }
        },
@@ -4551,37 +5635,6 @@
          "tooltip": true,
          "viz": false
         }
-       }
-      ]
-     },
-     {
-      "matcher": {
-       "id": "byName",
-       "options": "Deviation"
-      },
-      "properties": [
-       {
-        "id": "color",
-        "value": {
-         "mode": "fixed",
-         "fixedColor": "#9b59d0"
-        }
-       },
-       {
-        "id": "custom.lineWidth",
-        "value": 1.5
-       },
-       {
-        "id": "custom.hideFrom",
-        "value": {
-         "legend": false,
-         "tooltip": true,
-         "viz": false
-        }
-       },
-       {
-        "id": "noValue",
-        "value": "–"
        }
       ]
      },
@@ -4650,6 +5703,76 @@
      {
       "matcher": {
        "id": "byName",
+       "options": "Real Long Deviation at Entry"
+      },
+      "properties": [
+       {
+        "id": "color",
+        "value": {
+         "mode": "fixed",
+         "fixedColor": "#2a78d6"
+        }
+       },
+       {
+        "id": "custom.lineWidth",
+        "value": 4
+       },
+       {
+        "id": "custom.showPoints",
+        "value": "always"
+       },
+       {
+        "id": "custom.pointSize",
+        "value": 5
+       },
+       {
+        "id": "custom.hideFrom",
+        "value": {
+         "legend": true,
+         "tooltip": true,
+         "viz": false
+        }
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "Real Short Deviation at Entry"
+      },
+      "properties": [
+       {
+        "id": "color",
+        "value": {
+         "mode": "fixed",
+         "fixedColor": "#d95926"
+        }
+       },
+       {
+        "id": "custom.lineWidth",
+        "value": 4
+       },
+       {
+        "id": "custom.showPoints",
+        "value": "always"
+       },
+       {
+        "id": "custom.pointSize",
+        "value": 5
+       },
+       {
+        "id": "custom.hideFrom",
+        "value": {
+         "legend": true,
+         "tooltip": true,
+         "viz": false
+        }
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
        "options": "Long In · Dev"
       },
       "properties": [
@@ -4684,7 +5807,7 @@
        },
        {
         "id": "displayName",
-        "value": "Long Lines"
+        "value": "Long In / Out"
        },
        {
         "id": "noValue",
@@ -4766,7 +5889,7 @@
        },
        {
         "id": "displayName",
-        "value": "Short Lines"
+        "value": "Short In / Out"
        },
        {
         "id": "noValue",
@@ -4970,23 +6093,27 @@
      {
       "matcher": {
        "id": "byName",
-       "options": "Exit · Dev"
+       "options": "Undone Long Entry · Dev"
       },
       "properties": [
        {
         "id": "color",
         "value": {
          "mode": "fixed",
-         "fixedColor": "text"
+         "fixedColor": "#898781"
         }
        },
        {
-        "id": "custom.drawStyle",
-        "value": "points"
+        "id": "custom.lineWidth",
+        "value": 1
        },
        {
-        "id": "custom.pointSize",
-        "value": 9
+        "id": "custom.fillBelowTo",
+        "value": "Undone Long Entry · Base · Dev"
+       },
+       {
+        "id": "custom.fillOpacity",
+        "value": 100
        },
        {
         "id": "custom.hideFrom",
@@ -4998,7 +6125,11 @@
        },
        {
         "id": "displayName",
-        "value": "Exit ●"
+        "value": "Undone Entry ▲▼"
+       },
+       {
+        "id": "custom.showPoints",
+        "value": "never"
        },
        {
         "id": "noValue",
@@ -5009,38 +6140,7 @@
      {
       "matcher": {
        "id": "byName",
-       "options": "Forced Exit · Dev"
-      },
-      "properties": [
-       {
-        "id": "color",
-        "value": {
-         "mode": "fixed",
-         "fixedColor": "#fab219"
-        }
-       },
-       {
-        "id": "custom.drawStyle",
-        "value": "points"
-       },
-       {
-        "id": "custom.pointSize",
-        "value": 9
-       },
-       {
-        "id": "custom.hideFrom",
-        "value": {
-         "legend": true,
-         "tooltip": true,
-         "viz": false
-        }
-       }
-      ]
-     },
-     {
-      "matcher": {
-       "id": "byName",
-       "options": "Other · Dev"
+       "options": "Undone Long Entry · Base · Dev"
       },
       "properties": [
        {
@@ -5051,12 +6151,12 @@
         }
        },
        {
-        "id": "custom.drawStyle",
-        "value": "points"
+        "id": "custom.lineWidth",
+        "value": 1
        },
        {
-        "id": "custom.pointSize",
-        "value": 6
+        "id": "custom.showPoints",
+        "value": "never"
        },
        {
         "id": "custom.hideFrom",
@@ -5071,71 +6171,152 @@
      {
       "matcher": {
        "id": "byName",
-       "options": "Deviation · Tooltip"
+       "options": "Undone Short Entry · Dev"
       },
       "properties": [
-       {
-        "id": "decimals",
-        "value": 1
-       },
        {
         "id": "color",
         "value": {
          "mode": "fixed",
-         "fixedColor": "#9b59d0"
+         "fixedColor": "#898781"
         }
+       },
+       {
+        "id": "custom.lineWidth",
+        "value": 1
        },
        {
         "id": "custom.hideFrom",
         "value": {
          "legend": true,
-         "tooltip": false,
-         "viz": true
+         "tooltip": true,
+         "viz": false
         }
        },
        {
-        "id": "mappings",
-        "value": [
-         {
-          "type": "value",
-          "options": {
-           "-2000000000": {
-            "text": "No Anchor",
-            "color": "#898781",
-            "index": 0
-           },
-           "-3000000000": {
-            "text": "No Book",
-            "color": "#898781",
-            "index": 1
-           },
-           "-4000000000": {
-            "text": "Warmup",
-            "color": "#898781",
-            "index": 2
-           },
-           "-5000000000": {
-            "text": "No Levels",
-            "color": "#898781",
-            "index": 3
-           },
-           "-6000000000": {
-            "text": "Book Not OK",
-            "color": "#898781",
-            "index": 4
-           },
-           "-9400000000": {
-            "text": "0.0",
-            "color": "text",
-            "index": 5
-           }
-          }
-         }
-        ]
+        "id": "displayName",
+        "value": "Undone Entry ▼"
+       },
+       {
+        "id": "custom.showPoints",
+        "value": "never"
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "Undone Short Entry · Base · Dev"
+      },
+      "properties": [
+       {
+        "id": "color",
+        "value": {
+         "mode": "fixed",
+         "fixedColor": "#898781"
+        }
+       },
+       {
+        "id": "custom.lineWidth",
+        "value": 1
+       },
+       {
+        "id": "custom.showPoints",
+        "value": "never"
+       },
+       {
+        "id": "custom.hideFrom",
+        "value": {
+         "legend": true,
+         "tooltip": true,
+         "viz": false
+        }
+       },
+       {
+        "id": "custom.fillBelowTo",
+        "value": "Undone Short Entry · Dev"
+       },
+       {
+        "id": "custom.fillOpacity",
+        "value": 100
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "Long Exit · Dev"
+      },
+      "properties": [
+       {
+        "id": "color",
+        "value": {
+         "mode": "fixed",
+         "fixedColor": "#0ca30c"
+        }
+       },
+       {
+        "id": "custom.drawStyle",
+        "value": "points"
+       },
+       {
+        "id": "custom.pointSize",
+        "value": 10
+       },
+       {
+        "id": "custom.hideFrom",
+        "value": {
+         "legend": false,
+         "tooltip": true,
+         "viz": false
+        }
        },
        {
         "id": "displayName",
-        "value": "Deviation bps"
+        "value": "Long Exit ●"
+       },
+       {
+        "id": "noValue",
+        "value": "–"
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "Short Exit · Dev"
+      },
+      "properties": [
+       {
+        "id": "color",
+        "value": {
+         "mode": "fixed",
+         "fixedColor": "#d03b3b"
+        }
+       },
+       {
+        "id": "custom.drawStyle",
+        "value": "points"
+       },
+       {
+        "id": "custom.pointSize",
+        "value": 10
+       },
+       {
+        "id": "custom.hideFrom",
+        "value": {
+         "legend": false,
+         "tooltip": true,
+         "viz": false
+        }
+       },
+       {
+        "id": "displayName",
+        "value": "Short Exit ●"
+       },
+       {
+        "id": "noValue",
+        "value": "–"
        }
       ]
      },
@@ -5348,7 +6529,7 @@
        },
        {
         "id": "displayName",
-        "value": "波动率 (σ) bps"
+        "value": "Volatility (σ) bps"
        }
       ]
      },
@@ -5640,31 +6821,31 @@
            },
            "3": {
             "text": "Long Exit",
-            "color": "text",
+            "color": "#0ca30c",
             "index": 2
            },
            "4": {
             "text": "Short Exit",
-            "color": "text",
+            "color": "#d03b3b",
             "index": 3
            },
            "5": {
-            "text": "Forced Exit",
-            "color": "#fab219",
+            "text": "Forced Long Exit",
+            "color": "#0ca30c",
             "index": 4
            },
-           "6": {
-            "text": "Trim",
-            "color": "#898781",
+           "11": {
+            "text": "Forced Short Exit",
+            "color": "#d03b3b",
             "index": 5
            },
-           "7": {
-            "text": "Complete",
+           "8": {
+            "text": "Undone Long Entry",
             "color": "#898781",
             "index": 6
            },
-           "8": {
-            "text": "Void Entry",
+           "10": {
+            "text": "Undone Short Entry",
             "color": "#898781",
             "index": 7
            }
@@ -5740,6 +6921,11 @@
             "text": "0",
             "color": "text",
             "index": 0
+           },
+           "-9600000000": {
+            "text": "— (not in this order)",
+            "color": "#898781",
+            "index": 1
            }
           }
          }
@@ -5790,6 +6976,11 @@
             "text": "No Fill",
             "color": "#898781",
             "index": 0
+           },
+           "-9600000000": {
+            "text": "—",
+            "color": "#898781",
+            "index": 1
            }
           }
          }
@@ -5797,7 +6988,7 @@
        },
        {
         "id": "displayName",
-        "value": "${bull} Avg Price"
+        "value": "${bull} Avg Price USDT"
        }
       ]
      },
@@ -5840,6 +7031,11 @@
             "text": "0",
             "color": "text",
             "index": 0
+           },
+           "-9600000000": {
+            "text": "— (not in this order)",
+            "color": "#898781",
+            "index": 1
            }
           }
          }
@@ -5890,6 +7086,11 @@
             "text": "No Fill",
             "color": "#898781",
             "index": 0
+           },
+           "-9600000000": {
+            "text": "—",
+            "color": "#898781",
+            "index": 1
            }
           }
          }
@@ -5897,7 +7098,107 @@
        },
        {
         "id": "displayName",
-        "value": "${bear} Avg Price"
+        "value": "${bear} Avg Price USDT"
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "Bull Trimmed"
+      },
+      "properties": [
+       {
+        "id": "unit",
+        "value": "none"
+       },
+       {
+        "id": "decimals",
+        "value": 2
+       },
+       {
+        "id": "color",
+        "value": {
+         "mode": "fixed",
+         "fixedColor": "#898781"
+        }
+       },
+       {
+        "id": "custom.hideFrom",
+        "value": {
+         "legend": true,
+         "tooltip": false,
+         "viz": true
+        }
+       },
+       {
+        "id": "mappings",
+        "value": [
+         {
+          "type": "value",
+          "options": {
+           "-9400000000": {
+            "text": "0",
+            "color": "text",
+            "index": 0
+           }
+          }
+         }
+        ]
+       },
+       {
+        "id": "displayName",
+        "value": "${bull} Trimmed Back ct"
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "Bear Trimmed"
+      },
+      "properties": [
+       {
+        "id": "unit",
+        "value": "none"
+       },
+       {
+        "id": "decimals",
+        "value": 2
+       },
+       {
+        "id": "color",
+        "value": {
+         "mode": "fixed",
+         "fixedColor": "#898781"
+        }
+       },
+       {
+        "id": "custom.hideFrom",
+        "value": {
+         "legend": true,
+         "tooltip": false,
+         "viz": true
+        }
+       },
+       {
+        "id": "mappings",
+        "value": [
+         {
+          "type": "value",
+          "options": {
+           "-9400000000": {
+            "text": "0",
+            "color": "text",
+            "index": 0
+           }
+          }
+         }
+        ]
+       },
+       {
+        "id": "displayName",
+        "value": "${bear} Trimmed Back ct"
        }
       ]
      },
@@ -5940,6 +7241,11 @@
             "text": "0",
             "color": "text",
             "index": 0
+           },
+           "-9600000000": {
+            "text": "— (not in this order)",
+            "color": "#898781",
+            "index": 1
            }
           }
          }
@@ -6012,7 +7318,7 @@
        },
        {
         "id": "displayName",
-        "value": "Fees USDT"
+        "value": "Fees Paid USDT"
        }
       ]
      },
@@ -6154,13 +7460,22 @@
       "include": {
        "names": [
         "time",
+        "+0.5σ",
+        "−0.5σ",
         "+1σ",
         "−1σ",
+        "+1.5σ",
+        "−1.5σ",
+        "+2σ",
+        "−2σ",
+        "+2.5σ",
+        "−2.5σ",
         "+3σ",
         "−3σ",
-        "Deviation",
         "Real Long Deviation",
         "Real Short Deviation",
+        "Real Long Deviation at Entry",
+        "Real Short Deviation at Entry",
         "Long In · Dev",
         "Long Out · Dev",
         "Short In · Dev",
@@ -6169,9 +7484,12 @@
         "Long Entry · Base · Dev",
         "Short Entry · Dev",
         "Short Entry · Base · Dev",
-        "Exit · Dev",
-        "Forced Exit · Dev",
-        "Other · Dev",
+        "Undone Long Entry · Dev",
+        "Undone Long Entry · Base · Dev",
+        "Undone Short Entry · Dev",
+        "Undone Short Entry · Base · Dev",
+        "Long Exit · Dev",
+        "Short Exit · Dev",
         "Execution",
         "Action",
         "Decided",
@@ -6179,11 +7497,12 @@
         "Bull Avg",
         "Bear Filled",
         "Bear Avg",
+        "Bull Trimmed",
+        "Bear Trimmed",
         "Notional",
         "Fees",
         "Cycle Net",
         "At Deviation",
-        "Deviation · Tooltip",
         "Real Long Deviation · Tooltip",
         "Real Short Deviation · Tooltip",
         "Sigma · Tooltip",
@@ -6197,40 +7516,53 @@
      "options": {
       "indexByName": {
        "time": 0,
-       "+1σ": 1,
-       "−1σ": 2,
-       "+3σ": 3,
-       "−3σ": 4,
-       "Deviation": 5,
-       "Real Long Deviation": 6,
-       "Real Short Deviation": 7,
-       "Long In · Dev": 8,
-       "Long Out · Dev": 9,
-       "Short In · Dev": 10,
-       "Short Out · Dev": 11,
-       "Long Entry · Dev": 12,
-       "Long Entry · Base · Dev": 13,
-       "Short Entry · Dev": 14,
-       "Short Entry · Base · Dev": 15,
-       "Exit · Dev": 16,
-       "Forced Exit · Dev": 17,
-       "Other · Dev": 18,
-       "Execution": 19,
-       "Action": 20,
-       "Decided": 21,
-       "Bull Filled": 22,
-       "Bull Avg": 23,
-       "Bear Filled": 24,
-       "Bear Avg": 25,
-       "Notional": 26,
-       "Fees": 27,
-       "Cycle Net": 28,
-       "At Deviation": 29,
-       "Deviation · Tooltip": 30,
-       "Real Long Deviation · Tooltip": 31,
-       "Real Short Deviation · Tooltip": 32,
-       "Sigma · Tooltip": 33,
-       "Entry": 34
+       "+0.5σ": 1,
+       "−0.5σ": 2,
+       "+1σ": 3,
+       "−1σ": 4,
+       "+1.5σ": 5,
+       "−1.5σ": 6,
+       "+2σ": 7,
+       "−2σ": 8,
+       "+2.5σ": 9,
+       "−2.5σ": 10,
+       "+3σ": 11,
+       "−3σ": 12,
+       "Real Long Deviation": 13,
+       "Real Short Deviation": 14,
+       "Real Long Deviation at Entry": 15,
+       "Real Short Deviation at Entry": 16,
+       "Long In · Dev": 17,
+       "Long Out · Dev": 18,
+       "Short In · Dev": 19,
+       "Short Out · Dev": 20,
+       "Long Entry · Dev": 21,
+       "Long Entry · Base · Dev": 22,
+       "Short Entry · Dev": 23,
+       "Short Entry · Base · Dev": 24,
+       "Undone Long Entry · Dev": 25,
+       "Undone Long Entry · Base · Dev": 26,
+       "Undone Short Entry · Dev": 27,
+       "Undone Short Entry · Base · Dev": 28,
+       "Long Exit · Dev": 29,
+       "Short Exit · Dev": 30,
+       "Execution": 31,
+       "Action": 32,
+       "Decided": 33,
+       "Bull Filled": 34,
+       "Bull Avg": 35,
+       "Bear Filled": 36,
+       "Bear Avg": 37,
+       "Bull Trimmed": 38,
+       "Bear Trimmed": 39,
+       "Notional": 40,
+       "Fees": 41,
+       "Cycle Net": 42,
+       "At Deviation": 43,
+       "Real Long Deviation · Tooltip": 44,
+       "Real Short Deviation · Tooltip": 45,
+       "Sigma · Tooltip": 46,
+       "Entry": 47
       },
       "renameByName": {},
       "excludeByName": {}
@@ -6255,7 +7587,7 @@
    "id": 18,
    "type": "table",
    "title": "Round Trips · Newest First",
-   "description": "Every round trip of the Run open at any time in the Range, newest first, at most 500; no-fill ones (nothing traded) left out.\n\n- **Execution ID**: the round trip's opening (its first entry), UTC+8 (owner item 83): every marker of the round trip on the Spread and Deviation charts (entries, completions, trims, exits) shows the same ID; click for its orders below.\n- **Closed, Held**: its close, and open to close (to now while open).\n- **Side**: Long: both legs bought; Short: both sold.\n- **Notional**: both legs' entry value, USDT (a One Leg round trip: that leg's).\n- **In σ**: the executable deviation at its entries, weighted by their value.\n- **Out σ**: at the exit decision (– for a forced exit or none).\n- **Net**: Gross + Fees + Funding, USDT; Open while open, Pending (amber) while a funding settlement it held through has no record.\n- **Net Bps**: Net ÷ Notional × 10⁴ (bps of the notional, not of the spread).\n- **End Reason**: why it closed.",
+   "description": "Every round trip of the Run open at any time in the Range, newest first, at most 500; no-fill ones (nothing traded) left out.\n\n- **Execution ID**: the round trip's opening (its first entry), UTC+8 (owner item 83): every marker of the round trip on the Spread and Deviation charts (entries, completions, trims, exits) shows the same ID; click for its orders below.\n- **Closed, Held**: its close, and open to close (to now while open).\n- **Side**: Long: both legs bought; Short: both sold.\n- **Notional**: both legs' entry value, USDT (a One Leg round trip: that leg's).\n- **In σ**: the executable deviation at its entries, weighted by their value.\n- **Out σ**: at the exit decision (– for a forced exit or none).\n- **Net**: Gross − Fees + Funding, USDT; Open while open, Pending (amber) while a funding settlement it held through has no record.\n- **Net bps**: Net ÷ Notional × 10⁴ (bps of the notional, not of the spread).\n- **End Reason**: why it closed.",
    "gridPos": {
     "x": 0,
     "y": 69,
@@ -6365,7 +7697,7 @@
       "properties": [
        {
         "id": "custom.width",
-        "value": 72
+        "value": 68
        }
       ]
      },
@@ -6408,7 +7740,7 @@
        },
        {
         "id": "custom.width",
-        "value": 64
+        "value": 56
        }
       ]
      },
@@ -6418,6 +7750,10 @@
        "options": "Notional"
       },
       "properties": [
+       {
+        "id": "displayName",
+        "value": "Notional USDT"
+       },
        {
         "id": "custom.align",
         "value": "right"
@@ -6432,7 +7768,7 @@
        },
        {
         "id": "custom.width",
-        "value": 94
+        "value": 88
        }
       ]
      },
@@ -6472,7 +7808,7 @@
        },
        {
         "id": "custom.width",
-        "value": 64
+        "value": 56
        }
       ]
      },
@@ -6512,7 +7848,7 @@
        },
        {
         "id": "custom.width",
-        "value": 64
+        "value": 56
        }
       ]
      },
@@ -6522,6 +7858,10 @@
        "options": "Net"
       },
       "properties": [
+       {
+        "id": "displayName",
+        "value": "Net USDT"
+       },
        {
         "id": "custom.align",
         "value": "right"
@@ -6604,7 +7944,7 @@
        },
        {
         "id": "custom.width",
-        "value": 80
+        "value": 84
        }
       ]
      },
@@ -6616,7 +7956,7 @@
       "properties": [
        {
         "id": "displayName",
-        "value": "Net Bps"
+        "value": "Net bps"
        },
        {
         "id": "custom.align",
@@ -6700,7 +8040,7 @@
        },
        {
         "id": "custom.width",
-        "value": 72
+        "value": 64
        }
       ]
      },
@@ -6712,7 +8052,7 @@
       "properties": [
        {
         "id": "custom.minWidth",
-        "value": 140
+        "value": 120
        }
       ]
      }
@@ -6743,7 +8083,7 @@
    "id": 20,
    "type": "table",
    "title": "Orders · ct, USDT and ms",
-   "description": "Every order of the picked round trip (the Range's newest by default), in the order the program sent them, its fills folded in.\n\n- **Purpose**: Entry, Complete (the leg that filled less), Trim (the leg that filled more), Exit, Forced.\n- **Side**: Buy or Sell; RO: a reduce-only order.\n- **Qty, Filled**: contracts ordered and filled.\n- **Limit, Avg**: the limit and the fills' average price, USDT, to the leg's tick.\n- **Fee**: USDT, as a contribution (a cost negative); Pending while the venue has not reported it.\n- **Latency**: sent → final state in hand, ms, this host's clock (paper: the configured simulation).\n- **Status**: Filled, Partial, No Fill (an IOC that met nothing), Rejected (with the venue's code), Working, Unknown (being queried).",
+   "description": "Every order of the picked round trip (the Range's newest by default), in the order the program sent them, its fills folded in.\n\n- **Purpose**: Entry, Complete (the leg that filled less), Trim (the leg that filled more), Exit, Forced.\n- **Side**: Buy or Sell; RO: a reduce-only order.\n- **Qty, Filled**: contracts ordered and filled.\n- **Limit, Avg**: the limit and the fills' average price, USDT, to the leg's tick.\n- **Fee**: USDT paid, a cost shown as a positive amount (as in Summary); Pending while the venue has not reported it.\n- **Latency**: sent → final state in hand, ms, this host's clock (paper: the configured simulation).\n- **Status**: Filled, Partial, No Fill (an IOC that met nothing), Rejected (with the venue's code), Working, Unknown (being queried).",
    "gridPos": {
     "x": 0,
     "y": 77,
@@ -6764,7 +8104,7 @@
      "format": "table",
      "rawQuery": true,
      "editorMode": "code",
-     "rawSql": "SELECT * FROM (WITH sel AS MATERIALIZED (SELECT r.run_id, r.live, r.started_ms, r.stopped_ms, r.host, r.config, coalesce(r.stopped_ms, (extract(epoch FROM now()) * 1000)::bigint) AS end_ms\n                         FROM trade.process_run r WHERE r.run_id = (SELECT CASE '$run' WHEN '__live' THEN (SELECT x.run_id FROM trade.process_run x WHERE x.live ORDER BY x.started_ms DESC LIMIT 1) WHEN '__paper' THEN (SELECT x.run_id FROM trade.process_run x WHERE NOT x.live ORDER BY x.started_ms DESC LIMIT 1) ELSE '$run' END) AND coalesce(r.config #>> '{cex,pair,bull,ticker}', 'SOXL') || ' / ' || coalesce(r.config #>> '{cex,pair,bear,ticker}', 'SOXS') = '$combo'),\nrg AS MATERIALIZED (SELECT greatest(sel.started_ms, (CASE WHEN '${since}' ~ '^[0-9]{1,14}$' AND '${since}' <> '0' THEN '${since}'::bigint + CASE WHEN '${since_hour}' ~ '^[0-9]{1,2}$' THEN '${since_hour}'::int ELSE 0 END * 3600000 ELSE 0 END)) AS from_ms, least(sel.end_ms + 1, (CASE WHEN '${until}' ~ '^[0-9]{1,14}$' AND '${until}'::bigint < 99999999999999 THEN '${until}'::bigint + CASE WHEN '${until_hour}' ~ '^[0-9]{1,2}$' THEN '${until_hour}'::int ELSE 24 END * 3600000 ELSE 99999999999999 END)) AS to_ms FROM sel)\nSELECT to_timestamp(o.submitted_ms / 1000.0) AS \"Time\", initcap(o.purpose) AS \"Purpose\", CASE o.leg WHEN 'bull' THEN '$bull' ELSE '$bear' END AS \"Leg\",\n       initcap(o.side) || CASE WHEN o.reduce_only THEN ' · RO' ELSE '' END AS \"Side\", o.qty AS \"Qty\", o.cum_exec_qty AS \"Filled\",\n       CASE o.leg WHEN 'bull' THEN to_char(o.price, 'FM9990.00') ELSE to_char(o.price, 'FM9990.000') END AS \"Limit\", CASE o.leg WHEN 'bull' THEN to_char(o.avg_price, 'FM9990.00') ELSE to_char(o.avg_price, 'FM9990.000') END AS \"Avg\", CASE WHEN o.cum_exec_qty = 0 THEN NULL WHEN NOT o.fee_known THEN -9100000000 ELSE -o.fee END AS \"Fee\",\n       o.final_ms - o.sent_ms AS \"Latency\",\n       CASE WHEN o.unknown THEN 'Unknown' WHEN o.status = 'filled' THEN 'Filled' WHEN o.status = 'cancelled' AND o.cum_exec_qty > 0 THEN 'Partial'\n            WHEN o.status = 'cancelled' THEN 'No Fill' WHEN o.status IN ('pending', 'acked') THEN 'Working'\n            ELSE initcap(replace(o.status, '_', ' ')) END || coalesce(' · ' || nullif(concat_ws(' ', o.error_code, o.error_message), ''), '') AS \"Status\"\nFROM trade.cex_order o WHERE o.live = (SELECT sel.live FROM sel) AND o.cycle_id = '$cycle' ORDER BY o.submitted_ms, o.client_order_id) z\nUNION ALL SELECT NULL AS \"Time\", NULL AS \"Purpose\", NULL AS \"Leg\", NULL AS \"Side\", NULL AS \"Qty\", NULL AS \"Filled\", NULL AS \"Limit\", NULL AS \"Avg\", NULL AS \"Fee\", NULL AS \"Latency\", 'No order: no round trip in the Range' AS \"Status\" WHERE NOT EXISTS (WITH sel AS MATERIALIZED (SELECT r.run_id, r.live, r.started_ms, r.stopped_ms, r.host, r.config, coalesce(r.stopped_ms, (extract(epoch FROM now()) * 1000)::bigint) AS end_ms\n                         FROM trade.process_run r WHERE r.run_id = (SELECT CASE '$run' WHEN '__live' THEN (SELECT x.run_id FROM trade.process_run x WHERE x.live ORDER BY x.started_ms DESC LIMIT 1) WHEN '__paper' THEN (SELECT x.run_id FROM trade.process_run x WHERE NOT x.live ORDER BY x.started_ms DESC LIMIT 1) ELSE '$run' END) AND coalesce(r.config #>> '{cex,pair,bull,ticker}', 'SOXL') || ' / ' || coalesce(r.config #>> '{cex,pair,bear,ticker}', 'SOXS') = '$combo'),\nrg AS MATERIALIZED (SELECT greatest(sel.started_ms, (CASE WHEN '${since}' ~ '^[0-9]{1,14}$' AND '${since}' <> '0' THEN '${since}'::bigint + CASE WHEN '${since_hour}' ~ '^[0-9]{1,2}$' THEN '${since_hour}'::int ELSE 0 END * 3600000 ELSE 0 END)) AS from_ms, least(sel.end_ms + 1, (CASE WHEN '${until}' ~ '^[0-9]{1,14}$' AND '${until}'::bigint < 99999999999999 THEN '${until}'::bigint + CASE WHEN '${until_hour}' ~ '^[0-9]{1,2}$' THEN '${until_hour}'::int ELSE 24 END * 3600000 ELSE 99999999999999 END)) AS to_ms FROM sel)\nSELECT to_timestamp(o.submitted_ms / 1000.0) AS \"Time\", initcap(o.purpose) AS \"Purpose\", CASE o.leg WHEN 'bull' THEN '$bull' ELSE '$bear' END AS \"Leg\",\n       initcap(o.side) || CASE WHEN o.reduce_only THEN ' · RO' ELSE '' END AS \"Side\", o.qty AS \"Qty\", o.cum_exec_qty AS \"Filled\",\n       CASE o.leg WHEN 'bull' THEN to_char(o.price, 'FM9990.00') ELSE to_char(o.price, 'FM9990.000') END AS \"Limit\", CASE o.leg WHEN 'bull' THEN to_char(o.avg_price, 'FM9990.00') ELSE to_char(o.avg_price, 'FM9990.000') END AS \"Avg\", CASE WHEN o.cum_exec_qty = 0 THEN NULL WHEN NOT o.fee_known THEN -9100000000 ELSE -o.fee END AS \"Fee\",\n       o.final_ms - o.sent_ms AS \"Latency\",\n       CASE WHEN o.unknown THEN 'Unknown' WHEN o.status = 'filled' THEN 'Filled' WHEN o.status = 'cancelled' AND o.cum_exec_qty > 0 THEN 'Partial'\n            WHEN o.status = 'cancelled' THEN 'No Fill' WHEN o.status IN ('pending', 'acked') THEN 'Working'\n            ELSE initcap(replace(o.status, '_', ' ')) END || coalesce(' · ' || nullif(concat_ws(' ', o.error_code, o.error_message), ''), '') AS \"Status\"\nFROM trade.cex_order o WHERE o.live = (SELECT sel.live FROM sel) AND o.cycle_id = '$cycle' ORDER BY o.submitted_ms, o.client_order_id)"
+     "rawSql": "SELECT * FROM (WITH sel AS MATERIALIZED (SELECT r.run_id, r.live, r.started_ms, r.stopped_ms, r.host, r.config, coalesce(r.stopped_ms, (extract(epoch FROM now()) * 1000)::bigint) AS end_ms\n                         FROM trade.process_run r WHERE r.run_id = (SELECT CASE '$run' WHEN '__live' THEN (SELECT x.run_id FROM trade.process_run x WHERE x.live ORDER BY x.started_ms DESC LIMIT 1) WHEN '__paper' THEN (SELECT x.run_id FROM trade.process_run x WHERE NOT x.live ORDER BY x.started_ms DESC LIMIT 1) ELSE '$run' END) AND coalesce(r.config #>> '{cex,pair,bull,ticker}', 'SOXL') || ' / ' || coalesce(r.config #>> '{cex,pair,bear,ticker}', 'SOXS') = '$combo'),\nrg AS MATERIALIZED (SELECT greatest(sel.started_ms, (CASE WHEN '${since}' ~ '^[0-9]{1,14}$' AND '${since}' <> '0' THEN '${since}'::bigint + CASE WHEN '${since_hour}' ~ '^[0-9]{1,2}$' THEN '${since_hour}'::int ELSE 0 END * 3600000 ELSE 0 END)) AS from_ms, least(sel.end_ms + 1, (CASE WHEN '${until}' ~ '^[0-9]{1,14}$' AND '${until}'::bigint < 99999999999999 THEN '${until}'::bigint + CASE WHEN '${until_hour}' ~ '^[0-9]{1,2}$' THEN '${until_hour}'::int ELSE 24 END * 3600000 ELSE 99999999999999 END)) AS to_ms FROM sel)\nSELECT to_timestamp(o.submitted_ms / 1000.0) AS \"Time\", initcap(o.purpose) AS \"Purpose\", CASE o.leg WHEN 'bull' THEN '$bull' ELSE '$bear' END AS \"Leg\",\n       initcap(o.side) || CASE WHEN o.reduce_only THEN ' · RO' ELSE '' END AS \"Side\", o.qty AS \"Qty\", o.cum_exec_qty AS \"Filled\",\n       CASE o.leg WHEN 'bull' THEN to_char(o.price, 'FM9990.00') ELSE to_char(o.price, 'FM9990.000') END AS \"Limit\", CASE o.leg WHEN 'bull' THEN to_char(o.avg_price, 'FM9990.00') ELSE to_char(o.avg_price, 'FM9990.000') END AS \"Avg\", CASE WHEN o.cum_exec_qty = 0 THEN NULL WHEN NOT o.fee_known THEN -9100000000 ELSE o.fee END AS \"Fee\",\n       o.final_ms - o.sent_ms AS \"Latency\",\n       CASE WHEN o.unknown THEN 'Unknown' WHEN o.status = 'filled' THEN 'Filled' WHEN o.status = 'cancelled' AND o.cum_exec_qty > 0 THEN 'Partial'\n            WHEN o.status = 'cancelled' THEN 'No Fill' WHEN o.status IN ('pending', 'acked') THEN 'Working'\n            ELSE initcap(replace(o.status, '_', ' ')) END || coalesce(' · ' || nullif(concat_ws(' ', o.error_code, o.error_message), ''), '') AS \"Status\"\nFROM trade.cex_order o WHERE o.live = (SELECT sel.live FROM sel) AND o.cycle_id = '$cycle' ORDER BY o.submitted_ms, o.client_order_id) z\nUNION ALL SELECT NULL AS \"Time\", NULL AS \"Purpose\", NULL AS \"Leg\", NULL AS \"Side\", NULL AS \"Qty\", NULL AS \"Filled\", NULL AS \"Limit\", NULL AS \"Avg\", NULL AS \"Fee\", NULL AS \"Latency\", 'No order: no round trip in the Range' AS \"Status\" WHERE NOT EXISTS (WITH sel AS MATERIALIZED (SELECT r.run_id, r.live, r.started_ms, r.stopped_ms, r.host, r.config, coalesce(r.stopped_ms, (extract(epoch FROM now()) * 1000)::bigint) AS end_ms\n                         FROM trade.process_run r WHERE r.run_id = (SELECT CASE '$run' WHEN '__live' THEN (SELECT x.run_id FROM trade.process_run x WHERE x.live ORDER BY x.started_ms DESC LIMIT 1) WHEN '__paper' THEN (SELECT x.run_id FROM trade.process_run x WHERE NOT x.live ORDER BY x.started_ms DESC LIMIT 1) ELSE '$run' END) AND coalesce(r.config #>> '{cex,pair,bull,ticker}', 'SOXL') || ' / ' || coalesce(r.config #>> '{cex,pair,bear,ticker}', 'SOXS') = '$combo'),\nrg AS MATERIALIZED (SELECT greatest(sel.started_ms, (CASE WHEN '${since}' ~ '^[0-9]{1,14}$' AND '${since}' <> '0' THEN '${since}'::bigint + CASE WHEN '${since_hour}' ~ '^[0-9]{1,2}$' THEN '${since_hour}'::int ELSE 0 END * 3600000 ELSE 0 END)) AS from_ms, least(sel.end_ms + 1, (CASE WHEN '${until}' ~ '^[0-9]{1,14}$' AND '${until}'::bigint < 99999999999999 THEN '${until}'::bigint + CASE WHEN '${until_hour}' ~ '^[0-9]{1,2}$' THEN '${until_hour}'::int ELSE 24 END * 3600000 ELSE 99999999999999 END)) AS to_ms FROM sel)\nSELECT to_timestamp(o.submitted_ms / 1000.0) AS \"Time\", initcap(o.purpose) AS \"Purpose\", CASE o.leg WHEN 'bull' THEN '$bull' ELSE '$bear' END AS \"Leg\",\n       initcap(o.side) || CASE WHEN o.reduce_only THEN ' · RO' ELSE '' END AS \"Side\", o.qty AS \"Qty\", o.cum_exec_qty AS \"Filled\",\n       CASE o.leg WHEN 'bull' THEN to_char(o.price, 'FM9990.00') ELSE to_char(o.price, 'FM9990.000') END AS \"Limit\", CASE o.leg WHEN 'bull' THEN to_char(o.avg_price, 'FM9990.00') ELSE to_char(o.avg_price, 'FM9990.000') END AS \"Avg\", CASE WHEN o.cum_exec_qty = 0 THEN NULL WHEN NOT o.fee_known THEN -9100000000 ELSE o.fee END AS \"Fee\",\n       o.final_ms - o.sent_ms AS \"Latency\",\n       CASE WHEN o.unknown THEN 'Unknown' WHEN o.status = 'filled' THEN 'Filled' WHEN o.status = 'cancelled' AND o.cum_exec_qty > 0 THEN 'Partial'\n            WHEN o.status = 'cancelled' THEN 'No Fill' WHEN o.status IN ('pending', 'acked') THEN 'Working'\n            ELSE initcap(replace(o.status, '_', ' ')) END || coalesce(' · ' || nullif(concat_ws(' ', o.error_code, o.error_message), ''), '') AS \"Status\"\nFROM trade.cex_order o WHERE o.live = (SELECT sel.live FROM sel) AND o.cycle_id = '$cycle' ORDER BY o.submitted_ms, o.client_order_id)"
     }
    ],
    "fieldConfig": {
@@ -6799,7 +8139,7 @@
        },
        {
         "id": "custom.width",
-        "value": 104
+        "value": 100
        }
       ]
      },
@@ -6811,7 +8151,7 @@
       "properties": [
        {
         "id": "custom.width",
-        "value": 80
+        "value": 72
        }
       ]
      },
@@ -6823,7 +8163,7 @@
       "properties": [
        {
         "id": "custom.width",
-        "value": 64
+        "value": 56
        }
       ]
      },
@@ -6835,7 +8175,7 @@
       "properties": [
        {
         "id": "custom.width",
-        "value": 72
+        "value": 64
        }
       ]
      },
@@ -6845,6 +8185,10 @@
        "options": "Qty"
       },
       "properties": [
+       {
+        "id": "displayName",
+        "value": "Qty ct"
+       },
        {
         "id": "custom.align",
         "value": "right"
@@ -6886,6 +8230,10 @@
       },
       "properties": [
        {
+        "id": "displayName",
+        "value": "Filled ct"
+       },
+       {
         "id": "custom.align",
         "value": "right"
        },
@@ -6926,6 +8274,10 @@
       },
       "properties": [
        {
+        "id": "displayName",
+        "value": "Limit USDT"
+       },
+       {
         "id": "custom.align",
         "value": "right"
        },
@@ -6942,6 +8294,10 @@
       },
       "properties": [
        {
+        "id": "displayName",
+        "value": "Avg USDT"
+       },
+       {
         "id": "custom.align",
         "value": "right"
        },
@@ -6957,6 +8313,10 @@
        "options": "Fee"
       },
       "properties": [
+       {
+        "id": "displayName",
+        "value": "Fee USDT"
+       },
        {
         "id": "custom.align",
         "value": "right"
@@ -7006,38 +8366,6 @@
         ]
        },
        {
-        "id": "custom.cellOptions",
-        "value": {
-         "type": "color-text"
-        }
-       },
-       {
-        "id": "color",
-        "value": {
-         "mode": "thresholds"
-        }
-       },
-       {
-        "id": "thresholds",
-        "value": {
-         "mode": "absolute",
-         "steps": [
-          {
-           "color": "#d03b3b",
-           "value": null
-          },
-          {
-           "color": "text",
-           "value": 0
-          },
-          {
-           "color": "#0ca30c",
-           "value": 1e-06
-          }
-         ]
-        }
-       },
-       {
         "id": "custom.width",
         "value": 84
        }
@@ -7050,12 +8378,16 @@
       },
       "properties": [
        {
+        "id": "displayName",
+        "value": "Latency ms"
+       },
+       {
         "id": "custom.align",
         "value": "right"
        },
        {
         "id": "unit",
-        "value": "suffix: ms"
+        "value": "none"
        },
        {
         "id": "decimals",
@@ -7079,7 +8411,7 @@
        },
        {
         "id": "custom.width",
-        "value": 72
+        "value": 64
        }
       ]
      },
@@ -7091,7 +8423,7 @@
       "properties": [
        {
         "id": "custom.minWidth",
-        "value": 130
+        "value": 110
        },
        {
         "id": "custom.cellOptions",
@@ -7178,7 +8510,7 @@
     "x": 0,
     "y": 85,
     "w": 24,
-    "h": 4
+    "h": 5
    },
    "datasource": {
     "type": "grafana-postgresql-datasource",
@@ -7211,7 +8543,7 @@
       "filterable": false,
       "inspect": false,
       "minWidth": 60,
-      "wrapHeaderText": false
+      "wrapHeaderText": true
      },
      "mappings": [],
      "noValue": "–"
@@ -7235,6 +8567,10 @@
        "options": "Venue"
       },
       "properties": [
+       {
+        "id": "displayName",
+        "value": "Venue ct"
+       },
        {
         "id": "custom.align",
         "value": "right"
@@ -7272,6 +8608,10 @@
       },
       "properties": [
        {
+        "id": "displayName",
+        "value": "Ledger ct"
+       },
+       {
         "id": "custom.align",
         "value": "right"
        },
@@ -7308,6 +8648,10 @@
       },
       "properties": [
        {
+        "id": "displayName",
+        "value": "Mark USDT"
+       },
+       {
         "id": "custom.align",
         "value": "right"
        },
@@ -7343,6 +8687,10 @@
        "options": "Liq Price"
       },
       "properties": [
+       {
+        "id": "displayName",
+        "value": "Liq Price USDT"
+       },
        {
         "id": "custom.align",
         "value": "right"
@@ -7448,6 +8796,10 @@
       },
       "properties": [
        {
+        "id": "displayName",
+        "value": "Venue UPL USDT"
+       },
+       {
         "id": "custom.align",
         "value": "right"
        },
@@ -7516,6 +8868,10 @@
       },
       "properties": [
        {
+        "id": "displayName",
+        "value": "Exposure USDT"
+       },
+       {
         "id": "custom.align",
         "value": "right"
        },
@@ -7551,6 +8907,10 @@
        "options": "Funding"
       },
       "properties": [
+       {
+        "id": "displayName",
+        "value": "Funding bps"
+       },
        {
         "id": "custom.align",
         "value": "right"
@@ -7662,7 +9022,7 @@
    "collapsed": false,
    "gridPos": {
     "x": 0,
-    "y": 89,
+    "y": 90,
     "w": 24,
     "h": 1
    },
@@ -7675,7 +9035,7 @@
    "description": "What else the program trades on (the mean model, its scale, the entry and exit points, M, L and N are in Parameters above): the taker fee it counts, the margin over costs an entry needs (spread bps), whether the mean warms up again when the anchor changes; the smallest batch (USDT); take ratio: the share of the depth up to the pricing level an order takes; the time and the spread bps between entries of a cycle. · process_run.config of the Run.",
    "gridPos": {
     "x": 0,
-    "y": 90,
+    "y": 91,
     "w": 6,
     "h": 8
    },
@@ -7770,7 +9130,7 @@
    "description": "How it trades: Live (real orders on Bitget) or Paper; the book level each leg's limit sits at ($bull / $bear); the order channel (WS or REST) and the book feed × its connections; how long it waits to complete the other leg; the slip a forced exit may pay; the order latency paper simulates ($bull / $bear; a paper Run only). · process_run.config of the Run.",
    "gridPos": {
     "x": 6,
-    "y": 90,
+    "y": 91,
     "w": 6,
     "h": 8
    },
@@ -7865,7 +9225,7 @@
    "description": "When it stops and what it trusts: how long before the regular close it flattens; how old a book or the USD/USDT rate F may be; how long a NAV must stay unchanged to be confirmed; how long a stop may take before an alarm; the ex-dates of the dividends (and splits) it knows; edits to the market calendar. · process_run.config of the Run.",
    "gridPos": {
     "x": 12,
-    "y": 90,
+    "y": 91,
     "w": 6,
     "h": 8
    },
@@ -7960,7 +9320,7 @@
    "description": "Which start this is (its name and mode are in the row titles and the Execution tiles): start and stop (UTC+8), host and run_id. · process_run.config of the Run.",
    "gridPos": {
     "x": 18,
-    "y": 90,
+    "y": 91,
     "w": 6,
     "h": 8
    },
@@ -8055,7 +9415,7 @@
    "collapsed": true,
    "gridPos": {
     "x": 0,
-    "y": 98,
+    "y": 99,
     "w": 24,
     "h": 1
    },
@@ -8067,7 +9427,7 @@
      "description": "Each second's answer in the Range (signal_sample.idle_reason) in words.\n\n- **Answer**: the state and the reason.\n- **Seconds, Share**: how many seconds, and their share of the Range's.",
      "gridPos": {
       "x": 0,
-      "y": 99,
+      "y": 100,
       "w": 9,
       "h": 8
      },
@@ -8200,7 +9560,7 @@
      "description": "Seconds in the Range the executable deviation was past an entry line but no entry went out (decision at_line_blocked).\n\n- **Reason, Side**: why, and the side it would have entered.\n- **Last**: the newest such second, UTC+8.",
      "gridPos": {
       "x": 9,
-      "y": 99,
+      "y": 100,
       "w": 8,
       "h": 8
      },
@@ -8349,7 +9709,7 @@
      "description": "Why the Run's round trips of the Range that closed ended (no-fill ones included).\n\n- **Cycles**: how many.\n- **Net**: their net, USDT (Pending ones out of it).\n- **Pending**: those whose funding is not known yet.",
      "gridPos": {
       "x": 17,
-      "y": 99,
+      "y": 100,
       "w": 7,
       "h": 8
      },
@@ -8419,6 +9779,10 @@
          "options": "Net"
         },
         "properties": [
+         {
+          "id": "displayName",
+          "value": "Net USDT"
+         },
          {
           "id": "custom.align",
           "value": "right"
@@ -8501,7 +9865,7 @@
          },
          {
           "id": "custom.width",
-          "value": 80
+          "value": 92
          }
         ]
        },
@@ -8538,7 +9902,7 @@
      "description": "Each stage over the Run's orders submitted in the Range; paper: the configured simulated latency, not a measurement.\n\n- **Clock**: local: this host's clock; venue: Bitget's.\n- **Orders**: orders measured.\n- **Median, P90, Max**: the median, 90th percentile and largest, ms.",
      "gridPos": {
       "x": 0,
-      "y": 107,
+      "y": 108,
       "w": 24,
       "h": 6
      },
@@ -8626,6 +9990,10 @@
         },
         "properties": [
          {
+          "id": "displayName",
+          "value": "Median ms"
+         },
+         {
           "id": "custom.align",
           "value": "right"
          },
@@ -8666,6 +10034,10 @@
         },
         "properties": [
          {
+          "id": "displayName",
+          "value": "P90 ms"
+         },
+         {
           "id": "custom.align",
           "value": "right"
          },
@@ -8705,6 +10077,10 @@
          "options": "Max"
         },
         "properties": [
+         {
+          "id": "displayName",
+          "value": "Max ms"
+         },
          {
           "id": "custom.align",
           "value": "right"
@@ -8754,7 +10130,7 @@
    "collapsed": true,
    "gridPos": {
     "x": 0,
-    "y": 99,
+    "y": 100,
     "w": 24,
     "h": 1
    },
@@ -8766,7 +10142,7 @@
      "description": "Every start of the program, both modes, newest first, as the Run picker lists them (the one shown marked), whatever the filters.\n\n- **Run**: click to show that Run, its whole life on the charts.\n- **State**: Running (a sample in the last minute), Stopped (in order), Lost (neither: crashed or killed).\n- **Ran**: start to stop, or to now.\n- **N**: the notional M × L it may hold, USDT.\n- **Run ID**: process_run.run_id.",
      "gridPos": {
       "x": 0,
-      "y": 100,
+      "y": 101,
       "w": 24,
       "h": 6
      },
@@ -8957,6 +10333,10 @@
         },
         "properties": [
          {
+          "id": "displayName",
+          "value": "N USDT"
+         },
+         {
           "id": "custom.align",
           "value": "right"
          },
@@ -8970,7 +10350,7 @@
          },
          {
           "id": "custom.width",
-          "value": 72
+          "value": 88
          }
         ]
        },
@@ -9015,7 +10395,7 @@
      "description": "Every event a module of the Run recorded (trade.event) in the Range, newest first, at most 200; the errors are also in Alerts.\n\n- **Level**: Error (a person is needed), Warn, or another level the program writes.\n- **Module, Kind**: who wrote it and what it is.\n- **Message, Detail**: its words and its figures.",
      "gridPos": {
       "x": 0,
-      "y": 106,
+      "y": 107,
       "w": 24,
       "h": 5
      },
@@ -9188,7 +10568,7 @@
      "description": "Every anchor, NAV and dividend the program read in the Run's mode for the sessions of the Run in the Range, newest first; its own reading, apart from Combo Spread's Anchors table.\n\n- **Kind**: bell_f (the F inside the bell), bell (F × Binance's index at the close), nav_seen (a NAV first seen), nav (confirmed after 1 h unchanged), dividend.\n- **Value**: USD per share.\n- **Known**: when the program learned it, UTC+8.",
      "gridPos": {
       "x": 0,
-      "y": 111,
+      "y": 112,
       "w": 14,
       "h": 7
      },
@@ -9288,6 +10668,10 @@
         },
         "properties": [
          {
+          "id": "displayName",
+          "value": "Value USD"
+         },
+         {
           "id": "custom.align",
           "value": "right"
          },
@@ -9317,7 +10701,7 @@
          },
          {
           "id": "custom.width",
-          "value": 88
+          "value": 96
          }
         ]
        },
@@ -9327,6 +10711,10 @@
          "options": "F"
         },
         "properties": [
+         {
+          "id": "displayName",
+          "value": "F USD/USDT"
+         },
          {
           "id": "custom.align",
           "value": "right"
@@ -9357,7 +10745,7 @@
          },
          {
           "id": "custom.width",
-          "value": 80
+          "value": 112
          }
         ]
        },
@@ -9406,7 +10794,7 @@
      "description": "Each funding record of the Run's two contracts settled in the Range, and each settlement a finished round trip still waits for.\n\n- **Status**: Booked (to the round trip whose interval holds the settlement) or Awaited (amber).\n- **Amount**: + received.\n- **Execution ID**: the round trip it is booked to, by its opening time (UTC+8).",
      "gridPos": {
       "x": 14,
-      "y": 111,
+      "y": 112,
       "w": 10,
       "h": 7
      },
@@ -9515,6 +10903,10 @@
         },
         "properties": [
          {
+          "id": "displayName",
+          "value": "Amount USDT"
+         },
+         {
           "id": "custom.align",
           "value": "right"
          },
@@ -9576,7 +10968,7 @@
          },
          {
           "id": "custom.width",
-          "value": 80
+          "value": 104
          }
         ]
        },

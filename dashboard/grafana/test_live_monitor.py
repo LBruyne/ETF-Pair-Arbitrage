@@ -228,9 +228,24 @@ class Shape(unittest.TestCase):
             self.assertEqual(props["Long Entry" + chart]["color"]["fixedColor"], board.GOOD)
             self.assertEqual(props["Long Entry" + chart]["custom.fillBelowTo"], "Long Entry · Base" + chart)
             self.assertEqual(props["Short Entry" + chart]["color"]["fixedColor"], board.BAD)
-            self.assertEqual(props["Exit" + chart]["custom.drawStyle"], "points")
+            # owner item 84: exits are circles in the colour of the position they close; undone entries grey triangles; the
+            # stretch past an entry line drawn thick; Combo Spread's σ lines 0.5-3σ, grey, in neither legend nor tooltip;
+            # no line on the mids on Deviation.
+            self.assertEqual((props["Long Exit" + chart]["custom.drawStyle"], props["Long Exit" + chart]["color"]["fixedColor"]), ("points", board.GOOD))
+            self.assertEqual((props["Short Exit" + chart]["custom.drawStyle"], props["Short Exit" + chart]["color"]["fixedColor"]), ("points", board.BAD))
+            self.assertTrue(props["Undone Long Entry" + chart]["color"]["fixedColor"].startswith(board.GREY))
+            self.assertNotIn("Deviation", names)
+            self.assertNotIn("Other" + chart, names)
+            sig = [n for n in names if n.endswith("σ")]
+            self.assertEqual(len(sig), 12, sig)
+            for n in sig:
+                self.assertEqual(props[n]["custom.hideFrom"], {"legend": True, "tooltip": True, "viz": False})
+            at = [n for n in names if n.endswith("at Entry")]
+            self.assertEqual(len(at), 2)
+            for n in at:
+                self.assertEqual(props[n]["custom.lineWidth"], 4)
             in_legend = [n for n in p["transformations"][1]["options"]["indexByName"] if n != "time" and not (props.get(n, {}).get("custom.hideFrom", {}) or {}).get("legend")]
-            self.assertLessEqual(len(in_legend), 8, (p["title"], in_legend))
+            self.assertLessEqual(len(in_legend), 10, (p["title"], in_legend))
         self.assertEqual(set(n for n, _ in board.ALL_COLUMNS) - kept, set())
 
     def test_no_spread_unit_d(self):
@@ -381,12 +396,21 @@ class Queries(unittest.TestCase):
             if psql_json(newest)[0]["ts_ms"] != s["ts_ms"]:
                 continue   # a new second came in between the reads
             one = lambda x: Decimal(str(math.floor(float(x) * 10 + 0.5) / 10)) if x is not None else None
-            self.assertEqual((m["Mean"], m["Volatility"]), (one(s["mu_d"]), one(s["sigma_d"])))
             fmt = lambda x: ("{:,.1f}".format(Decimal(str(x)).quantize(Decimal("0.1"), rounding="ROUND_HALF_UP") + 0) + board.NBSP + "bps").replace("-", "−")
+            self.assertEqual((m["Mean"], m["Volatility"]), (fmt(s["mu_d"]) if s["mu_d"] is not None else None, one(s["sigma_d"])))
+            cfg = rid["config"] if isinstance(rid["config"], dict) else json.loads(rid["config"])
+            ok = s["depth_ok_bull"] and s["depth_ok_bear"] and not (s["conflict_bull"] or s["conflict_bear"])
             if s["stats_ready"]:
                 rl = fmt(float(s["mu_d"]) + float(s["x_long_d"])) if s["x_long_d"] is not None else "–"
                 rs = fmt(float(s["mu_d"]) + float(s["x_short_d"])) if s["x_short_d"] is not None else "–"
-                self.assertEqual(m["Real Spread"], "Long%s%s / Short%s%s" % (board.NBSP, rl, board.NBSP, rs))
+                if ok:   # owner item 84: the side at or past its entry line marked (and lit by the tile's mapping)
+                    d_in_, sig_ = float(cfg["strategy"]["d_in"]), float(s["sigma_d"])
+                    hit_l = s["x_long_d"] is not None and float(s["x_long_d"]) / sig_ <= -d_in_
+                    hit_s = s["x_short_d"] is not None and float(s["x_short_d"]) / sig_ >= d_in_
+                    self.assertEqual(m["Real Long"], rl + (" · Entry" if hit_l else ""))
+                    self.assertEqual(m["Real Short"], rs + (" · Entry" if hit_s else ""))
+                else:
+                    self.assertEqual((m["Real Long"], m["Real Short"]), ("—", "—"))
                 dev = float(s["mid_d"]) - float(s["mu_d"])
                 self.assertEqual(m["Deviation"], "%s · %s%sσ" % (fmt(dev), "{:.2f}".format(Decimal(str(dev / float(s["sigma_d"]))).quantize(Decimal("0.01"), rounding="ROUND_HALF_UP") + 0).replace("-", "−"), board.NBSP))
             self.assertEqual(float(m["F"]), float(s["f"]))
@@ -609,8 +633,13 @@ class Queries(unittest.TestCase):
         counts."""
         for run in self.runs():
             with self.subTest(run=run):
-                r, want = self.expected_alerts(run)
-                got = psql_json(fill(board.Q_ALERTS, self.values(1, run)))
+                key = lambda x: (x[1], x[2], x[3], x[4]) if x[4] is not None else (x[1], x[2], x[3])
+                for _ in range(5):   # a running Run's book conflicts start and end every few seconds: read both at one second
+                    r, want = self.expected_alerts(run)
+                    got = psql_json(fill(board.Q_ALERTS, self.values(1, run)))
+                    rows = [(0, g["Severity"], g["Status"], g["Source"], g["What"], None) for g in got]
+                    if r["stopped_ms"] or sorted(map(key, rows), key=str) == sorted(map(key, want), key=str):
+                        break
                 if not want:
                     self.assertEqual([(g["Detail"], g["What"]) for g in got], [("No alert in this Run: nothing stopped or held trading", None)])
                     continue
@@ -687,18 +716,62 @@ class Queries(unittest.TestCase):
                     self.assertIsNotNone(r[n], "%s h, %s: %s NULL" % (hours, r["time"], n))
                 if r["Action"]:
                     decided.add(r["Decided"])
-                for side in ("Long Entry", "Short Entry"):
+                # owner item 84: the thick stretch is the real line itself, only where it is at or past its entry line
+                for at, line_ in (("Real Long at Entry", "Real Long Spread"), ("Real Short at Entry", "Real Short Spread"),
+                                  ("Real Long Deviation at Entry", "Real Long Deviation"), ("Real Short Deviation at Entry", "Real Short Deviation")):
+                    if r[at] is not None:
+                        self.assertEqual(r[at], r[line_], (r["time"], at))
+                for side, _, _ in board.TRIANGLES:
                     if r[side] is not None:
                         self.assertIsNotNone(r[side + " · Base"])
             decisions = psql_json(fill("SELECT d.ts_ms FROM trade.decision d WHERE d.run_id = '%s' AND d.kind IN "
-                                       "('entry', 'exit', 'complete', 'trim', 'forced') AND d.ts_ms >= $__from AND d.ts_ms <= $__to" % self.PAPER_RUN, v))
+                                       "('entry', 'exit', 'forced') AND d.ts_ms >= $__from AND d.ts_ms <= $__to" % self.PAPER_RUN, v))
             self.assertEqual(decided, {d["ts_ms"] for d in decisions}, "%s h" % hours)
+        # 4.2.1 (the lead's item 78 audit): a marker counts its whole step. The live exit of 2026-11-26 15:17:00.138 closed SOXL
+        # by its own order and SOXS by the exit of the remaining leg 57 ms later: its marker shows both legs, never 0 / No Fill
+        # for a leg that was filled; fees are a positive cost everywhere.
+        live = "1795676364501-backup-tk-huichao"
+        lv = dict(self.values(1, live), __from=1795676100000, __to=1795677900000)
+        marks = {}
+        for r in psql_json(fill(board.Q_EXECUTION, lv)):
+            if r["Action"]:
+                marks.setdefault(r["Decided"], r)
+        exit_ = marks[1795677420138]
+        self.assertEqual(board.ACTIONS[exit_["Action"]], "Short Exit")
+        self.assertEqual((exit_["Bull Filled"], exit_["Bull Avg"], exit_["Bear Filled"], exit_["Bear Avg"]),
+                         (Decimal("15.55"), Decimal("33.01"), Decimal("8.01"), Decimal("60.355")))
+        # 4.3: the follow-ups (completions, trims, the remaining leg's exit) have no marker of their own; an undone entry shows
+        # what was trimmed back (15:00:18.990: SOXL 15.58 filled, SOXS no fill, SOXL 15.58 trimmed back).
+        self.assertNotIn(1795677420195, marks)
+        undone = marks[1795676418990]
+        self.assertEqual(board.ACTIONS[undone["Action"]], "Undone Short Entry")
+        self.assertEqual((undone["Bull Filled"], undone["Bear Filled"], undone["Bear Avg"], undone["Bull Trimmed"]),
+                         (Decimal("15.58"), board.ZERO, board.NO_FILL, Decimal("15.58")))
+        for decided, r in marks.items():
+            self.assertTrue(r["Fees"] == board.FEE_PENDING or r["Fees"] == 0 or r["Fees"] > 0, decided)
+        # Every main marker's legs equal its step's orders recomputed here: its own and the non-trim orders of the decisions
+        # sent for it (batch_sent_ms); a leg it sent no order on is "—".
+        steps = psql_json(
+            "SELECT m.ts_ms, o.leg, count(*) AS n, sum(o.cum_exec_qty) AS q FROM trade.decision m JOIN trade.cex_order o ON o.live = m.live "
+            "AND (o.client_order_id IN (SELECT jsonb_array_elements_text(m.detail -> 'client_order_ids')) OR o.purpose <> 'trim' AND "
+            "o.client_order_id IN (SELECT f.detail ->> 'client_order_id' FROM trade.decision f WHERE f.live = m.live AND f.cycle_id = m.cycle_id "
+            "AND f.kind IN ('trim', 'complete') AND (f.detail ->> 'batch_sent_ms')::bigint = m.ts_ms)) "
+            "WHERE m.run_id = '%s' AND m.kind IN ('entry', 'exit', 'forced') GROUP BY 1, 2" % live)
+        got = {(s["ts_ms"], s["leg"]): s["q"] for s in steps}
+        for decided, r in marks.items():
+            for leg, col in (("bull", "Bull Filled"), ("bear", "Bear Filled")):
+                want = got.get((decided, leg))
+                shown_ = r[col]
+                if want is None:
+                    self.assertEqual(shown_, board.NOT_IN, (decided, leg))
+                else:
+                    self.assertEqual(Decimal("0") if shown_ == board.ZERO else shown_, round(want, 2), (decided, leg))
         # Owner item 83: every marker of a round trip carries its Execution ID, the round trip's opening (its row in Round Trips).
         v = self.values(168, self.PAPER_RUN)
         rows = psql_json(fill(board.Q_EXECUTION, v))
         cycles = {r["ts_ms"]: r["opened_ms"] for r in psql_json(
             "SELECT d.ts_ms, c.opened_ms FROM trade.decision d JOIN trade.cycle c ON c.live = d.live AND c.cycle_id = d.cycle_id "
-            "WHERE d.run_id = '%s' AND d.kind IN ('entry', 'exit', 'complete', 'trim', 'forced')" % self.PAPER_RUN)}
+            "WHERE d.run_id = '%s' AND d.kind IN ('entry', 'exit', 'forced')" % self.PAPER_RUN)}
         seen = {(r["Decided"], r["Execution"]) for r in rows if r["Action"]}
         self.assertTrue(seen)
         for decided, execution in seen:
@@ -710,21 +783,27 @@ class Queries(unittest.TestCase):
         # Each triangle is whole (no NULL row inside it breaks its two series) and none overlaps another: the entries of a
         # triangle's width after its start are drawn by it (the round trip of 08:14:01-08:43:15 UTC+8 has short entries at
         # 08:14:01, 08:14:03 and three at 08:17:14).
-        entries = [r["ts_ms"] for r in psql_json(
-            "SELECT d.ts_ms FROM trade.decision d JOIN trade.lot l ON l.live = d.live AND l.lot_id = d.lot_id WHERE d.run_id = '%s' "
-            "AND d.kind = 'entry' AND l.status <> 'void' ORDER BY d.ts_ms" % self.PAPER_RUN)]   # a void entry is a grey circle
+        entries = psql_json(
+            "SELECT d.ts_ms, l.status = 'void' AS undone FROM trade.decision d JOIN trade.lot l ON l.live = d.live AND l.lot_id = d.lot_id "
+            "WHERE d.run_id = '%s' AND d.kind = 'entry' ORDER BY d.ts_ms" % self.PAPER_RUN)
+        # (an undone entry is a grey triangle, 4.3, drawn only where no entry's triangle is within a width of it)
         for f0, f1 in ((1795651500000, 1795654200000), (1795651980000, 1795652340000), (1795629729414, 1795666000000)):
             v = dict(self.values(1, self.PAPER_RUN), __from=f0, __to=f1)
             half = psql_json(fill("SELECT greatest(%s, ($__to - $__from) / 130)::bigint AS half" % board.STEP_MS, v))[0]["half"]
             starts = []
-            for ts in entries:
-                if not starts or ts > starts[-1] + 2 * half:
-                    starts.append(ts)
+            for e in entries:
+                if not e["undone"] and f0 <= e["ts_ms"] <= f1 and (not starts or e["ts_ms"] > starts[-1] + 2 * half):
+                    starts.append(e["ts_ms"])
+            grey = []
+            for e in entries:
+                if e["undone"] and f0 <= e["ts_ms"] <= f1 and all(abs(e["ts_ms"] - s) > 2 * half for s in starts) and (not grey or e["ts_ms"] > grey[-1] + 2 * half):
+                    grey.append(e["ts_ms"])
+            starts = sorted(starts + grey)
             rows = psql_json(fill(board.Q_EXECUTION, v))
             for r in rows:
                 ms = round(datetime.fromisoformat(r["time"]).timestamp() * 1000)
                 inside = [s for s in starts if abs(ms - s) <= half and f0 <= s <= f1]
-                drawn = r["Long Entry"] is not None or r["Short Entry"] is not None
+                drawn = any(r[n] is not None for n, _, _ in board.TRIANGLES)
                 if all(r[n] is None for n, _ in board.ALL_COLUMNS):
                     continue
                 self.assertEqual(bool(inside), drawn, (f0, r["time"]))
@@ -799,7 +878,7 @@ class Queries(unittest.TestCase):
         net = psql_json(fill(board.Q_CUM_PNL, v))
         want = sum(fills[c["cycle_id"]]["gross"] - fills[c["cycle_id"]]["fees"] + c["funding"] for c in known)
         tol = sum(Decimal("0.0002") * fills[c["cycle_id"]]["fills"] for c in known if c["live"])
-        self.assertAlmostEqual(-(p["Fee"] or 0), sum(fills[c["cycle_id"]]["fees"] for c in known), delta=tol)
+        self.assertAlmostEqual(p["Fee"] or 0, sum(fills[c["cycle_id"]]["fees"] for c in known), delta=tol)   # a positive cost (4.2.1)
         self.assertAlmostEqual(p["PnL"], want, delta=tol)
         self.assertAlmostEqual(p["Gross"], sum(fills[c["cycle_id"]]["gross"] for c in known), delta=tol)
         self.assertEqual((net[-1]["PnL"], gross[-1]["Gross"]), (p["PnL"], p["Gross"]))   # owner items 77, 80: each chart ends on the Summary
