@@ -2,6 +2,13 @@
 database (core/store/schema.sql, core/SPEC.md 5.6), read by the read-only role etfpair_trade_reader through the data source
 etfpair-trade (dashboard/SPEC.md section 7).
 
+Version 4.4 (core/SPEC.md 12, step 10.9: the thin leg first): the lines read strategy.entry_in / entry_out (d_in / d_out of
+the Runs before) and exit2; Parameters adds Exit 2 and a Thin Leg First strip (thin leg, pair window, pair stop, top-up max,
+exit pair window); a batch's marker reads its end state (built and built partial an entry, entry failed the grey triangle,
+unwound at a profit or at the stop an amber one) and its pairing; an exit's its stage, pre-check, how its thick leg closed and
+the expected against the actual net; an entry's step counts every order of its lot, an exit's the thick leg's exit_pair
+orders; Round Trips counts the batches, Orders names each order's step.
+
 Version 4.1 (owner items 76-78): a Run is named start–end · Bitget · pair · mode, without a number; Status holds Execution
 (no Close; the Phase in Combo Spread's words and colours), Account (4.0's Margin: position or residual, ledger, equity,
 maintenance margin, margin ratio, liquidation, funding) and Market (two strips after Combo Spread's latest second, with the
@@ -30,9 +37,9 @@ change of the anchors in use (owner item 62).
 
 Owner item 80 (4.2): every spread figure is in bps as Combo Spread writes it (the program's spread unit, 10⁴ × the two legs'
 deviations added; 1 bps of spread is 0.5 bps of the two legs' total notional), no D; money is USDT. The program's lines are those
-of the Run (process_run.config: strategy.d_in, strategy.d_out): a Long enters at x <= -d_in sigma on the buying side (Buy
-Both) and exits at x >= -d_out sigma on the selling side (Sell Both); a Short enters at x >= d_in sigma on Sell Both and
-exits at x <= d_out sigma on Buy Both (core/SPEC.md 5.2). Every picked setting reaches SQL inside quotes ('$run', '$combo',
+of the Run (process_run.config: strategy.entry_in, strategy.entry_out; d_in, d_out before PRD 4.0): a Long enters at x <=
+-entry_in sigma on the buying side (Buy Both) and exits at x >= -entry_out sigma on the selling side (Sell Both); a Short
+enters at x >= entry_in sigma on Sell Both and exits at x <= entry_out sigma on Buy Both (core/SPEC.md 5.2); exit2 the same. Every picked setting reaches SQL inside quotes ('$run', '$combo',
 '${since}', '$cycle', ...) and is parsed there; the reader role is the boundary (dashboard/SPEC.md section 6).
 
 Grafana's tooltip shows a nearby point's value in place of a NULL, so on the execution charts every tooltip row has a
@@ -99,8 +106,17 @@ IDLE = [("no_signal", "Ready", "No Signal Yet"),
         ("order_unknown", "Held Back", "Order Outcome Unknown"), ("not_ready", "Held Back", "Starting Up"),
         ("stopping", "Held Back", "Stopping"), ("no_new_entries", "Held Back", "Stop Pending"),
         ("settings", "Needs a Person", "Account Settings"), ("store_error", "Needs a Person", "Records Not Written"),
-        ("position_mismatch", "Needs a Person", "Position Mismatch")]
-STATE_COLORS = {"Ready": GOOD, "Order Sent": GOOD, "Blocked": TEXT, "Held Back": WARN, "Needs a Person": BAD}
+        ("position_mismatch", "Needs a Person", "Position Mismatch"),
+        # 4.4, the thin leg first (core/strategy/types.go, SPEC 12.4-12.7): Pairing (amber) while a batch holds a leg not
+        # paired yet or an exit's thick leg is still open; the two-stage exit's ordinary answers Blocked.
+        ("pair_bound", "Pairing", "Thick Leg Beyond Its Bound"), ("window", "Pairing", "Pair Window Over"),
+        ("stop_d", "Pairing", "Ideal Spread Stop"), ("profit", "Pairing", "Thin Leg Profit Close"),
+        ("exit_bound", "Pairing", "Exit: Thick Leg Beyond Break-Even"), ("d1_loss", "Pairing", "Exit Below Break-Even"),
+        ("exit_window", "Pairing", "Exit: Thick Leg Hard Close"), ("exit_stop_d", "Pairing", "Exit: Thick Leg Hard Close"),
+        ("valuation", "Held Back", "Close Not Valued"), ("forced", "Held Back", "Forced Exit"),
+        ("no_profit", "Blocked", "Exit 1: Round Not in Profit"), ("precheck", "Blocked", "Exit 1: Batch Short of Break-Even"),
+        ("half_done", "Blocked", "Half Closed, Rest at Exit 2")]
+STATE_COLORS = {"Ready": GOOD, "Order Sent": GOOD, "Blocked": TEXT, "Pairing": WARN, "Held Back": WARN, "Needs a Person": BAD}
 # Why a cycle ended (core/inventory/types.go); a code not listed reads as its own words.
 END_REASONS = {"exit_line": "Exit Line", "close_window": "Flattened Before Close", "stop": "Program Stopped", "session_changed": "Session Ended",
                "no_fill": "No Fill", "one_leg": "One Leg Only", "dust_only": "Trimmed to Dust", "store_error": "Not Recorded"}
@@ -283,14 +299,29 @@ def run_config(path, fallback):
     return "SELECT coalesce((SELECT r.config #>> '{%s}' FROM trade.process_run r WHERE r.run_id = %s), '%s')" % (path, RUN_ID, fallback)
 
 
-# The program's settings of each run (process_run.config, the effective config.yaml).
-D_IN = "(r.config -> 'strategy' ->> 'd_in')::float8"
-D_OUT = "(r.config -> 'strategy' ->> 'd_out')::float8"
-# The lines of the Run in words, for the Live Execution row's title: Long in −2σ / out +0.5σ · Short in +2σ / out −0.5σ.
+# The program's settings of each run (process_run.config, the effective config.yaml). PRD 4.0 (core/SPEC.md 12.8) renamed
+# strategy.d_in / d_out to entry_in / entry_out (entry_out is exit1 when exit2 is set); the Runs before keep the old keys, so
+# every reader takes the new key and falls back to the old one. exit2 is NULL without a second exit line.
+def entry_in(r):
+    return "coalesce(%s.config #>> '{strategy,entry_in}', %s.config #>> '{strategy,d_in}')::float8" % (r, r)
+
+
+def entry_out(r):
+    return "coalesce(%s.config #>> '{strategy,entry_out}', %s.config #>> '{strategy,d_out}')::float8" % (r, r)
+
+
+def exit2(r):
+    return "(%s.config #>> '{strategy,exit2}')::float8" % r
+
+
+D_IN, D_OUT, EXIT2 = entry_in("r"), entry_out("r"), exit2("r")
+# The lines of the Run in words, for the Live Execution row's title: Long in −1σ / out +0.5σ, +1σ · Short in +1σ / out −0.5σ,
+# −1σ (the second exit only when exit2 is set).
 SIGNED_SIGMA = "CASE WHEN {x} < 0 THEN '−' ELSE '+' END || trim_scale(abs({x})::numeric)::text || 'σ'"
-LINES_TEXT = sql("""'Long in ' || @L_IN@ || ' / out ' || @L_OUT@ || ' · Short in ' || @S_IN@ || ' / out ' || @S_OUT@""",
-                 L_IN=SIGNED_SIGMA.format(x="-" + D_IN), L_OUT=SIGNED_SIGMA.format(x="-" + D_OUT),
-                 S_IN=SIGNED_SIGMA.format(x=D_IN), S_OUT=SIGNED_SIGMA.format(x=D_OUT))
+LINES_TEXT = sql("""'Long in ' || @L_IN@ || ' / out ' || @L_OUT@ || coalesce(', ' || @L_OUT2@, '') || ' · Short in ' || @S_IN@ || ' / out ' || @S_OUT@
+                    || coalesce(', ' || @S_OUT2@, '')""",
+                 L_IN=SIGNED_SIGMA.format(x="-" + D_IN), L_OUT=SIGNED_SIGMA.format(x="-" + D_OUT), L_OUT2=SIGNED_SIGMA.format(x="-" + EXIT2),
+                 S_IN=SIGNED_SIGMA.format(x=D_IN), S_OUT=SIGNED_SIGMA.format(x=D_OUT), S_OUT2=SIGNED_SIGMA.format(x=EXIT2))
 Q_LINES = sql("""SELECT coalesce((SELECT @LINES@ FROM trade.process_run r WHERE r.run_id = @RUN_ID@), 'no Run')""", LINES=LINES_TEXT, RUN_ID=RUN_ID)
 
 # --------------------------------------------------------------------------------------------------------------- the top
@@ -323,15 +354,18 @@ SIGMA = "nullif(s.sigma_d, 0)"
 # leg's conflicting book or unusable depth): sigma ready, both legs' depth usable, neither book in conflict. The executable
 # figures (the Buy Both / Sell Both curves of Live Execution, Market's Signal) are shown only then (Signal: No Book).
 EXECUTABLE = "({s}.stats_ready AND {s}.depth_ok_bull AND {s}.depth_ok_bear AND NOT ({s}.conflict_bull OR {s}.conflict_bear))"
-# The distance in sigma, positive while the line is still ahead, to the open cycle's exit (a Long: Sell Both up to -d_out;
-# a Short: Buy Both down to +d_out).
-TO_EXIT = ("CASE s.direction WHEN 'long' THEN -(sr.config -> 'strategy' ->> 'd_out')::float8 - s.x_short_d / {s} "
-           "WHEN 'short' THEN s.x_long_d / {s} - (sr.config -> 'strategy' ->> 'd_out')::float8 END").format(s=SIGMA)
+# The distance in sigma, positive while the line is still ahead, to the open cycle's exit line (a Long: Sell Both up to
+# -entry_out, or -exit2 for the second line; a Short: Buy Both down to +entry_out, +exit2).
+def to_exit(line):
+    return ("CASE s.direction WHEN 'long' THEN -{d} - s.x_short_d / {s} WHEN 'short' THEN s.x_long_d / {s} - {d} END").format(s=SIGMA, d=line)
+
+
+TO_EXIT, TO_EXIT2 = to_exit(entry_out("sr")), to_exit(exit2("sr"))
 
 
 def market_signal(s, d_in):
     """SQL: the Signal of sample s in Combo Spread's words (owner item 76): Long when the executable Buy Both is at or past
-    −d_in σ, Short when Sell Both is at or past +d_in σ, None inside; No Anchor, No Mean (σ not ready) and No Book (a leg's
+    −entry_in σ, Short when Sell Both is at or past +entry_in σ, None inside; No Anchor, No Mean (σ not ready) and No Book (a leg's
     book conflicts or its depth is unusable: the executor enters on none, owner item 70)."""
     sig = "nullif(%s.sigma_d, 0)" % s
     return ("CASE WHEN {s}.ts_ms IS NULL THEN NULL WHEN {s}.anchor_kind IS NULL THEN 'No Anchor' WHEN NOT {s}.stats_ready OR {sig} IS NULL THEN 'No Mean' "
@@ -344,10 +378,11 @@ WITH @LATEST@, @HELD@
 SELECT CASE WHEN s.ts_ms IS NULL THEN NULL WHEN s.direction IS NULL THEN 'Flat' ELSE initcap(s.direction) END AS "Side",
        CASE WHEN s.direction IS NOT NULL THEN CASE s.direction WHEN 'short' THEN -s.hold_bull ELSE s.hold_bull END END AS "Bull",
        CASE WHEN s.direction IS NOT NULL THEN CASE s.direction WHEN 'short' THEN -s.hold_bear ELSE s.hold_bear END END AS "Bear",
-       h.v_bull + h.v_bear AS "Cost", @HELD_FOR@ AS "Held", @TO_EXIT@ AS "To Exit"
+       h.v_bull + h.v_bear AS "Cost", @HELD_FOR@ AS "Held", @TO_EXIT@ AS "To Exit", @TO_EXIT2@ AS "To Exit 2"
 FROM (SELECT 1) one LEFT JOIN r ON true LEFT JOIN s ON true LEFT JOIN h ON true LEFT JOIN sr ON true""",
             LATEST=LATEST, HELD=HELD, HELD_FOR=span("%s - h.opened_ms" % NOW_MS),
-            TO_EXIT="CASE WHEN s.stats_ready AND s.depth_ok_bull AND s.depth_ok_bear THEN %s END" % shown(TO_EXIT, 2))
+            TO_EXIT="CASE WHEN s.stats_ready AND s.depth_ok_bull AND s.depth_ok_bear THEN %s END" % shown(TO_EXIT, 2),
+            TO_EXIT2="CASE WHEN s.stats_ready AND s.depth_ok_bull AND s.depth_ok_bear THEN %s END" % shown(TO_EXIT2, 2))
 
 # ------------------------------------------------------------------------------------------- Status · Running Session
 # Owner items 73-76: the board starts, as the sibling dex-cex board does, with Status · Running Session: Execution and
@@ -363,7 +398,11 @@ ENTRY_WORDS = {"no_signal": "ready", "regular_hours": "regular hours", "spacing"
                "conflict_bull": "held · $bull conflict", "conflict_bear": "held · $bear conflict", "fx_stale": "held · F stale",
                "rejected_backoff": "held · backing off", "no_anchor": "held · no anchor", "depth": "held · exit depth", "no_price": "held · no price",
                "order_unknown": "held · order unknown", "not_ready": "starting", "stopping": "stopping", "no_new_entries": "stop pending",
-               "settings": "stop · settings", "store_error": "stop · records", "position_mismatch": "stop · mismatch"}
+               "settings": "stop · settings", "store_error": "stop · records", "position_mismatch": "stop · mismatch",
+               "pair_bound": "pairing · beyond bound", "window": "pairing · window over", "stop_d": "pairing · spread stop",
+               "profit": "pairing · profit close", "exit_bound": "exit · beyond break-even", "d1_loss": "exit · below break-even",
+               "exit_window": "exit · hard close", "exit_stop_d": "exit · hard close", "valuation": "held · not valued", "forced": "held · forced exit",
+               "no_profit": "exit 1 · no profit", "precheck": "exit 1 · short of break-even", "half_done": "half closed"}
 BLOCKED_WORDS = [w for c, s, _ in IDLE for k, w in ENTRY_WORDS.items() if k == c and s == "Blocked"]
 
 
@@ -504,31 +543,52 @@ SELECT @MID_BULL@ AS "Bull Price", s.anchor_bull AS "Bull Anchor", @MID_BEAR@ AS
 FROM (SELECT 1) one LEFT JOIN r ON true LEFT JOIN s ON true LEFT JOIN sr ON true""",
                LATEST=LATEST, MID_BULL=shown("s.mid_bull", 3), MID_BEAR=shown("s.mid_bear", 3), MEAN=bps_text("s.mu_d"), SIGMA_BPS=shown("s.sigma_d", 1),
                SIGMA=SIGMA, LONG=bps_text("s.mu_d + s.x_long_d"), SHORT=bps_text("s.mu_d + s.x_short_d"), DEV_BPS=bps_text("s.mid_d - s.mu_d"),
-               SIGNAL=market_signal("s", "(sr.config -> 'strategy' ->> 'd_in')::float8"), S=NBSP, EXEC=EXECUTABLE.format(s="s"),
-               D_IN="(sr.config -> 'strategy' ->> 'd_in')::float8")
+               SIGNAL=market_signal("s", entry_in("sr")), S=NBSP, EXEC=EXECUTABLE.format(s="s"), D_IN=entry_in("sr"))
 # Under the Summary (owner item 80): the Run's parameters a trader reads with its results, from process_run.config: the mean
-# model and its scale, the volatility's scale, the entry and exit points in σ and in spread bps at the newest second's σ, the
-# real capital M, the leverage L and the notional N = M × L (USDT). The Settings row keeps the rest.
+# model and its scale, the volatility's scale, the entry point and the exit lines in σ and in spread bps at the newest
+# second's σ (4.4: Exit 1 is entry_out, the line of the half close when exit2 is set; Exit 2 none without it), the real
+# capital M, the leverage L and the notional N = M × L (USDT). The Settings row keeps the rest.
+def sigma_bps(x):
+    """A setting in σ and in spread bps at the newest second's σ: 1σ · 3.1 bps, −0.5σ · −1.5 bps (a minus as −)."""
+    return "replace(trim_scale((%s)::numeric)::text || 'σ · ' || coalesce(%s, '–%sbps'), '-', '−')" % (x, bps_text("%s * s.sigma_d" % x), NBSP)
+
+
+def go_dur(x):
+    """A Go duration as config.yaml's effective form writes it, shortened: 1m0s -> 1m, 1h0m0s -> 1h, 30s stays."""
+    return "regexp_replace(regexp_replace(%s, '([hm])0s$', '\\1'), 'h0m$', 'h')" % x
+
+
+# 4.4 (core/SPEC.md 12.8, step 10.9): the thin-leg-first execution's settings beside the size (a second strip under the
+# signal's: eight short figures stay on one line at 880 px, thirteen did not): which leg goes first (exec.thin_leg: bull, bear,
+# or "" for both legs together, the way before), how long the other leg is chased after the thin leg's first fill
+# (pair_window), the ideally paired spread worse than at the decision that ends the chase (pair_stop_d, spread bps), how far
+# top-ups may take the thin leg (thin_topup_max × its planned quantity) and how long an exit's other leg waits for its
+# break-even bound (exit_pair_window). A Run before it: both together, the rest not used (—). One query, in the strips' order
+# (a strip fed by -- Dashboard -- shows the frame's order).
 Q_PARAMS = sql("""
 WITH @LATEST@
 SELECT upper(r.config #>> '{strategy,mean_model}') || ' · ' || (r.config #>> '{strategy,mean_minutes}') || '@S@min' AS "Mean Model",
        (r.config #>> '{strategy,sigma_minutes}') || '@S@min' AS "Volatility Scale",
-       replace(@D_IN@ || 'σ · ' || coalesce(@IN_BPS@, '–@S@bps'), '-', '−') AS "Entry",
-       replace(@D_OUT@ || 'σ · ' || coalesce(@OUT_BPS@, '–@S@bps'), '-', '−') AS "Exit",
-       (r.config #>> '{inventory,capital}')::numeric AS "Capital M",
-       (r.config #>> '{inventory,capital}')::numeric * (r.config #>> '{inventory,leverage}')::numeric AS "Notional N",
+       @IN@ AS "Entry", @OUT@ AS "Exit 1", coalesce(@OUT2@, 'none') AS "Exit 2",
        to_char(round((r.config #>> '{inventory,capital}')::numeric), 'FM999,999,990') || ' U' AS "Capital M Text", (r.config #>> '{inventory,leverage}')::numeric AS "Leverage L",
-       to_char(round((r.config #>> '{inventory,capital}')::numeric * (r.config #>> '{inventory,leverage}')::numeric), 'FM999,999,990') || ' U' AS "Notional N Text"
-FROM r LEFT JOIN s ON true""", LATEST=LATEST, D_IN="trim_scale((r.config #>> '{strategy,d_in}')::numeric)::text",
-                D_OUT="trim_scale((r.config #>> '{strategy,d_out}')::numeric)::text",
-                IN_BPS=bps_text("(r.config #>> '{strategy,d_in}')::float8 * s.sigma_d"), OUT_BPS=bps_text("(r.config #>> '{strategy,d_out}')::float8 * s.sigma_d"),
-                S=NBSP)
+       to_char(round((r.config #>> '{inventory,capital}')::numeric * (r.config #>> '{inventory,leverage}')::numeric), 'FM999,999,990') || ' U' AS "Notional N Text",
+       CASE WHEN NOT @THIN@ THEN 'both@S@together'
+            ELSE coalesce(r.config #>> ARRAY['cex', 'pair', r.config #>> '{exec,thin_leg}', 'ticker'], r.config #>> '{exec,thin_leg}') || '@S@first' END AS "Thin Leg",
+       CASE WHEN @THIN@ THEN @WINDOW@ ELSE '—' END AS "Pair Window",
+       CASE WHEN @THIN@ THEN trim_scale((r.config #>> '{exec,pair_stop_d}')::numeric)::text || '@S@bps' ELSE '—' END AS "Pair Stop",
+       CASE WHEN @THIN@ THEN trim_scale((r.config #>> '{exec,thin_topup_max}')::numeric)::text || '@S@×' ELSE '—' END AS "Top-Up Max",
+       CASE WHEN @THIN@ THEN @EXIT_WINDOW@ ELSE '—' END AS "Exit Pair Window",
+       (r.config #>> '{inventory,capital}')::numeric AS "Capital M",
+       (r.config #>> '{inventory,capital}')::numeric * (r.config #>> '{inventory,leverage}')::numeric AS "Notional N"
+FROM r LEFT JOIN s ON true""", LATEST=LATEST, IN=sigma_bps(D_IN), OUT=sigma_bps(D_OUT), OUT2="CASE WHEN %s IS NOT NULL THEN %s END" % (EXIT2, sigma_bps(EXIT2)),
+               S=NBSP, THIN="coalesce(r.config #>> '{exec,thin_leg}', '') <> ''", WINDOW=go_dur("(r.config #>> '{exec,pair_window}')"),
+               EXIT_WINDOW=go_dur("(r.config #>> '{exec,exit_pair_window}')"))
 # The colours of the words (Grafana takes the first mapping that matches): the mode first, then red, amber, green, grey;
 # an amount, a time or a share plain.
 STATUS_WORDS = [
     ("^LIVE$", "#8a1f1f"), ("^PAPER$", "#5a5953")] + [("^%s$" % word, PHASE_COLORS[name]) for name, word in PHASE_WORDS.items()] + [
     ("^(lost|stale · .*|mismatch|\\d+ unknown|.* left open|near · .*|high · .*|stop · .*)$", BAD),
-    ("^(starting|.* conflict.*|.* unusable.*|not read|held · .*|stopping|stop pending|warn · .*|residual · .*|\\d+ awaited)$", WARN),
+    ("^(starting|.* conflict.*|.* unusable.*|not read|held · .*|pairing · .*|exit · .*|stopping|stop pending|warn · .*|residual · .*|\\d+ awaited)$", WARN),
     ("^(up .*|ok|ok · .*|match|none open|\\d+ working|ready|order sent|(long|short)( · .*)?)$", WELL),
     ("^(no data|no run|stopped|flat|paper|%s)$" % "|".join(re.escape(w) for w in BLOCKED_WORDS), GREY),
     ("^([+−].* U|[0-9,.]+ U|\\d\\d‑\\d\\d\u00a0\\d\\d:\\d\\d)$", "transparent")]
@@ -550,9 +610,9 @@ STATUS_WORDS = [
 GAP_MS = 5000
 SEVERITY = {"critical": BAD, "serious": SERIOUS, "warning": WARN}
 ALERT_STATUS = {"Open": BAD, "In Progress": WARN, "Recovered": GOOD, "Recorded": TEXT}
-HELD_CODES = [c for c, s, _ in IDLE if s in ("Held Back", "Needs a Person") and c != "not_ready"]
+HELD_CODES = [c for c, s, _ in IDLE if s in ("Held Back", "Needs a Person") and c not in ("not_ready", "forced")]   # a forced exit has its own alert
 CRITICAL_CODES = [c for c, s, _ in IDLE if s == "Needs a Person"]
-D_IN_R = "(sr.config -> 'strategy' ->> 'd_in')::float8"
+D_IN_R = entry_in("sr")
 
 
 def quoted(codes):
@@ -602,12 +662,12 @@ al AS (
          'venue / ledger: $bull ' || coalesce(@PB@, '–') || ' / ' || @LB@ || ', $bear ' || coalesce(@PE@, '–') || ' / ' || @LE@ || ' ct; no orders until a person checks', NULL
   FROM mis
   UNION ALL
-  SELECT coalesce(c.closed_ms, c.opened_ms), CASE WHEN c.end_reason = 'one_leg' THEN 'serious' ELSE 'warning' END,
+  SELECT coalesce(c.closed_ms, c.opened_ms), CASE WHEN c.end_reason = 'one_leg' AND NOT @THIN_C@ THEN 'serious' ELSE 'warning' END,
          CASE WHEN c.end_reason = 'dust_only' OR c.dust_bull <> 0 OR c.dust_bear <> 0 THEN 'Recorded' ELSE 'Recovered' END,
          'Execution ' || @OPENED@,
-         CASE c.end_reason WHEN 'one_leg' THEN 'One Leg Only' WHEN 'stop' THEN 'Stopped While Holding' WHEN 'session_changed' THEN 'Session Ended While Holding'
-              WHEN 'store_error' THEN 'Not Recorded' ELSE 'Dust Left' END,
-         initcap(c.direction) || ', ' || @REASON@ || ', net ' || CASE WHEN c.funding_known THEN replace(to_char(c.net, 'FM999,990.0000'), '-', '−') || ' USDT' ELSE 'Pending' END
+         CASE WHEN c.end_reason = 'one_leg' AND @THIN_C@ THEN 'Nothing Paired' ELSE CASE c.end_reason WHEN 'one_leg' THEN 'One Leg Only' WHEN 'stop' THEN 'Stopped While Holding' WHEN 'session_changed' THEN 'Session Ended While Holding'
+              WHEN 'store_error' THEN 'Not Recorded' ELSE 'Dust Left' END END,
+         initcap(c.direction) || ', ' || CASE WHEN c.end_reason = 'one_leg' AND @THIN_C@ THEN 'every batch unwound' ELSE @REASON@ END || ', net ' || CASE WHEN c.funding_known THEN replace(to_char(c.net, 'FM999,990.0000'), '-', '−') || ' USDT' ELSE 'Pending' END
            || CASE WHEN c.dust_bull <> 0 OR c.dust_bear <> 0 THEN '; dust left (recorded only): $bull ' || @DB@ || ', $bear ' || @DE@ || ' ct' ELSE '' END, c.cycle_id
   FROM trade.cycle c WHERE @RUN_C@ AND (c.end_reason IN ('one_leg', 'stop', 'session_changed', 'store_error', 'dust_only') OR c.dust_bull <> 0 OR c.dust_bear <> 0)
   UNION ALL
@@ -615,6 +675,22 @@ al AS (
          'Forced Exit', CASE d.detail ->> 'cause' WHEN 'stop' THEN 'on the stop' WHEN 'close_window' THEN 'before the close' ELSE coalesce(d.detail ->> 'cause', 'forced') END
            || ', IOC with ' || coalesce(d.detail ->> 'slip_bps', '–') || ' bps slip', d.cycle_id
   FROM trade.decision d LEFT JOIN trade.cycle c ON c.live = d.live AND c.cycle_id = d.cycle_id WHERE @RUN_D@ AND d.kind = 'forced'
+  UNION ALL
+  SELECT d.ts_ms, 'warning', CASE WHEN c.status = 'open' AND @LIVE_RUN@ THEN 'In Progress' ELSE 'Recovered' END, 'Execution ' || coalesce(@OPENED@, '–'),
+         CASE d.kind WHEN 'pair' THEN 'Thin Leg Unwound' ELSE 'Exit Hard Close' END,
+         CASE d.reason WHEN 'window' THEN 'the pair window ran out with ' || coalesce(@UNPAIRED@, '–') || ' ct of $bear not paired: unwound'
+                       WHEN 'stop_d' THEN 'the ideally paired spread ' || coalesce(@IDEAL@, '–') || ' bps against ' || coalesce(@DEC@, '–') || ' bps at the decision: unwound'
+                       WHEN 'too_small' THEN 'what was not paired is too small to pair: unwound'
+                       WHEN 'exit_window' THEN 'the exit''s thick leg found no price within break-even in the exit pair window: closed whatever the price'
+                       WHEN 'exit_stop_d' THEN 'the ideal closing spread ' || coalesce(@IDEAL@, '–') || ' bps against ' || coalesce(@DEC@, '–') || ' bps at the decision: closed whatever the price'
+                       ELSE coalesce(d.reason, '–') END, d.cycle_id
+  FROM trade.decision d LEFT JOIN trade.cycle c ON c.live = d.live AND c.cycle_id = d.cycle_id
+  WHERE @RUN_D@ AND d.kind IN ('pair', 'exit_pair') AND d.detail ->> 'action' = 'risk_exit'
+  UNION ALL
+  SELECT d.ts_ms, 'warning', CASE WHEN c.status = 'open' AND @LIVE_RUN@ THEN 'In Progress' ELSE 'Recovered' END, 'Execution ' || coalesce(@OPENED@, '–'),
+         'Exit Below Break-Even', 'the batch''s pre-check expected a round net of ' || coalesce(@EXPECTED@, '–') || ' USDT; it exits all the same at '
+           || CASE d.detail ->> 'line' WHEN 'exit2' THEN 'exit 2' ELSE 'the exit line' END || ' (PRD 9.2)', d.cycle_id
+  FROM trade.decision d LEFT JOIN trade.cycle c ON c.live = d.live AND c.cycle_id = d.cycle_id WHERE @RUN_D@ AND d.kind = 'exit' AND d.reason = 'd1_loss'
   UNION ALL
   SELECT c.closed_ms, 'warning', CASE WHEN @LIVE_RUN@ THEN 'In Progress' ELSE 'Open' END, 'Execution ' || @OPENED@, 'Funding Awaited',
          jsonb_array_length(c.funding_awaited) || ' settlement(s) without a record: its net stays Pending', c.cycle_id
@@ -641,7 +717,12 @@ SELECT NULL, NULL, NULL, NULL, NULL, 'No alert in this Run: nothing stopped or h
                FIRST=clock("h.first_ms", "HH24:MI:SS"), GAP=span("x.gap"), GAP_MS=str(GAP_MS), NOW=NOW_MS, AGE=span("%s - s.ts_ms" % NOW_MS),
                STALE_MS=str(SAMPLE_AGE_S * 1000), PB=ct("mis.pb"), LB=ct("mis.lb"), PE=ct("mis.pe"), LE=ct("mis.le"),
                OPENED=clock("c.opened_ms", "MM-DD HH24:MI:SS"), REASON="lower(%s)" % end_reason("c.end_reason"), DB=ct("c.dust_bull"),
-               DE=ct("c.dust_bear"), QTY=ct("o.qty"), PRICE=ct("o.price"))
+               DE=ct("c.dust_bear"), QTY=ct("o.qty"), PRICE=ct("o.price"),
+               THIN_C="EXISTS (SELECT 1 FROM trade.lot x WHERE x.live = c.live AND x.cycle_id = c.cycle_id AND to_jsonb(x) ->> 'end_state' IS NOT NULL)",
+               UNPAIRED="trim_scale(round(((d.detail ->> 'thin_qty')::numeric - coalesce((d.detail ->> 'thick_qty')::numeric, 0) * c.pair_anchor_bull / c.pair_anchor_bear), 2))::text",
+               IDEAL="replace(to_char(round((d.detail ->> 'd_ideal')::numeric, 1), 'FM9990.0'), '-', '−')",
+               DEC="replace(to_char(round((d.detail ->> 'd_dec')::numeric, 1), 'FM9990.0'), '-', '−')",
+               EXPECTED="replace(to_char((d.detail ->> 'expected_net')::numeric, 'FM9990.00'), '-', '−')")
 
 
 # ------------------------------------------------------------------------------------------------------------------- P&L
@@ -703,40 +784,101 @@ Q_CUM_GROSS, Q_CUM_PNL = cumulative("gross", "Gross"), cumulative("net", "PnL")
 STEP_MS = ("(SELECT CASE WHEN r <= 1000 THEN 1000 WHEN r <= 5000 THEN 5000 WHEN r <= 10000 THEN 10000 "
            "WHEN r <= 30000 THEN 30000 ELSE ceil(r / 60000) * 60000 END::bigint FROM (SELECT ($__to - $__from) / 1500.0 AS r) x)")
 
-# The decisions drawn as markers (owner item 81): every entry, exit, completion, trim and forced exit, at its instant; an
-# entry whose lot became void (no fill, one leg) is a Void Entry. Each with the fills of its step (4.2.1): an entry, exit or
-# forced exit with its own orders and those of the completions and exits of the remaining leg sent for it (decisions whose
-# detail.batch_sent_ms is its instant; not the trims, which undo part of an entry and have their own marker), so an exit
-# whose two legs were closed by separate orders shows both; a trim, completion or exit of the remaining leg ("· One Leg")
-# with its own order only, its other leg "—" (no order there), never 0 / No Fill. Both legs' filled contracts and average
-# price, the notional (USDT, both legs), the fees paid (a cost, positive, as in Summary and Orders), and its round trip's
-# net (Pending, or Open while open). Its place: on the Spread chart its executable spread at the decision (mu_d + x_d, the Real Long Spread
-# of an entry Long or exit Short, the Real Short Spread of the others), on the Deviation chart x_d; a completion's, trim's
-# or forced exit's the spread and deviation on the mids of the newest sample in the minute before it.
+# The decisions drawn as markers (owner item 81): every entry, exit and forced exit, at its instant. Each with the fills of its
+# step (4.2.1): its own orders and those sent for it, so an exit whose two legs were closed by separate orders shows both:
+#   an entry    every order booked on its lot (cex_order.lot_id): with both legs together the completions and trims sent for
+#               the batch; with the thin leg first (4.4, core/SPEC.md 12.4) the thin order, its top-ups (purpose entry), the
+#               thick leg's pairing orders (purpose complete) and the unwinds and profit closes of the unpaired thin leg (trim);
+#   an exit     its orders, the exits of the remaining leg sent for it (decisions whose detail.batch_sent_ms is its instant)
+#               and, with the thin leg first (12.7), the thick leg's orders of its exit_pair steps up to the next exit or forced
+#               exit of the round trip;
+#   forced      its orders.
+# Trims count apart (Trimmed Back), never in the fills. Both legs' filled contracts and average price, the notional (USDT,
+# both legs), the fees paid (a cost, positive, as in Summary and Orders), and its round trip's net (Pending, or Open while
+# open); a leg the step sent no order on is "—", never 0 / No Fill. Its place: on the Spread chart its executable spread at
+# the decision (mu_d + x_d), on the Deviation chart x_d; a forced exit's the spread and deviation on the mids of the newest
+# sample in the minute before it.
+# 4.4: an entry's batch reads its end state from its lot (lot.end_state of a thin-leg-first batch, read through to_jsonb so
+# that a database whose program has not added the column yet still answers; for a batch of both legs together the void
+# reason): built and built partial are entries; entry_failed (the thin leg filled nothing) and a void no_fill are Failed
+# Entries (the grey triangle of 4.3's undone entry); unwound at a profit or at the stop, and 4.3's undone entry (one_leg: a
+# leg filled and was trimmed back), are Unwound Entries. Its pairing facts come from its lot's pair decisions: the end and
+# why (the risk exit's reason first: window, stop_d, too_small; else profit, stopping, forced), the ideally paired spread
+# that ended it (or at the end), the thick leg's VWAP cap P* and how long the pairing took from the thin leg's first fill. An
+# exit's stage (detail.line: exit1 the half, exit2 the rest, exit the one line), whether its pre-check passed (detail.d1:
+# false; true = it exits below break-even all the same, D1 of core/SPEC.md 12.7), how its thick leg closed (the end of its
+# exit_pair steps: within the bound, or a hard close at exit_pair_window or the spread stop, D2), and the round's expected
+# net at the decision against the actual one after the batch: the first is the loss the program accepted, their difference
+# what the execution cost.
 DECISION_KINDS = ("entry", "exit", "forced")   # 4.3: completions, trims and remaining-leg exits are in their step's marker
 ACTIONS = {1: "Long Entry", 2: "Short Entry", 3: "Long Exit", 4: "Short Exit", 5: "Forced Long Exit", 11: "Forced Short Exit",
-           8: "Undone Long Entry", 10: "Undone Short Entry"}
+           6: "Failed Long Entry", 7: "Failed Short Entry", 12: "Unwound Long Entry", 13: "Unwound Short Entry"}
+UNWOUND = WARN   # 4.4: an unwound batch, amber, apart from the grey failed entry
 ACTION_COLORS = {"Long Entry": GOOD, "Short Entry": BAD, "Long Exit": GOOD, "Short Exit": BAD, "Forced Long Exit": GOOD, "Forced Short Exit": BAD,
-                 "Undone Long Entry": GREY, "Undone Short Entry": GREY}
+                 "Failed Long Entry": GREY, "Failed Short Entry": GREY, "Unwound Long Entry": UNWOUND, "Unwound Short Entry": UNWOUND}
+UNWOUND_ENDS = ("unwound_profit", "unwound_stop", "one_leg")
+BATCH_ENDS = {"built": "Built", "built_partial": "Built Partial", "entry_failed": "Failed · No Thin Fill", "unwound_profit": "Unwound at a Profit",
+              "unwound_stop": "Unwound at the Stop", "no_fill": "No Fill", "one_leg": "One Leg, Trimmed Back", "store_error": "Not Recorded",
+              "pairing": "Pairing Now"}
+BATCH_WHY = {"window": "Pair Window Over", "stop_d": "Ideal Spread Stop", "too_small": "Too Small to Pair", "profit": "Thin Leg Closed at a Profit",
+             "stopping": "Program Stopping", "forced": "Forced Exit"}
+EXIT_STAGES = {"exit1": "Exit 1 · Half", "exit2": "Exit 2 · The Rest", "exit": "One Line · All"}
+PRECHECKS = {"passed": "Passed", "failed": "Failed · Exits Anyway"}
+THICK_CLOSES = {"bound": "Within Break-Even", "exit_window": "Hard Close · Window", "exit_stop_d": "Hard Close · Stop",
+                "stopping": "Handed to the Stop", "forced": "Handed to Forced Exit", "no_fill": "No Thin Fill"}
+
+
+def coded_word(x, words):
+    """SQL: the code (1, 2, ...) of the word x in words (dict order), 0 (hidden in the tooltip) for none."""
+    return "CASE %s %s ELSE 0 END" % (x, " ".join("WHEN '%s' THEN %d" % (k, i + 1) for i, k in enumerate(words)))
+
+
+def word_codes(words, colors=None):
+    return code_texts({i + 1: w for i, w in enumerate(words.values())}, colors)
+
+
 MARKERS = sql("""
 m0 AS (
   SELECT d.ts_ms, d.run_id, (d.detail ->> 'x_d')::float8 AS x, (d.detail ->> 'mu_d')::float8 AS mu,
-         CASE WHEN d.kind = 'entry' AND l.status = 'void' THEN CASE d.direction WHEN 'short' THEN 10 ELSE 8 END
+         CASE WHEN d.kind = 'entry' AND l.status = 'void' AND l.es IN @UNWOUND@ THEN CASE d.direction WHEN 'short' THEN 13 ELSE 12 END
+              WHEN d.kind = 'entry' AND l.status = 'void' THEN CASE d.direction WHEN 'short' THEN 7 ELSE 6 END
               WHEN d.kind = 'entry' THEN CASE d.direction WHEN 'short' THEN 2 ELSE 1 END
               WHEN d.kind = 'exit' THEN CASE d.direction WHEN 'short' THEN 4 ELSE 3 END
               ELSE CASE d.direction WHEN 'short' THEN 11 ELSE 5 END END AS action,
          CASE WHEN c.status = 'open' THEN @OPEN@ WHEN NOT c.funding_known THEN @PENDING@ ELSE c.net END AS cycle_net, c.opened_ms AS exec_ms,
          coalesce(d.detail -> 'client_order_ids', jsonb_build_array(d.detail ->> 'client_order_id')) AS ids,
-         d.live, d.cycle_id
+         d.live, d.cycle_id, d.lot_id, d.kind, d.detail,
+         CASE WHEN d.kind = 'entry' THEN coalesce(l.es, CASE WHEN d.detail ? 'thin_leg' AND l.status = 'building' THEN 'pairing' END) END AS batch_end,
+         (SELECT min(n.ts_ms) FROM trade.decision n WHERE n.live = d.live AND n.cycle_id = d.cycle_id AND n.kind IN ('exit', 'forced') AND n.ts_ms > d.ts_ms) AS next_ms
   FROM trade.decision d
-  LEFT JOIN trade.lot l ON l.live = d.live AND l.lot_id = d.lot_id
+  LEFT JOIN LATERAL (SELECT x.status, coalesce(to_jsonb(x) ->> 'end_state', CASE WHEN x.status = 'void' THEN x.void_reason END) AS es
+                     FROM trade.lot x WHERE x.live = d.live AND x.lot_id = d.lot_id) l ON true
   LEFT JOIN trade.cycle c ON c.live = d.live AND c.cycle_id = d.cycle_id
   WHERE @RUN_D@ AND d.kind IN @KINDS@ AND d.ts_ms >= @CHART_FROM@ AND d.ts_ms <= @CHART_TO@),
 m AS (
-  SELECT m0.ts_ms, m0.run_id, m0.action, m0.cycle_net, m0.exec_ms, coalesce(m0.mu + m0.x, n.mid) AS ys, coalesce(m0.x, n.dev) AS yd, o.*
+  SELECT m0.ts_ms, m0.run_id, m0.action, m0.cycle_net, m0.exec_ms, coalesce(m0.mu + m0.x, n.mid) AS ys, coalesce(m0.x, n.dev) AS yd, o.*,
+         @BATCH_END@ AS batch_end, @BATCH_WHY@ AS batch_why, pf.d_ideal, pf.cap, pf.paired_ms,
+         CASE WHEN m0.kind = 'exit' THEN @STAGE@ ELSE 0 END AS stage,
+         CASE WHEN m0.kind = 'exit' AND m0.detail ? 'd1' THEN CASE WHEN (m0.detail ->> 'd1')::boolean THEN 2 ELSE 1 END ELSE 0 END AS precheck,
+         CASE WHEN ef.end_action IS NULL THEN 0 WHEN ef.end_action = 'no_fill' THEN @NO_FILL_CLOSE@ ELSE @THICK@ END AS thick_close,
+         CASE WHEN m0.kind = 'exit' THEN (m0.detail ->> 'expected_net')::numeric END AS expected, ef.actual
   FROM m0
   LEFT JOIN LATERAL (SELECT s.mid_d AS mid, s.mid_d - s.mu_d AS dev FROM trade.signal_sample s
                      WHERE s.ts_ms <= m0.ts_ms AND s.ts_ms > m0.ts_ms - 60000 AND @RUN_S@ ORDER BY s.ts_ms DESC LIMIT 1) n ON m0.x IS NULL OR m0.mu IS NULL
+  LEFT JOIN LATERAL (
+    SELECT (array_agg(nullif(f.reason, '') ORDER BY f.detail ->> 'action' = 'risk_exit' DESC, f.ts_ms DESC)
+              FILTER (WHERE f.detail ->> 'action' IN ('risk_exit', 'done') AND nullif(f.reason, '') IS NOT NULL))[1] AS why,
+           (array_agg((f.detail ->> 'd_ideal')::float8 ORDER BY f.detail ->> 'action' = 'risk_exit' DESC, f.ts_ms DESC)
+              FILTER (WHERE f.detail ->> 'action' IN ('risk_exit', 'done') AND f.detail ? 'd_ideal'))[1] AS d_ideal,
+           (array_agg((f.detail ->> 'vwap_cap')::numeric ORDER BY f.ts_ms DESC) FILTER (WHERE (f.detail ->> 'vwap_cap')::numeric > 0))[1] AS cap,
+           max(f.ts_ms) FILTER (WHERE f.detail ->> 'action' = 'done') - min((f.detail ->> 'first_fill_ms')::bigint) AS paired_ms
+    FROM trade.decision f WHERE f.live = m0.live AND f.lot_id = m0.lot_id AND f.kind = 'pair') pf ON m0.kind = 'entry'
+  LEFT JOIN LATERAL (
+    SELECT (array_agg(f.detail ->> 'action' ORDER BY f.ts_ms DESC) FILTER (WHERE f.detail ->> 'action' IN ('done', 'no_fill', 'hand_over')))[1] AS end_action,
+           (array_agg(nullif(f.reason, '') ORDER BY f.ts_ms DESC) FILTER (WHERE f.detail ->> 'action' IN ('done', 'no_fill', 'hand_over')))[1] AS hard,
+           (array_agg((f.detail ->> 'actual_net')::numeric ORDER BY f.ts_ms DESC) FILTER (WHERE f.detail ? 'actual_net'))[1] AS actual
+    FROM trade.decision f WHERE f.live = m0.live AND f.cycle_id = m0.cycle_id AND f.kind = 'exit_pair' AND f.ts_ms >= m0.ts_ms
+      AND f.ts_ms < coalesce(m0.next_ms, @NO_END@)) ef ON m0.kind = 'exit'
   CROSS JOIN LATERAL (
     SELECT sum(o.cum_exec_qty) FILTER (WHERE o.leg = 'bull' AND NOT o.undo) AS q_bull, sum(o.cum_exec_value) FILTER (WHERE o.leg = 'bull' AND NOT o.undo) AS v_bull,
            sum(o.cum_exec_qty) FILTER (WHERE o.leg = 'bear' AND NOT o.undo) AS q_bear, sum(o.cum_exec_value) FILTER (WHERE o.leg = 'bear' AND NOT o.undo) AS v_bear,
@@ -744,10 +886,16 @@ m AS (
            sum(o.cum_exec_qty) FILTER (WHERE o.leg = 'bull' AND o.undo) AS t_bull, sum(o.cum_exec_qty) FILTER (WHERE o.leg = 'bear' AND o.undo) AS t_bear,
            sum(o.fee) AS fee, bool_or(o.cum_exec_qty > 0 AND NOT o.fee_known) AS fee_pending
     FROM (SELECT o.*, o.purpose = 'trim' AS undo FROM trade.cex_order o WHERE @RUN_O@ AND (o.client_order_id IN (SELECT jsonb_array_elements_text(m0.ids))
+      OR m0.kind = 'entry' AND o.lot_id = m0.lot_id
       OR o.client_order_id IN (
         SELECT f.detail ->> 'client_order_id' FROM trade.decision f
-        WHERE f.live = m0.live AND f.cycle_id = m0.cycle_id AND f.kind IN ('trim', 'complete') AND (f.detail ->> 'batch_sent_ms')::bigint = m0.ts_ms))) o) o)""",
-              RUN_D=of_run("d"), RUN_S=of_run("s"), RUN_O=of_mode("o"), CHART_FROM=CHART_FROM, CHART_TO=CHART_TO, KINDS="(%s)" % ", ".join("'%s'" % k for k in DECISION_KINDS), OPEN=str(OPEN), PENDING=str(PENDING))
+        WHERE f.live = m0.live AND f.cycle_id = m0.cycle_id AND (f.kind IN ('trim', 'complete') AND (f.detail ->> 'batch_sent_ms')::bigint = m0.ts_ms
+          OR m0.kind = 'exit' AND f.kind = 'exit_pair' AND f.ts_ms >= m0.ts_ms AND f.ts_ms < coalesce(m0.next_ms, @NO_END@))))) o) o)""",
+              RUN_D=of_run("d"), RUN_S=of_run("s"), RUN_O=of_mode("o"), CHART_FROM=CHART_FROM, CHART_TO=CHART_TO, KINDS="(%s)" % ", ".join("'%s'" % k for k in DECISION_KINDS),
+              OPEN=str(OPEN), PENDING=str(PENDING), UNWOUND="(%s)" % ", ".join("'%s'" % k for k in UNWOUND_ENDS), NO_END=NO_END_MS,
+              BATCH_END=coded_word("m0.batch_end", BATCH_ENDS), BATCH_WHY=coded_word("pf.why", BATCH_WHY), STAGE=coded_word("m0.detail ->> 'line'", EXIT_STAGES),
+              NO_FILL_CLOSE=str(list(THICK_CLOSES).index("no_fill") + 1),
+              THICK=coded_word("coalesce(CASE WHEN ef.end_action = 'hand_over' THEN coalesce(ef.hard, 'stopping') ELSE ef.hard END, 'bound')", THICK_CLOSES))
 
 
 # The tooltip rows of a decision: on every row within about 13 px of it (WINDOW_MS) the decision c nearest the row, 0 elsewhere,
@@ -768,25 +916,35 @@ def avg_price(leg):
         l=leg, p=shown("c.v_%s / c.q_%s" % (leg, leg), TICK_DECIMALS[leg]), no=NO_FILL, ni=NOT_IN))
 
 
+def maybe(x, decimals):
+    """A figure a decision may not have: hidden (0) without it, a real zero as ZERO."""
+    return near("CASE WHEN %s IS NULL THEN 0 ELSE %s END" % (x, nonzero(x, decimals)))
+
+
 MARKER_INFO = [("Execution", near("coalesce(c.exec_ms, %d)" % NO_SAMPLE)), ("Action", near("c.action")), ("Decided", near("c.ts_ms")),
+               ("Batch End", near("c.batch_end")), ("Batch Why", near("c.batch_why")),
+               ("Exit Stage", near("c.stage")), ("Pre-Check", near("c.precheck")), ("Thick Leg Close", near("c.thick_close")),
                ("Bull Filled", filled("bull")), ("Bull Avg", avg_price("bull")), ("Bear Filled", filled("bear")), ("Bear Avg", avg_price("bear")),
                ("Bull Trimmed", near(shown("coalesce(c.t_bull, 0)", 2))), ("Bear Trimmed", near(shown("coalesce(c.t_bear, 0)", 2))),   # 0: hidden
+               ("Bull Cap", maybe("c.cap", 3)), ("Ideal Spread", maybe("c.d_ideal", 1)), ("Paired In", maybe("c.paired_ms / 1000.0", 2)),
                ("Notional", near(nonzero("coalesce(c.v_bull, 0) + coalesce(c.v_bear, 0)", 2))),
                ("Fees", near("CASE WHEN c.fee_pending THEN %d ELSE %s END" % (FEE_PENDING, nonzero("coalesce(c.fee, 0)", 2)))),
+               ("Expected Net", maybe("c.expected", 2)), ("Actual Net", maybe("c.actual", 2)), ("Execution Cost", maybe("c.actual - c.expected", 2)),
                ("Cycle Net", near("CASE WHEN c.cycle_net <= %d THEN c.cycle_net ELSE %s END" % (PENDING, nonzero("c.cycle_net", 2)))),
                ("At Spread", near("CASE WHEN c.ys IS NULL THEN %d ELSE %s END" % (NO_SAMPLE, nonzero("c.ys", 1)))),
                ("At Deviation", near("CASE WHEN c.yd IS NULL THEN %d ELSE %s END" % (NO_SAMPLE, nonzero("c.yd", 1))))]
 WINDOW_MS = "greatest(x.step, ($__to - $__from) / 90)"
 
-# The markers (owner item 81): a long entry a green triangle pointing up, a short entry a red one pointing down, an exit a
-# circle (a forced exit amber, a trim, completion or void entry a small grey one). Grafana draws points as circles only, so a
-# triangle is drawn as a filled band (fillBelowTo) between two series around the decision's place: a flat side (Base) and a
-# peak that rises from it to the apex at the decision's instant, half a width (x.half, about 9 px) either side; its height
-# an 18th of the chart's span in the window (x.hs on Spread, x.hd on Deviation), so it reads alike at every zoom. The rows at
-# the decision's instant ± half a width carry its corners. Triangles never overlap (one series cannot draw two at once): an
-# entry within a triangle's width (2 × x.half) after the start of the one before it is drawn by that one (tri), its own
-# tooltip there as for every decision; zooming in separates them. Entries come first: an undone entry (grey) is drawn only
-# where no entry's triangle is within a width of it (4.3: an undone one hid the real entry 5 s after it).
+# The markers (owner items 81, 84; 4.4): a long entry a green triangle pointing up, a short entry a red one pointing down, a
+# failed entry grey and an unwound one amber (the same direction); an exit a circle in the colour of the position it closes.
+# Grafana draws points as circles only, so a triangle is drawn as a filled band (fillBelowTo) between two series around the
+# decision's place: a flat side (Base) and a peak that rises from it to the apex at the decision's instant, half a width
+# (x.half, about 9 px) either side; its height an 18th of the chart's span in the window (x.hs on Spread, x.hd on Deviation),
+# so it reads alike at every zoom. The rows at the decision's instant ± half a width carry its corners. Triangles never
+# overlap (one series cannot draw two at once): an entry within a triangle's width (2 × x.half) after the start of the one
+# before it is drawn by that one (tri), its own tooltip there as for every decision; zooming in separates them. Entries come
+# first: a failed or unwound entry is drawn only where no entry's triangle is within a width of it (4.3: an undone one hid the
+# real entry 5 s after it).
 def triangle(y, h, up):
     """The peak of the triangle e at y (its height h) on a row p: y ∓ h/2 at its corners, y ± h/2 at its apex."""
     sign = "+" if up else "-"
@@ -799,7 +957,7 @@ def base(y, h, up):
 
 
 def glyphs(chart, y, h):
-    """The marker columns of one chart (owner items 81, 84): four triangles (peak and base) and two circles."""
+    """The marker columns of one chart (owner items 81, 84): six triangles (peak and base) and two circles."""
     out = []
     for name, act, up in TRIANGLES:
         out += [("%s%s" % (name, chart), "CASE WHEN e.action = %d THEN %s END" % (act, shown(triangle(y, h, up), 2))),
@@ -809,21 +967,25 @@ def glyphs(chart, y, h):
     return out
 
 
-# The triangles: entries (green ▲ Long, red ▼ Short) and entries undone (grey, the same direction: a lot voided, one leg filled
-# and trimmed back); the circles: exits in the colour of the position they close (owner item 84: closing a Short red, closing
-# a Long green; a forced exit too, its tooltip says Forced).
-TRIANGLES = (("Long Entry", 1, True), ("Short Entry", 2, False), ("Undone Long Entry", 8, True), ("Undone Short Entry", 10, False))
+# The triangles: entries (green ▲ Long, red ▼ Short), failed entries (grey: the thin leg filled nothing; with both legs
+# together, a void no-fill lot) and unwound entries (amber: a leg filled and was closed back, at a profit or at the stop; with
+# both legs together 4.3's undone entry), both in the entry's direction; the circles: exits in the colour of the position they
+# close (owner item 84: closing a Short red, closing a Long green; a forced exit too, its tooltip says Forced).
+TRIANGLES = (("Long Entry", 1, True), ("Short Entry", 2, False), ("Failed Long Entry", 6, True), ("Failed Short Entry", 7, False),
+             ("Unwound Long Entry", 12, True), ("Unwound Short Entry", 13, False))
+SECOND_TRIANGLES = (6, 7, 12, 13)   # drawn only where no entry's triangle is
 CIRCLES = (("Long Exit", (3, 5)), ("Short Exit", (4, 11)))
 SPREAD_GLYPHS, DEVIATION_GLYPHS = glyphs("", "e.ys", "x.hs"), glyphs(" · Dev", "e.yd", "x.hd")
 # The drawn lines, in bps (owner items 80, 81; after Combo Spread's Spread and Deviation charts). Spread: the Real Long Spread
 # (buying both at their pricing levels, blue) and the Real Short Spread (selling both, orange), the Mean, and the program's
-# lines around it: a Long enters when Real Long Spread falls to Mean − d_in σ (blue dashed) and exits when Real Short Spread
-# rises to Mean − d_out σ (blue dotted); a Short the mirror (orange). Deviation: the same less the Mean, the deviation on the
+# lines around it: a Long enters when Real Long Spread falls to Mean − entry_in σ (blue dashed) and exits when Real Short Spread
+# rises to Mean − entry_out σ (blue dotted); a Short the mirror (orange). Deviation: the same less the Mean, the deviation on the
 # mids (purple), ±1 σ and ±3 σ (grey). The lines need sigma; they are computed here, not in the browser (Grafana's binary
 # calculation reads a NULL as 0). Real spreads only where the executor trades (EXECUTABLE, owner item 70).
 SIGMAS = (0.5, 1, 1.5, 2, 2.5, 3)   # owner item 84: the volatility lines as Combo Spread draws them
-LINES = {"Long In": ("-p.d_in", BLUE, [6, 4]), "Long Out": ("-p.d_out", BLUE, [2, 3]),
-         "Short In": ("p.d_in", ORANGE, [6, 4]), "Short Out": ("p.d_out", ORANGE, [2, 3])}
+# 4.4: the second exit line (exit2, NULL without it) dash-dotted beside the first's dots.
+LINES = {"Long In": ("-p.d_in", BLUE, [6, 4]), "Long Out": ("-p.d_out", BLUE, [2, 3]), "Long Out 2": ("-p.exit2", BLUE, [8, 3, 2, 3]),
+         "Short In": ("p.d_in", ORANGE, [6, 4]), "Short Out": ("p.d_out", ORANGE, [2, 3]), "Short Out 2": ("p.exit2", ORANGE, [8, 3, 2, 3])}
 SIG = "nullif(p.sigma, 0)"
 spread_sigma = lambda sg, k: "Mean %s %gσ" % (sg, k)
 dev_sigma = lambda sg, k: "%s%gσ" % (sg, k)
@@ -857,7 +1019,7 @@ STATE_COLUMNS = [("Entry", "CASE WHEN p.idle IS NULL THEN 100 %s ELSE 99 END" % 
 # Near a decision the tooltip shows the decision only: the point's rows are hidden there too.
 ALL_COLUMNS = LINE_COLUMNS + [(n, "CASE WHEN p.anchored IS NULL OR c.n IS NOT NULL THEN 0 ELSE %s END" % q)
                               for n, q in TOOLTIP_COLUMNS + STATE_COLUMNS] + SPREAD_GLYPHS + DEVIATION_GLYPHS + MARKER_INFO
-RAW = ["mid", "mu", "sigma", "rl", "rs", "xl", "xs", "d_in", "d_out", "anchored", "booked", "idle"]
+RAW = ["mid", "mu", "sigma", "rl", "rs", "xl", "xs", "d_in", "d_out", "exit2", "anchored", "booked", "idle"]
 # The two charts' one query (the Deviation chart shows the Spread chart's result): per step bucket of one run and one session,
 # at its last sample; each decision as three rows (its instant and its triangle's two corners) with the values of the
 # bucket before it when that is of the same run (so they do not break the lines), and on every row the decision nearest it
@@ -882,7 +1044,7 @@ x AS MATERIALIZED (
          greatest(coalesce(greatest(max(b.xl), 3 * max(b.sigma)) - least(min(b.xs), -3 * max(b.sigma)), 0), 2) / 18 AS hd
   FROM x0 LEFT JOIN b ON true GROUP BY x0.step),
 k AS (
-  SELECT b.*, @D_IN@ AS d_in, @D_OUT@ AS d_out,
+  SELECT b.*, @D_IN@ AS d_in, @D_OUT@ AS d_out, @EXIT2@ AS exit2,
          lead(b.ts) OVER w AS next_ts, lead(b.run_id) OVER w AS next_run, lead(b.session_id) OVER w AS next_session
   FROM b CROSS JOIN sel r
   WINDOW w AS (ORDER BY b.ts)),
@@ -895,7 +1057,7 @@ gl AS (
   SELECT t0.i, CASE WHEN t0.ts_ms > gl.start + 2 * x.half THEN t0.ts_ms ELSE gl.start END FROM gl JOIN t0 ON t0.i = gl.i + 1 CROSS JOIN x),
 tr AS (SELECT DISTINCT ON (gl.start) t0.ts_ms, t0.action, t0.ys, t0.yd FROM gl JOIN t0 ON t0.i = gl.i AND t0.ts_ms = gl.start ORDER BY gl.start, t0.i),
 u0 AS (SELECT mm.ts_ms, mm.action, mm.ys, mm.yd, row_number() OVER (ORDER BY mm.ts_ms, mm.n) AS i FROM mm CROSS JOIN x
-       WHERE mm.action IN (8, 10) AND NOT EXISTS (SELECT 1 FROM tr WHERE abs(tr.ts_ms - mm.ts_ms) <= 2 * x.half)),
+       WHERE mm.action IN @SECOND@ AND NOT EXISTS (SELECT 1 FROM tr WHERE abs(tr.ts_ms - mm.ts_ms) <= 2 * x.half)),
 ul AS (
   SELECT u0.i, u0.ts_ms AS start FROM u0 WHERE u0.i = 1
   UNION ALL
@@ -921,7 +1083,7 @@ SELECT to_timestamp(t.ts / 1000.0) AS time, @NAMES@ FROM (
   UNION ALL
   SELECT greatest(k.ts + 1, k.next_ts - 1), 0, @NULLS@ FROM k CROSS JOIN x
   WHERE k.next_ts IS NOT NULL AND (k.next_ts - k.ts > greatest(2 * x.step, 3000) OR k.next_run <> k.run_id OR k.next_session <> k.session_id)) t
-ORDER BY t.ts, t.ord""", SEL=SEL, STEP=STEP_MS, RUN_S=of_run("s"), CHART_FROM=CHART_FROM, CHART_TO=CHART_TO, D_IN=D_IN, D_OUT=D_OUT, MARKERS=MARKERS, EXECUTABLE=EXECUTABLE.format(s="s"),
+ORDER BY t.ts, t.ord""", SEL=SEL, SECOND="(%s)" % ", ".join(map(str, SECOND_TRIANGLES)), STEP=STEP_MS, RUN_S=of_run("s"), CHART_FROM=CHART_FROM, CHART_TO=CHART_TO, D_IN=D_IN, D_OUT=D_OUT, EXIT2=EXIT2, MARKERS=MARKERS, EXECUTABLE=EXECUTABLE.format(s="s"),
                   RAW_K=", ".join("k.%s" % c for c in RAW), NULL_RAW=", ".join("NULL" for _ in RAW), WINDOW=WINDOW_MS,
                   WIN_RAW=", ".join("CASE WHEN u.run IS DISTINCT FROM u.brun THEN NULL ELSE %s(u.%s) OVER v END AS %s"
                                     % ("bool_or" if c in ("anchored", "booked") else "max", c, c) for c in RAW),
@@ -998,7 +1160,7 @@ def cfg(path):
 
 
 def dur(path):
-    return "regexp_replace(regexp_replace(%s, '([hm])0s$', '\\1'), 'h0m$', 'h')" % cfg(path)
+    return go_dur(cfg(path))
 
 
 def cfg_num(path, suffix=""):
@@ -1035,6 +1197,8 @@ SETTINGS = [
         ("Book Max Age", dur("cex,depth_max_age")),
         ("F Max Age", dur("cex,fx_max_age")),
         ("NAV Settles", dur("cex,nav_settle_delay")),
+        ("NAV Watch", dur("cex,nav_watch")),
+        ("NAV Hot Switch", cfg_num("cex,nav_hot_switch_d", " bps")),
         ("Stop Alarm", dur("exec,stop_alarm_after")),
         ("Ex-Dates", "coalesce((SELECT string_agg(a.d, ', ' ORDER BY a.d) FROM (SELECT DISTINCT replace(substr(x ->> 'ex_date', 6), '-', '%s') "
                                "|| CASE WHEN x ->> 'kind' = 'dividend' THEN '' ELSE ' ' || (x ->> 'kind') END AS d "
@@ -1067,13 +1231,22 @@ WHERE v.value IS NOT NULL ORDER BY v.o""",
 IN_RANGE = "%s AND c.opened_ms < %s AND coalesce(c.closed_ms, %s) >= %s" % (cycle_of_run("c"), TO_MS, NOW_MS, FROM_MS)
 TRADED = "%s AND c.end_reason IS DISTINCT FROM 'no_fill'" % IN_RANGE
 NET_CODED = "CASE WHEN c.status = 'open' THEN %d WHEN NOT c.funding_known THEN %d ELSE c.net END" % (OPEN, PENDING)
+# 4.4: a lot's end: lot.end_state of a thin-leg-first batch (through to_jsonb: a database without the column yet answers too),
+# else its void reason, building while it is built, built otherwise (both legs together).
+LOT_END = ("coalesce(to_jsonb({x}) ->> 'end_state', CASE {x}.status WHEN 'void' THEN coalesce({x}.void_reason, 'no_fill') WHEN 'building' THEN 'building' "
+           "ELSE 'built' END)")
+# How a lot ended, in words (Batch Ends, the Batches of a round trip).
+BATCH_WORDS = {"built": "Built", "built_partial": "Built Partial", "unwound_profit": "Unwound at a Profit", "unwound_stop": "Unwound at the Stop",
+               "one_leg": "Unwound: One Leg Trimmed Back", "entry_failed": "Entry Failed", "no_fill": "No Fill", "building": "Pairing Now",
+               "store_error": "Not Recorded"}
 Q_BLOTTER = or_say(sql("""
 WITH @SEL@
 SELECT c.cycle_id, to_timestamp(c.opened_ms / 1000.0) AS "Opened", to_timestamp(c.closed_ms / 1000.0) AS "Closed", @HELD@ AS "Held",
        initcap(c.direction) AS "Side", l.notional AS "Notional", @ENTRY@ AS "In σ", @EXIT@ AS "Out σ", @NET@ AS "Net",
        CASE WHEN c.status <> 'open' AND c.funding_known AND l.notional > 0 THEN 10000 * c.net / l.notional END AS "Net bps",
-       @REASON@ AS "End Reason"
+       CASE WHEN c.end_reason = 'one_leg' AND bt.thin THEN 'Nothing Paired' ELSE @REASON@ END AS "End Reason"
 FROM trade.cycle c
+CROSS JOIN LATERAL (SELECT bool_or(to_jsonb(x) ->> 'end_state' IS NOT NULL) AS thin FROM trade.lot x WHERE x.live = c.live AND x.cycle_id = c.cycle_id) bt
 CROSS JOIN LATERAL (SELECT sum(x.entry_value_bull + x.entry_value_bear) AS notional,
                            sum(x.x_d / nullif(x.sigma_d, 0) * (x.entry_value_bull + x.entry_value_bear))
                              / nullif(sum(x.entry_value_bull + x.entry_value_bear) FILTER (WHERE x.sigma_d <> 0), 0) AS entry
@@ -1082,7 +1255,8 @@ LEFT JOIN LATERAL (SELECT (d.detail ->> 'x_d')::float8 / nullif((d.detail ->> 's
                    WHERE d.live = c.live AND d.cycle_id = c.cycle_id AND d.kind = 'exit' ORDER BY d.ts_ms DESC LIMIT 1) e ON true
 WHERE @TRADED@
 ORDER BY c.opened_ms DESC LIMIT 500""", SEL=SEL, TRADED=TRADED, HELD=span("coalesce(c.closed_ms, %s) - c.opened_ms" % NOW_MS),
-                ENTRY=shown("l.entry", 2), EXIT=shown("e.x", 2), NET=NET_CODED, REASON=end_reason("c.end_reason")), ['cycle_id', 'Opened', 'Closed', 'Held', 'Side', 'Notional', 'In σ', 'Out σ', 'Net', 'Net bps', 'End Reason'], 'End Reason', 'No round trip in the Range')
+                ENTRY=shown("l.entry", 2), EXIT=shown("e.x", 2), NET=NET_CODED, REASON=end_reason("c.end_reason")),
+                   ['cycle_id', 'Opened', 'Closed', 'Held', 'Side', 'Notional', 'In σ', 'Out σ', 'Net', 'Net bps', 'End Reason'], 'End Reason', 'No round trip in the Range')
 # The round trips of the Range for the (hidden) Round Trip setting, newest first (the default); no-fill ones too, so that
 # one can be looked at by its address; one option that says so when there is none.
 Q_CYCLE_OPTIONS = sql("""
@@ -1103,17 +1277,60 @@ def leg_price(x):
         x, "0" * TICK_DECIMALS["bull"], x, "0" * TICK_DECIMALS["bear"])
 
 
+# 4.4: the entry batches of the picked round trip, one row per lot in its order: when it opened, how it ended (BATCH_WORDS)
+# and why (its pair decisions: the risk exit's reason first), each leg's contracts it opened (entries, top-ups, pairing
+# orders) and those closed back (trims: unwinds and profit closes), how long the pairing took and the lot's net (USDT,
+# Open while it holds a position).
+Q_BATCH_ROWS = or_say(sql("""
+WITH @SEL@
+SELECT 'Batch ' || l.seq AS "Batch", to_timestamp(l.opened_ms / 1000.0) AS "Opened", @END@ AS "End", @WHY@ AS "Why",
+       o.q_bull AS "Bull", o.q_bear AS "Bear", o.back AS "Back", p.ms / 1000.0 AS "Pairing",
+       CASE WHEN l.status IN ('closed', 'void') THEN l.net ELSE @OPEN@ END AS "Net"
+FROM trade.cycle c JOIN trade.lot l ON l.live = c.live AND l.cycle_id = c.cycle_id
+CROSS JOIN LATERAL (SELECT sum(o.cum_exec_qty) FILTER (WHERE o.leg = 'bull' AND o.purpose IN ('entry', 'complete')) AS q_bull,
+                           sum(o.cum_exec_qty) FILTER (WHERE o.leg = 'bear' AND o.purpose IN ('entry', 'complete')) AS q_bear,
+                           sum(o.cum_exec_qty) FILTER (WHERE o.purpose = 'trim') AS back
+                    FROM trade.cex_order o WHERE o.live = l.live AND o.lot_id = l.lot_id) o
+LEFT JOIN LATERAL (SELECT max(f.ts_ms) FILTER (WHERE f.detail ->> 'action' = 'done') - min((f.detail ->> 'first_fill_ms')::bigint) AS ms,
+                          (array_agg(nullif(f.reason, '') ORDER BY f.detail ->> 'action' = 'risk_exit' DESC, f.ts_ms DESC)
+                             FILTER (WHERE f.detail ->> 'action' IN ('risk_exit', 'done') AND nullif(f.reason, '') IS NOT NULL))[1] AS why
+                   FROM trade.decision f WHERE f.live = l.live AND f.lot_id = l.lot_id AND f.kind = 'pair') p ON true
+WHERE @RUN_C@ AND c.cycle_id = @CYCLE@ ORDER BY l.seq""", SEL=SEL, CYCLE="'$cycle'", OPEN=str(OPEN), RUN_C=cycle_of_run("c"),
+                          END=plain(LOT_END.format(x="l"), BATCH_WORDS), WHY="CASE p.why %s ELSE initcap(replace(p.why, '_', ' ')) END" % " ".join(
+                              "WHEN '%s' THEN '%s'" % kv for kv in BATCH_WHY.items())),
+                      ['Batch', 'Opened', 'End', 'Why', 'Bull', 'Bear', 'Back', 'Pairing', 'Net'], 'Why', 'No batch in this round trip')
+
+
+# 4.4: the step each order was sent for (item 5 of step 10.9: with the thin leg first the thick leg's pairing orders are
+# purpose complete and the unwinds and profit closes of the unpaired thin leg trim): the decision that names it (its first),
+# the batch (lot seq) of an entry's orders: Batch 2 · Thin Leg, · Top-Up, · Pair, · Unwind, · Profit Close; Exit 1 · Thin,
+# Exit 1 · Thick, Exit 2 · Hard Close; with both legs together Entry, Complete, Trim, Exit, Forced.
+LINE_WORD = "CASE k.line WHEN 'exit1' THEN 'Exit 1' WHEN 'exit2' THEN 'Exit 2' ELSE 'Exit' END"
+ORDER_STEP = sql("""coalesce('Batch ' || l.seq || ' · ', '') || CASE
+  WHEN k.kind = 'entry' AND k.thin THEN 'Thin Leg' WHEN k.kind = 'entry' THEN 'Entry'
+  WHEN k.kind = 'pair' THEN CASE k.action WHEN 'send_thick' THEN 'Pair' WHEN 'send_thin' THEN 'Top-Up' WHEN 'close_thin' THEN 'Profit Close'
+                                          WHEN 'unwind' THEN 'Unwind' ELSE initcap(replace(k.action, '_', ' ')) END
+  WHEN k.kind = 'exit' THEN @LINE@ || CASE WHEN k.thin THEN ' · Thin' ELSE '' END
+  WHEN k.kind = 'exit_pair' THEN @LINE@ || CASE k.action WHEN 'hard_close' THEN ' · Hard Close' ELSE ' · Thick' END
+  ELSE initcap(replace(coalesce(k.kind, o.purpose), '_', ' ')) END""", LINE=LINE_WORD)
 Q_ORDERS = or_say(sql("""
 WITH @SEL@
-SELECT to_timestamp(o.submitted_ms / 1000.0) AS "Time", initcap(o.purpose) AS "Purpose", CASE o.leg WHEN 'bull' THEN '$bull' ELSE '$bear' END AS "Leg",
+SELECT to_timestamp(o.submitted_ms / 1000.0) AS "Time", initcap(o.purpose) AS "Purpose", @STEP@ AS "Step", CASE o.leg WHEN 'bull' THEN '$bull' ELSE '$bear' END AS "Leg",
        initcap(o.side) || CASE WHEN o.reduce_only THEN ' · RO' ELSE '' END AS "Side", o.qty AS "Qty", o.cum_exec_qty AS "Filled",
        @LIMIT@ AS "Limit", @AVG@ AS "Avg", CASE WHEN o.cum_exec_qty = 0 THEN NULL WHEN NOT o.fee_known THEN @FEE_PENDING@ ELSE o.fee END AS "Fee",
        o.final_ms - o.sent_ms AS "Latency",
        CASE WHEN o.unknown THEN 'Unknown' WHEN o.status = 'filled' THEN 'Filled' WHEN o.status = 'cancelled' AND o.cum_exec_qty > 0 THEN 'Partial'
             WHEN o.status = 'cancelled' THEN 'No Fill' WHEN o.status IN ('pending', 'acked') THEN 'Working'
             ELSE initcap(replace(o.status, '_', ' ')) END || coalesce(' · ' || nullif(concat_ws(' ', o.error_code, o.error_message), ''), '') AS "Status"
-FROM trade.cex_order o WHERE @RUN_O@ AND o.cycle_id = @CYCLE@ ORDER BY o.submitted_ms, o.client_order_id""",
-               SEL=SEL, RUN_O=of_mode("o"), CYCLE=CYCLE, FEE_PENDING=str(FEE_PENDING), LIMIT=leg_price("o.price"), AVG=leg_price("o.avg_price")), ['Time', 'Purpose', 'Leg', 'Side', 'Qty', 'Filled', 'Limit', 'Avg', 'Fee', 'Latency', 'Status'], 'Status', 'No order: no round trip in the Range')
+FROM trade.cex_order o
+LEFT JOIN LATERAL (SELECT k.kind, k.detail ->> 'action' AS action, k.detail ->> 'line' AS line, k.detail ? 'thin_leg' AS thin FROM trade.decision k
+                   WHERE k.live = o.live AND k.cycle_id = o.cycle_id
+                     AND (k.detail ->> 'client_order_id' = o.client_order_id OR k.detail -> 'client_order_ids' ? o.client_order_id)
+                   ORDER BY k.ts_ms LIMIT 1) k ON true
+LEFT JOIN trade.lot l ON l.live = o.live AND l.lot_id = o.lot_id
+WHERE @RUN_O@ AND o.cycle_id = @CYCLE@ ORDER BY o.submitted_ms, o.client_order_id""",
+               SEL=SEL, RUN_O=of_mode("o"), CYCLE=CYCLE, FEE_PENDING=str(FEE_PENDING), LIMIT=leg_price("o.price"), AVG=leg_price("o.avg_price"), STEP=ORDER_STEP),
+                  ['Time', 'Purpose', 'Step', 'Leg', 'Side', 'Qty', 'Filled', 'Limit', 'Avg', 'Fee', 'Latency', 'Status'], 'Status', 'No order: no round trip in the Range')
 
 # -------------------------------------------------------------------------------------------------------------- Inventory
 # Each leg at the Run's newest inventory sample (every 10 s), as the sibling board's Positions Now: the venue's position and
@@ -1163,6 +1380,21 @@ CROSS JOIN LATERAL (VALUES @STAGES@) k(i, stage, clock, ms)
 WHERE @RUN_O@ AND @RANGE_O@ AND k.ms IS NOT NULL
 GROUP BY k.i, k.stage, k.clock ORDER BY k.i""", SEL=SEL, RUN_O=of_run("o"), RANGE_O=in_range("o.submitted_ms"),
                 STAGES=", ".join("(%d, '%s', '%s', %s)" % (i, s, c, q) for i, (s, c, q) in enumerate(LATENCY_STAGES))), ['Stage', 'Clock', 'Orders', 'Median', 'P90', 'Max'], 'Stage', 'No order in the Range')
+
+# 4.4: how the Run's entry batches opened in the Range ended (the replay's count of end states, core/SPEC.md 12.10): their
+# number, their net (the lots' own, closed or void: a void lot's is what its unwind or profit close made), and the median time
+# from the thin leg's first fill to the end of the pairing.
+Q_BATCHES = or_say(sql("""
+WITH @SEL@
+SELECT @WORD@ AS "Batch End", count(*) AS "Batches", sum(l.net) FILTER (WHERE l.status IN ('closed', 'void')) AS "Net",
+       percentile_cont(0.5) WITHIN GROUP (ORDER BY p.ms) / 1000.0 AS "Pairing s"
+FROM trade.lot l
+LEFT JOIN LATERAL (SELECT max(f.ts_ms) FILTER (WHERE f.detail ->> 'action' = 'done') - min((f.detail ->> 'first_fill_ms')::bigint) AS ms
+                   FROM trade.decision f WHERE f.live = l.live AND f.lot_id = l.lot_id AND f.kind = 'pair') p ON true
+WHERE @RUN_L@ AND @RANGE_L@
+GROUP BY 1 ORDER BY min(@ORDER@), 1""", SEL=SEL, RUN_L=of_run("l"), RANGE_L=in_range("l.opened_ms"), WORD=plain(LOT_END.format(x="l"), BATCH_WORDS),
+                       ORDER="CASE %s %s ELSE 99 END" % (LOT_END.format(x="l"), " ".join("WHEN '%s' THEN %d" % (k, i) for i, k in enumerate(BATCH_WORDS)))),
+                   ['Batch End', 'Batches', 'Net', 'Pairing s'], 'Batch End', 'No entry batch in the Range')
 
 # ------------------------------------------------------------------------------------------------- Diagnostics · System
 # The Run's events of every module in the Range (trade.event: today the program writes only its errors there), newest first;
@@ -1386,15 +1618,15 @@ def build():
         ("Real Long", "Owner item 80: the spread at both legs' pricing levels buying both (where a Long enters and a Short exits), in "
                       "spread bps: 10⁴ × (F × (P_bull ÷ A_bull + P_bear ÷ A_bear) − 2), the two legs' deviations added, as Combo Spread "
                       "writes it (1 bps of spread is 0.5 bps of the two legs' notional); owner item 84: blue with · Entry when it is at or "
-                      "past its entry line (Mean − d_in σ); — while a leg's book conflicts or its depth is unusable (owner item 70).",
+                      "past its entry line (Mean − entry_in σ); — while a leg's book conflicts or its depth is unusable (owner item 70).",
          dict(ENTRY_HIT, displayName="Real Spread · Long")),
-        ("Real Short", "Selling both (where a Short enters and a Long exits): orange with · Entry at or past Mean + d_in σ.",
+        ("Real Short", "Selling both (where a Short enters and a Long exits): orange with · Entry at or past Mean + entry_in σ.",
          dict(ENTRY_HIT_SHORT, displayName="Real Spread · Short")),
         ("Mean", "The program's mean of the spread (on the mids), bps (a minus sign, as in the real spreads).", None),
         ("Volatility", "Volatility (σ): the standard deviation of the spread, bps.", dict(bps1, displayName="Volatility (σ)")),
         ("Deviation", "Spread on the mids − Mean, in bps and in σ.", None),
-        ("Signal", "In Combo Spread's words, on the program's executable deviations: Long (Buy Both at or past −d_in σ), Short (Sell Both at "
-                   "or past +d_in σ), None inside; No Anchor, No Mean (σ not ready), No Book (a leg's book conflicts or its depth is "
+        ("Signal", "In Combo Spread's words, on the program's executable deviations: Long (Buy Both at or past −entry_in σ), Short (Sell Both at "
+                   "or past +entry_in σ), None inside; No Anchor, No Mean (σ not ready), No Book (a leg's book conflicts or its depth is "
                    "unusable: the program enters on none).", value_map(SIGNAL_COLORS)),
     ], 0, y, 24, 3, intro="The same second, as Combo Spread's Spread and Signal · Latest Second; every spread figure in bps.", source=market,
         columns=["Real Long", "Real Short", "Mean", "Volatility", "Deviation", "Signal"], title_size=12, value_size=16))
@@ -1442,18 +1674,38 @@ def build():
         columns=["PnL", "Gross", "Fee", "Funding", "Open PnL", "Notional Text", "Peak Used Text", "Win Rate", "Return"]))
     y += 4
     usdt0 = {"unit": "locale", "decimals": 0, "mappings": [NO_FIGURE]}
-    panels.append(stat_strip("Parameters", Q_PARAMS, [
+    params = stat_strip("Parameters", Q_PARAMS, [
         ("Mean Model", "The mean of the spread: EMA or SMA, over its scale in minutes.", None),
         ("Volatility Scale", "The window of Volatility (σ), the spread's standard deviation, in minutes.", None),
-        ("Entry", "d_in: a Long enters when Buy Both is d_in σ below the mean, a Short when Sell Both is d_in σ above it; in spread bps "
-                  "at the newest second's σ.", None),
-        ("Exit", "d_out: a Long exits when Sell Both reaches −d_out σ from the mean (past it, on the other side, when d_out is "
-                 "negative), a Short the mirror; in spread bps at the newest second's σ.", None),
+        ("Entry", "entry_in (d_in before PRD 4.0): a Long enters when Buy Both is entry_in σ below the mean, a Short when Sell Both is "
+                  "entry_in σ above it; in spread bps at the newest second's σ.", None),
+        ("Exit 1", "entry_out (d_out before): a Long exits when Sell Both reaches −entry_out σ from the mean (past it, on the other side, "
+                   "when it is negative), a Short the mirror; with Exit 2 set this line closes half the position (the round must be in "
+                   "profit), else all of it; in spread bps at the newest second's σ.", {"displayName": "Exit" + NBSP + "1"}),
+        ("Exit 2", "exit2: the line that closes the rest, even below break-even (PRD 9.2); none: one exit line only.", {"displayName": "Exit" + NBSP + "2"}),
+    ], 0, y, 24, 3, intro="The Run's settings (process_run.config) that its results are read with (owner item 80): its signal; its size and "
+                          "execution in the strip below, the rest in Settings.",
+        title_size=12, value_size=16, columns=["Mean Model", "Volatility Scale", "Entry", "Exit 1", "Exit 2"])
+    panels.append(params)
+    y += 3
+    panels.append(stat_strip("Size and Execution", None, [
         ("Capital M Text", "The real capital the Run may use, USDT.", {"displayName": "Capital M"}),
         ("Leverage L", "The total leverage.", {"unit": "suffix:×", "decimals": 0, "mappings": [NO_FIGURE]}),
         ("Notional N Text", "M × L: the notional the Run may hold, USDT.", {"displayName": "Notional N"}),
-    ], 0, y, 24, 3, intro="The Run's settings (process_run.config) that its results are read with (owner item 80); the rest in Settings below.",
-        title_size=12, value_size=16, columns=["Mean Model", "Volatility Scale", "Entry", "Exit", "Capital M Text", "Leverage L", "Notional N Text"]))
+        ("Thin Leg", "exec.thin_leg (4.4): the leg an entry batch and a line exit batch send first, alone (core/SPEC.md 12.4, 12.7); the "
+                     "other leg follows by the first one's fills; both together: the way before (a Run before PRD 4.0).", None),
+        ("Pair Window", "pair_window: how long the other leg is chased after the thin leg's first fill; then the part not paired is "
+                        "unwound.", None),
+        ("Pair Stop", "pair_stop_d, spread bps: the ideally paired spread this much worse than at the decision ends the chase (entry) "
+                      "or closes the exit's other leg whatever its break-even (exit).", None),
+        ("Top-Up Max", "thin_topup_max: top-ups of the thin leg, while the spread goes on widening, keep its fills within this many "
+                       "times its planned quantity.", {"displayName": "Top" + NBHY + "Up" + NBSP + "Max"}),
+        ("Exit Pair Window", "exit_pair_window: how long an exit's other leg waits for its break-even bound before it closes whatever "
+                             "the price.", {"displayName": "Exit" + NBSP + "Window"}),
+    ], 0, y, 24, 3, intro="How much the Run may hold and how it executes a batch (process_run.config inventory and exec); — where it sends "
+                          "both legs together.", source=params,
+        title_size=12, value_size=16, columns=["Capital M Text", "Leverage L", "Notional N Text", "Thin Leg", "Pair Window", "Pair Stop",
+                                               "Top-Up Max", "Exit Pair Window"]))
     y += 3
     panels.append(xy("Cumulative Gross · USDT", [("A", Q_CUM_GROSS), ("Period", Q_PERIOD)], 0, y, 12, 8,
                      "The running Gross over the Range (both legs' fills, sells less buys), as the Summary counts it, stepping at each "
@@ -1477,11 +1729,13 @@ def build():
         ("Cost", "USDT: what the held contracts cost at entry, both legs (the notional held).",
          {"unit": "locale", "decimals": 0, "mappings": [NO_FIGURE], "displayName": "Cost · USDT"}),
         ("Held", "Time since the round trip opened.", None),
-        ("To Exit", "σ still to go to the exit line (a Long: Sell Both up to −d_out σ; a Short: Buy Both down to +d_out σ); 0 or less: at the "
-                    "line, the exit is being sent · –: a leg's depth is unusable (the program sends no exit then; a book conflict does not stop "
-                    "an exit).", {"unit": "suffix:σ", "decimals": 2, "mappings": [NO_FIGURE], "displayName": "To" + NBSP + "Exit"}),
+        ("To Exit", "σ still to go to the (first) exit line (a Long: Sell Both up to −entry_out σ; a Short: Buy Both down to +entry_out σ); "
+                    "0 or less: at the line · –: a leg's depth is unusable (the program sends no exit then; a book conflict does not stop "
+                    "an exit).", {"unit": "suffix:σ", "decimals": 2, "mappings": [NO_FIGURE], "displayName": "To" + NBSP + "Exit" + NBSP + "1"}),
+        ("To Exit 2", "The same to the second line (exit2), which closes the rest; – without it.",
+         {"unit": "suffix:σ", "decimals": 2, "mappings": [NO_FIGURE], "displayName": "To" + NBSP + "Exit" + NBSP + "2"}),
     ], 0, y, 24, 3, intro="The Run's newest second (a stopped Run's last), whatever the Range.",
-        columns=["Side", "Bull", "Bear", "Cost", "Held", "To Exit"], value_size=16, title_size=12)
+        columns=["Side", "Bull", "Bear", "Cost", "Held", "To Exit", "To Exit 2"], value_size=16, title_size=12)
     panels.append(position); y += 3
 
     # ------------------------------------------------------------------ Live Execution
@@ -1508,7 +1762,8 @@ def build():
         # Grafana fills between two series only where the one with fillBelowTo is above the other: a ▲'s peak fills down to
         # its base, a ▼'s base down to its peak. The two undone entries share one legend item (grey).
         looks = {"Long Entry": (GOOD, "Long Entry ▲", True), "Short Entry": (BAD, "Short Entry ▼", True),
-                 "Undone Long Entry": (GREY, "Undone Entry ▲▼", True), "Undone Short Entry": (GREY, "Undone Entry ▼", False)}
+                 "Failed Long Entry": (GREY, "Failed ▲▼", True), "Failed Short Entry": (GREY, "Failed ▼", False),
+                 "Unwound Long Entry": (UNWOUND, "Unwound ▲▼", True), "Unwound Short Entry": (UNWOUND, "Unwound ▼", False)}
         for name, _, up in TRIANGLES:
             color, label, legend = looks[name]
             peak_name, base_name = name + chart, "%s · Base%s" % (name, chart)
@@ -1534,16 +1789,31 @@ def build():
         return named(name, {"color": {"mode": "fixed", "fixedColor": GREY + "%02X" % round(255 * (0.35 + 0.13 * k))}, "custom.lineWidth": 1,
                             "custom.lineStyle": {"fill": "dash", "dash": [6, 4] if k == int(k) else [2, 3]}, "custom.hideFrom": hidden})
     trimmed_text = code_texts({ZERO: "0"}, {"0": TEXT})
+    zero1 = code_texts({ZERO: "0.0"}, {"0.0": TEXT})
+    zero2 = code_texts({ZERO: "0.00"}, {"0.00": TEXT})
     marker_tooltip = [tooltip_only("Execution", TEXT, code_texts({NO_SAMPLE: "–"}), {"unit": "time:MM-DD HH:mm:ss"}, shown="Execution ID"),
                       tooltip_only("Action", TEXT, action), tooltip_only("Decided", TEXT, props={"unit": "time:HH:mm:ss.SSS"}),
+                      tooltip_only("Batch End", TEXT, word_codes(BATCH_ENDS, {"Built": TEXT, "Built Partial": TEXT, "Unwound at a Profit": UNWOUND,
+                                                                             "Unwound at the Stop": UNWOUND, "One Leg, Trimmed Back": UNWOUND}), shown="Batch"),
+                      tooltip_only("Batch Why", TEXT, word_codes(BATCH_WHY, {w: TEXT for w in BATCH_WHY.values()}), shown="Batch Ended By"),
+                      tooltip_only("Exit Stage", TEXT, word_codes(EXIT_STAGES, {w: TEXT for w in EXIT_STAGES.values()}), shown="Exit Stage"),
+                      tooltip_only("Pre-Check", TEXT, word_codes(PRECHECKS, {"Passed": TEXT, "Failed · Exits Anyway": WARN}), shown="Exit Pre-Check"),
+                      tooltip_only("Thick Leg Close", TEXT, word_codes(THICK_CLOSES, {"Within Break-Even": TEXT, "Hard Close · Window": WARN,
+                                                                                     "Hard Close · Stop": WARN}), shown="${bull} Exit Closed"),
                       tooltip_only("Bull Filled", TEXT, qty_text, {"unit": "none", "decimals": 2}, shown="${bull} ct"),
                       tooltip_only("Bull Avg", TEXT, price_text, {"unit": "none", "decimals": TICK_DECIMALS["bull"]}, shown="${bull} Avg Price USDT"),
                       tooltip_only("Bear Filled", TEXT, qty_text, {"unit": "none", "decimals": 2}, shown="${bear} ct"),
                       tooltip_only("Bear Avg", TEXT, price_text, {"unit": "none", "decimals": TICK_DECIMALS["bear"]}, shown="${bear} Avg Price USDT"),
                       tooltip_only("Bull Trimmed", GREY, trimmed_text, {"unit": "none", "decimals": 2}, shown="${bull} Trimmed Back ct"),
                       tooltip_only("Bear Trimmed", GREY, trimmed_text, {"unit": "none", "decimals": 2}, shown="${bear} Trimmed Back ct"),
+                      tooltip_only("Bull Cap", TEXT, qty_text, {"unit": "none", "decimals": 3}, shown="${bull} Pair Cap P* USDT"),
+                      tooltip_only("Ideal Spread", TEXT, zero1, {"unit": "none", "decimals": 1}, shown="Ideal Paired Spread bps"),
+                      tooltip_only("Paired In", TEXT, zero2, {"unit": "none", "decimals": 2}, shown="Pairing Took s"),
                       tooltip_only("Notional", TEXT, qty_text, {"unit": "locale", "decimals": 0}, shown="Notional USDT"),
                       tooltip_only("Fees", TEXT, money_text, {"unit": "none", "decimals": 2}, shown="Fees Paid USDT"),
+                      tooltip_only("Expected Net", TEXT, money_text, {"unit": "none", "decimals": 2}, shown="Expected Round Net USDT"),
+                      tooltip_only("Actual Net", TEXT, money_text, {"unit": "none", "decimals": 2}, shown="Round Net After USDT"),
+                      tooltip_only("Execution Cost", TEXT, money_text, {"unit": "none", "decimals": 2}, shown="Execution vs Expected USDT"),
                       tooltip_only("Cycle Net", TEXT, money_text, {"unit": "none", "decimals": 2}, shown="Round Trip PnL USDT")]
     common_tips = [tooltip_only("Sigma · Tooltip", LIGHT_GREY, no_value1, {"decimals": 1}, shown="Volatility (σ) bps"),
                    tooltip_only("Entry", TEXT, entry_text)]
@@ -1553,8 +1823,8 @@ def build():
                     [series("Real Long Spread", BLUE, width=1.5, tooltip=False), series("Real Short Spread", ORANGE, width=1.5, tooltip=False),
                      at_entry("Real Long at Entry", BLUE), at_entry("Real Short at Entry", ORANGE),
                      series("Mean", TEXT, width=1, tooltip=False),
-                     line("Long In", shown_as="Long In / Out"), line("Long Out", legend=False), line("Short In", shown_as="Short In / Out"),
-                     line("Short Out", legend=False)] + decision_marks("") +
+                     line("Long In", shown_as="Long In / Out"), line("Long Out", legend=False), line("Long Out 2", legend=False),
+                     line("Short In", shown_as="Short In / Out"), line("Short Out", legend=False), line("Short Out 2", legend=False)] + decision_marks("") +
                     [tooltip_only("Real Long Spread · Tooltip", BLUE, no_value1, {"decimals": 1}, shown="Real Long Spread bps"),
                      tooltip_only("Real Short Spread · Tooltip", ORANGE, no_value1, {"decimals": 1}, shown="Real Short Spread bps"),
                      tooltip_only("Mean · Tooltip", TEXT, no_value1, {"decimals": 1}, shown="Mean bps")] + common_tips + marker_tooltip +
@@ -1570,22 +1840,29 @@ def build():
                   "conflicts or its depth is unusable, owner item 70); a gap: no sample (process down), or a new session or run; shaded: "
                   "each round trip from entry to exit (blue Long, orange Short; its mark under the chart: times, end reason, PnL); purple "
                   "marks: a change of the anchors in use, with reason and both legs' anchors before → after (owner item 62).")
-    marker_note = ("Markers (owner items 81, 84): a long entry a green triangle ▲, a short entry a red triangle ▼; an entry undone (its "
-                   "lot voided: one leg filled and was trimmed back) a grey triangle; an exit a circle in the colour of the position it "
+    marker_note = ("Markers (owner items 81, 84; 4.4): a long entry a green triangle ▲, a short entry a red triangle ▼; a failed entry "
+                   "(the thin leg filled nothing; with both legs together no fill) a grey triangle; an unwound entry (a leg filled and "
+                   "was closed back: at a profit or at the stop) an amber triangle; an exit a circle in the colour of the position it "
                    "closes (closing a Long green, closing a Short red; a forced exit too, its tooltip says Forced); at the decision's "
                    "executable spread. Hover one for its Execution ID (the round trip's opening, UTC+8, owner item 83: every marker of "
                    "one round trip has the same, as its row in Round Trips), the action, each leg's filled contracts and average price, "
-                   "what was trimmed back, the notional, the fees paid (a cost, positive) and the round trip's PnL. A marker counts its "
-                   "whole step: its orders and the completions, trims and exits of the remaining leg sent for it, so an exit whose legs "
-                   "were closed by separate orders shows both; a leg it sent no order on shows —.")
+                   "what was trimmed back or unwound, the notional, the fees paid (a cost, positive) and the round trip's PnL. A marker "
+                   "counts its whole step: an entry every order of its batch (with the thin leg first the thin order, its top-ups, the "
+                   "other leg's pairing orders and the unwinds), an exit its orders and those of its other leg, so an exit whose legs "
+                   "were closed by separate orders shows both; a leg it sent no order on shows —. With the thin leg first an entry also "
+                   "shows how its batch ended and why, the other leg's pair cap P*, the ideally paired spread and how long the pairing "
+                   "took; an exit its stage (Exit 1 the half, Exit 2 the rest), its pre-check (failed: it exits below break-even all "
+                   "the same, a loss accepted), how its other leg closed (within break-even, or a hard close at the window or the "
+                   "spread stop) and the round's net expected at the decision against the net after the batch: their difference is "
+                   "what the execution cost.")
     spread = timeseries("Spread · bps", Q_EXECUTION, 0, y, 24, 13, spread_lines, decimals=0, calcs=(), description=bullets(
         "After Combo Spread's Spread chart (owner item 81), in spread bps: 10⁴ × (F × (P_bull ÷ A_bull + P_bear ÷ A_bear) − 2), the "
         "two legs' deviations added (1 bps of spread is 0.5 bps of the two legs' notional), on the time picker's axis.",
-        [("Real Long Spread", "buying both legs at their pricing levels (blue): a Long enters when it falls to Mean − d_in σ (blue dashed), "
-                              "a Short exits when it falls to Mean + d_out σ (orange dotted); thick where it is at or past its entry line "
+        [("Real Long Spread", "buying both legs at their pricing levels (blue): a Long enters when it falls to Mean − entry_in σ (blue dashed), "
+                              "a Short exits when it falls to Mean + entry_out σ (orange dotted); thick where it is at or past its entry line "
                               "(owner item 84)."),
-         ("Real Short Spread", "selling both (orange): a Short enters when it rises to Mean + d_in σ (orange dashed), a Long exits when it "
-                               "rises to Mean − d_out σ (blue dotted); thick at or past its entry line."),
+         ("Real Short Spread", "selling both (orange): a Short enters when it rises to Mean + entry_in σ (orange dashed), a Long exits when it "
+                               "rises to Mean − entry_out σ (blue dotted); thick at or past its entry line."),
          ("Mean", "the program's mean of the spread on the mids."),
          ("Volatility lines", "Mean ± 0.5, 1, 1.5, 2, 2.5 and 3 σ, grey, whole multiples dashed and halves dotted, stronger further out, "
                               "as Combo Spread draws them (owner item 84); the Run's entry and exit lines in colour over them."),
@@ -1600,7 +1877,8 @@ def build():
                  [series("Real Long Deviation", BLUE, width=1.5, tooltip=False), series("Real Short Deviation", ORANGE, width=1.5, tooltip=False),
                   at_entry("Real Long Deviation at Entry", BLUE), at_entry("Real Short Deviation at Entry", ORANGE),
                   line("Long In · Dev", shown_as="Long In / Out"), line("Long Out · Dev", legend=False),
-                  line("Short In · Dev", shown_as="Short In / Out"), line("Short Out · Dev", legend=False)] + decision_marks(" · Dev") +
+                  line("Long Out 2 · Dev", legend=False), line("Short In · Dev", shown_as="Short In / Out"), line("Short Out · Dev", legend=False),
+                  line("Short Out 2 · Dev", legend=False)] + decision_marks(" · Dev") +
                  [tooltip_only("Real Long Deviation · Tooltip", BLUE, no_value1, {"decimals": 1}, shown="Real Long Deviation bps"),
                   tooltip_only("Real Short Deviation · Tooltip", ORANGE, no_value1, {"decimals": 1}, shown="Real Short Deviation bps")] +
                  common_tips + marker_tooltip + [tooltip_only("At Deviation", PURPLE, at_text, {"decimals": 1}, shown="At Deviation bps")])
@@ -1612,8 +1890,8 @@ def build():
                            description=bullets(
         "After Combo Spread's Deviation chart (owner item 81): the Spread chart with its Mean at zero, in spread bps; no line on the "
         "mids (owner item 84).",
-        [("Real Long Deviation, Real Short Deviation", "the real spreads − Mean (blue, orange): a Long enters when blue falls to −d_in σ "
-                                                       "(blue dashed) and exits when orange rises to −d_out σ (blue dotted); a Short the "
+        [("Real Long Deviation, Real Short Deviation", "the real spreads − Mean (blue, orange): a Long enters when blue falls to −entry_in σ "
+                                                       "(blue dashed) and exits when orange rises to −entry_out σ (blue dotted); a Short the "
                                                        "mirror (orange lines); thick at or past the entry line."),
          ("Volatility lines", "± 0.5, 1, 1.5, 2, 2.5 and 3 σ, grey, as on the Spread chart."),
          ("Markers", marker_note.replace("executable spread", "executable deviation")),
@@ -1638,7 +1916,8 @@ def build():
          ("Notional", "both legs' entry value, USDT (a One Leg round trip: that leg's)."),
          ("In σ", "the executable deviation at its entries, weighted by their value."), ("Out σ", "at the exit decision (– for a forced exit or none)."),
          ("Net", "Gross − Fees + Funding, USDT; Open while open, Pending (amber) while a funding settlement it held through has no record."),
-         ("Net bps", "Net ÷ Notional × 10⁴ (bps of the notional, not of the spread)."), ("End Reason", "why it closed.")]), overrides=[
+         ("Net bps", "Net ÷ Notional × 10⁴ (bps of the notional, not of the spread)."),
+         ("End Reason", "why it closed; Nothing Paired (4.4): the thin leg first and every batch unwound (the program's one_leg).")]), overrides=[
         col("cycle_id", custom_hidden=True),
         col("Opened", 116, displayName="Execution ID", unit="time:MM-DD HH:mm:ss", links=[{"title": "Show this round trip's orders", "url": link, "targetBlank": False}]),
         col("Closed", 80, unit="time:HH:mm:ss"), col("Held", 68),
@@ -1652,20 +1931,41 @@ def build():
 
     def num(d):
         return dict(custom_align="right", unit="none", decimals=d, mappings=[NO_FIGURE])
+    panels.append(table("Batches · ct, USDT and s", Q_BATCH_ROWS, 0, y, 24, 6, description=bullets(
+        "The entry batches of the picked round trip, in their order (4.4, core/SPEC.md 12.4: with the thin leg first one batch sends the "
+        "thin leg alone, pairs it with the other leg, and ends in one of five states).",
+        [("End", "Built, Built Partial (part paired, the rest of the thin leg unwound or closed at a profit), Unwound at a Profit or at "
+                 "the Stop (nothing paired), Entry Failed (the thin leg filled nothing), Pairing Now; with both legs together Built, "
+                 "Unwound: One Leg Trimmed Back, No Fill."),
+         ("Why", "what ended the pairing: Pair Window Over, Ideal Spread Stop, Too Small to Pair, Thin Leg Closed at a Profit, Program "
+                 "Stopping, Forced Exit; empty when the other leg paired it all."),
+         ("$bull ct, $bear ct", "the contracts the batch opened on each leg (the thin order, its top-ups, the other leg's pairing orders)."),
+         ("Back ct", "what was closed back (unwinds and profit closes of the thin leg's unpaired part; with both legs together trims)."),
+         ("Pairing s", "from the thin leg's first fill to the end of the pairing, seconds."),
+         ("Net USDT", "the batch's own net (its lot's): of an unwound batch what the unwind or profit close made; Open while it holds a "
+                      "position (its exits are the round trip's).")]), overrides=[
+        col("Batch", 68), col("Opened", 96, unit="time:HH:mm:ss.SSS"), col("End", 140), col("Why", custom_minWidth=156),
+        col("Bull", 68, displayName="${bull} ct", **num(2)), col("Bear", 68, displayName="${bear} ct", **num(2)), col("Back", 64, displayName="Back ct", **num(2)),
+        col("Pairing", 64, displayName="Pairing s", **num(2)), col("Net", custom_minWidth=84, displayName="Net USDT", **dict(money_col, mappings=[NO_FIGURE, PENDING_TEXT]))]))
+    y += 6
     panels.append(table("Orders · ct, USDT and ms", Q_ORDERS, 0, y, 24, 7, description=bullets(
         "Every order of the picked round trip (the Range's newest by default), in the order the program sent them, its fills folded in.",
-        [("Purpose", "Entry, Complete (the leg that filled less), Trim (the leg that filled more), Exit, Forced."),
+        [("Step", "what the order was for, from the decision that sent it (4.4; it replaces 4.3's Purpose column, which stays in the "
+                  "panel's data): Batch n · Thin Leg or Top-Up (purpose entry), Pair (complete: the other leg pairing the thin leg's "
+                  "fills), Unwind or Profit Close (trim: the thin leg's unpaired part closed back), n the entry batch of the round "
+                  "trip; Exit 1 · Thin, Exit 1 · Thick, Exit 2 · Hard Close (the thick leg closed whatever its break-even); with both "
+                  "legs together Batch n · Entry, Complete (the leg that filled less), Trim (the leg that filled more), Exit, Forced."),
          ("Side", "Buy or Sell; RO: a reduce-only order."), ("Qty, Filled", "contracts ordered and filled."),
          ("Limit, Avg", "the limit and the fills' average price, USDT, to the leg's tick."),
          ("Fee", "USDT paid, a cost shown as a positive amount (as in Summary); Pending while the venue has not reported it."),
          ("Latency", "sent → final state in hand, ms, this host's clock (paper: the configured simulation)."),
          ("Status", "Filled, Partial, No Fill (an IOC that met nothing), Rejected (with the venue's code), Working, Unknown (being queried).")]),
         overrides=[
-        col("Time", 100, unit="time:HH:mm:ss.SSS"), col("Purpose", 72), col("Leg", 56), col("Side", 64), col("Qty", 64, displayName="Qty ct", **num(2)),
-        col("Filled", 64, displayName="Filled ct", **num(2)), col("Limit", 80, displayName="Limit USDT", custom_align="right"),
-        col("Avg", 80, displayName="Avg USDT", custom_align="right"),
-        col("Fee", 84, displayName="Fee USDT", custom_align="right", unit="none", decimals=5, mappings=[NO_FIGURE, PENDING_TEXT]), col("Latency", 64, displayName="Latency ms", **num(0)),
-        col("Status", custom_minWidth=110, custom_cellOptions={"type": "color-text"},
+        col("Time", 96, unit="time:HH:mm:ss.SSS"), col("Purpose", custom_hidden=True), col("Step", 148), col("Leg", 52), col("Side", 64),
+        col("Qty", 56, displayName="Qty ct", **num(2)), col("Filled", 56, displayName="Filled ct", **num(2)),
+        col("Limit", 72, displayName="Limit USDT", custom_align="right"), col("Avg", 72, displayName="Avg USDT", custom_align="right"),
+        col("Fee", 76, displayName="Fee USDT", custom_align="right", unit="none", decimals=5, mappings=[NO_FIGURE, PENDING_TEXT]), col("Latency", 64, displayName="Latency ms", **num(0)),
+        col("Status", custom_minWidth=100, custom_cellOptions={"type": "color-text"},
             mappings=regex_colors([("Rejected", BAD), ("Unknown", WARN), ("Partial", WARN), ("No Fill", GREY)]))])); y += 7
 
     # ------------------------------------------------------------------ Inventory
@@ -1737,7 +2037,15 @@ def build():
             "Why the Run's round trips of the Range that closed ended (no-fill ones included).",
             [("Cycles", "how many."), ("Net", "their net, USDT (Pending ones out of it)."), ("Pending", "those whose funding is not known yet.")]),
             overrides=[col("End Reason", None), col("Cycles", 64, custom_align="right"), col("Net", 92, displayName="Net USDT", **money_col), col("Pending", 72, custom_align="right")]),
-        table("Order Latency by Stage · ms", Q_LATENCY, 0, sy + 8, 24, 6, description=bullets(
+        table("Batch Ends · USDT and s", Q_BATCHES, 14, sy + 8, 10, 6, description=bullets(
+            "How the Run's entry batches opened in the Range ended (4.4, core/SPEC.md 12.4; one batch is one lot).",
+            [("Batch End", "Built, Built Partial, Unwound at a Profit or at the Stop, Entry Failed (the thin leg filled nothing); a Run "
+                           "trading both legs together: Built, Unwound (a leg filled and was trimmed back), No Fill."),
+             ("Net", "the lots' own net, USDT: of a void lot what its unwind or profit close made; an open lot's is not in it."),
+             ("Pairing s", "the median time from the thin leg's first fill to the end of the pairing, seconds (thin leg first only).")]),
+            overrides=[col("Batch End", None), col("Batches", 64, custom_align="right"), col("Net", 92, displayName="Net USDT", **money_col),
+                       col("Pairing s", 72, **num(2))]),
+        table("Order Latency by Stage · ms", Q_LATENCY, 0, sy + 8, 14, 6, description=bullets(
             "Each stage over the Run's orders submitted in the Range; paper: the configured simulated latency, not a measurement.",
             [("Clock", "local: this host's clock; venue: Bitget's."), ("Orders", "orders measured."),
              ("Median, P90, Max", "the median, 90th percentile and largest, ms.")]), overrides=[

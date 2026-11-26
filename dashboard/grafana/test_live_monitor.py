@@ -52,6 +52,11 @@ def enclosing_rest(q, i):
     return q[i:]
 
 
+def entry_in(cfg):
+    """The Run's entry line: strategy.entry_in, d_in before PRD 4.0 (core/SPEC.md 12.8)."""
+    return cfg["strategy"].get("entry_in", cfg["strategy"].get("d_in"))
+
+
 def utc8(ms):
     """A Unix millisecond time as a naive UTC+8 datetime."""
     return datetime.fromtimestamp((ms + 8 * 3600000) / 1000, timezone.utc).replace(tzinfo=None)
@@ -175,7 +180,7 @@ class Shape(unittest.TestCase):
                 if re.match(pattern, word):
                     return c
         state = {c: s for c, s, _ in board.IDLE}
-        want = {"Ready": board.WELL, "Blocked": board.GREY, "Held Back": board.WARN, "Needs a Person": board.BAD}
+        want = {"Ready": board.WELL, "Blocked": board.GREY, "Pairing": board.WARN, "Held Back": board.WARN, "Needs a Person": board.BAD}
         for code, word in board.ENTRY_WORDS.items():
             w = word.replace("$bull", "SOXL").replace("$bear", "SOXS")
             self.assertEqual(colour(w), want[state[code]], "%s: %s" % (code, w))
@@ -233,7 +238,12 @@ class Shape(unittest.TestCase):
             # no line on the mids on Deviation.
             self.assertEqual((props["Long Exit" + chart]["custom.drawStyle"], props["Long Exit" + chart]["color"]["fixedColor"]), ("points", board.GOOD))
             self.assertEqual((props["Short Exit" + chart]["custom.drawStyle"], props["Short Exit" + chart]["color"]["fixedColor"]), ("points", board.BAD))
-            self.assertTrue(props["Undone Long Entry" + chart]["color"]["fixedColor"].startswith(board.GREY))
+            # 4.4: a failed entry (the thin leg filled nothing) the grey triangle, an unwound one amber; the second exit line drawn
+            self.assertTrue(props["Failed Long Entry" + chart]["color"]["fixedColor"].startswith(board.GREY))
+            self.assertEqual(props["Unwound Long Entry" + chart]["color"]["fixedColor"], board.UNWOUND)
+            self.assertEqual(props["Unwound Long Entry" + chart]["custom.fillBelowTo"], "Unwound Long Entry · Base" + chart)
+            self.assertNotEqual(board.UNWOUND, board.GREY)
+            self.assertIn("Long Out 2" + chart, names)
             self.assertNotIn("Deviation", names)
             self.assertNotIn("Other" + chart, names)
             sig = [n for n in names if n.endswith("σ")]
@@ -245,7 +255,7 @@ class Shape(unittest.TestCase):
             for n in at:
                 self.assertEqual(props[n]["custom.lineWidth"], 4)
             in_legend = [n for n in p["transformations"][1]["options"]["indexByName"] if n != "time" and not (props.get(n, {}).get("custom.hideFrom", {}) or {}).get("legend")]
-            self.assertLessEqual(len(in_legend), 10, (p["title"], in_legend))
+            self.assertLessEqual(len(in_legend), 11, (p["title"], in_legend))
         self.assertEqual(set(n for n, _ in board.ALL_COLUMNS) - kept, set())
 
     def test_no_spread_unit_d(self):
@@ -353,9 +363,21 @@ class Queries(unittest.TestCase):
             sigma = sigma[0]["sigma_d"] if sigma else None
             num = lambda x: format(Decimal(str(x)).normalize(), "f").replace("-", "−")
             bps = lambda d: ("{:,.1f}".format(Decimal(str(d)) * Decimal(str(sigma))) + board.NBSP + "bps").replace("-", "−") if sigma is not None else "–" + board.NBSP + "bps"
+            # PRD 4.0 renamed d_in / d_out to entry_in / entry_out: a Run before it keeps the old keys and shows the same
+            d_in, d_out, x2 = s_.get("entry_in", s_.get("d_in")), s_.get("entry_out", s_.get("d_out")), s_.get("exit2")
             if psql_json("SELECT stopped_ms FROM trade.process_run WHERE run_id = '%s'" % run)[0]["stopped_ms"]:   # a running Run's σ moves
-                self.assertEqual(par["Entry"], "%sσ · %s" % (num(s_["d_in"]), bps(s_["d_in"])), run)
-                self.assertEqual(par["Exit"], "%sσ · %s" % (num(s_["d_out"]), bps(s_["d_out"])), run)
+                self.assertEqual(par["Entry"], "%sσ · %s" % (num(d_in), bps(d_in)), run)
+                self.assertEqual(par["Exit 1"], "%sσ · %s" % (num(d_out), bps(d_out)), run)
+                self.assertEqual(par["Exit 2"], "%sσ · %s" % (num(x2), bps(x2)) if x2 is not None else "none", run)
+            ex = cfg.get("exec", {})
+            pair = {k: par[k] for k in ("Thin Leg", "Pair Window", "Pair Stop", "Top-Up Max", "Exit Pair Window")}
+            if ex.get("thin_leg"):
+                self.assertEqual(pair["Thin Leg"], cfg["cex"]["pair"][ex["thin_leg"]]["ticker"] + board.NBSP + "first", run)
+                self.assertEqual((pair["Pair Window"], pair["Exit Pair Window"]), (ex["pair_window"], ex["exit_pair_window"]), run)
+                self.assertEqual(pair["Pair Stop"], num(ex["pair_stop_d"]) + board.NBSP + "bps", run)
+                self.assertEqual(pair["Top-Up Max"], num(ex["thin_topup_max"]) + board.NBSP + "×", run)
+            else:
+                self.assertEqual(list(pair.values()), ["both" + board.NBSP + "together", "—", "—", "—", "—"], run)
             self.assertEqual((par["Mean Model"], par["Volatility Scale"]), ("%s · %s%smin" % (s_["mean_model"].upper(), s_["mean_minutes"], board.NBSP),
                                                                             "%s%smin" % (s_["sigma_minutes"], board.NBSP)), run)
             self.assertEqual((par["Capital M"], par["Leverage L"], par["Notional N"]), (m, lev, m * lev), run)
@@ -404,7 +426,7 @@ class Queries(unittest.TestCase):
                 rl = fmt(float(s["mu_d"]) + float(s["x_long_d"])) if s["x_long_d"] is not None else "–"
                 rs = fmt(float(s["mu_d"]) + float(s["x_short_d"])) if s["x_short_d"] is not None else "–"
                 if ok:   # owner item 84: the side at or past its entry line marked (and lit by the tile's mapping)
-                    d_in_, sig_ = float(cfg["strategy"]["d_in"]), float(s["sigma_d"])
+                    d_in_, sig_ = float(entry_in(cfg)), float(s["sigma_d"])
                     hit_l = s["x_long_d"] is not None and float(s["x_long_d"]) / sig_ <= -d_in_
                     hit_s = s["x_short_d"] is not None and float(s["x_short_d"]) / sig_ >= d_in_
                     self.assertEqual(m["Real Long"], rl + (" · Entry" if hit_l else ""))
@@ -419,7 +441,7 @@ class Queries(unittest.TestCase):
                 self.assertAlmostEqual(float(m["Bull Price"]), float(s["mid_bull"]), delta=0.0005)
             self.assertEqual(m["Anchor"], {"nav": "NAV", "bell": "Bell"}.get(s["anchor_kind"], "Missing"))
             cfg = rid["config"] if isinstance(rid["config"], dict) else json.loads(rid["config"])
-            d_in, sig = float(cfg["strategy"]["d_in"]), float(s["sigma_d"] or 0)
+            d_in, sig = float(entry_in(cfg)), float(s["sigma_d"] or 0)
             ok = s["depth_ok_bull"] and s["depth_ok_bear"] and not (s["conflict_bull"] or s["conflict_bear"])
             want = ("No Anchor" if s["anchor_kind"] is None else "No Mean" if not s["stats_ready"] or not sig else "No Book" if not ok
                     else "Long" if s["x_long_d"] is not None and float(s["x_long_d"]) / sig <= -d_in
@@ -567,7 +589,7 @@ class Queries(unittest.TestCase):
         md = lambda ms: utc8(ms).strftime("%m-%d %H:%M:%S").replace("-", board.NBHY).replace(" ", board.NBSP)
         words = {c: w.replace("Bull ", "SOXL ").replace("Bear ", "SOXS ") for c, _, w in board.IDLE}
         cfg = r["config"] if isinstance(r["config"], dict) else json.loads(r["config"])
-        d_in = float(cfg["strategy"]["d_in"])
+        d_in = float(entry_in(cfg))
         samples = psql_json("SELECT ts_ms, idle_reason, stats_ready, x_long_d, x_short_d, sigma_d FROM trade.signal_sample WHERE run_id = '%s' AND live = %s "
                             "ORDER BY ts_ms" % (run, r["live"]))
         out, eps, prev = [], [], None
@@ -600,10 +622,13 @@ class Queries(unittest.TestCase):
         what = {"one_leg": "One Leg Only", "stop": "Stopped While Holding", "session_changed": "Session Ended While Holding", "store_error": "Not Recorded"}
         for c in cycles:
             dust = c["dust_bull"] != 0 or c["dust_bear"] != 0
+            # 4.4: a thin-leg-first round trip on one leg paired nothing (every batch unwound): a warning, Nothing Paired
+            thin = bool(psql_json("SELECT 1 AS x FROM trade.lot l WHERE l.live = %s AND l.cycle_id = '%s' AND to_jsonb(l) ->> 'end_state' IS NOT NULL"
+                                  % (r["live"], c["cycle_id"])))
             if c["end_reason"] in what or c["end_reason"] == "dust_only" or dust:
-                out.append((c["closed_ms"] or c["opened_ms"], "serious" if c["end_reason"] == "one_leg" else "warning",
+                out.append((c["closed_ms"] or c["opened_ms"], "serious" if c["end_reason"] == "one_leg" and not thin else "warning",
                             "Recorded" if c["end_reason"] == "dust_only" or dust else "Recovered", "Execution " + md(c["opened_ms"]),
-                            what.get(c["end_reason"], "Dust Left"), None))
+                            "Nothing Paired" if c["end_reason"] == "one_leg" and thin else what.get(c["end_reason"], "Dust Left"), None))
             if isinstance(c["funding_awaited"], list) and c["funding_awaited"]:
                 out.append((c["closed_ms"], "warning", "In Progress" if running else "Open", "Execution " + md(c["opened_ms"]), "Funding Awaited", None))
         by_id = {c["cycle_id"]: c for c in psql_json("SELECT * FROM trade.cycle WHERE live = %s" % r["live"])}
@@ -611,6 +636,14 @@ class Queries(unittest.TestCase):
             c = by_id.get(d["cycle_id"])
             out.append((d["ts_ms"], "serious", "In Progress" if c and c["status"] == "open" and running else "Recovered",
                         "Execution " + (md(c["opened_ms"]) if c else "–"), "Forced Exit", None))
+        # 4.4: a batch's unwind of its unpaired thin leg and an exit's hard close of its thick leg (risk exits), an exit below
+        # break-even (its pre-check failed, D1)
+        for d in psql_json("SELECT * FROM trade.decision WHERE run_id = '%s' AND live = %s AND (kind IN ('pair', 'exit_pair') AND detail ->> 'action' = 'risk_exit' "
+                           "OR kind = 'exit' AND reason = 'd1_loss')" % (run, r["live"])):
+            c = by_id.get(d["cycle_id"])
+            w = {"pair": "Thin Leg Unwound", "exit_pair": "Exit Hard Close", "exit": "Exit Below Break-Even"}[d["kind"]]
+            out.append((d["ts_ms"], "warning", "In Progress" if c and c["status"] == "open" and running else "Recovered",
+                        "Execution " + (md(c["opened_ms"]) if c else "–"), w, None))
         for o in orders:
             if o["unknown"] or o["not_found"] or o["status"] in ("rejected", "not_sent", "never_arrived"):
                 w = ("Order Outcome Unknown" if o["unknown"] else "Order Not Found" if o["not_found"] else "Order Rejected" if o["status"] == "rejected"
@@ -744,7 +777,7 @@ class Queries(unittest.TestCase):
         # what was trimmed back (15:00:18.990: SOXL 15.58 filled, SOXS no fill, SOXL 15.58 trimmed back).
         self.assertNotIn(1795677420195, marks)
         undone = marks[1795676418990]
-        self.assertEqual(board.ACTIONS[undone["Action"]], "Undone Short Entry")
+        self.assertEqual(board.ACTIONS[undone["Action"]], "Unwound Short Entry")   # 4.4: 4.3's undone entry is an unwound one
         self.assertEqual((undone["Bull Filled"], undone["Bear Filled"], undone["Bear Avg"], undone["Bull Trimmed"]),
                          (Decimal("15.58"), board.ZERO, board.NO_FILL, Decimal("15.58")))
         for decided, r in marks.items():
@@ -818,6 +851,95 @@ class Queries(unittest.TestCase):
         self.assertTrue(apex)
         self.assertLess(float(apex[0]["Short Entry"]), float(d["ys"]))          # the apex below the decision's place: pointing down
         self.assertGreater(float(apex[0]["Short Entry · Base"]), float(d["ys"]))
+
+    def test_thin_leg_first(self):
+        """4.4 (core/SPEC.md 12, step 10.9) on every Run whose config sends the thin leg first (none in production before the
+        program trades that way: the dev database's synthetic Run, v44/scripts/synth.py): each entry's marker is its lot's end state
+        (built and built partial an entry, entry failed the grey triangle, unwound the amber one) and counts every order of its lot,
+        trims apart (the thick leg's pairing orders are purpose complete, the unwinds and profit closes trim); each exit's marker
+        counts its thin order and its thick leg's exit_pair orders up to the next exit, with its stage, pre-check, expected net and
+        net after the batch; Round Trips counts the batches, Orders names every order's step, Batch Ends counts the lots."""
+        runs = [r["run_id"] for r in psql_json("SELECT run_id FROM trade.process_run WHERE coalesce(config #>> '{exec,thin_leg}', '') <> ''")]
+        if not runs:
+            self.skipTest("no Run with the thin leg first in this database")
+        ends = list(board.BATCH_ENDS)
+        for run in runs:
+            r = psql_json("SELECT started_ms, stopped_ms FROM trade.process_run WHERE run_id = '%s'" % run)[0]
+            v = dict(self.values(1, run), __from=r["started_ms"], __to=r["stopped_ms"] or int(time.time() * 1000))
+            marks = {}
+            for row in psql_json(fill(board.Q_EXECUTION, v)):
+                if row["Action"]:
+                    marks.setdefault(row["Decided"], row)
+            decisions = psql_json("SELECT d.ts_ms, d.kind, d.cycle_id, d.lot_id, d.direction, d.reason, d.detail, to_jsonb(l) ->> 'end_state' AS es, l.status, "
+                                  "(SELECT min(n.ts_ms) FROM trade.decision n WHERE n.live = d.live AND n.cycle_id = d.cycle_id AND n.kind IN ('exit', 'forced') "
+                                  "AND n.ts_ms > d.ts_ms) AS next_ms FROM trade.decision d LEFT JOIN trade.lot l ON l.live = d.live AND l.lot_id = d.lot_id "
+                                  "WHERE d.run_id = '%s' AND d.kind IN ('entry', 'exit')" % run)
+            if not decisions:   # a live Run that has not traded yet (production's first thin-leg-first Run while it warms up)
+                continue
+            seen = set()
+            for d in decisions:
+                m = marks[d["ts_ms"]]
+                detail = json.loads(d["detail"]) if isinstance(d["detail"], str) else d["detail"]
+                if d["kind"] == "entry":
+                    want = {"built": "Entry", "built_partial": "Entry", "entry_failed": "Failed Entry", "unwound_profit": "Unwound Entry",
+                            "unwound_stop": "Unwound Entry"}[d["es"]]
+                    self.assertEqual(board.ACTIONS[m["Action"]], want.replace("Entry", ("Long " if d["direction"] == "long" else "Short ") + "Entry"), d["ts_ms"])
+                    self.assertEqual(m["Batch End"], ends.index(d["es"]) + 1, d["ts_ms"])
+                    seen.add(d["es"])
+                    orders = psql_json("SELECT leg, purpose, cum_exec_qty AS q FROM trade.cex_order WHERE live AND lot_id = '%s'" % d["lot_id"])
+                else:
+                    orders = psql_json(
+                        "SELECT o.leg, o.purpose, o.cum_exec_qty AS q FROM trade.cex_order o WHERE o.live AND o.client_order_id IN ("
+                        "SELECT jsonb_array_elements_text(detail -> 'client_order_ids') FROM trade.decision WHERE run_id = '{r}' AND ts_ms = {t} AND kind = 'exit' "
+                        "UNION SELECT detail ->> 'client_order_id' FROM trade.decision WHERE run_id = '{r}' AND cycle_id = '{c}' AND kind = 'exit_pair' "
+                        "AND ts_ms >= {t} AND ts_ms < {n})".format(r=run, t=d["ts_ms"], c=d["cycle_id"], n=d["next_ms"] or 10 ** 14))
+                    self.assertEqual(m["Exit Stage"], list(board.EXIT_STAGES).index(detail["line"]) + 1, d["ts_ms"])
+                    self.assertEqual(m["Pre-Check"], 2 if detail["d1"] else 1, d["ts_ms"])
+                    self.assertEqual(m["Expected Net"] if m["Expected Net"] != board.ZERO else 0, round(Decimal(detail["expected_net"]), 2), d["ts_ms"])
+                    end = psql_json("SELECT detail ->> 'actual_net' AS a, reason FROM trade.decision WHERE run_id = '{r}' AND cycle_id = '{c}' AND kind = 'exit_pair' "
+                                    "AND detail ->> 'action' = 'done' AND ts_ms >= {t} AND ts_ms < {n}".format(r=run, t=d["ts_ms"], c=d["cycle_id"], n=d["next_ms"] or 10 ** 14))
+                    self.assertEqual(m["Actual Net"], round(Decimal(end[0]["a"]), 2), d["ts_ms"])
+                    self.assertEqual(m["Thick Leg Close"], list(board.THICK_CLOSES).index(end[0]["reason"] or "bound") + 1, d["ts_ms"])
+                for leg, col, trim in (("bull", "Bull Filled", "Bull Trimmed"), ("bear", "Bear Filled", "Bear Trimmed")):
+                    got = [o["q"] for o in orders if o["leg"] == leg and o["purpose"] != "trim"]
+                    shown_ = m[col]
+                    if not got:
+                        self.assertEqual(shown_, board.NOT_IN, (d["ts_ms"], leg))
+                    else:
+                        self.assertEqual(Decimal(0) if shown_ == board.ZERO else shown_, round(sum(got), 2), (d["ts_ms"], leg))
+                    self.assertEqual(m[trim], round(sum((o["q"] for o in orders if o["leg"] == leg and o["purpose"] == "trim"), Decimal(0)), 2), (d["ts_ms"], leg))
+            if run.endswith("-synthetic-thin"):   # the dev database's synthetic Run (v44/scripts/synth.py) has every kind of batch
+                self.assertLessEqual({"built", "built_partial", "entry_failed", "unwound_profit", "unwound_stop"}, seen)
+            # Round Trip Detail · Batches: each lot of each round trip in its order, its end in words, its legs' fills, what was closed
+            # back, its net; Round Trips says Nothing Paired for a round trip whose every batch unwound
+            for c in psql_json("SELECT cycle_id, end_reason FROM trade.cycle WHERE run_id = '%s'" % run):
+                rows = [b_ for b_ in psql_json(fill(board.Q_BATCH_ROWS, dict(v, cycle=c["cycle_id"])))]
+                lots = psql_json("SELECT l.seq, l.status, l.net, to_jsonb(l) ->> 'end_state' AS es, "
+                                 "(SELECT sum(cum_exec_qty) FROM trade.cex_order o WHERE o.live AND o.lot_id = l.lot_id AND o.purpose = 'trim') AS back "
+                                 "FROM trade.lot l WHERE l.live AND l.cycle_id = '%s' ORDER BY l.seq" % c["cycle_id"])
+                self.assertEqual([(b_["Batch"], b_["End"], b_["Back"], b_["Net"]) for b_ in rows],
+                                 [("Batch %d" % l["seq"], board.BATCH_WORDS[l["es"]], l["back"], l["net"]) for l in lots], c["cycle_id"])
+            trips = {t_["cycle_id"]: t_["End Reason"] for t_ in psql_json(fill(board.Q_BLOTTER, v)) if t_["cycle_id"]}
+            for c in psql_json("SELECT cycle_id FROM trade.cycle WHERE run_id = '%s' AND end_reason = 'one_leg'" % run):
+                self.assertEqual(trips[c["cycle_id"]], "Nothing Paired")
+            # Orders: every order's step; the thick leg's pairing orders Pair, the thin leg's closes Unwind / Profit Close, an exit's
+            # thick leg Thick or Hard Close
+            for c in psql_json("SELECT cycle_id FROM trade.cycle WHERE run_id = '%s'" % run):
+                for o in psql_json(fill(board.Q_ORDERS, dict(v, cycle=c["cycle_id"]))):
+                    step = o["Step"]
+                    self.assertTrue(step, o)
+                    if o["Purpose"] == "Complete":
+                        self.assertRegex(step, r"^Batch \d+ · Pair$")
+                    elif o["Purpose"] == "Trim":
+                        self.assertRegex(step, r"^Batch \d+ · (Unwind|Profit Close)$")
+                    elif o["Purpose"] == "Entry":
+                        self.assertRegex(step, r"^Batch \d+ · (Thin Leg|Top-Up)$")
+                    elif o["Purpose"] == "Exit":
+                        self.assertRegex(step, r"^Exit [12]? ?· (Thin|Thick|Hard Close)$".replace("Exit [12]? ?", "(Exit [12]|Exit) "))
+            # Batch Ends: one row per end state, the lots' count
+            got = {b["Batch End"]: b["Batches"] for b in psql_json(fill(board.Q_BATCHES, v))}
+            lots = psql_json("SELECT to_jsonb(l) ->> 'end_state' AS es, count(*) AS n FROM trade.lot l WHERE l.run_id = '%s' GROUP BY 1" % run)
+            self.assertEqual(got, {board.BATCH_WORDS[l["es"]]: l["n"] for l in lots})
 
     def test_no_entry_signal_on_an_unusable_book(self):
         """Owner item 70 (the auditor's review): a sample whose leg's book conflicts (or whose depth is unusable) gives no entry
