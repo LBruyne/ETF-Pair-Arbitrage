@@ -28,7 +28,7 @@ import (
 
 // rowTypes is one zero row of every table.
 var rowTypes = []Row{ProcessRunRow{}, MinuteBarRow{}, SignalSampleRow{}, AnchorFactRow{}, CycleRow{}, LotRow{}, OrderRow{},
-	FillRow{}, DecisionRow{}, FundingRow{}, FundingRateRow{}, InventorySampleRow{}, InventoryStateRow{}, EventRow{}}
+	FillRow{}, DecisionRow{}, FundingRow{}, FundingRateRow{}, InventorySampleRow{}, InventoryStateRow{}, EventRow{}, ExitStageRow{}}
 
 func dec(s string) decimal.Decimal { return decimal.RequireFromString(s) }
 
@@ -387,7 +387,7 @@ func asMap(t testing.TB, row any) map[string]any {
 }
 
 // Every row type fits its table: a zero row, with every `omitempty` and JSON
-// column NULL, is accepted by each of the 14 tables.
+// column NULL, is accepted by each of the 15 tables.
 func TestEveryTableTakesItsRow(t *testing.T) {
 	s, check := startStore(t, Config{}, testConfig(t), testTimings())
 	clearTables(t, check)
@@ -964,6 +964,61 @@ func TestLoadState(t *testing.T) {
 	}
 	if st, err = s.LoadState(ctx, session); err != nil || st.Cycle != nil || len(st.Lots) != 0 || len(st.Orders) != 0 || st.LastEntry == nil || st.LastEntry.LotID != "c-open-1" {
 		t.Errorf("after the close: cycle = %+v, lots %d, orders %d, last entry %+v, err %v", st.Cycle, len(st.Lots), len(st.Orders), st.LastEntry, err)
+	}
+}
+
+// The thin leg first (SPEC 12.4, 12.6): a lot's end state is written and
+// read back; the last entry for the spacing is the newest batch that sent a
+// thin order however it ended (a void lot with an end state counts, a void
+// lot without one does not); the unfinished cycle's half target H of exit1
+// is read back as last written, and another cycle's or mode's is not.
+func TestLoadStateThinLegFirst(t *testing.T) {
+	s, check := startStore(t, Config{Live: false}, testConfig(t), testTimings())
+	clearTables(t, check)
+	live, _ := startStore(t, Config{Live: true}, testConfig(t), testTimings())
+	ctx := context.Background()
+	cycle := CycleRow{CycleID: "c-thin", SessionID: "2026-11-25", Direction: "short", Status: "open", PairAnchorKind: "bell",
+		PairAnchorBull: dec("40"), PairAnchorBear: dec("60"), OpenedMs: 1000}
+	lot := func(id string, seq int, status, void, end string, openedMs int64) LotRow {
+		return LotRow{LotID: id, CycleID: "c-thin", Seq: seq, Status: status, VoidReason: void, EndState: end, Direction: "short", XD: float64(seq), OpenedMs: openedMs}
+	}
+	stage := ExitStageRow{CycleID: "c-thin", SetMs: 5000, BuiltLots: 1, TargetBull: dec("52.65"), TargetBear: dec("35.1"), ClosedBull: dec("0"), ClosedBear: dec("0")}
+	if err := s.WriteSync(cycle,
+		lot("c-thin-1", 1, "open", "", "built", 1000),
+		lot("c-thin-2", 2, "void", "entry_failed", "entry_failed", 2000),
+		lot("c-thin-3", 3, "void", "store_error", "", 3000),
+		stage,
+		ExitStageRow{CycleID: "c-other", SetMs: 1, BuiltLots: 9, TargetBull: dec("1"), TargetBear: dec("1"), ClosedBull: dec("0"), ClosedBear: dec("0")},
+	); err != nil {
+		t.Fatal(err)
+	}
+	// H is closed in two batches: the second write replaces the first.
+	stage.ClosedBull, stage.ClosedBear, stage.DoneMs = dec("52.65"), dec("35.1"), 6000
+	if err := s.WriteSync(stage); err != nil {
+		t.Fatal(err)
+	}
+	if err := live.WriteSync(ExitStageRow{CycleID: "c-thin", SetMs: 7, BuiltLots: 3, TargetBull: dec("2"), TargetBear: dec("2"), ClosedBull: dec("0"), ClosedBear: dec("0")}); err != nil {
+		t.Fatal(err)
+	}
+
+	st, err := s.LoadState(ctx, "2026-11-25")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(st.Lots) != 3 || st.Lots[0].EndState != "built" || st.Lots[1].EndState != "entry_failed" || st.Lots[1].VoidReason != "entry_failed" || st.Lots[2].EndState != "" {
+		t.Errorf("lots %+v, want the end states built, entry_failed and none", st.Lots)
+	}
+	if st.LastEntry == nil || st.LastEntry.LotID != "c-thin-2" {
+		t.Errorf("last entry %+v, want c-thin-2: the newest batch that sent a thin order, entry_failed included", st.LastEntry)
+	}
+	if e := st.ExitStage; e == nil || e.CycleID != "c-thin" || e.BuiltLots != 1 || !e.TargetBull.Equal(dec("52.65")) || !e.ClosedBear.Equal(dec("35.1")) || e.DoneMs != 6000 {
+		t.Errorf("exit stage %+v, want c-thin's as last written", st.ExitStage)
+	}
+	if lst, err := live.LoadState(ctx, "2026-11-25"); err != nil || lst.ExitStage != nil {
+		t.Errorf("live: exit stage %+v (err %v), want none: live has no unfinished cycle", lst.ExitStage, err)
+	}
+	if n := query1[int64](t, check, "SELECT count(*) FROM trade.lot WHERE end_state IS NULL AND lot_id = 'c-thin-3'"); n != 1 {
+		t.Errorf("a lot without an end state: %d rows with end_state NULL, want 1", n)
 	}
 }
 

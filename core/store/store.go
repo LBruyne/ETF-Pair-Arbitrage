@@ -590,9 +590,10 @@ func tablesOf(rows []statement) string {
 // LoadState reads what a restarted process continues from, of the store's
 // own mode: the unfinished cycle (status open or takeover, whatever its
 // session) with its lots and orders, the inventory state, the minute bars
-// and anchor facts of sessionID, the last lot that was built, and what the
-// ledger needs beside the cycle: the funding records booked and the
-// finished cycles whose funding is not known yet.
+// and anchor facts of sessionID, the last lot that was built (or, with the
+// thin leg first, that sent its thin order), the unfinished cycle's half
+// target of exit1, and what the ledger needs beside the cycle: the funding
+// records booked and the finished cycles whose funding is not known yet.
 // main calls it before any manager runs.
 func (s *Store) LoadState(ctx context.Context, sessionID string) (State, error) {
 	var st State
@@ -615,6 +616,13 @@ func (s *Store) LoadState(ctx context.Context, sessionID string) (State, error) 
 		if st.Orders, err = load[OrderRow](ctx, s.pool, "live = $1 AND cycle_id = $2 ORDER BY submitted_ms, client_order_id", live, st.Cycle.CycleID); err != nil {
 			return st, err
 		}
+		stages, err := load[ExitStageRow](ctx, s.pool, "live = $1 AND cycle_id = $2", live, st.Cycle.CycleID)
+		if err != nil {
+			return st, err
+		}
+		if len(stages) == 1 {
+			st.ExitStage = &stages[0]
+		}
 	}
 
 	// What the ledger carries between cycles.
@@ -634,8 +642,10 @@ func (s *Store) LoadState(ctx context.Context, sessionID string) (State, error) 
 		return st, err
 	}
 
-	// The last built lot, for the spacing of the next entry.
-	last, err := load[LotRow](ctx, s.pool, "live = $1 AND status IN ('open', 'closed') ORDER BY opened_ms DESC LIMIT 1", live)
+	// The last built lot, for the spacing of the next entry; with the thin
+	// leg first every batch that sent its thin order counts, however it ended
+	// (it has an end state).
+	last, err := load[LotRow](ctx, s.pool, "live = $1 AND (status IN ('open', 'closed') OR end_state IS NOT NULL) ORDER BY opened_ms DESC LIMIT 1", live)
 	if err != nil {
 		return st, err
 	}

@@ -114,6 +114,7 @@ var tables = map[string]tableSpec{
 	"inventory_sample": {kind: kindSample, key: []string{"ts_ms", "run_id"}},
 	"inventory_state":  {kind: kindState, key: []string{"live"}},
 	"event":            {kind: kindFact, key: []string{"run_id", "seq"}, seq: true},
+	"exit_stage":       {kind: kindState, key: []string{"live", "cycle_id"}},
 }
 
 // --- rows ---
@@ -226,6 +227,7 @@ type LotRow struct {
 	Seq            int             `json:"seq"`
 	Status         string          `json:"status"`
 	VoidReason     string          `json:"void_reason,omitempty"`
+	EndState       string          `json:"end_state,omitempty"` // a thin-leg-first batch's end state (SPEC 12.4); empty while building and for a batch whose legs went together
 	Direction      string          `json:"direction"`
 	XD             float64         `json:"x_d"`
 	MuD            float64         `json:"mu_d"`
@@ -400,6 +402,23 @@ type EventRow struct {
 
 func (EventRow) Table() string { return "event" }
 
+// ExitStageRow is the half target H of exit1 of one cycle (exit_stage,
+// written by exec; SPEC 12.6): set when the round was in profit at exit1,
+// closed towards by the exit1 batches, and void once a batch is built after
+// it (BuiltLots no longer matches).
+type ExitStageRow struct {
+	CycleID    string          `json:"cycle_id"`
+	SetMs      int64           `json:"set_ms"`
+	BuiltLots  int             `json:"built_lots"`
+	TargetBull decimal.Decimal `json:"target_bull"`
+	TargetBear decimal.Decimal `json:"target_bear"`
+	ClosedBull decimal.Decimal `json:"closed_bull"`
+	ClosedBear decimal.Decimal `json:"closed_bear"`
+	DoneMs     int64           `json:"done_ms,omitempty"`
+}
+
+func (ExitStageRow) Table() string { return "exit_stage" }
+
 // --- state read back at start ---
 
 // State is what LoadState returns: the rows a restarted process continues
@@ -411,7 +430,8 @@ type State struct {
 	Inventory   *InventoryStateRow // nil when it was never written
 	MinuteBars  []MinuteBarRow     // the given session's minutes, oldest first
 	AnchorFacts []AnchorFactRow    // the given session's anchor facts, in the order they were learned
-	LastEntry   *LotRow            // the most recently opened lot that was built (status open or closed); nil when there is none
+	LastEntry   *LotRow            // the most recently opened lot that was built (status open or closed), or that sent a thin order first however it ended (an end state is set); nil when there is none
+	ExitStage   *ExitStageRow      // the unfinished cycle's half target of exit1; nil when none was set
 
 	// What the ledger needs beyond the unfinished cycle.
 	Funding        []FundingRow // every funding record booked, oldest first: a record is booked once, by its record_id

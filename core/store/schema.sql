@@ -109,7 +109,7 @@ CREATE TABLE IF NOT EXISTS trade.cycle (
     session_id        TEXT NOT NULL,        -- the session it was opened in
     direction         TEXT NOT NULL,        -- long (both legs bought) or short
     status            TEXT NOT NULL,        -- open, closed or takeover
-    end_reason        TEXT,                 -- exit_line, close_window, stop, session_changed, no_fill, one_leg, dust_only (built, no exit order: what was built, after any trims, was left as dust only) or store_error (its row was not confirmed written, so it never traded); NULL while open
+    end_reason        TEXT,                 -- exit_line, close_window, stop, session_changed, no_fill (with the thin leg first also: its batches ended entry_failed), one_leg (also: unwound_profit or unwound_stop), dust_only (built, no exit order: what was built, after any trims, was left as dust only) or store_error (its row was not confirmed written, so it never traded); NULL while open
     pair_anchor_kind  TEXT NOT NULL,        -- the anchors that size all of its lots: their kind
     pair_anchor_bull  NUMERIC NOT NULL,     -- and their two values, USD per share
     pair_anchor_bear  NUMERIC NOT NULL,
@@ -135,7 +135,8 @@ CREATE TABLE IF NOT EXISTS trade.lot (
     cycle_id          TEXT NOT NULL,
     seq               INTEGER NOT NULL,     -- its order within the cycle
     status            TEXT NOT NULL,        -- building, open, closed or void
-    void_reason       TEXT,                 -- no_fill, one_leg or store_error (its row was not confirmed written, so its orders were never sent); NULL unless void
+    -- end_state (a thin-leg-first batch's end) is added at the end of this file
+    void_reason       TEXT,                 -- no_fill, one_leg or store_error (its row was not confirmed written, so its orders were never sent); with the thin leg first entry_failed, unwound_profit or unwound_stop (its end state); NULL unless void
     direction         TEXT NOT NULL,
     x_d               DOUBLE PRECISION,     -- executable deviation at the decision, in spread units
     mu_d              DOUBLE PRECISION,     -- the mean at the decision
@@ -229,7 +230,7 @@ CREATE TABLE IF NOT EXISTS trade.decision (
     ts_ms      BIGINT NOT NULL,
     cycle_id   TEXT,
     lot_id     TEXT,
-    kind       TEXT NOT NULL,               -- entry, exit, complete, trim, forced or at_line_blocked; paper_match: a paper order as matched (written by cex)
+    kind       TEXT NOT NULL,               -- entry, exit, complete, trim, forced or at_line_blocked; with the thin leg first also pair (a step of an entry batch in pairing) and exit_pair (a step of a line exit batch's other leg), the step in detail.action; paper_match: a paper order as matched (written by cex)
     direction  TEXT,
     reason     TEXT,
     detail     JSONB,                       -- the numbers needed to recompute the decision; of a paper_match, the order, its result and the leg's book when it was taken and when it was matched
@@ -359,3 +360,35 @@ DO $$ BEGIN
             ADD COLUMN margin_ratio NUMERIC;  -- the whole account's margin ratio as the venue reports it (Bitget mgnRatio: maintenance margin / equity, cross margin); account-wide like equity
     END IF;
 END $$;
+
+-- lot: the end state of a thin-leg-first entry batch (owner items 89-95,
+-- core/SPEC.md 12.4): built or built_partial for a lot that became a
+-- position, entry_failed, unwound_profit or unwound_stop for a void one
+-- (the same value as its void_reason). NULL while the batch is building and
+-- for a batch whose two legs went together. Added only when missing (see
+-- the note at the top).
+DO $$ BEGIN
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema = 'trade' AND table_name = 'lot' AND column_name = 'end_state') THEN
+        ALTER TABLE trade.lot
+            ADD COLUMN end_state TEXT;  -- built, built_partial, entry_failed, unwound_profit or unwound_stop; NULL while building and without a thin leg first
+    END IF;
+END $$;
+
+-- exit_stage (state): the half target H of exit1 of a cycle (core/SPEC.md
+-- 12.6, PRD 9.11): set once while closing the whole round at exit1 would
+-- make a profit, closed towards by the exit1 batches, read back at a restart.
+-- A batch built after it makes it void (built_lots no longer matches); the
+-- next H replaces the row.
+CREATE TABLE IF NOT EXISTS trade.exit_stage (
+    live         BOOLEAN NOT NULL,
+    cycle_id     TEXT NOT NULL,
+    run_id       TEXT NOT NULL,             -- the run that wrote it last
+    set_ms       BIGINT NOT NULL,           -- when H was set
+    built_lots   INTEGER NOT NULL,          -- how many batches of the cycle were built when H was set
+    target_bull  NUMERIC NOT NULL,          -- H per leg: half the thin leg's holding, the other leg by the pairing anchors
+    target_bear  NUMERIC NOT NULL,
+    closed_bull  NUMERIC NOT NULL,          -- what the exit1 batches closed towards H so far
+    closed_bear  NUMERIC NOT NULL,
+    done_ms      BIGINT,                    -- when H was closed in full; NULL before
+    PRIMARY KEY (live, cycle_id)
+);
