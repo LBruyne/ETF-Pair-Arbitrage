@@ -227,7 +227,7 @@ func plan(ctx context.Context, o options) (*config.Config, []window, error) {
 			sim: simConfig{start: sp.from, end: sp.to}}
 		if run != nil {
 			w.sim.refs, w.sim.state, w.sim.bars, w.sim.facts, w.sim.lastEntry = run.refs, run.state, run.bars, run.facts, run.lastEntry
-		} else if w.sim.refs, err = boardRefs(ctx, dsn, base.Cex.Pair.Bull.Ticker, base.Cex.Pair.Bear.Ticker, cal, sp.from, sp.to); err != nil {
+		} else if w.sim.refs, err = boardRefs(ctx, dsn, base.Cex.Pair.Bull.Ticker, base.Cex.Pair.Bear.Ticker, base.Cex.NAVWatch, cal, sp.from, sp.to); err != nil {
 			return nil, nil, err
 		}
 		windows = append(windows, w)

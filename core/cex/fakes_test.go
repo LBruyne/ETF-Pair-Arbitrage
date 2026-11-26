@@ -438,6 +438,8 @@ type fakeIssuer struct {
 	navDates      []string                   // the trade date of every NAV call
 	distributions map[string][]Distribution
 	err           error
+	navErr        map[string]error // ticker -> the error its NAV read returns; nil: none
+	navDate       string           // the trade date the NAVs are of; "": any date asked for
 	navCalls      int
 	distCalls     int
 }
@@ -455,6 +457,12 @@ func (f *fakeIssuer) NAV(ctx context.Context, ticker string, tradeDate time.Time
 	f.navDates = append(f.navDates, tradeDate.Format(dateLayout))
 	if f.err != nil {
 		return decimal.Decimal{}, false, f.err
+	}
+	if err := f.navErr[ticker]; err != nil {
+		return decimal.Decimal{}, false, err
+	}
+	if f.navDate != "" && tradeDate.Format(dateLayout) != f.navDate {
+		return decimal.Decimal{}, false, nil
 	}
 	nav, ok := f.navs[ticker]
 	return nav, ok, nil

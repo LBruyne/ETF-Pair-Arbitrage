@@ -22,7 +22,8 @@ cex:
   order_transport: ws         # how orders are sent: ws, the default (a logged-in WebSocket connection kept for orders and chosen by its ping; an order goes by REST while it is not up) or rest (a signed request on a connection kept warm)
   depth_max_age: 10s          # a leg's depth, or its best price, older than this is not usable
   fx_max_age: 60s             # F (USDT-USD) older than this stops entries; exits go on with the last value
-  nav_settle_delay: 1h        # a NAV unchanged this long replaces the bell anchor
+  nav_watch: 1h               # the NAV replaces the bell anchor at the first read of both legs; it is read on this long after that, and a new value switches the anchor again (owner items 96-97; the old nav_settle_delay is refused)
+  nav_hot_switch_d: 1         # in spread units: a NAV switch in the watch whose spread jump at the current mids is below this keeps the mean and sigma (hot switch); a larger one warms them up again
   # Trading days the built-in calendar does not know, in New York time:
   #   - { date: 2026-12-24, close: "13:00", source: "..." }   an early close
   #   - { date: 2026-12-25, close: closed, source: "..." }    no regular session
@@ -54,7 +55,7 @@ strategy:
   completion_window: 5s       # this long after a batch is sent, its short leg may still be completed; later it is trimmed back. Used only while exec.thin_leg is ""
   forced_slip_bps: 10         # forced exits and trims give up this much past the best price, of each leg's price
   forced_exit_before_close: 1m   # positions are closed this long before the regular close
-  rewarm_on_anchor_change: false # true: the mean and sigma warm up again after the anchor changes from bell to NAV
+  rewarm_on_anchor_change: true  # true (the owner's value, item 96): the mean and sigma warm up again when the NAV replaces the bell anchor, and after a NAV switch of cex.nav_hot_switch_d or more; false keeps them through every anchor change
 
 # The capital and the quota. Both keys must be written.
 inventory:

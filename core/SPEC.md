@@ -217,7 +217,8 @@ type Config struct {
     Pair             Pair               `yaml:"pair"`              // the two legs
     DepthMaxAge      time.Duration      `yaml:"depth_max_age"`     // a leg's depth or best price older than this is not usable
     FXMaxAge         time.Duration      `yaml:"fx_max_age"`
-    NAVSettleDelay   time.Duration      `yaml:"nav_settle_delay"`
+    NAVWatch         time.Duration      `yaml:"nav_watch"`         // after the NAV first replaces the bell anchor it is read on this long (owner item 97)
+    NAVHotSwitchD    float64            `yaml:"nav_hot_switch_d"`  // spread units: a NAV switch with a smaller jump keeps the mean and sigma
     CalendarOverrides []CalendarOverride `yaml:"calendar_overrides"`
     CorporateActions []CorporateAction  `yaml:"corporate_actions"` // planned ex-dates, kept by hand
 }
@@ -286,6 +287,7 @@ type Anchors struct {
     Kind       AnchorKind
     Bull, Bear decimal.Decimal // USD per share, dividend already subtracted from its effective time on
     KnownAt    time.Time       // when this pair of values became usable
+    SwitchedAt time.Time       // when the anchor itself was taken (bell read, or the NAV in use switched to); a dividend does not move it
     EntryBan   bool            // inside a dividend or split window (PRD 3.4)
     RestartAt  time.Time       // the mean and sigma restart at this time (a dividend took effect); zero otherwise
 }
@@ -501,9 +503,13 @@ Session 开始（常规收盘）              Kind = ""                      # �
   ↓ 没读到：每 5 分钟（timings.anchorPoll）再读
 铃锚点                               Kind = bell，A = F × 指数      # F：Coinbase 那一分钟 1 分钟 K 线的收盘（第 69 条），没有或读失败就 5 秒后再读（referenceRetry），指数没有就每 5 分钟再读
   ↓ 从收盘起每 5 分钟每只基金读一次 NAV（用户授权的节奏）（开始这个 Session 的那个交易日的）
-  ↓ 两条腿的数字都读到、各自从第一次读到起满 nav_settle_delay（1 小时）没有变过（变了重新计时）
-NAV                                  Kind = nav，A = NAV            # 之后不再读，到下一次收盘
+  ↓ 同一轮两条腿的数字都读到（第 97 条：不等稳定 1 小时）
+NAV                                  Kind = nav，A = NAV            # nav_watch（1 小时）内照常每 5 分钟读
+  ↓ 观察期内一条腿的数字变了：这一轮就换成新数字（另一条腿不变），再写一组 nav 事实
+NAV（新数字）                         Kind = nav，A = 新 NAV          # 观察期从第一次换成 NAV 算起；过后不再读，到下一次收盘
 ```
+
+每次换锚（铃锚点读到、换成 NAV、观察期里换成新 NAV）`Anchors.SwitchedAt` 取换锚时刻（与 `KnownAt` 相同，分红调整只动 `KnownAt`、不动它）：exec 靠它区分“换锚”和“分红调整”，决定热切换还是重新预热（5.4，PRD 11.3）。cex 只发布数字，不算价差（跳变由 exec 在当时的中间价上算），阈值 `nav_hot_switch_d` 经 `CexManager.NAVHotSwitchD()` 给 exec。
 
 - 两条腿总是同一种锚点。Direxion 的密钥没配或被拒：停在铃锚点，打一条 Error。
 - **分红**：`corporate_actions` 里有这条腿的除息日时，`Carrier`（载体日纽约 04:00）到生效时刻 T（除息日前一个日历日的纽约 20:00）之间 `EntryBan = true`；金额从载体日的收盘起每 5 分钟读一次，读到就停。到 T：`RestartAt = T`（均线和 σ 在生效时刻重新开始，不管金额读没读到）；金额已读到则 A 改为 A − Div、`EntryBan = false`；没读到则 A 不变、`EntryBan` 保持，读到的那一刻改 A、解除，均线不再重新开始（PRD 3.4）。T 之后这个 Session 的锚点一律是减过 Div 的：T 之后才确认的 NAV 也减。
@@ -554,7 +560,7 @@ NAV                                  Kind = nav，A = NAV            # 之后不
 - **`Venue.FinancialRecords` 只返回资金费结算流水**：流水类型是线上的字符串，留在适配器里，manager 只按合约筛。
 - **读取间隔**（`timings`）：资金费流水首次回看 7 天、之后每分钟读一次并重叠一个间隔；合约规则每小时；账户设置每分钟；结算费率每 5 分钟（每条腿 100 条，新的结算各写一行 `funding_rate`）；持仓在启动时读到成功一次，之后只在 `ReadPositions` 时读；账户权益和保证金率每 10 秒（与 `inventory_sample` 同频，只在交易所适配器实现了 `AccountAssetsReader` 时读，纸面交易所不实现；结果只存在一个原子指针里，不关 `AccountChanged`，不唤醒任何循环）。
 - **`TradingReady`**：规则已读到且两个合约在线；实盘另要求私有流在线（第 5.2 步加上：适配器实现可选接口 `PrivateStreamStatus{PrivateUp() bool}`，纸面交易所不实现）。`Restore` 的 `orders` 参数第 5.1 步起使用。
-- **NAV**：取到分；返回的交易日必须等于所问的日期；在“两条腿这一轮都读到、且都满 `nav_settle_delay` 没变”的那次读取时确认。铃锚点不取整。
+- **NAV**（第 96–97 条，`readNAV`）：取到分；返回的交易日必须等于所问的日期。第一次读到、或与上次读到的不同，写一行 `nav_seen`。同一轮两条腿都读到的那一轮换成 NAV（不再有 `nav_settle_delay`；配置里写旧键会报错）；之后 `nav_watch` 内照常每 `anchorPoll` 读，一轮里有新数字就在这一轮换成它（读失败的那条腿保留在用的数字）。每次换锚两条腿各写一行 `nav`，`known_ms` 相同，detail 带 `watch_until_ms`。观察期过后不再读 NAV。重启（`restore`）取本 Session 每条腿最新的 `nav` 行作在用的 NAV、最早的 `nav` 行的时刻作观察期起点（所以重启在观察期内会接着读、过了就不读），`nav_seen` 取每条腿最新的；只有一条腿的 `nav` 行时当作还没换。铃锚点不取整。
 - **分红**：调整后的 `KnownAt` 取锚点得知时刻、T、金额读到时刻三者里最晚的；窗口跨两个 Session，按时刻判断。每天的核对在启动时做一次、之后每 24 小时，只对晚于当前 Session 起始日的除息日报警。Direxion 的密钥缺失或被拒：本次运行不再读，一条 Error 加 `event`。
 - **`SettingsOK`** 只在结果变化时打 Error 加 `event`。`event.kind` 新增：`account_settings_differ`、`calendar_differs`、`issuer_key`、`ex_date_not_configured`、`split_entry_ban`。
 - **日历**：`Calendar` 另有 `CarrierDay(exDate)`、`CompareSchedule(days)`；休市日和提前收盘日的表与看板采集器的日期相同。
@@ -1326,9 +1332,11 @@ func (m *ExecManager) observe(now time.Time, books cex.Books) {
         m.runStart, m.restartedAt, m.stats = len(m.bars), a.RestartAt, strategy.Stats{}
     }
     if a.Kind != m.anchors.Kind || !a.Bull.Equal(m.anchors.Bull) || !a.Bear.Equal(m.anchors.Bear) {
-        m.anchorChangedAt = now                                      // bell → NAV: Stats holds no anchor, nothing to recompute
-        if a.Kind != m.anchors.Kind && m.strat.Config().RewarmOnAnchorChange { // only bell → NAV, not a dividend adjustment
-            m.runStart, m.stats = len(m.bars), strategy.Stats{}
+        m.anchorChangedAt = now                                      // Stats holds no anchor, nothing to recompute
+        switched := a.Kind != m.anchors.Kind || !a.SwitchedAt.Equal(m.anchors.SwitchedAt) // a dividend adjustment keeps SwitchedAt
+        jump := anchorJump(f, midBull, midBear, m.anchors, a)        // NaN without both mids
+        if switched && m.warmsUpAgain(a.Kind != m.anchors.Kind, jump) { // bell → NAV always; NAV → NAV when |jump| >= nav_hot_switch_d or unknown
+            m.runStart = first bar at or after rewarmMinute(a.SwitchedAt), not before the run's start
         }
         m.event("anchor_changed", ...)                               // with the spread's jump (PRD 11.4)
     }
@@ -1439,7 +1447,7 @@ func (m *ExecManager) forcedExit(now time.Time, unknown bool) (done bool) {
 3. 各 manager `go Run`；exec 的 `recover`：
    - **认单**：只在有未结束的一轮时做，`cex.RecoverOrders(ctx, cycleID)`：读两个合约的历史订单（起点由轮次号得出），两个合约都读到才认；编号里的轮次等于这一轮、本地没有的单，按 `ClientOrderID` 的几段补出记录并入订单表，返回新认回的名单。接着 `inv.Sync(cex.CycleOrders(cycleID))`，再对名单里每张单 `cex.SetOrderLot(id, string(inv.LotOf(id)))`（5.4a：归属只定一次并存库）。空仓启动不认单——别的轮次的单在库里已有完整的行，重认会用缺 `lot_id`、`quota_price` 的记录覆盖它（0.8 及以前写的“没有未结束的一轮时取最近 2 小时”已删除）。没有最终状态的订单由 cex 继续查询。
    - **等结果**：读回的没有最终状态的订单都已是 `Unknown`（cex 在查），不用等它们；再 `syncOrders` 一次（读 cex 的订单快照入账，不依赖通知）。这一轮里最后一个 `building` 的 lot 和它的订单重建为当前批；没有就是空批。`ClientOrderID` 的序号从这一轮已有订单（本地的和认回的）的最大序号加一接着编。
-   - **分钟**：本 Session 自己记下的分钟直接用；自己没有的分钟用 `etfpair.perp_second` 补——取这一分钟里最后一个两条腿都有买一卖一的秒（`second_ms ∈ (minute, minute + 60 s]`，按 `second_ms` 倒序第一行），F 取 Coinbase 那一分钟 K 线的收盘；补不出的是无效分钟。读 `perp_second` 带 `venue = 'bitget'`，经 `store.LoadPerpSeconds`；F 的分钟收盘经 `cex.FXMinuteCloses(ctx, from, to)` 按区间一次读回。置 `m.session`、`m.bars`、`m.runStart`（最后一个无效分钟或分红生效时刻之后；`rewarm_on_anchor_change` 打开时还有 NAV 成为锚点的那一分钟，取库里 `anchor_fact` 两条腿 `nav` 的 `known_ms` 较晚者，5.4c）、`m.stats`、`m.lastReady`（本 Session 的分钟里最近一次就绪的 `Stats`）、`m.minute`（当前这一分钟的起点）、`m.anchors`、`m.restartedAt`（`Anchors.RestartAt`）、`m.anchorChangedAt`（当前锚点的得知时刻）。
+   - **分钟**：本 Session 自己记下的分钟直接用；自己没有的分钟用 `etfpair.perp_second` 补——取这一分钟里最后一个两条腿都有买一卖一的秒（`second_ms ∈ (minute, minute + 60 s]`，按 `second_ms` 倒序第一行），F 取 Coinbase 那一分钟 K 线的收盘；补不出的是无效分钟。读 `perp_second` 带 `venue = 'bitget'`，经 `store.LoadPerpSeconds`；F 的分钟收盘经 `cex.FXMinuteCloses(ctx, from, to)` 按区间一次读回。置 `m.session`、`m.bars`、`m.runStart`（最后一个无效分钟或分红生效时刻之后；还有最后一次重新预热的换锚所在的那一分钟：`anchorSwitches` 把库里本 Session 的 `bell`、`nav` 事实按 `(kind, known_ms)` 分成一次次换锚，`restoredRewarm` 对每一次按 `warmsUpAgain` 判断——铃锚点换成 NAV 在 `rewarm_on_anchor_change` 打开时总是预热，NAV 换 NAV 的跳变用换锚那一分钟之前最后一个有效分钟的中间价和 F 算，5.4c、5.4e）、`m.stats`、`m.lastReady`（本 Session 的分钟里最近一次就绪的 `Stats`）、`m.minute`（当前这一分钟的起点）、`m.anchors`、`m.restartedAt`（`Anchors.RestartAt`）、`m.anchorChangedAt`（当前锚点的得知时刻）。
    - **核对**：`inv.Reconcile`。一致就进入循环——属于已结束 Session 的仓位由 `forcedDue` 直接平掉；不符则不发单、报警。
 4. 任何一步读不到事实就每 5 秒重试，不当作空仓；持仓与账本不符则 1 秒后再读（与循环相同，第二次差额相同、账本未变即确认不符，带着不符进入循环，5.4c）。恢复期间收到停止信号：只记 `stop.stopping`（之后不开仓），恢复照常做完——上一个进程可能留着仓位或结果未知的订单，不能直接退出；进入循环后由 `stopCheck` 按同一个条件决定何时退出，人工接管也照 5.4 的规则。
 
@@ -1553,7 +1561,7 @@ func (m *ExecManager) forcedExit(now time.Time, unknown bool) (done bool) {
 - 恢复的重试：持仓与账本不符时 1 秒后再读（`reconcileAgain`，与循环相同），读不到事实仍是 5 秒（`recoverRetry`）。inventory 确认不符去掉了“两次之间不超过 2 × 1 秒”的上限，改为同一差额、账本没有变过、至少隔 1 秒、中间没有读到相符的，就是不符——原先恢复 5 秒一次的重试永远确认不了，较慢的 REST 也会让间隔超过 2 秒（第 6.2–6.4 步合并审查定下的上限因此取消）。差额或账本变了从头算：两次互不相关、大小相同的滞后（中间账本因新的一批变了）不算不符，测试 `TestUnrelatedEqualDifferencesDoNotConfirm`（审查的复现：仓位 1 的 SOXS 滞后 −1，读取失败 20 秒，仓位 2 同样滞后 −1）。测试 `TestRecoveryConfirmsAPersistentDifference`（生产的重试间隔下 3 秒内确认）、`TestPersistentMismatchInRecovery`（审计原例：间隔 5 秒的十次读取）、`TestMismatchConfirmsOnlyTheSameDifference`（替代原来的 `TestMismatchConfirmsOnlyTheSameRecentDifference`：相隔 30 秒的同一差额现在确认）。
 - 已知仓位的只减仓单（按线平仓、强制平仓、回吐）走原来的路径。
 
-**重启时按 NAV 的得知时刻重新预热**（`bars.go`、`recover.go`）。`rewarm_on_anchor_change` 打开时，连续运行在铃锚点换成 NAV 时重新算均值和 σ；重启时恢复分钟原先不知道这件事，带着切换前的分钟直接就绪。改法：两处用同一条规则 `rewarmMinute`——新的一段从 NAV 得知时刻（`Anchors.KnownAt`，库里 `anchor_fact` 的 `nav` 行的 `known_ms`，两条腿相同）所在的那一分钟起算，无论循环是在那一分钟里还是下一分钟才看到它（原先连续运行从看到它时开着的分钟起算），但不早于当前这一段的起点（那一分钟无效、或分红在它结束时生效，新的一段都已从它之后开始，PRD 4.6；测试 `TestRewarmKeepsALaterRunStart`）；只有 NAV 替换铃锚点时才重新预热，NAV 是本 Session 第一个锚点时不预热。`ExecManager.Restore` 多收本 Session 的 `anchor_fact` 行（`main` 已经读回、交给 cex 的那一份）；`restoreMinutes` 在库里有 `nav` 行、且有更早的 `bell` 行时，按 `nav` 行的时刻切开——那一分钟已结束时在重放中切开，还开着时切在当前分钟。默认 `false` 不受影响。（cex 的 `Anchors` 不带“NAV 替换铃锚点的时刻”，交易程序这一侧不改 cex，所以从 `anchor_fact` 行取。）测试 `TestRestartInsideTheWarmUpAfterTheNAV`，八种情形逐一与不中断的运行比较重启后的就绪状态、首个就绪分钟和首个开仓决定的 x、μ、σ、价格、数量：NAV 05:03:20 得知、预热 2 分钟，在 NAV 之后 30 秒（同一分钟内）和 70 秒（下一分钟）重启；NAV 05:03:59.900 得知、循环 05:04:00.100 才看到（两边都从 05:03 起算，05:04 起就绪）；NAV 是第一个锚点（两边都不预热）；每种都另跑默认 `false`。仍有两种不一致：上一个进程启动时 NAV 已确认（库里有更早的 `bell` 行，但循环第一个看到的就是 NAV，连续运行不预热，重启会预热）；NAV 恰在读回状态之后、进入循环之前确认（重启不预热）。
+**重启时按 NAV 的得知时刻重新预热**（`bars.go`、`recover.go`；第 97 条起换锚可以有多次，`navKnownAt` 由 5.4e 的 `anchorSwitches` / `restoredRewarm` 取代，`rewarmMinute` 改按 `Anchors.SwitchedAt`）。`rewarm_on_anchor_change` 打开时，连续运行在铃锚点换成 NAV 时重新算均值和 σ；重启时恢复分钟原先不知道这件事，带着切换前的分钟直接就绪。改法：两处用同一条规则 `rewarmMinute`——新的一段从 NAV 得知时刻（`Anchors.KnownAt`，库里 `anchor_fact` 的 `nav` 行的 `known_ms`，两条腿相同）所在的那一分钟起算，无论循环是在那一分钟里还是下一分钟才看到它（原先连续运行从看到它时开着的分钟起算），但不早于当前这一段的起点（那一分钟无效、或分红在它结束时生效，新的一段都已从它之后开始，PRD 4.6；测试 `TestRewarmKeepsALaterRunStart`）；只有 NAV 替换铃锚点时才重新预热，NAV 是本 Session 第一个锚点时不预热。`ExecManager.Restore` 多收本 Session 的 `anchor_fact` 行（`main` 已经读回、交给 cex 的那一份）；`restoreMinutes` 在库里有 `nav` 行、且有更早的 `bell` 行时，按 `nav` 行的时刻切开——那一分钟已结束时在重放中切开，还开着时切在当前分钟。默认 `false` 不受影响。（cex 的 `Anchors` 不带“NAV 替换铃锚点的时刻”，交易程序这一侧不改 cex，所以从 `anchor_fact` 行取。）测试 `TestRestartInsideTheWarmUpAfterTheNAV`，八种情形逐一与不中断的运行比较重启后的就绪状态、首个就绪分钟和首个开仓决定的 x、μ、σ、价格、数量：NAV 05:03:20 得知、预热 2 分钟，在 NAV 之后 30 秒（同一分钟内）和 70 秒（下一分钟）重启；NAV 05:03:59.900 得知、循环 05:04:00.100 才看到（两边都从 05:03 起算，05:04 起就绪）；NAV 是第一个锚点（两边都不预热）；每种都另跑默认 `false`。仍有两种不一致：上一个进程启动时 NAV 已确认（库里有更早的 `bell` 行，但循环第一个看到的就是 NAV，连续运行不预热，重启会预热）；NAV 恰在读回状态之后、进入循环之前确认（重启不预热）。
 
 **持有期间不变的订单快照不重算**（`inventory/ledger.go`）。循环每被唤醒一次就把这一轮的订单快照交给 `Sync`；原先每次都重排、重算全部仓位并逐行比较要写的行，审计量到 2 / 20 / 100 张单每次 8 / 51 / 272 µs。改法：快照里没有比已入账更新的记录（每张单的 `UpdateSeq` 都不大于已有的；cex 的订单表保证每次变化都给更大的 `UpdateSeq`）时不重算，只看资金费是否因时间跨过结算点而变成待出账，变了才整体重算。建批、结批（`SettleLot`、`CloseCycle`）和资金费入账照旧各自刷新。测试 `TestUnchangedSnapshotIsNotRecomputed`（不变的快照每次至多 2 次内存分配）、`TestSnapshotReuseChangesNothing`（同一串快照，一份照常、一份每次都给新的 `UpdateSeq` 迫使整体重算：账本和写出的 `cycle`、`lot` 行完全相同，包括持仓跨过 08:00 结算点、订单没变时 `funding_known` 变为假）。基准 `BenchmarkSyncUnchanged`（本机）：2 / 20 / 100 张单从 7.4 / 68 / 318 µs、216 / 1,795 / 8,795 次分配，降到 0.09 / 0.72 / 3.5 µs、0 次分配。inventory 的测试辅助函数（`ord`、`fill`、`working`、`timed`）因此和 cex 一样给每个新版本递增的 `UpdateSeq`。cex 每次复制和排序快照（`CycleOrders`）的开销不在这一项里。
 
@@ -1568,6 +1576,16 @@ func (m *ExecManager) forcedExit(now time.Time, unknown bool) (done bool) {
 **订单手续费截断到 8 位**（`cex/bitget/convert.go`，第 9 步只读核对 `experiments/core_step9_checks_20261126/REPORT.md` 第 3 节）。`order` 推送的手续费带 10 位，`order-info` 和逐笔成交是截断到 8 位；程序原先 `Round(8)` 四舍五入，第 9 位 ≥ 5 时账本比交易所多 1e-8 USDT（0.0003574896 记成 0.00035749，交易所 0.00035748）。改为 `Truncate(8)`，账本与交易所的记录逐笔相等。测试 `TestOrderFeeIsCutToTheVenuesEightDecimals`（0.0003574896 → 0.00035748，改前 0.00035749；0.000357344 → 0.00035734 不变）。
 
 **开仓判断少一次价格转换**（`strategy/entry.go`）。`EvaluateEntry` 已经有两条腿价格和锚点的 `float64`，原先又调 `levelSpread` 从 `decimal` 再转一遍；改为 `Spread(in.F, pBull, aBull, pBear, aBear) - mu`。输入是同样的四个 `float64`，结果逐位相同；数量、额度和费用仍用 `decimal`。`levelSpread` 还被平仓和 `Deviation` 用，保留。测试 `TestEntryDeviationBitIdentical`（两个方向、四个 F：开仓的 x 与 `Deviation` 的 x 逐位相等）。基准 `BenchmarkEvaluateEntryNoSignal`（两个方向都定价、都不到线，本机五次取中位）：3,552 → 2,322 ns/op，222 → 145 次分配，5,023 → 3,437 B/op。只是函数本身的耗时；实盘的时延看真实发单和回报的记录（5.7）。
+
+### 5.4e 换锚不等稳定、观察期内热切换或再预热（第 96–97 条，2026-11-26）
+
+用户第 96 条：“Bell 换成 NAV的时候，需要rewarm，改一下”；第 97 条：“换锚点不需要稳定1小时，只要两腿都读到就可以开始rewarm；一段时间内如果有改变，改变不大（例如低于1bps）也可以直接热切换锚点，改变较大就重新rewarm”。取代原来的 1 小时稳定（`nav_settle_delay` 删除，写旧键报错）。
+
+- **cex**（`anchors.go` 的 `readNAV`、`restore`、`anchors`）：同一轮两条腿都读到就换成 NAV；`nav_watch`（1 小时，从第一次换成 NAV 算起）内照常每 `anchorPoll` 读，有新数字就在这一轮换；过后不读。每次换锚一组 `nav` 事实，`Anchors.SwitchedAt` 是换锚时刻。重启取最新的一组 `nav` 和最早一组的时刻（观察期接着走）。
+- **exec**（`bars.go` 的 `anchorChanged`、`warmsUpAgain`；`recover.go` 的 `anchorSwitches`、`restoredRewarm`）：`SwitchedAt` 或种类变了才是换锚（分红调整不是）。`rewarm_on_anchor_change` 打开时：铃锚点换成 NAV 总是从 `rewarmMinute(SwitchedAt)` 起重新预热；NAV 换 NAV 在当时的中间价上算跳变 `mid_jump_d`（PRD 11.4），绝对值低于 `cex.nav_hot_switch_d`（1 个价差单位）是热切换（均值和 σ 不动，按新锚点表达），否则（含没有中间价）重新预热。`anchor_changed` 事件多一个 `switched`。仓位和这一轮的配比锚点不动（PRD 11.2），预热期间出场用最近一次就绪的统计（PRD 9.7）。
+- **重启**：`restoredRewarm` 按库里的换锚序列重做同样的判断；NAV 换 NAV 的跳变用换锚那一分钟之前最后一个有效分钟的中间价和 F（连续运行用的是当时的盘口，跳变只差中间价的微小变化，只在跳变恰好贴着阈值时可能判得不同），没有这样的分钟按预热算。
+- **回放**：纸面运行按 `anchor_fact` 里一组组 `nav` 行逐次发布（`factPairs`）；看板库按同一规则从 `etf_nav_obs` 重建（`navWatchPairs`，5.8）。
+- 测试：`TestAnchorNAVAtTheFirstRoundReadingBothLegs`（不等 1 小时；观察期内一条腿变了另一条腿读失败也换；观察期结束后不再读；下一个 Session 重新开始）、`TestAnchorNAVNeedsBothLegsInOneRound`（两条腿分在两轮读到不算）、`TestAnchorRestoreContinuesTheSession`（观察期内重启接着读、按第一次换锚计时结束；观察期后重启不读，取最新的 NAV）、`TestAnchorRestoreBeforeTheFirstSwitch`、`TestNAVSwitchHotOrRewarm`（铃锚点换 NAV 预热；跳变 −0.25 单位热切换；分红调整不算换锚；跳变约 −27 单位再预热；默认 `false` 都不预热）、`TestRestartAfterNAVSwitchesInTheWatch`（小、大两种跳变下重启后的起点和就绪与不中断的运行相同）、`TestFactPairsFollowTheSwitches`、`TestBoardNAVFollowsTheWatch`、配置的旧键 `nav_settle_delay` 被拒。
 
 ### 5.5 `config`、`.env`、`logger`、`main.go`
 
@@ -1585,7 +1603,8 @@ cex:
   order_transport: ws         # ws (default) | rest: how orders are sent (5.7: ws was 9 ms faster to order creation on real orders)
   depth_max_age: 10s          # a leg's depth, or its best price, older than this is not usable
   fx_max_age: 60s             # F older than this stops entries; exits go on with the last value
-  nav_settle_delay: 1h        # a NAV unchanged this long replaces the bell anchor
+  nav_watch: 1h               # the NAV replaces the bell anchor at the first read of both legs, and is read on this long (owner items 96-97)
+  nav_hot_switch_d: 1         # spread units: a NAV switch in the watch with a smaller jump at the mids keeps the mean and sigma
   calendar_overrides: []      # {date: 2026-12-24, close: "13:00" | closed, source: ...}, New York time
   corporate_actions:          # planned ex-dates, kept by hand together with dashboard/config.yaml
     - { ticker: SOXL, ex_date: 2026-12-22, kind: dividend, source: "..." }
@@ -1607,7 +1626,7 @@ strategy:
   completion_window: 5s       # after an entry batch is sent, its short leg may still be completed this long
   forced_slip_bps: 10         # forced exits and trims give up this much past the best price, of each leg's price
   forced_exit_before_close: 1m
-  rewarm_on_anchor_change: false   # true: the mean and sigma warm up again after bell → NAV
+  rewarm_on_anchor_change: true    # owner item 96: the mean and sigma warm up again after bell → NAV, and after a NAV switch of nav_hot_switch_d or more
 
 inventory:
   capital: "1000"             # M, USDT
@@ -1823,8 +1842,8 @@ func (s *Store) LoadState(ctx context.Context, sessionID string) (State, error) 
 **输入**
 
 - 盘口：录制服务的原始帧（`experiments/book_tape/bitget/<日>/<合约>.<频道>.<首条接收毫秒>.jsonl.gz`），每条腿深度 + `books1`，按本机接收时刻合并成一条时间线；同一毫秒里不同频道的先后录制没有记下，按 `seq`、深度先于 `books1`、bull 先于 bear 排。SOXS 的深度：录到 `books5`（2026-11-25 18:00:07.412 UTC+8 起）就用 `books5`，之前用 `books50` 截到前 5 档代替（结果里标明 `bear_depth`）。一条腿的断线是录制服务里订阅这条腿 `books1` 的那个 feed 的 `disconnected`（`events.jsonl`；以 feed 的 `connected` 帧里的订阅为准）：2026-11-26 之前每个组合一条连接带全部频道，一次断线丢两条腿；之后盘口在 `bitget-<组合>-books` 上，3 条连接、同一 `seq` 只存先到的那份（与本程序 `book_connections` 的取法相同，用户第 72 条），最后一条连接断开才写 `disconnected`，单条连接的断开（`link_disconnected`）不丢腿，成交那个 feed 的断线也不丢。录下的已是每个频道一条按先到合并的流，所以 `book_connections` 在回放里固定为 1。正在写的最后一个文件末尾不完整时读到那里为止。
-- F 和锚点：一般回测读看板库（只读角色，密码取自 `dashboard/.env` 的 `ETFPAIR_DB_READER_PASSWORD`，程序内拼 DSN，不打印）：F 是 `fx_minute` 每分钟那次采样（按采样时刻生效，60 秒失效规则照旧），铃锚点是 `etf_bell`、NAV 是 `etf_nav` 每只基金第一次确认的值，两腿都知道时（较晚那条腿的得知时刻）生效；每个 Session 在它的收盘时刻先发布“无锚点”。看板库里 11-26 之前的铃锚点 F 是看板当时的 ticker 读数（旧规则），不是 K 线收盘，两者差约 1e-5，只影响换锚那一刻的价差水平。
-- 复现一次纸面运行（`-paper-run <run_id>`）：读 trade schema（只读 DSN 在 `core/.env.reader`）里那次运行的配置（`process_run.config`）、开始时刻、它每秒用的 F（`signal_sample.f`，作为那一秒的读数）、它的 `anchor_fact`（铃锚点、NAV 按得知时刻），以及它启动时读回的东西：同一 Session 开始前的 `minute_bar`、开始时已知的锚点事实、开始前最后一个仓位（开仓间隔）、R（账本起点之后、开始之前已结束各轮的净额）。
+- F 和锚点：一般回测读看板库（只读角色，密码取自 `dashboard/.env` 的 `ETFPAIR_DB_READER_PASSWORD`，程序内拼 DSN，不打印）：F 是 `fx_minute` 每分钟那次采样（按采样时刻生效，60 秒失效规则照旧），铃锚点是 `etf_bell`，两腿都知道时（较晚那条腿的得知时刻）生效；NAV 按交易程序的换锚规则（第 97 条）从 `etf_nav_obs` 重建（`navWatchPairs`）：每个数字取采集器第一次读到它的时刻（`received_ms`），两只基金都有数字时换成 NAV，之后配置的 `nav_watch` 内每个新数字再换一次（同一毫秒的合成一次），过了观察期的不取；采集器的读取时刻不是交易程序的轮次，同一数字被替换后又回来的情况表里看不到；每个 Session 在它的收盘时刻先发布“无锚点”。看板库里 11-26 之前的铃锚点 F 是看板当时的 ticker 读数（旧规则），不是 K 线收盘，两者差约 1e-5，只影响换锚那一刻的价差水平。
+- 复现一次纸面运行（`-paper-run <run_id>`）：读 trade schema（只读 DSN 在 `core/.env.reader`）里那次运行的配置（`process_run.config`）、开始时刻、它每秒用的 F（`signal_sample.f`，作为那一秒的读数）、它的 `anchor_fact`（铃锚点、NAV 按得知时刻；`factPairs` 把同一 `known_ms` 的一组 `bell` 或 `nav` 行当作一次换锚，观察期里的每次换锚各发布一次，`SwitchedAt` 取它的时刻），以及它启动时读回的东西：同一 Session 开始前的 `minute_bar`、开始时已知的锚点事实、开始前最后一个仓位（开仓间隔）、R（账本起点之后、开始之前已结束各轮的净额）。
 - 日历是程序自己的（`cex.NewCalendar` 加所用配置的人工改动；复现纸面运行时用那次运行自己的配置）。
 - 复现纸面运行的前提（`checkRestart`，不满足就报错退出）：存的 `inventory_state` 的起点早于那次运行的开始（它是整行替换的状态行，起点更晚说明之后被换过，开始时的 R 不可知）；开始时没有跨着它的未结束的一轮（回放不恢复未结束的一轮）。
 - 循环的启动（`exec.Start`，含恢复）限 30 秒墙钟（`startWithin`）：恢复失败时按墙钟等待重试，回放里会一直转；按时返回的启动，它的 context 保留给之后的读取。`summary.json` 写明资金费不计。

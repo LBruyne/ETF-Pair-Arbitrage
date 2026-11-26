@@ -47,7 +47,7 @@ func TestRestartInsideTheWarmUpAfterTheNAV(t *testing.T) {
 	}
 	for _, c := range cases {
 		nav := func(r *rig) {
-			r.src.setAnchors(cex.Anchors{SessionID: r.m.session.ID, Kind: cex.AnchorNAV, Bull: dec("40"), Bear: dec("60"), KnownAt: c.navAt})
+			r.src.setAnchors(cex.Anchors{SessionID: r.m.session.ID, Kind: cex.AnchorNAV, Bull: dec("40"), Bear: dec("60"), KnownAt: c.navAt, SwitchedAt: c.navAt})
 		}
 		// play runs the events in [from, until) and returns the first ready
 		// minute seen, zero when none.
@@ -171,7 +171,7 @@ func TestRewarmKeepsALaterRunStart(t *testing.T) {
 				t.Fatalf("the run starts at minute %d, want after %s", before, showTime(c.last))
 			}
 			a := r.m.anchors
-			a.Kind, a.KnownAt = cex.AnchorNAV, next.Add(-100*time.Millisecond)
+			a.Kind, a.KnownAt, a.SwitchedAt = cex.AnchorNAV, next.Add(-100*time.Millisecond), next.Add(-100*time.Millisecond)
 			r.src.setAnchors(a)
 			r.stepAt(next.Add(100 * time.Millisecond))
 			if r.m.runStart != before {

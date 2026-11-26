@@ -179,6 +179,9 @@ type cexSource interface {
 	FX(now time.Time) (fx cex.FX, fresh bool)
 	// Anchors is the published pair of anchors, of the Session it names.
 	Anchors() cex.Anchors
+	// NAVHotSwitchD is cex.nav_hot_switch_d: a NAV switch whose spread
+	// jump is below it keeps the mean and sigma.
+	NAVHotSwitchD() float64
 	// Session is the Session that contains now.
 	Session(now time.Time) cex.Session
 	// ReferenceChanged is closed at the next publication of F, the anchors,

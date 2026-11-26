@@ -162,8 +162,8 @@ func run(cfg *config.Config, signals chan os.Signal) error {
 	emgr.UseStore(st)
 
 	// What the previous run stored is read back before any manager runs:
-	// the current Session's anchor facts, so the bell anchor and the NAV's
-	// settle delay continue instead of starting over, and the ledger (R,
+	// the current Session's anchor facts, so the bell anchor, the NAV in use
+	// and its watch continue instead of starting over, and the ledger (R,
 	// the dust, the booked funding and the unfinished cycle with its lots
 	// and orders).
 	sessionID := cmgr.Session(started).ID

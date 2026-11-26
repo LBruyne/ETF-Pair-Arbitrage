@@ -228,42 +228,32 @@ func TestAnchorBellFixesTheCandleFWhenTheIndexIsLate(t *testing.T) {
 // itoa writes an integer for an expected JSON text.
 func itoa(n int64) string { return strconv.FormatInt(n, 10) }
 
-// The NAV of the Session's trading day replaces the bell anchor once both
-// legs' values have been stable for nav_settle_delay; a value that changes
-// starts its delay again; after the switch nothing more is read.
-func TestAnchorBellThenNAVAfterAStableHour(t *testing.T) {
-	r := anchorRig(t, testConfig(), monClose) // nav_settle_delay 1 h
+// The NAV of the Session's trading day replaces the bell anchor at the first
+// round that reads both legs' NAV, without a settle delay (owner items
+// 96-97). For nav_watch after that switch the NAV is read on: a new value
+// of either leg switches the anchor in that round, with the other leg's
+// value kept. After the watch nothing more is read until the next Session.
+func TestAnchorNAVAtTheFirstRoundReadingBothLegs(t *testing.T) {
+	r := anchorRig(t, testConfig(), monClose) // nav_watch 1 h, anchor_poll 5 min
 	wantAnchors(t, r.stepAt(monClose.Add(time.Minute)), AnchorBell, "39.96", "49.95")
-	bellAt := monClose.Add(time.Minute)
+	if a := r.m.Anchors(); !a.SwitchedAt.Equal(monClose.Add(time.Minute)) {
+		t.Errorf("bell anchor switched at %s, want when it was read", showTime(a.SwitchedAt))
+	}
 
-	// Thirteen hours on the issuer publishes both NAVs.
+	// Thirteen hours on the issuer publishes both NAVs: the next round takes
+	// them at once.
 	seen := monClose.Add(13 * time.Hour)
 	wantAnchors(t, r.stepAt(seen.Add(-5*time.Minute)), AnchorBell, "39.96", "49.95")
 	r.issuer.setNAV("SOXL", "40.10")
 	r.issuer.setNAV("SOXS", "49.80")
-	wantAnchors(t, r.stepAt(seen), AnchorBell, "39.96", "49.95")
+	changed := r.m.ReferenceChanged()
+	a := r.stepAt(seen)
+	wantAnchors(t, a, AnchorNAV, "40.10", "49.80")
+	if !a.KnownAt.Equal(seen) || !a.SwitchedAt.Equal(seen) {
+		t.Errorf("NAV known at %s, switched at %s, want both at the round that read both legs", showTime(a.KnownAt), showTime(a.SwitchedAt))
+	}
 	if got := r.issuer.navDates[len(r.issuer.navDates)-1]; got != "2026-12-21" {
 		t.Errorf("the NAV was asked for trade date %s, want the day that started the Session", got)
-	}
-	// Half an hour on the bull fund's NAV is revised: its hour starts again.
-	revised := seen.Add(30 * time.Minute)
-	for at := seen.Add(5 * time.Minute); at.Before(revised); at = at.Add(5 * time.Minute) {
-		r.stepAt(at)
-	}
-	r.issuer.setNAV("SOXL", "40.12")
-	r.stepAt(revised)
-	// An hour after the first sight the bear leg is stable, the bull leg not
-	// yet: both stay on the bell anchor.
-	for at := revised.Add(5 * time.Minute); at.Before(revised.Add(time.Hour)); at = at.Add(5 * time.Minute) {
-		if a := r.stepAt(at); a.Kind != AnchorBell || !a.KnownAt.Equal(bellAt) {
-			t.Fatalf("at %s: %+v, want the bell anchor until both NAVs are stable", showTime(at), a)
-		}
-	}
-	changed := r.m.ReferenceChanged()
-	a := r.stepAt(revised.Add(time.Hour))
-	wantAnchors(t, a, AnchorNAV, "40.12", "49.80")
-	if !a.KnownAt.Equal(revised.Add(time.Hour)) {
-		t.Errorf("NAV known at %s, want the moment it was confirmed", showTime(a.KnownAt))
 	}
 	select {
 	case <-changed:
@@ -271,29 +261,49 @@ func TestAnchorBellThenNAVAfterAStableHour(t *testing.T) {
 		t.Error("ReferenceChanged was not closed by the switch to NAV")
 	}
 
-	// The facts: the fixed F and the bell anchor of each leg, a nav_seen per
-	// value seen, two nav rows.
+	// Unchanged reads in the watch change nothing.
+	wantAnchors(t, r.stepAt(seen.Add(5*time.Minute)), AnchorNAV, "40.10", "49.80")
+
+	// Ten minutes on the bull fund's NAV is revised while the bear fund's
+	// read fails: the anchor switches in that round, the bear leg keeps its
+	// value.
+	revised := seen.Add(10 * time.Minute)
+	r.issuer.setNAV("SOXL", "40.12")
+	r.issuer.navErr = map[string]error{"SOXS": errors.New("direxion: http 502")}
+	a = r.stepAt(revised)
+	wantAnchors(t, a, AnchorNAV, "40.12", "49.80")
+	if !a.KnownAt.Equal(revised) || !a.SwitchedAt.Equal(revised) {
+		t.Errorf("revised NAV known at %s, switched at %s, want the round that read it", showTime(a.KnownAt), showTime(a.SwitchedAt))
+	}
+	r.issuer.navErr = nil
+
+	// The facts: a nav_seen per value seen, the two nav rows of each switch.
 	var kinds []string
 	for _, f := range r.facts() {
 		kinds = append(kinds, f.Kind+"/"+f.Leg+"/"+f.Value.String())
 	}
-	want := []string{"bell_f/bull/0.999", "bell_f/bear/0.999", "bell/bull/39.96", "bell/bear/49.95", "nav_seen/bull/40.1", "nav_seen/bear/49.8", "nav_seen/bull/40.12", "nav/bull/40.12", "nav/bear/49.8"}
+	want := []string{"bell_f/bull/0.999", "bell_f/bear/0.999", "bell/bull/39.96", "bell/bear/49.95",
+		"nav_seen/bull/40.1", "nav_seen/bear/49.8", "nav/bull/40.1", "nav/bear/49.8",
+		"nav_seen/bull/40.12", "nav/bull/40.12", "nav/bear/49.8"}
 	if !slices.Equal(kinds, want) {
 		t.Errorf("anchor facts = %v\nwant %v", kinds, want)
 	}
 
-	// Confirmed: no further read, and a later revision is not taken.
+	// The watch runs an hour from the first switch, not from the revision:
+	// the round at seen + 55 min is the last one that reads.
+	r.stepAt(seen.Add(55 * time.Minute))
 	calls := r.issuer.navCalls
 	r.issuer.setNAV("SOXL", "41")
-	for at := revised.Add(time.Hour + 5*time.Minute); at.Before(revised.Add(3 * time.Hour)); at = at.Add(5 * time.Minute) {
+	for at := seen.Add(time.Hour); at.Before(seen.Add(3 * time.Hour)); at = at.Add(5 * time.Minute) {
 		wantAnchors(t, r.stepAt(at), AnchorNAV, "40.12", "49.80")
 	}
 	if r.issuer.navCalls != calls {
-		t.Errorf("%d NAV reads after the confirmation", r.issuer.navCalls-calls)
+		t.Errorf("%d NAV reads after the watch", r.issuer.navCalls-calls)
 	}
 
 	// The next close starts a new Session without an anchor, and the reads
-	// start over.
+	// start over; the issuer has no NAV of the new day yet.
+	r.issuer.navDate = "2026-12-21"
 	next := ny(2026, 12, 22, 16, 0)
 	if a := r.stepAt(next); a.SessionID != "2026-12-22" || a.Kind != AnchorNone || !a.Bull.IsZero() {
 		t.Errorf("at the next close: %+v, want a new Session without an anchor", a)
@@ -303,21 +313,28 @@ func TestAnchorBellThenNAVAfterAStableHour(t *testing.T) {
 	}
 }
 
-// Both legs always use the same kind: one fund's NAV alone, however stable,
-// changes nothing.
-func TestAnchorBothLegsSameKind(t *testing.T) {
+// Both legs always use the same kind, and the NAV replaces the bell anchor
+// only at a round that read both legs: one leg read on one round and the
+// other on the next is not yet a switch.
+func TestAnchorNAVNeedsBothLegsInOneRound(t *testing.T) {
 	r := anchorRig(t, testConfig(), monClose)
 	r.stepAt(monClose.Add(time.Minute))
 	r.issuer.setNAV("SOXL", "40.10")
 	for at := monClose.Add(5 * time.Minute); at.Before(monClose.Add(4 * time.Hour)); at = at.Add(5 * time.Minute) {
 		wantAnchors(t, r.stepAt(at), AnchorBell, "39.96", "49.95")
 	}
-	// The other fund's NAV appears: its own hour runs from now.
+	// The bear fund's NAV appears in a round whose bull read fails.
 	late := monClose.Add(4 * time.Hour)
 	r.issuer.setNAV("SOXS", "49.80")
+	r.issuer.navErr = map[string]error{"SOXL": errors.New("direxion: timeout")}
 	wantAnchors(t, r.stepAt(late), AnchorBell, "39.96", "49.95")
-	wantAnchors(t, r.stepAt(late.Add(55*time.Minute)), AnchorBell, "39.96", "49.95")
-	wantAnchors(t, r.stepAt(late.Add(time.Hour)), AnchorNAV, "40.10", "49.80")
+	// The next round reads both.
+	r.issuer.navErr = nil
+	a := r.stepAt(late.Add(5 * time.Minute))
+	wantAnchors(t, a, AnchorNAV, "40.10", "49.80")
+	if !a.KnownAt.Equal(late.Add(5 * time.Minute)) {
+		t.Errorf("NAV known at %s, want the round that read both legs", showTime(a.KnownAt))
+	}
 }
 
 // Without a usable key the issuer is not read again: the Session stays on
@@ -423,13 +440,13 @@ func TestAnchorDividendWindowAndAdjustmentAtT(t *testing.T) {
 		t.Fatalf("at T: ban %t restart %s known %s, want no ban, both at T", a.EntryBan, showTime(a.RestartAt), showTime(a.KnownAt))
 	}
 
-	// A NAV confirmed after T is reduced too; the restart time stays T.
+	// A NAV that replaces the bell anchor after T is reduced too; the
+	// restart time stays T, and the switch time is the NAV's.
 	r.issuer.setNAV("SOXL", "40.10")
 	r.issuer.setNAV("SOXS", "49.80")
-	r.stepAt(effective.Add(5 * time.Minute))
-	a = r.stepAt(effective.Add(65 * time.Minute))
+	a = r.stepAt(effective.Add(5 * time.Minute))
 	wantAnchors(t, a, AnchorNAV, "39.99", "49.59")
-	if a.EntryBan || !a.RestartAt.Equal(effective) || !a.KnownAt.Equal(effective.Add(65*time.Minute)) {
+	if a.EntryBan || !a.RestartAt.Equal(effective) || !a.KnownAt.Equal(effective.Add(5*time.Minute)) || !a.SwitchedAt.Equal(effective.Add(5*time.Minute)) {
 		t.Fatalf("NAV after T: %+v", a)
 	}
 
@@ -444,7 +461,9 @@ func TestAnchorDividendWindowAndAdjustmentAtT(t *testing.T) {
 		t.Errorf("dividend facts = %+v", dividends)
 	}
 
-	// The Session after it carries nothing of the dividend.
+	// The Session after it carries nothing of the dividend; the issuer has
+	// no NAV of its day yet.
+	r.issuer.navDate = "2026-12-21"
 	tueClose := ny(2026, 12, 22, 16, 0)
 	if a := r.stepAt(tueClose); a.EntryBan || !a.RestartAt.IsZero() || a.Kind != AnchorNone {
 		t.Fatalf("the next Session: %+v", a)
@@ -568,64 +587,74 @@ func TestAnchorSplitBansEntriesUntilRemoved(t *testing.T) {
 }
 
 // A restart inside a Session continues from the stored facts: the bell
-// anchor with its known-at time and without a new read, the NAV's settle
-// delay from when the value was first seen, a confirmed NAV at once.
+// anchor with its known-at time and without a new read, the latest NAV of
+// the Session and the watch that runs from its first switch.
 func TestAnchorRestoreContinuesTheSession(t *testing.T) {
-	// The first run reads the bell anchor and sees both NAVs.
+	// The first run reads the bell anchor, switches to the NAV and takes a
+	// revision of it.
 	r := anchorRig(t, withDividends(), monClose)
 	r.issuer.distributions["SOXL"] = []Distribution{{ExDate: "2026-12-22", Amount: dec("0.11"), Declared: true}}
 	r.issuer.distributions["SOXS"] = []Distribution{{ExDate: "2026-12-22", Amount: dec("0.21"), Declared: true}}
 	bellAt, effective := monClose.Add(time.Minute), ny(2026, 12, 21, 20, 0)
-	r.stepAt(bellAt)
+	before := r.stepAt(bellAt)
+	wantAnchors(t, before, AnchorBell, "39.96", "49.95")
 	seen := monClose.Add(13 * time.Hour)
 	r.issuer.setNAV("SOXL", "40.10")
 	r.issuer.setNAV("SOXS", "49.80")
-	before := r.stepAt(seen)
-	wantAnchors(t, before, AnchorBell, "39.85", "49.74") // past T: the bell anchor less the dividends
+	wantAnchors(t, r.stepAt(seen), AnchorNAV, "39.99", "49.59") // past T: the NAV less the dividends
+	revised := seen.Add(10 * time.Minute)
+	r.issuer.setNAV("SOXL", "40.12")
+	before = r.stepAt(revised)
+	wantAnchors(t, before, AnchorNAV, "40.01", "49.59")
 	facts := AnchorFactsFromRows(r.facts())
-	if len(facts) != 8 {
-		t.Fatalf("%d facts stored, want the fixed F, bell, dividend and nav_seen for each leg", len(facts))
-	}
 
-	// The second run starts forty minutes later with those facts. Its
-	// sources could not give the bell anchor again.
-	restart := seen.Add(40 * time.Minute)
+	// The second run starts ten minutes later, inside the watch, with those
+	// facts. Its sources could not give the bell anchor again.
+	restart := revised.Add(10 * time.Minute)
 	r2 := newRig(t, withDividends(), restart)
-	r2.issuer.setNAV("SOXL", "40.10")
+	r2.issuer.setNAV("SOXL", "40.12")
 	r2.issuer.setNAV("SOXS", "49.80")
 	r2.m.Restore(facts, nil)
 	a := r2.stepAt(restart)
-	wantAnchors(t, a, AnchorBell, "39.85", "49.74")
-	if !a.KnownAt.Equal(effective) || !a.RestartAt.Equal(effective) || a.EntryBan {
-		t.Fatalf("after the restart: known %s restart %s ban %t; want both at T as before the restart, no ban", showTime(a.KnownAt), showTime(a.RestartAt), a.EntryBan)
+	wantAnchors(t, a, AnchorNAV, "40.01", "49.59")
+	if !a.KnownAt.Equal(revised) || !a.SwitchedAt.Equal(revised) || !a.RestartAt.Equal(effective) || a.EntryBan {
+		t.Fatalf("after the restart: known %s switched %s restart %s ban %t; want the revision's time, T, no ban",
+			showTime(a.KnownAt), showTime(a.SwitchedAt), showTime(a.RestartAt), a.EntryBan)
 	}
 	if !sameAnchors(a, before) {
 		t.Errorf("the restart changed the anchors:\n before %+v\n after  %+v", before, a)
 	}
-	if r2.index.calls != 0 || r2.fx.candleCalls != 0 || r2.issuer.distCalls != 2 {
-		t.Errorf("after the restart: %d index reads, %d candle reads, %d distribution reads; want 0, 0 and the daily check only", r2.index.calls, r2.fx.candleCalls, r2.issuer.distCalls)
+	if r2.index.calls != 0 || r2.fx.candleCalls != 0 || r2.issuer.navCalls != 2 {
+		t.Errorf("after the restart: %d index reads, %d candle reads, %d NAV reads; want 0, 0 and the watch's read of both legs", r2.index.calls, r2.fx.candleCalls, r2.issuer.navCalls)
 	}
 	if n := len(r2.facts()); n != 0 {
 		t.Errorf("the restart recorded %d facts it already had", n)
 	}
-	// The hour runs from the first sight, not from the restart.
-	wantAnchors(t, r2.stepAt(seen.Add(55*time.Minute)), AnchorBell, "39.85", "49.74")
-	a = r2.stepAt(seen.Add(time.Hour))
-	wantAnchors(t, a, AnchorNAV, "39.99", "49.59")
-	if !a.KnownAt.Equal(seen.Add(time.Hour)) {
-		t.Errorf("NAV known at %s, want an hour after it was first seen", showTime(a.KnownAt))
+	// The watch goes on: a revision switches again ...
+	r2.issuer.setNAV("SOXS", "49.70")
+	a = r2.stepAt(restart.Add(5 * time.Minute))
+	wantAnchors(t, a, AnchorNAV, "40.01", "49.49")
+	// ... and ends an hour after the first switch, not after the restart.
+	r2.stepAt(seen.Add(55 * time.Minute))
+	calls := r2.issuer.navCalls
+	r2.issuer.setNAV("SOXS", "49")
+	for at := seen.Add(time.Hour); at.Before(seen.Add(2 * time.Hour)); at = at.Add(5 * time.Minute) {
+		r2.stepAt(at)
+	}
+	if r2.issuer.navCalls != calls {
+		t.Errorf("%d NAV reads after the watch of the restored Session", r2.issuer.navCalls-calls)
 	}
 
-	// A third run after the confirmation has the NAV at once and reads
+	// A third run after the watch has the latest NAV at once and reads
 	// nothing; facts of another Session are ignored.
 	facts = append(facts, AnchorFactsFromRows(r2.facts())...)
 	facts = append(facts, AnchorFact{SessionID: "2026-12-18", Kind: FactNAV, Leg: Bull, Value: dec("1"), KnownAt: monClose}, AnchorFact{SessionID: "2026-12-18", Kind: FactNAV, Leg: Bear, Value: dec("1"), KnownAt: monClose})
 	r3 := newRig(t, withDividends(), seen.Add(2*time.Hour))
 	r3.m.Restore(facts, nil)
 	a = r3.stepAt(seen.Add(2 * time.Hour))
-	wantAnchors(t, a, AnchorNAV, "39.99", "49.59")
-	if !a.KnownAt.Equal(seen.Add(time.Hour)) || r3.issuer.navCalls != 0 {
-		t.Errorf("restored NAV: known %s, %d NAV reads; want the stored confirmation time and no read", showTime(a.KnownAt), r3.issuer.navCalls)
+	wantAnchors(t, a, AnchorNAV, "40.01", "49.49")
+	if !a.KnownAt.Equal(restart.Add(5*time.Minute)) || r3.issuer.navCalls != 0 {
+		t.Errorf("restored NAV: known %s, %d NAV reads; want the last switch's time and no read", showTime(a.KnownAt), r3.issuer.navCalls)
 	}
 
 	// Without stored facts a restart starts the Session's reads over.
@@ -634,6 +663,33 @@ func TestAnchorRestoreContinuesTheSession(t *testing.T) {
 	wantAnchors(t, a, AnchorBell, "39.96", "49.95")
 	if !a.KnownAt.Equal(restart) {
 		t.Errorf("without facts the bell anchor is known at %s, want the restart", showTime(a.KnownAt))
+	}
+}
+
+// A restart that stored a NAV seen for one leg only, or for both legs on
+// different rounds, has no NAV yet: the next round that reads both legs
+// switches, as an uninterrupted run would.
+func TestAnchorRestoreBeforeTheFirstSwitch(t *testing.T) {
+	seen := monClose.Add(13 * time.Hour)
+	facts := []AnchorFact{
+		{SessionID: "2026-12-21", Kind: FactBell, Leg: Bull, Value: dec("39.96"), F: dec("0.999"), Source: "binance", KnownAt: monClose.Add(time.Minute)},
+		{SessionID: "2026-12-21", Kind: FactBell, Leg: Bear, Value: dec("49.95"), F: dec("0.999"), Source: "binance", KnownAt: monClose.Add(time.Minute)},
+		{SessionID: "2026-12-21", Kind: FactNAVSeen, Leg: Bull, Value: dec("40.10"), Source: "direxion", KnownAt: seen},
+	}
+	restart := seen.Add(2 * time.Minute)
+	r := newRig(t, testConfig(), restart)
+	r.m.Restore(facts, nil)
+	wantAnchors(t, r.stepAt(restart), AnchorBell, "39.96", "49.95") // the issuer has nothing now
+	r.issuer.setNAV("SOXL", "40.10")
+	r.issuer.setNAV("SOXS", "49.80")
+	a := r.stepAt(restart.Add(5 * time.Minute))
+	wantAnchors(t, a, AnchorNAV, "40.10", "49.80")
+	var kinds []string
+	for _, f := range r.facts() {
+		kinds = append(kinds, f.Kind+"/"+f.Leg+"/"+f.Value.String())
+	}
+	if want := []string{"nav_seen/bear/49.8", "nav/bull/40.1", "nav/bear/49.8"}; !slices.Equal(kinds, want) {
+		t.Errorf("facts after the restart = %v, want %v (the bull value was seen before)", kinds, want)
 	}
 }
 

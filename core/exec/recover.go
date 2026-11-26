@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
+	"sort"
 	"time"
 
 	"etf-pair-arbitrage/core/cex"
@@ -138,9 +140,9 @@ func (m *ExecManager) recoverOnce(ctx context.Context, now time.Time) error {
 // with F the source's close of that minute; a minute with neither is
 // invalid. The mean and sigma then run as if the loop had closed every
 // minute itself: they restart after an invalid minute, at a dividend's
-// effect and, with rewarm_on_anchor_change, at rewarmMinute of the NAV that
-// replaced the bell anchor (navKnownAt), as anchorChanged does; the last
-// ready stats are kept for the exits.
+// effect and at rewarmMinute of the last switch of the anchor that warmed
+// them up again (restoredRewarm), as anchorChanged does; the last ready
+// stats are kept for the exits.
 func (m *ExecManager) restoreMinutes(ctx context.Context, now time.Time) error {
 	s := m.session
 	from, to := s.Start.Truncate(time.Minute), now.Truncate(time.Minute)
@@ -182,16 +184,9 @@ func (m *ExecManager) restoreMinutes(ctx context.Context, now time.Time) error {
 		}
 	}
 
-	// Replay the minutes as closeMinutes would have closed them.
-	var restartAt, rewarmAt time.Time
-	if a := m.cex.Anchors(); a.SessionID == s.ID {
-		restartAt = a.RestartAt
-	}
-	if navAt := navKnownAt(m.restoredFacts, s.ID); m.scfg.RewarmOnAnchorChange && !navAt.IsZero() {
-		rewarmAt = rewarmMinute(navAt)
-	}
-	m.bars, m.runStart, m.stats = nil, 0, strategy.Stats{}
-	ownN, filled, restarted := 0, 0, false
+	// The minutes as closeMinutes would have closed them.
+	var bars []strategy.MinuteBar
+	ownN, filled := 0, 0
 	for t := from; t.Before(to); t = t.Add(time.Minute) {
 		bar := strategy.MinuteBar{Minute: t}
 		if row, held := own[t.UnixMilli()]; held {
@@ -204,11 +199,24 @@ func (m *ExecManager) restoreMinutes(ctx context.Context, now time.Time) error {
 				filled++
 			}
 		}
+		bars = append(bars, bar)
+	}
+
+	// The mean and sigma over them, restarting where the loop would have.
+	var restartAt time.Time
+	if a := m.cex.Anchors(); a.SessionID == s.ID {
+		restartAt = a.RestartAt
+	}
+	rewarmAt := m.restoredRewarm(bars, anchorSwitches(m.restoredFacts, s.ID))
+	m.bars, m.runStart, m.stats = nil, 0, strategy.Stats{}
+	restarted := false
+	for _, bar := range bars {
+		t := bar.Minute
 		if !restartAt.IsZero() && !restarted && !t.Before(restartAt) {
 			m.runStart, restarted = len(m.bars), true // the dividend took effect: the run starts here
 		}
 		if t.Equal(rewarmAt) {
-			m.runStart = len(m.bars) // the NAV became the anchor in this minute
+			m.runStart = len(m.bars) // the anchor switched in this minute and warmed the mean up again
 		}
 		m.bars = append(m.bars, bar)
 		if !bar.Valid {
@@ -228,26 +236,65 @@ func (m *ExecManager) restoreMinutes(ctx context.Context, now time.Time) error {
 	return nil
 }
 
-// navKnownAt is when the NAV replaced the Session's bell anchor as the
-// stored facts say: the known time of its confirmed NAV (cex.FactNAV, one
-// time for both legs). Zero without it, and when no bell anchor was known
-// before it: the loop warms up again only when the NAV replaces the bell
-// anchor, not when it is the Session's first anchor.
-func navKnownAt(facts []store.AnchorFactRow, sessionID string) time.Time {
-	var bell, nav time.Time
+// anchorSwitch is one switch of a Session's anchor as the stored facts say:
+// the bell anchor read (cex.FactBell), or the anchor switched to a NAV
+// (cex.FactNAV), both legs with one known time.
+type anchorSwitch struct {
+	at     time.Time
+	values cex.Anchors // Kind, Bull and Bear
+}
+
+// anchorSwitches lists the Session's switches of the anchor from its stored
+// facts, oldest first.
+func anchorSwitches(facts []store.AnchorFactRow, sessionID string) []anchorSwitch {
+	byTime := map[string]*anchorSwitch{}
+	var out []*anchorSwitch
 	for _, f := range facts {
-		switch known := time.UnixMilli(f.KnownMs); {
-		case f.SessionID != sessionID:
-		case f.Kind == cex.FactBell:
-			bell = known
-		case f.Kind == cex.FactNAV:
-			nav = known
+		if f.SessionID != sessionID || f.Kind != cex.FactBell && f.Kind != cex.FactNAV {
+			continue
+		}
+		key := fmt.Sprintf("%s/%d", f.Kind, f.KnownMs)
+		sw := byTime[key]
+		if sw == nil {
+			sw = &anchorSwitch{at: time.UnixMilli(f.KnownMs), values: cex.Anchors{Kind: cex.AnchorKind(f.Kind)}}
+			byTime[key] = sw
+			out = append(out, sw)
+		}
+		if f.Leg == cex.Bull.String() {
+			sw.values.Bull = f.Value
+		} else {
+			sw.values.Bear = f.Value
 		}
 	}
-	if bell.IsZero() || !bell.Before(nav) {
-		return time.Time{}
+	sort.SliceStable(out, func(i, j int) bool { return out[i].at.Before(out[j].at) })
+	list := make([]anchorSwitch, len(out))
+	for i, sw := range out {
+		list[i] = *sw
 	}
-	return nav
+	return list
+}
+
+// restoredRewarm is the minute of the last switch that warmed the mean and
+// sigma up again, as anchorChanged decided it (warmsUpAgain); zero when
+// none did. The first anchor of a Session warms nothing up. The spread's
+// jump of a NAV switch is taken at the mids and F of the last valid minute
+// before its minute: the restart does not have the mids the loop saw.
+func (m *ExecManager) restoredRewarm(bars []strategy.MinuteBar, switches []anchorSwitch) time.Time {
+	var at time.Time
+	for i := 1; i < len(switches); i++ {
+		prev, sw := switches[i-1], switches[i]
+		minute, jump := rewarmMinute(sw.at), math.NaN()
+		for j := len(bars) - 1; j >= 0; j-- {
+			if b := bars[j]; b.Valid && b.Minute.Before(minute) {
+				jump = anchorJump(b.F, b.MidBull, b.MidBear, prev.values, sw.values)
+				break
+			}
+		}
+		if m.warmsUpAgain(sw.values.Kind != prev.values.Kind, jump) {
+			at = minute
+		}
+	}
+	return at
 }
 
 // restoreBatch takes up the entry batch whose lot was still being built

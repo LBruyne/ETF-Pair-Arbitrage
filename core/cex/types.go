@@ -9,6 +9,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 	"strings"
 	"time"
 
@@ -24,14 +25,15 @@ type Config struct {
 	OrderTransport    OrderTransport     `yaml:"order_transport"`    // how an order reaches the venue: ws (the default) or rest
 	DepthMaxAge       time.Duration      `yaml:"depth_max_age"`      // a leg's depth, or its best price, older than this is not usable
 	FXMaxAge          time.Duration      `yaml:"fx_max_age"`         // F older than this stops entries; exits go on with the last value
-	NAVSettleDelay    time.Duration      `yaml:"nav_settle_delay"`   // a NAV unchanged for this long replaces the bell anchor
+	NAVWatch          time.Duration      `yaml:"nav_watch"`          // after the NAV first replaces the bell anchor it is read on this long; a new value switches the anchor again
+	NAVHotSwitchD     float64            `yaml:"nav_hot_switch_d"`   // a NAV switch whose spread jump at the current mids is below this, in spread units, keeps the mean and sigma; a larger one warms them up again
 	CalendarOverrides []CalendarOverride `yaml:"calendar_overrides"` // closures and early closes the built-in calendar does not know
 	CorporateActions  []CorporateAction  `yaml:"corporate_actions"`  // planned ex-dates, kept by hand
 }
 
 // DefaultConfig holds the values a key left out of config.yaml keeps. The
 // pair has no default: it must be written.
-var DefaultConfig = Config{BookConnections: 3, OrderTransport: OrderTransportWS, DepthMaxAge: 10 * time.Second, FXMaxAge: 60 * time.Second, NAVSettleDelay: time.Hour}
+var DefaultConfig = Config{BookConnections: 3, OrderTransport: OrderTransportWS, DepthMaxAge: 10 * time.Second, FXMaxAge: 60 * time.Second, NAVWatch: time.Hour, NAVHotSwitchD: 1}
 
 // OrderTransport names the way orders are sent to the venue. The default
 // is ws: on real orders it created the order about 9 ms sooner than rest
@@ -122,8 +124,11 @@ func (c Config) Validate() error {
 	if c.FXMaxAge <= 0 {
 		errs = append(errs, fmt.Errorf("cex.fx_max_age must be positive, got %s", c.FXMaxAge))
 	}
-	if c.NAVSettleDelay <= 0 {
-		errs = append(errs, fmt.Errorf("cex.nav_settle_delay must be positive, got %s", c.NAVSettleDelay))
+	if c.NAVWatch <= 0 {
+		errs = append(errs, fmt.Errorf("cex.nav_watch must be positive, got %s", c.NAVWatch))
+	}
+	if !(c.NAVHotSwitchD >= 0) || math.IsInf(c.NAVHotSwitchD, 1) {
+		errs = append(errs, fmt.Errorf("cex.nav_hot_switch_d must be a finite number of spread units, 0 or more, got %v", c.NAVHotSwitchD))
 	}
 	for i, o := range c.CalendarOverrides {
 		path := fmt.Sprintf("cex.calendar_overrides[%d]", i)
@@ -473,6 +478,7 @@ type Anchors struct {
 	Kind       AnchorKind
 	Bull, Bear decimal.Decimal // USD per share, with a dividend already subtracted from the moment it took effect
 	KnownAt    time.Time       // when this pair of values became usable
+	SwitchedAt time.Time       // when the anchor itself was taken: the bell anchor read, or the NAV in use switched to; a dividend does not move it
 	EntryBan   bool            // inside a dividend or split window: no entries
 	RestartAt  time.Time       // the mean and sigma restart at this time (a dividend took effect); zero otherwise
 }
@@ -487,8 +493,8 @@ type Distribution struct {
 // The kinds of AnchorFact, as stored in anchor_fact.kind.
 const (
 	FactBell     = "bell"     // the bell anchor of one leg
-	FactNAVSeen  = "nav_seen" // a NAV value read for the first time; its settle delay starts at KnownAt
-	FactNAV      = "nav"      // the NAV confirmed as the anchor
+	FactNAVSeen  = "nav_seen" // a NAV value of one leg read for the first time, or different from the one read before it
+	FactNAV      = "nav"      // the NAV the anchor switched to, both legs with one known time per switch: the first replaces the bell anchor, a later one is a new value in the watch
 	FactDividend = "dividend" // the amount of a dividend that takes effect in the Session
 )
 

@@ -171,6 +171,15 @@ func TestLoad(t *testing.T) {
 		{name: "the old d_out is refused", edits: []edit{{"  entry_out: -0.5 ", "  d_out: -0.5 "}}, env: envFull,
 			wantErr: []string{"field d_out not found"}},
 
+		// Owner items 96-97: nav_settle_delay gave way to nav_watch; the old key is refused, not read.
+		{name: "the old nav_settle_delay is refused", edits: []edit{{"  nav_watch: 1h ", "  nav_settle_delay: 1h "}}, env: envFull,
+			wantErr: []string{"field nav_settle_delay not found"}},
+		{name: "nav_watch zero", edits: []edit{{"  nav_watch: 1h ", "  nav_watch: 0s "}}, env: envFull,
+			wantErr: []string{"cex.nav_watch must be positive"}},
+		{name: "nav_hot_switch_d negative", edits: []edit{{"  nav_hot_switch_d: 1 ", "  nav_hot_switch_d: -1 "}}, env: envFull,
+			wantErr: []string{"cex.nav_hot_switch_d must be a finite number of spread units, 0 or more"}},
+		{name: "nav_hot_switch_d zero: every NAV change warms up again", edits: []edit{{"  nav_hot_switch_d: 1 ", "  nav_hot_switch_d: 0 "}}, env: envFull},
+
 		// exit2: optional; -entry_in <= exit2 <= entry_out (SPEC 12.6).
 		{name: "exit2 written", edits: []edit{{"  # exit2: -1 ", "  exit2: -1 "}}, env: envFull},
 		{name: "exit2 equal to entry_out is allowed", edits: []edit{{"  # exit2: -1 ", "  exit2: -0.5 "}}, env: envFull},

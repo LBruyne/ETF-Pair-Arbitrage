@@ -83,11 +83,13 @@ type pairAnchor struct {
 	known      int64
 }
 
-// anchorRefs turns the pairs into anchor publications.
+// anchorRefs turns the pairs into anchor publications. Each pair is a switch
+// of the anchor at its known time (cex.Anchors.SwitchedAt), as the anchor
+// loop publishes it.
 func anchorRefs(pairs []pairAnchor) []refEvent {
 	var out []refEvent
 	for _, p := range pairs {
-		a := cex.Anchors{SessionID: p.session, Kind: p.kind, Bull: p.bull, Bear: p.bear, KnownAt: time.UnixMilli(p.known)}
+		a := cex.Anchors{SessionID: p.session, Kind: p.kind, Bull: p.bull, Bear: p.bear, KnownAt: time.UnixMilli(p.known), SwitchedAt: time.UnixMilli(p.known)}
 		out = append(out, refEvent{at: p.known, anchors: &a})
 	}
 	return out
@@ -107,9 +109,10 @@ func sortRefs(refs []refEvent) {
 
 // boardRefs reads F and the anchors of [from, to) from the board's
 // database: F from fx_minute (the collector's sample of each minute, at its
-// sample time), the bell anchor from etf_bell and the NAV from etf_nav, each
-// pair known when its later leg was.
-func boardRefs(ctx context.Context, dsn string, bull, bear string, cal *cex.Calendar, from, to time.Time) ([]refEvent, error) {
+// sample time), the bell anchor from etf_bell (the pair known when its later
+// leg was), and the NAV switches the program's rule gives on the board's
+// NAV observations (navWatchPairs, with the configured nav_watch).
+func boardRefs(ctx context.Context, dsn string, bull, bear string, watch time.Duration, cal *cex.Calendar, from, to time.Time) ([]refEvent, error) {
 	conn, err := pgx.Connect(ctx, dsn)
 	if err != nil {
 		return nil, fmt.Errorf("replay: board database: %w", err)
@@ -140,24 +143,32 @@ func boardRefs(ctx context.Context, dsn string, bull, bear string, cal *cex.Cale
 		sessions = append(sessions, s.ID)
 	}
 	var pairs []pairAnchor
-	for _, q := range []struct {
-		kind cex.AnchorKind
-		sql  string
-	}{
-		{cex.AnchorBell, `select ticker, price, known_ms from etfpair.etf_bell where session_date = $1::date and ticker = any($2)`},
-		// The first confirmation of each fund's NAV of the day.
-		{cex.AnchorNAV, `select distinct on (ticker) ticker, nav, confirmed_ms from etfpair.etf_nav where session_date = $1::date and ticker = any($2) order by ticker, confirmed_ms`},
-	} {
-		for _, id := range sessions {
-			p, ok, err := readPair(ctx, conn, q.sql, id, bull, bear)
-			if err != nil {
+	for _, id := range sessions {
+		p, ok, err := readPair(ctx, conn, `select ticker, price, known_ms from etfpair.etf_bell where session_date = $1::date and ticker = any($2)`, id, bull, bear)
+		if err != nil {
+			return nil, err
+		}
+		if ok {
+			p.kind = cex.AnchorBell
+			pairs = append(pairs, p)
+		}
+		// Every distinct NAV of the day with when the collector first read it.
+		rows, err := conn.Query(ctx, `select ticker, nav, received_ms from etfpair.etf_nav_obs where session_date = $1::date and ticker = any($2) order by received_ms, ticker`, id, []string{bull, bear})
+		if err != nil {
+			return nil, err
+		}
+		var obs []navObs
+		for rows.Next() {
+			var o navObs
+			if err := rows.Scan(&o.ticker, &o.nav, &o.firstMs); err != nil {
 				return nil, err
 			}
-			if ok {
-				p.kind = q.kind
-				pairs = append(pairs, p)
-			}
+			obs = append(obs, o)
 		}
+		if err := rows.Err(); err != nil {
+			return nil, err
+		}
+		pairs = append(pairs, navWatchPairs(id, obs, bull, bear, watch)...)
 	}
 	refs = append(refs, anchorRefs(pairs)...)
 	sortRefs(refs)
@@ -263,8 +274,7 @@ func readPaperRun(ctx context.Context, dsn, runID string, to time.Time) (*paperR
 	if err != nil {
 		return nil, err
 	}
-	pairs := map[string]*pairAnchor{}
-	var order []string
+	var all []store.AnchorFactRow
 	for rows.Next() {
 		var f store.AnchorFactRow
 		var detail string
@@ -275,33 +285,12 @@ func readPaperRun(ctx context.Context, dsn, runID string, to time.Time) (*paperR
 		if f.KnownMs <= run.startedMs && f.SessionID == session.ID {
 			run.facts = append(run.facts, f)
 		}
-		if f.Kind != string(cex.AnchorBell) && f.Kind != string(cex.AnchorNAV) {
-			continue
-		}
-		key := f.SessionID + "/" + f.Kind
-		p := pairs[key]
-		if p == nil {
-			p = &pairAnchor{session: f.SessionID, kind: cex.AnchorKind(f.Kind)}
-			pairs[key] = p
-			order = append(order, key)
-		}
-		if f.Leg == cex.Bull.String() {
-			p.bull = f.Value
-		} else {
-			p.bear = f.Value
-		}
-		p.known = max(p.known, f.KnownMs)
+		all = append(all, f)
 	}
 	if err := rows.Err(); err != nil {
 		return nil, err
 	}
-	var list []pairAnchor
-	for _, key := range order {
-		if p := pairs[key]; !p.bull.IsZero() && !p.bear.IsZero() {
-			list = append(list, *p)
-		}
-	}
-	run.refs = append(run.refs, anchorRefs(list)...)
+	run.refs = append(run.refs, anchorRefs(factPairs(all))...)
 	sortRefs(run.refs)
 
 	// The minutes of its Session it had recorded before it started.
@@ -378,4 +367,88 @@ func checkRestart(sinceMs, startedMs int64, openAcross []string) error {
 		return fmt.Errorf("cycles %v were open across the run's start %s; the replay restores no open cycle", openAcross, showMs(startedMs))
 	}
 	return nil
+}
+
+// factPairs turns a run's anchor facts, ordered by known time, into the
+// switches of its anchors: each bell or nav fact pair with one known time is
+// one switch (cex records both legs of a switch at once), so a NAV switched
+// again in the watch is a publication of its own (owner items 96-97). A
+// switch with one leg stored is left out.
+func factPairs(rows []store.AnchorFactRow) []pairAnchor {
+	pairs := map[string]*pairAnchor{}
+	var order []string
+	for _, f := range rows {
+		if f.Kind != cex.FactBell && f.Kind != cex.FactNAV {
+			continue
+		}
+		key := fmt.Sprintf("%s/%s/%d", f.SessionID, f.Kind, f.KnownMs)
+		p := pairs[key]
+		if p == nil {
+			p = &pairAnchor{session: f.SessionID, kind: cex.AnchorKind(f.Kind), known: f.KnownMs}
+			pairs[key] = p
+			order = append(order, key)
+		}
+		if f.Leg == cex.Bull.String() {
+			p.bull = f.Value
+		} else {
+			p.bear = f.Value
+		}
+	}
+	var list []pairAnchor
+	for _, key := range order {
+		if p := pairs[key]; !p.bull.IsZero() && !p.bear.IsZero() {
+			list = append(list, *p)
+		}
+	}
+	return list
+}
+
+// navObs is one distinct NAV of a fund for a trading day, as the board's
+// collector stored it, with when it was first read.
+type navObs struct {
+	ticker  string
+	nav     decimal.Decimal
+	firstMs int64
+}
+
+// navWatchPairs applies the program's NAV rule (owner items 96-97) to the
+// board's observations of one Session, in the order they were first read:
+// the NAV replaces the bell anchor once both funds have a value, with each
+// fund's latest; in nav_watch after that each new value is a switch, the
+// other fund keeping its value, and values first read in the same
+// millisecond are one switch; a value first read after the watch is not
+// taken. The board's reads are not the program's rounds, so the times are
+// those of the collector. The table keeps each value once: a value that
+// comes back after another is not seen again.
+func navWatchPairs(session string, obs []navObs, bull, bear string, watch time.Duration) []pairAnchor {
+	sort.SliceStable(obs, func(i, j int) bool { return obs[i].firstMs < obs[j].firstMs })
+	var cur [2]decimal.Decimal
+	var first int64
+	var out []pairAnchor
+	for _, o := range obs {
+		leg := cex.Bull
+		switch o.ticker {
+		case bull:
+		case bear:
+			leg = cex.Bear
+		default:
+			continue
+		}
+		if first != 0 && o.firstMs >= first+watch.Milliseconds() {
+			continue
+		}
+		cur[leg] = o.nav
+		if cur[cex.Bull].IsZero() || cur[cex.Bear].IsZero() {
+			continue
+		}
+		if first == 0 {
+			first = o.firstMs
+		}
+		if n := len(out); n > 0 && out[n-1].known == o.firstMs {
+			out[n-1].bull, out[n-1].bear = cur[cex.Bull], cur[cex.Bear]
+			continue
+		}
+		out = append(out, pairAnchor{session: session, kind: cex.AnchorNAV, bull: cur[cex.Bull], bear: cur[cex.Bear], known: o.firstMs})
+	}
+	return out
 }

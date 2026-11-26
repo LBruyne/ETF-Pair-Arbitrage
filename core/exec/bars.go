@@ -79,12 +79,13 @@ func (m *ExecManager) observe(r *round) {
 
 // anchorChanged takes the anchors' new values a. The first anchor of a
 // Session is logged. A change from one anchor to another within the Session
-// (bell to NAV, a dividend adjustment) keeps the mean and sigma, which hold
-// no anchor and are expressed under the new one at once (PRD 11.3), unless
-// rewarm_on_anchor_change asks for a new warm-up after bell to NAV, from
-// rewarmMinute on; it is an
-// event with the spread's jump at the current mids (PRD 11.4). Positions
-// and the cycle's pairing anchors are not touched (PRD 11.1, 11.2).
+// is an event with the spread's jump at the current mids (PRD 11.4).
+// Positions and the cycle's pairing anchors are not touched (PRD 11.1,
+// 11.2). The mean and sigma hold no anchor and are expressed under the new
+// one at once (PRD 11.3), unless the change is a switch of the anchor that
+// warms them up again (warmsUpAgain); the new run starts at rewarmMinute. A
+// dividend's adjustment keeps SwitchedAt and is not a switch: its restart
+// comes with RestartAt (PRD 4.6).
 func (m *ExecManager) anchorChanged(r *round, a cex.Anchors) {
 	log := logger.GlobalLogger
 	from := m.anchors
@@ -93,34 +94,50 @@ func (m *ExecManager) anchorChanged(r *round, a cex.Anchors) {
 		log.Info("exec: anchors", "session", a.SessionID, "kind", string(a.Kind), "bull_usd", a.Bull, "bear_usd", a.Bear, "known_at", showTime(a.KnownAt), "entry_ban", a.EntryBan)
 		return
 	}
-	rewarm := a.Kind != from.Kind && m.scfg.RewarmOnAnchorChange
+	jump := math.NaN()
+	if bull, bear := r.books.ByLeg[cex.Bull], r.books.ByLeg[cex.Bear]; hasMid(bull) && hasMid(bear) {
+		jump = anchorJump(r.fx.Price.InexactFloat64(), mid(bull), mid(bear), from, a)
+	}
+	switched := a.Kind != from.Kind || !a.SwitchedAt.Equal(from.SwitchedAt)
+	rewarm := switched && m.warmsUpAgain(a.Kind != from.Kind, jump)
 	if rewarm {
 		// A minute closed already when the loop sees the NAV only in the next
 		// one; never before the run's start (an invalid minute, a dividend).
-		start, from := rewarmMinute(a.KnownAt), len(m.bars)
+		start, from := rewarmMinute(a.SwitchedAt), len(m.bars)
 		for from > m.runStart && !m.bars[from-1].Minute.Before(start) {
 			from--
 		}
 		m.runStart = from
 		m.stats = strategy.ComputeStats(m.bars[m.runStart:], m.scfg)
 	}
-	jump := math.NaN()
-	if bull, bear := r.books.ByLeg[cex.Bull], r.books.ByLeg[cex.Bear]; hasMid(bull) && hasMid(bear) {
-		f, pBull, pBear := r.fx.Price.InexactFloat64(), mid(bull), mid(bear)
-		jump = strategy.Spread(f, pBull, a.Bull.InexactFloat64(), pBear, a.Bear.InexactFloat64()) - strategy.Spread(f, pBull, from.Bull.InexactFloat64(), pBear, from.Bear.InexactFloat64())
-	}
 	log.Info("exec: anchor changed", "session", a.SessionID, "from", string(from.Kind), "to", string(a.Kind), "from_bull_usd", from.Bull, "from_bear_usd", from.Bear,
-		"to_bull_usd", a.Bull, "to_bear_usd", a.Bear, "known_at", showTime(a.KnownAt), "mid_jump_d", jump, "rewarm", rewarm)
+		"to_bull_usd", a.Bull, "to_bear_usd", a.Bear, "known_at", showTime(a.KnownAt), "switched", switched, "mid_jump_d", jump, "rewarm", rewarm)
 	m.event(r.now, "info", "anchor_changed", "the anchors changed within the Session; positions and the cycle's pairing anchors are kept",
 		map[string]any{"session_id": a.SessionID, "from": from.Kind, "to": a.Kind, "from_bull": from.Bull, "from_bear": from.Bear, "to_bull": a.Bull, "to_bear": a.Bear,
-			"known_ms": a.KnownAt.UnixMilli(), "mid_jump_d": finite(jump), "rewarm": rewarm})
+			"known_ms": a.KnownAt.UnixMilli(), "switched": switched, "mid_jump_d": finite(jump), "rewarm": rewarm})
 }
 
-// rewarmMinute is the minute the mean and sigma start again from when the
-// NAV replaced the bell anchor (rewarm_on_anchor_change): the minute the NAV
-// became known in, whether the loop saw it in that minute or the next, and
-// at a restart.
-func rewarmMinute(navAt time.Time) time.Time { return navAt.Truncate(time.Minute) }
+// warmsUpAgain reports whether a switch of the anchor within the Session
+// starts the mean and sigma over (PRD 11.3, owner items 96-97). Only with
+// rewarm_on_anchor_change: the NAV replacing the bell anchor (kindChanged)
+// always does; a new NAV in the watch does when the spread's jump at the
+// mids is cex.nav_hot_switch_d or more, or unknown, and is a hot switch
+// otherwise.
+func (m *ExecManager) warmsUpAgain(kindChanged bool, jump float64) bool {
+	return m.scfg.RewarmOnAnchorChange && (kindChanged || !(math.Abs(jump) < m.cex.NAVHotSwitchD()))
+}
+
+// anchorJump is the spread's jump, in spread units, at the mids from the
+// anchors from to the anchors to.
+func anchorJump(f, midBull, midBear float64, from, to cex.Anchors) float64 {
+	return strategy.Spread(f, midBull, to.Bull.InexactFloat64(), midBear, to.Bear.InexactFloat64()) -
+		strategy.Spread(f, midBull, from.Bull.InexactFloat64(), midBear, from.Bear.InexactFloat64())
+}
+
+// rewarmMinute is the minute the mean and sigma start again from after a
+// switch of the anchor that warms them up again: the minute it became known
+// in, whether the loop saw it in that minute or the next, and at a restart.
+func rewarmMinute(switchedAt time.Time) time.Time { return switchedAt.Truncate(time.Minute) }
 
 // mid is a book's raw best bid and ask midpoint, in USDT.
 func mid(b *cex.Book) float64 {

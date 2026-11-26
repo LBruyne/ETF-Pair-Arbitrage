@@ -12,9 +12,11 @@ import (
 
 // anchorState is the anchor state of one Session, owned by the anchor loop.
 // A Session starts without an anchor, fixes the F of its closing minute and
-// gets the bell anchor a minute or two after its opening close, and switches to the issuer's NAV once both legs'
-// NAV of the Session's trading day have been stable for nav_settle_delay.
-// After that nothing is read until the next Session.
+// gets the bell anchor a minute or two after its opening close, and switches
+// to the issuer's NAV at the first read that finds both legs' NAV of the
+// Session's trading day (owner items 96-97). For nav_watch after that the
+// NAV is read on, and a new value switches the anchor again; after the
+// watch nothing is read until the next Session.
 type anchorState struct {
 	session Session
 
@@ -27,10 +29,11 @@ type anchorState struct {
 	nextBell    time.Time          // the next read of what the bell anchor still lacks
 
 	// the issuer's NAV of the trading day that starts the Session
-	navSeen  [2]decimal.Decimal // by leg: the value last read; zero until the first
-	navSince [2]time.Time       // by leg: when that value was first read; the settle delay runs from here
-	navAt    time.Time          // when both were confirmed; zero until then
-	nextNAV  time.Time          // the next read of the issuer
+	navSeen     [2]decimal.Decimal // by leg: the value last read; zero until the first
+	nav         [2]decimal.Decimal // by leg: the NAV the anchor uses; valid once navAt is set
+	navAt       time.Time          // when the NAV first replaced the bell anchor, the start of the watch; zero until then
+	navSwitchAt time.Time          // when the anchor last switched to a NAV: navAt, or a new value in the watch
+	nextNAV     time.Time          // the next read of the issuer
 
 	// the dividends whose entry ban reaches into this Session
 	dividends []*dividend
@@ -94,7 +97,7 @@ func (m *CexManager) bindCorporateActions() {
 
 // Restore hands the manager what the previous run stored, before Run: the
 // anchor facts of the Session the process restarts in, so the bell anchor,
-// the NAV's settle delay and every known-at time continue instead of
+// the NAV in use, its watch and every known-at time continue instead of
 // starting over, and the unfinished cycle's order records, which go into the
 // order table. An order read back without a final state becomes unknown and
 // is queried at the venue.
@@ -110,6 +113,11 @@ func (m *CexManager) Restore(facts []AnchorFact, orders []OrderRecord) {
 // Anchors.SessionID with the ID of the Session it is in and treats the
 // anchors of another Session as no anchor.
 func (m *CexManager) Anchors() Anchors { return m.reference.Load().anchors }
+
+// NAVHotSwitchD is the configured nav_hot_switch_d, in spread units: exec
+// keeps the mean and sigma through a NAV switch whose spread jump is below
+// it.
+func (m *CexManager) NAVHotSwitchD() float64 { return m.cfg.NAVHotSwitchD }
 
 // --- the anchor loop ---
 
@@ -177,13 +185,15 @@ func (m *CexManager) startSession(s Session, now time.Time) {
 }
 
 // restore takes over the stored facts of this Session: the F fixed for the
-// bell anchor, the bell anchor, the NAV values with the times they were
-// first seen, the confirmed NAV and the dividend amounts. Facts of another Session are ignored. A later nav_seen
-// of a leg replaces an earlier one: the NAV changed and its delay restarted.
+// bell anchor, the bell anchor, the NAV values last seen, the NAV of the
+// latest switch with the time of the first one (the watch runs from there)
+// and the dividend amounts. Facts of another Session are ignored; of each
+// kind and leg the latest counts.
 func (a *anchorState) restore(facts []AnchorFact) {
 	var bellLegs, navLegs [2]bool
-	var bellAt, navAt time.Time
+	var bellAt, navFirst, navLast time.Time
 	var nav [2]decimal.Decimal
+	var seenAt, navLegAt [2]time.Time
 	for _, f := range facts {
 		if f.SessionID != a.session.ID {
 			continue
@@ -194,11 +204,17 @@ func (a *anchorState) restore(facts []AnchorFact) {
 		case FactBell:
 			a.bell[f.Leg], bellLegs[f.Leg], bellAt = f.Value, true, latest(bellAt, f.KnownAt)
 		case FactNAVSeen:
-			if !f.KnownAt.Before(a.navSince[f.Leg]) {
-				a.navSeen[f.Leg], a.navSince[f.Leg] = f.Value, f.KnownAt
+			if !f.KnownAt.Before(seenAt[f.Leg]) {
+				a.navSeen[f.Leg], seenAt[f.Leg] = f.Value, f.KnownAt
 			}
 		case FactNAV:
-			nav[f.Leg], navLegs[f.Leg], navAt = f.Value, true, latest(navAt, f.KnownAt)
+			if !f.KnownAt.Before(navLegAt[f.Leg]) {
+				nav[f.Leg], navLegAt[f.Leg] = f.Value, f.KnownAt
+			}
+			if navFirst.IsZero() || f.KnownAt.Before(navFirst) {
+				navFirst = f.KnownAt
+			}
+			navLegs[f.Leg], navLast = true, latest(navLast, f.KnownAt)
 		case FactDividend:
 			for _, d := range a.dividends {
 				if d.inSession && d.leg == f.Leg {
@@ -213,7 +229,8 @@ func (a *anchorState) restore(facts []AnchorFact) {
 		a.bell = [2]decimal.Decimal{}
 	}
 	if navLegs[Bull] && navLegs[Bear] {
-		a.navSeen, a.navAt = nav, navAt
+		// The NAV in use is what a later read is compared with.
+		a.nav, a.navSeen, a.navAt, a.navSwitchAt = nav, nav, navFirst, navLast
 	}
 }
 
@@ -290,19 +307,24 @@ func (m *CexManager) readBell(ctx context.Context, now time.Time) {
 }
 
 // readNAV asks the issuer for both funds' NAV of the Session's trading day,
-// every anchorPoll from the Session's start until the NAV is confirmed. A
-// value read for the first time, or different from the one before, starts
-// that leg's settle delay. The NAV is confirmed, for both legs at once, at a
-// read that finds both values unchanged for at least nav_settle_delay.
+// every anchorPoll from the Session's start (owner items 96-97). A value
+// read for the first time, or different from the one before, is a nav_seen
+// fact. The first round that reads both legs switches the anchor from the
+// bell anchor to the NAV, without a settle delay. For nav_watch after that
+// switch the reads go on: a round that finds a new value of either leg
+// switches the anchor to it at once, the other leg keeping its value; exec
+// decides whether that warms the mean up again. Each switch is a nav fact
+// of both legs. After the watch the NAV is not read again in the Session.
 func (m *CexManager) readNAV(ctx context.Context, now time.Time) {
 	a := &m.anchor
-	if m.issuerOff || !a.navAt.IsZero() || now.Before(a.nextNAV) {
+	watching := !a.navAt.IsZero()
+	if m.issuerOff || now.Before(a.nextNAV) || watching && !now.Before(a.navAt.Add(m.cfg.NAVWatch)) {
 		return
 	}
 	log := logger.GlobalLogger
 	a.nextNAV = now.Add(m.timing.anchorPoll)
 	tradeDate := parseDay(a.session.ID)
-	read := 0
+	read, changed := 0, false
 	for _, leg := range Legs {
 		callCtx, cancel := context.WithTimeout(ctx, m.timing.sourceCall)
 		nav, ok, err := m.issuer.NAV(callCtx, m.tickers[leg], tradeDate)
@@ -319,23 +341,30 @@ func (m *CexManager) readNAV(ctx context.Context, now time.Time) {
 			continue
 		}
 		read++
-		if a.navSince[leg].IsZero() || !nav.Equal(a.navSeen[leg]) {
+		if !nav.Equal(a.navSeen[leg]) {
 			seenAt := m.timing.clock()
-			log.Info("cex: nav seen", "ticker", m.tickers[leg], "session", a.session.ID, "from", a.navSeen[leg], "to", nav, "settles_at", showTime(seenAt.Add(m.cfg.NAVSettleDelay)))
-			a.navSeen[leg], a.navSince[leg] = nav, seenAt
+			log.Info("cex: nav seen", "ticker", m.tickers[leg], "session", a.session.ID, "from", a.navSeen[leg], "to", nav)
+			a.navSeen[leg], changed = nav, true
 			m.recordFact(AnchorFact{SessionID: a.session.ID, Kind: FactNAVSeen, Leg: leg, Value: nav, Source: "direxion", KnownAt: seenAt}, map[string]any{"trade_date": a.session.ID})
 		}
 	}
-	// Confirmed only by a round that read both legs and found both stable.
-	confirmedAt := m.timing.clock()
-	if read < len(Legs) || confirmedAt.Sub(a.navSince[Bull]) < m.cfg.NAVSettleDelay || confirmedAt.Sub(a.navSince[Bear]) < m.cfg.NAVSettleDelay {
+	// The first switch needs a round that read both legs; in the watch a
+	// new value of either leg is a switch.
+	if watching && !changed || !watching && read < len(Legs) {
 		return
 	}
-	a.navAt = confirmedAt
-	for _, leg := range Legs {
-		m.recordFact(AnchorFact{SessionID: a.session.ID, Kind: FactNAV, Leg: leg, Value: a.navSeen[leg], Source: "direxion", KnownAt: a.navAt},
-			map[string]any{"trade_date": a.session.ID, "seen_ms": a.navSince[leg].UnixMilli()})
+	at := m.timing.clock()
+	if !watching {
+		a.navAt = at
 	}
+	from := a.nav
+	a.nav, a.navSwitchAt = a.navSeen, at
+	for _, leg := range Legs {
+		m.recordFact(AnchorFact{SessionID: a.session.ID, Kind: FactNAV, Leg: leg, Value: a.nav[leg], Source: "direxion", KnownAt: at},
+			map[string]any{"trade_date": a.session.ID, "watch_until_ms": a.navAt.Add(m.cfg.NAVWatch).UnixMilli()})
+	}
+	log.Info("cex: nav switched", "session", a.session.ID, "first", !watching, "from_bull_usd", from[Bull], "from_bear_usd", from[Bear],
+		"bull_usd", a.nav[Bull], "bear_usd", a.nav[Bear], "watch_until", showTime(a.navAt.Add(m.cfg.NAVWatch)))
 }
 
 // readDividends reads the amount of each dividend that takes effect in this
@@ -449,8 +478,8 @@ func (m *CexManager) splitActive(now time.Time) bool {
 }
 
 // anchors builds the published value from the state at now. Both legs use
-// the NAV once it is confirmed, else the bell anchor once it is read, else
-// nothing. A dividend bans entries from the pre-market of its carrier day to
+// the NAV once it has replaced the bell anchor, else the bell anchor once it
+// is read, else nothing. A dividend bans entries from the pre-market of its carrier day to
 // its effective time T. From T on the mean and sigma restart at T and the
 // leg's anchor is lowered by the amount, whichever kind the anchor is and
 // whenever it became known; while the amount is not read the anchor stays as
@@ -460,10 +489,11 @@ func (a *anchorState) anchors(now time.Time, splitBan bool) Anchors {
 	var value [2]decimal.Decimal
 	switch {
 	case !a.navAt.IsZero():
-		out.Kind, value, out.KnownAt = AnchorNAV, a.navSeen, a.navAt
+		out.Kind, value, out.KnownAt = AnchorNAV, a.nav, a.navSwitchAt
 	case !a.bellAt.IsZero():
 		out.Kind, value, out.KnownAt = AnchorBell, a.bell, a.bellAt
 	}
+	out.SwitchedAt = out.KnownAt
 	for _, d := range a.dividends {
 		switch {
 		case now.Before(d.banFrom):
@@ -490,7 +520,7 @@ func (a *anchorState) anchors(now time.Time, splitBan bool) Anchors {
 // sameAnchors compares two published values.
 func sameAnchors(a, b Anchors) bool {
 	return a.SessionID == b.SessionID && a.Kind == b.Kind && a.Bull.Equal(b.Bull) && a.Bear.Equal(b.Bear) &&
-		a.KnownAt.Equal(b.KnownAt) && a.EntryBan == b.EntryBan && a.RestartAt.Equal(b.RestartAt)
+		a.KnownAt.Equal(b.KnownAt) && a.SwitchedAt.Equal(b.SwitchedAt) && a.EntryBan == b.EntryBan && a.RestartAt.Equal(b.RestartAt)
 }
 
 // latest returns the latest of the given times.

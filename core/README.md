@@ -6,7 +6,7 @@ ETF Pair Arbitrage 的交易进程（Go）：读 Bitget 上 SOXLUSDT / SOXSUSDT 
 - **现状：SPEC 第 9 节的第 0–6.4 步已实现并提交**（各步都经独立审查；第 6.5 步纸面联调进行中）；第 8 步回放与选参（`cmd/replay`，SPEC 5.8）已实现，见下面“回放与选参”。下面按模块说明：
   - 两条腿的盘口：每条腿 `cex.book_connections` 条 Bitget 公共连接（默认 3），各订阅深度（两条腿都是 `books5`）和 `books1`，按撮合序号合并，判冲突和有效期（`Books()` 一次读出两条腿，`DepthUsable`、`DepthOK`、`HasPrice` 都在这同一份上回答）；
   - 汇率 F（Coinbase，每 5 秒一次）、美股日历与 Session、与 Binance 时段表的每小时核对；
-  - 锚点：铃锚点（Binance 指数 × F，F 是 Coinbase 收盘前一分钟 1 分钟 K 线的收盘，用户第 69 条）→ NAV 稳定 1 小时后换成 NAV（Direxion），分红窗口与 A − Div，拆股条目的不开仓窗口；每个事实写一行 `anchor_fact`，重启时读回接着用；
+  - 锚点：铃锚点（Binance 指数 × F，F 是 Coinbase 收盘前一分钟 1 分钟 K 线的收盘，用户第 69 条）→ 两条腿的 NAV（Direxion）在同一轮都读到就换成 NAV、不再等稳定 1 小时，之后 `nav_watch`（1 小时）内照常每 `anchor_poll` 读，数字变了就再换一次锚点（用户第 96–97 条；`rewarm_on_anchor_change: true` 时铃锚点换成 NAV 重新预热，换锚跳变低于 `nav_hot_switch_d` 热切换、否则再预热），分红窗口与 A − Div，拆股条目的不开仓窗口；每个事实写一行 `anchor_fact`，重启时读回接着用；
   - 合约规则和结算资金费率（Bitget 公开接口）。账户设置、持仓、资金费流水的读取按 `Venue` 接口实现。
 - **第 5.2 步 Bitget 的账户侧已实现**（`cex/bitget/rest.go`、`private.go`）：签名 REST（账户设置、持仓、按编号查订单、历史订单、成交、资金费流水、下单）和私有 WebSocket（登录，`order` / `fill` / `position` 三个频道，只留这一对合约和带本程序编号前缀的订单）。实盘模式下 `TradingReady` 还要求私有流在线。下单方法只在门控测试里对交易所调用过（下面的 `TestLiveOrderLatency`，第 54 条授权的 80 张成交不了的 IOC；`TestLiveWSOrderRoundTrip`，第 56 条的两次最小仓位开平）；只读的账户实测是门控的：`BITGET_ACCOUNT_READ_TEST=1 BITGET_ACCOUNT_ENV=<密钥文件> go test -run TestLiveBitgetAccountRead ./cex/bitget`（它的 HTTP 传输拒绝一切非 GET 请求）。
 - **延迟设计 L1–L4 和 WebSocket 下单已实现**（`core/SPEC.md` 5.7；用户第 53 条）：
@@ -76,7 +76,7 @@ scripts/dev_db.sh stop && rm -rf ../experiments/core_dev_db && scripts/dev_db.sh
 
 ## 回放与选参（`cmd/replay`，SPEC 5.8）
 
-用交易程序自己的组件（盘口合并、`PaperVenue` 的到单规则、strategy、inventory、exec）在虚拟时钟上回放录制服务的原始帧（`../experiments/book_tape`），只读看板库（F、铃锚点、NAV）或 trade schema（复现一次纸面运行），结果写成文件，不写任何库、不连交易所。在 `core/` 下：
+用交易程序自己的组件（盘口合并、`PaperVenue` 的到单规则、strategy、inventory、exec）在虚拟时钟上回放录制服务的原始帧（`../experiments/book_tape`），只读看板库（F、铃锚点；NAV 取 `etf_nav_obs` 每个数字第一次读到的时刻，按交易程序的换锚规则和配置的 `nav_watch` 重建每一次换锚）或 trade schema（复现一次纸面运行，每一组 `nav` 事实是一次换锚），结果写成文件，不写任何库、不连交易所。在 `core/` 下：
 
 ```bash
 go build -o /tmp/replay ./cmd/replay
