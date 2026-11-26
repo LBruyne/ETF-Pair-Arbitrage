@@ -70,8 +70,12 @@ def pg_env(dsn):
 
 def psql_json(q):
     """The rows of q as a list of dicts (one read-only statement)."""
-    r = subprocess.run(["psql", "-X", "-q", "-At", "-v", "ON_ERROR_STOP=1", "-c", "SELECT coalesce(json_agg(row_to_json(t)), '[]') FROM (%s) t" % q],
-                       capture_output=True, text=True, env=pg_env(DSN))
+    for attempt in range(5):   # the shared database refuses a connection now and then when its slots are full: try again
+        r = subprocess.run(["psql", "-X", "-q", "-At", "-v", "ON_ERROR_STOP=1", "-c", "SELECT coalesce(json_agg(row_to_json(t)), '[]') FROM (%s) t" % q],
+                           capture_output=True, text=True, env=pg_env(DSN))
+        if "remaining connection slots" not in r.stderr:
+            break
+        time.sleep(1 + attempt)
     if r.returncode:
         raise AssertionError(r.stderr.replace(DSN, "<dsn>")[:600])
     return json.loads(r.stdout, parse_float=Decimal)
@@ -138,20 +142,52 @@ class Shape(unittest.TestCase):
             if p["type"] != "row":
                 self.assertTrue(p["description"], p["title"])
         titles = [p["title"] for p in self.b["panels"] if p["type"] == "row"]
-        self.assertEqual([t.split(" · ")[0] for t in titles], ["Live Execution", "Round Trips", "Round Trip", "Risk & Account", "Settings",
-                                                               "Diagnostics", "Diagnostics"])
-        self.assertEqual([p.get("collapsed") for p in self.b["panels"] if p["type"] == "row"], [False] * 5 + [True, True])
+        self.assertEqual([t.split(" · ")[0] for t in titles], ["Status", "Execution Summary", "Position and Market", "Live Execution", "Round Trips",
+                                                               "Round Trip Detail", "Inventory", "Settings", "Execution Statistics", "System"])
+        self.assertEqual(titles[0], "Status · Running Session · ${runtext}")
+        self.assertEqual([p.get("collapsed") for p in self.b["panels"] if p["type"] == "row"], [False] * 8 + [True, True])
 
-    def test_the_trader_questions_on_top(self):
-        """Health, Position, Net and P&L, the last second's Legs and Spread, and Entry sit above the first row, in the top
-        fourteen grid units (no scrolling at 1680 px)."""
-        top = []
+    def test_status_first(self):
+        """Owner items 74-75: the board starts with Status · Running Session holding Execution, Margin and Alerts, in the top
+        fourteen grid units (no scrolling at 1680 px); Execution and Margin are word tiles coloured by STATUS_WORDS."""
+        top, rows = [], 0
         for p in self.b["panels"]:
-            if p["type"] == "row":
+            rows += p["type"] == "row"
+            if rows > 1:
                 break
             top.append(p)
-        self.assertEqual([p["title"].split(" · ")[0] for p in top], ["", "Health", "Position", "Net", "P&L", "Legs", "Spread", "Entry"])
+        self.assertEqual([p["title"] for p in top], ["Status · Running Session · ${runtext}", "Execution", "Margin", "Alerts"])
         self.assertLessEqual(max(p["gridPos"]["y"] + p["gridPos"]["h"] for p in top), 14)
+        for p in top[1:3]:
+            self.assertEqual(p["options"]["colorMode"], "background")
+            self.assertEqual([m["options"]["pattern"] for m in p["fieldConfig"]["defaults"]["mappings"]], [w for w, _ in board.STATUS_WORDS])
+
+    def test_every_word_has_its_colour(self):
+        """Each word the Status tiles can show takes the colour of what it means (the first STATUS_WORDS pattern it matches):
+        the program's entry answers by their state (ready / order sent green, the strategy's ordinary answers grey, held back
+        amber, a person needed red), the rest as listed."""
+        def colour(word):
+            for pattern, c in board.STATUS_WORDS:
+                if re.match(pattern, word):
+                    return c
+        state = {c: s for c, s, _ in board.IDLE}
+        want = {"Ready": board.WELL, "Blocked": board.GREY, "Held Back": board.WARN, "Needs a Person": board.BAD}
+        for code, word in board.ENTRY_WORDS.items():
+            w = word.replace("$bull", "SOXL").replace("$bear", "SOXS")
+            self.assertEqual(colour(w), want[state[code]], "%s: %s" % (code, w))
+        self.assertEqual(colour("order sent"), board.WELL)
+        nb = board.NBSP
+        for word, c in [("LIVE", "#8a1f1f"), ("PAPER", "#5a5953"), ("up 2h" + nb + "05m", board.WELL), ("stale · 25s", board.BAD), ("lost", board.BAD),
+                        ("starting", board.WARN), ("stopped", board.GREY), ("11‑26" + nb + "12:57", "transparent"), ("off hours", board.WELL),
+                        ("us regular", board.GREY), ("close window", board.WARN), ("in 1d" + nb + "12h", "transparent"), ("passed", board.GREY),
+                        ("nav", board.WELL), ("bell", board.WELL), ("missing", board.WARN), ("ok", board.WELL), ("SOXS conflict", board.WARN),
+                        ("SOXL unusable · SOXS conflict", board.WARN), ("none open", board.WELL), ("2 working", board.WELL), ("1 unknown", board.BAD),
+                        ("2 left open", board.BAD), ("flat", board.GREY), ("short · 55m", board.WELL), ("long left open", board.BAD),
+                        ("match", board.WELL), ("mismatch", board.BAD), ("not read", board.WARN), ("5,586.40 U", "transparent"), ("paper", board.GREY),
+                        ("ok · 0.23 %", board.WELL), ("warn · 35.00 %", board.WARN), ("high · 70.00 %", board.BAD), ("ok · SOXL 1,386 %", board.WELL),
+                        ("warn · SOXS 20 %", board.WARN), ("near · SOXL 8 %", board.BAD), ("76 % used", "transparent"), ("+0.22 U", "transparent"),
+                        ("−1.05 U", "transparent"), ("2 awaited", board.WARN), ("no data", board.GREY), ("no run", board.GREY)]:
+            self.assertEqual(colour(word), c, word)
 
     def test_execution_charts(self):
         """One frame for both charts; the Spread chart shows the Deviation chart's result; every tooltip row is a tooltip-only
@@ -232,7 +268,7 @@ class Queries(unittest.TestCase):
             want = [r["run_id"] for r in runs if r["live"] == live][-1:]
             got = psql_json(fill("WITH %s SELECT run_id FROM sel" % board.SEL, self.values(1, newest)))
             self.assertEqual([g["run_id"] for g in got], want)
-        self.assertEqual(psql_json(fill(board.Q_MODE, dict(self.values(1), combo="SOXL / SOXX")))[0]["Mode"], "NO RUN · pick a Run (or the Combo it trades)")
+        self.assertEqual(psql_json(fill(board.Q_STATUS_EXEC, dict(self.values(1), combo="SOXL / SOXX")))[0]["Mode"], "no run")
         self.assertEqual(psql_json(fill(board.Q_RUN_TEXT, self.values(1, "nonsense'; --"))), [{"__text": "No Run"}])
 
     def test_range(self):
@@ -285,7 +321,8 @@ class Queries(unittest.TestCase):
             got = sum(r["Seconds"] for r in psql_json(fill(board.Q_IDLE, v)))
             want = psql_json(fill("WITH %s SELECT count(*) AS n FROM trade.signal_sample s WHERE s.run_id = '%s' AND s.ts_ms >= "
                                   "(SELECT rg.from_ms FROM rg) AND s.ts_ms < (SELECT rg.to_ms FROM rg)" % (board.SEL, run), v))[0]["n"]
-            self.assertAlmostEqual(got, want, delta=5 if run in (self.runs()[-1], self.PAPER_RUN) else 0)   # a running Run adds seconds
+            running = psql_json("SELECT stopped_ms FROM trade.process_run WHERE run_id = '%s'" % run)[0]["stopped_ms"] is None
+            self.assertAlmostEqual(got, want, delta=5 if running else 0)   # a running Run adds seconds between the two reads
             mine = {r["cycle_id"] for r in psql_json("SELECT cycle_id FROM trade.cycle WHERE run_id = '%s' UNION SELECT cycle_id FROM "
                                                      "trade.decision WHERE run_id = '%s' AND cycle_id IS NOT NULL" % (run, run))}
             self.assertLessEqual({r["cycle_id"] for r in psql_json(fill(board.Q_BLOTTER, v))}, mine, run)
@@ -315,6 +352,195 @@ class Queries(unittest.TestCase):
             self.assertEqual(legs[1]["Book"], book)
             side = "Flat" if s["direction"] is None else s["direction"].title()
             self.assertEqual(now["Side"], side)
+
+    # ------------------------------------------------------------------------------------- Status · Running Session
+    def raw_run(self, run):
+        """The picked Run's own records the Status row reads, straight from the tables."""
+        r = psql_json("SELECT * FROM trade.process_run WHERE run_id = '%s'" % run)[0]
+        end = r["stopped_ms"] or int(time.time() * 1000)
+        s = psql_json("SELECT * FROM trade.signal_sample WHERE run_id = '%s' AND live = %s AND ts_ms <= %d AND ts_ms > %d ORDER BY ts_ms DESC LIMIT 1"
+                      % (run, r["live"], end, end - 172800000))
+        i = psql_json("SELECT * FROM trade.inventory_sample WHERE run_id = '%s' AND live = %s AND ts_ms <= %d AND ts_ms > %d ORDER BY ts_ms DESC LIMIT 1"
+                      % (run, r["live"], end, end - 172800000))
+        cycles = psql_json("SELECT * FROM trade.cycle c WHERE c.live = %s AND (c.run_id = '%s' OR c.cycle_id IN (SELECT d.cycle_id FROM trade.decision d "
+                           "WHERE d.run_id = '%s' AND d.cycle_id IS NOT NULL))" % (r["live"], run, run))
+        open_lots = psql_json("SELECT DISTINCT l.cycle_id FROM trade.lot l WHERE l.live = %s AND l.status IN ('building', 'open')" % r["live"])
+        orders = psql_json("SELECT * FROM trade.cex_order WHERE run_id = '%s' AND live = %s" % (run, r["live"]))
+        return r, (s or [None])[0], (i or [None])[0], cycles, {x["cycle_id"] for x in open_lots}, orders
+
+    def expected_status(self, run):
+        r, s, i, cycles, open_lots, orders = self.raw_run(run)
+        nb, stopped = board.NBSP, r["stopped_ms"] is not None
+        hm = lambda ms: utc8(ms).strftime("%m-%d %H:%M").replace("-", board.NBHY).replace(" ", nb)
+        held = [c for c in cycles if c["status"] == "open" and c["cycle_id"] in open_lots]
+        tick = {"bull": "SOXL", "bear": "SOXS"}
+        books = [("%s conflict" % tick[l]) if s["conflict_" + l] else ("%s unusable" % tick[l]) if not s["depth_ok_" + l] else None
+                 for l in ("bull", "bear")] if s else []
+        working = [o for o in orders if o["unknown"] or o["status"] in ("pending", "acked")]
+        ex = {"Mode": "LIVE" if r["live"] else "PAPER", "Start / End": hm(r["stopped_ms"] or r["started_ms"]),
+              "Phase": "stopped" if stopped else {"off_hours": "off hours", "regular": "us regular", "close_window": "close window"}[s["phase"]],
+              "Anchor": "stopped" if stopped else s["anchor_kind"] or "missing",
+              "Books": "stopped" if stopped else " · ".join(b for b in books if b) or "ok",
+              "Orders": "none open" if not working else "%d left open" % len(working) if stopped else
+                        "%d unknown" % sum(o["unknown"] for o in working) if any(o["unknown"] for o in working) else "%d working" % len(working),
+              "Entry": "stopped" if stopped else "order sent" if s["idle_reason"] is None else
+                       board.ENTRY_WORDS[s["idle_reason"]].replace("$bull", "SOXL").replace("$bear", "SOXS")}
+        pct = lambda x, q: str(Decimal(x).quantize(Decimal(q), rounding="ROUND_HALF_UP"))
+        awaited = sum(len(c["funding_awaited"]) for c in cycles if isinstance(c["funding_awaited"], list))
+        booked = sum((c["funding"] for c in cycles if c["funding_known"]), Decimal(0))
+        mg = {"Cycle": "flat" if not held else ("%s left open" % held[0]["direction"]) if stopped else held[0]["direction"],
+              "Positions": "mismatch" if i["mismatch"] else "not read" if i["pos_bull"] is None or i["pos_bear"] is None else "match",
+              "Equity": "paper" if not r["live"] else "stopped" if stopped else "{:,.2f} U".format(i["equity"]),
+              "Margin Ratio": "paper" if not r["live"] else "stopped" if stopped else "%s · %s %%" % (
+                  "ok" if i["margin_ratio"] < Decimal("0.3") else "warn" if i["margin_ratio"] < Decimal("0.6") else "high", pct(100 * i["margin_ratio"], "0.01")),
+              "Quota": "stopped" if stopped else "%s %% used" % pct(100 * i["quota_used"] / i["quota_total"], "1"),
+              "Funding": "%d awaited" % awaited if awaited else "%s%s U" % ("−" if booked < 0 else "+", "{:,.2f}".format(abs(booked)))}
+        if r["live"] and not stopped:
+            legs = [(l, (i["liq_" + l] - i["mark_" + l]) / i["mark_" + l] if i["pos_" + l] < 0 else (i["mark_" + l] - i["liq_" + l]) / i["mark_" + l])
+                    for l in ("bull", "bear") if i["pos_" + l] and i["liq_" + l] is not None]
+            if not i["pos_bull"] and not i["pos_bear"]:
+                mg["Liq Distance"] = "flat"
+            elif legs:
+                l, d = min(legs, key=lambda x: x[1])
+                mg["Liq Distance"] = "%s · %s %s %%" % ("near" if d < Decimal("0.1") else "warn" if d < Decimal("0.25") else "ok", tick[l], "{:,.0f}".format(100 * d))
+        else:
+            mg["Liq Distance"] = "paper" if not r["live"] else "stopped"
+        return r, s, i, ex, mg
+
+    def test_status_words_from_the_schema(self):
+        """Every Execution and Margin word of every Run against its own records read straight from the tables (process_run, its
+        newest signal_sample and inventory_sample, its orders not final, its open round trip, its funding): Mode, Start / End,
+        Phase, Anchor, Books, Orders, Entry; Cycle, Positions, Equity, Margin Ratio, Liq Distance, Quota, Funding; Run as
+        stopped or up / stale / lost. A running Run is read again until no new sample came in between."""
+        for run in self.runs():
+            for _ in range(5):
+                r, s, i, ex, mg = self.expected_status(run)
+                v = self.values(1, run)
+                got = psql_json(fill(board.Q_STATUS_EXEC, v))[0], psql_json(fill(board.Q_STATUS_MARGIN, v))[0]
+                if self.expected_status(run)[1:3] == (s, i):
+                    break
+            with self.subTest(run=run):
+                for k, want in ex.items():
+                    self.assertEqual(got[0][k], want, k)
+                for k, want in mg.items():
+                    self.assertEqual(got[1][k], want, k)
+                if r["stopped_ms"]:
+                    self.assertEqual(got[0]["Run"], "stopped")
+                    self.assertEqual((got[0]["Close"], got[1]["Open P&L"]), ("stopped", "stopped"))
+                else:
+                    self.assertRegex(got[0]["Run"], r"^(up |stale · |lost$|starting$)")
+                    self.assertRegex(got[0]["Close"], r"^(in |passed$)")
+
+    def expected_alerts(self, run):
+        """The Alerts of a Run recomputed in Python from its records (SPEC 7, Alerts)."""
+        r, s, i, cycles, open_lots, orders = self.raw_run(run)
+        running = r["stopped_ms"] is None
+        tick = {"bull": "SOXL", "bear": "SOXS"}
+        hms = lambda ms: utc8(ms).strftime("%H:%M:%S")
+        words = {c: w.replace("Bull ", "SOXL ").replace("Bear ", "SOXS ") for c, _, w in board.IDLE}
+        cfg = r["config"] if isinstance(r["config"], dict) else json.loads(r["config"])
+        d_in = float(cfg["strategy"]["d_in"])
+        samples = psql_json("SELECT ts_ms, idle_reason, stats_ready, x_long_d, x_short_d, sigma_d FROM trade.signal_sample WHERE run_id = '%s' AND live = %s "
+                            "ORDER BY ts_ms" % (run, r["live"]))
+        out, eps, prev = [], [], None
+        for x in samples:
+            sig = float(x["sigma_d"]) if x["sigma_d"] else None
+            xl, xs = x["x_long_d"], x["x_short_d"]   # SQL's NULL compares as unknown: only a known side counts
+            at = bool(x["stats_ready"] and sig and ((xl is not None and float(xl) / sig <= -d_in) or (xs is not None and float(xs) / sig >= d_in)))
+            new = prev is None or x["idle_reason"] != prev["idle_reason"] or x["ts_ms"] - prev["ts_ms"] > 3000
+            if prev is not None and x["ts_ms"] - prev["ts_ms"] > board.GAP_MS:
+                out.append((prev["ts_ms"], "serious", "Recovered", "Run", "Sample Gap", None))
+            if x["idle_reason"] in board.HELD_CODES:
+                if new:
+                    eps.append({"code": x["idle_reason"], "t0": x["ts_ms"], "n": 0, "at": 0})
+                eps[-1]["n"] += 1
+                eps[-1]["at"] += at
+            prev = x
+        for code in {e["code"] for e in eps}:
+            mine = [e for e in eps if e["code"] == code]
+            n, at = sum(e["n"] for e in mine), sum(e["at"] for e in mine)
+            crit = code in board.CRITICAL_CODES
+            status = ("Open" if crit else "In Progress") if running and s and s["idle_reason"] == code else "Recovered"
+            detail = "%d %s since %s, %d s in all, longest %d s%s" % (len(mine), "time" if len(mine) == 1 else "times", hms(mine[0]["t0"]), n,
+                                                                       max(e["n"] for e in mine), "; %d s of them past an entry line" % at if at else "")
+            out.append((mine[-1]["t0"], "critical" if crit else "warning", status, "Entry", words[code], detail))
+        inv = psql_json("SELECT ts_ms, mismatch FROM trade.inventory_sample WHERE run_id = '%s' AND live = %s ORDER BY ts_ms" % (run, r["live"]))
+        for k, x in enumerate(inv):
+            if x["mismatch"] and (k == 0 or not inv[k - 1]["mismatch"]):
+                last = next((y for y in inv[k:] if not y["mismatch"]), None)
+                out.append((x["ts_ms"], "critical", "Open" if last is None and running else "Recovered", "Positions", "Position Mismatch", None))
+        what = {"one_leg": "One Leg Only", "stop": "Stopped While Holding", "session_changed": "Session Ended While Holding", "store_error": "Not Recorded"}
+        for c in cycles:
+            dust = c["dust_bull"] != 0 or c["dust_bear"] != 0
+            if c["end_reason"] in what or c["end_reason"] == "dust_only" or dust:
+                out.append((c["closed_ms"] or c["opened_ms"], "serious" if c["end_reason"] == "one_leg" else "warning",
+                            "Recorded" if c["end_reason"] == "dust_only" or dust else "Recovered", "Round Trip " + hms(c["opened_ms"]),
+                            what.get(c["end_reason"], "Dust Left"), None))
+            if isinstance(c["funding_awaited"], list) and c["funding_awaited"]:
+                out.append((c["closed_ms"], "warning", "In Progress" if running else "Open", "Round Trip " + hms(c["opened_ms"]), "Funding Awaited", None))
+        by_id = {c["cycle_id"]: c for c in psql_json("SELECT * FROM trade.cycle WHERE live = %s" % r["live"])}
+        for d in psql_json("SELECT * FROM trade.decision WHERE run_id = '%s' AND live = %s AND kind = 'forced'" % (run, r["live"])):
+            c = by_id.get(d["cycle_id"])
+            out.append((d["ts_ms"], "serious", "In Progress" if c and c["status"] == "open" and running else "Recovered",
+                        "Round Trip " + (hms(c["opened_ms"]) if c else "–"), "Forced Exit", None))
+        for o in orders:
+            if o["unknown"] or o["not_found"] or o["status"] in ("rejected", "not_sent", "never_arrived"):
+                w = ("Order Outcome Unknown" if o["unknown"] else "Order Not Found" if o["not_found"] else "Order Rejected" if o["status"] == "rejected"
+                     else "Order Not Sent" if o["status"] == "not_sent" else "Order Never Arrived")
+                out.append((o["submitted_ms"], "warning" if o["status"] == "not_sent" else "serious",
+                            ("In Progress" if running else "Open") if o["unknown"] else "Recovered", "Order · " + tick[o["leg"]], w, None))
+        for e in psql_json("SELECT * FROM trade.event WHERE run_id = '%s' AND live = %s AND level IN ('error', 'warn')" % (run, r["live"])):
+            out.append((e["ts_ms"], "critical" if e["level"] == "error" else "warning", "Open", "Program · " + e["module"],
+                        e["kind"].replace("_", " ").title(), e["message"]))
+        if running and s is None or running and int(time.time() * 1000) - s["ts_ms"] > board.SAMPLE_AGE_S * 1000:
+            out.append((None, "critical", "Open", "Run", None, None))
+        return r, out
+
+    def test_alerts_from_the_schema(self):
+        """Every Alerts row of every Run against a recomputation from its records in Python: each Held Back / Needs a Person
+        reason as one row (how often, seconds in all, longest, the seconds past an entry line, from its first time), sample
+        gaps, mismatch episodes, round trips ended on one leg / on a stop / with dust / waiting for funding, forced exits, orders
+        rejected or unknown, the program's events; Severity, Status and Source of each; the unfinished first, then the newest.
+        A stopped Run's rows are compared whole; a running Run's (its newest seconds move) by everything but the Entry rows'
+        counts."""
+        for run in self.runs():
+            with self.subTest(run=run):
+                r, want = self.expected_alerts(run)
+                got = psql_json(fill(board.Q_ALERTS, self.values(1, run)))
+                if not want:
+                    self.assertEqual([(g["Detail"], g["What"]) for g in got], [("No alert in this Run: nothing stopped or held trading", None)])
+                    continue
+                rank = {"Open": 0, "In Progress": 1}
+                self.assertEqual([rank.get(g["Status"], 2) for g in got], sorted(rank.get(g["Status"], 2) for g in got), "unfinished first")
+                key = lambda x: (x[1], x[2], x[3], x[4]) if x[4] is not None else (x[1], x[2], x[3])
+                got_rows = [(round(datetime.fromisoformat(g["time"]).timestamp() * 1000), g["Severity"], g["Status"], g["Source"], g["What"], g["Detail"])
+                            for g in got]
+                self.assertEqual(sorted(map(key, got_rows), key=str), sorted(map(key, want), key=str))
+                if r["stopped_ms"]:
+                    for w in want:
+                        match = [g for g in got_rows if g[1:5] == w[1:5] and g[0] == w[0]]
+                        self.assertTrue(match, w)
+                        if w[5] is not None:
+                            self.assertEqual(match[0][5], w[5], w[4])
+
+    def test_positions_now_are_the_newest_inventory_sample(self):
+        """Inventory · Positions Now shows each leg of the Run's newest inventory_sample: the venue's and the ledger's position,
+        mark, liquidation price, the venue's unrealised P&L, and the distance to liquidation in % of the mark on its side."""
+        for run in self.runs():
+            for _ in range(5):
+                r, s, i, *_ = self.raw_run(run)
+                got = psql_json(fill(board.Q_POSITIONS, self.values(1, run)))
+                if self.raw_run(run)[2] == i:
+                    break
+            with self.subTest(run=run):
+                self.assertEqual([g["Leg"] for g in got], ["SOXL", "SOXS"])
+                for g, l in zip(got, ("bull", "bear")):
+                    self.assertEqual((g["Venue"], g["Ledger"], g["Mark"], g["Liq Price"], g["Venue UPL"]),
+                                     (i["pos_" + l], i["ledger_" + l], i["mark_" + l], i["liq_" + l], i["upl_" + l]))
+                    pos, mark, liq = i["pos_" + l], i["mark_" + l], i["liq_" + l]
+                    want = None if not pos or mark is None or liq is None else 100 * ((liq - mark) if pos < 0 else (mark - liq)) / mark
+                    self.assertEqual(g["Liq Distance"], want)
+                    self.assertEqual(g["Age"] is None, r["stopped_ms"] is not None)
 
     def test_plain_words(self):
         """End and idle reasons in words; a code the board does not list (a new end reason such as dust_only, before the board
@@ -382,7 +608,7 @@ class Queries(unittest.TestCase):
         v = self.values(24 * 30, run)
         fills = {r["cycle_id"]: r for r in psql_json(
             "SELECT o.cycle_id, sum(CASE f.side WHEN 'sell' THEN f.value ELSE -f.value END) AS gross, sum(f.fee) AS fees, "
-            "sum(f.value) FILTER (WHERE o.purpose IN ('entry', 'complete')) AS entry_value "
+            "sum(f.value) FILTER (WHERE o.purpose IN ('entry', 'complete')) AS entry_value, count(*) AS fills "
             "FROM trade.cex_fill f JOIN trade.cex_order o ON o.live = f.live AND o.client_order_id = f.client_order_id WHERE f.run_id = '%s' "
             "GROUP BY o.cycle_id" % run)}
         cycles = {r["cycle_id"]: r for r in psql_json("SELECT * FROM trade.cycle WHERE run_id = '%s'" % run)}
@@ -395,14 +621,24 @@ class Queries(unittest.TestCase):
                 continue
             self.assertEqual(row["Notional"], f["entry_value"] or 0, row["cycle_id"])
             if c["status"] != "open" and c["funding_known"] and c["dust_bull"] == 0 and c["dust_bear"] == 0:
-                self.assertEqual(row["Net"], f["gross"] - f["fees"] + c["funding"], row["cycle_id"])
+                # Bitget reports an order's cumulative value and fee rounded on their own, not as the sum of its fills' rounded
+                # ones: the live round trip c1795665649133 booked 359.9798 for an exit whose three fills sum to 359.9797. So a
+                # live Net may differ from the fills' by up to 0.0001 USDT per fill (value and fee); paper's match exactly.
+                tol = Decimal("0.0002") * f["fills"] if c["live"] else 0
+                self.assertAlmostEqual(row["Net"], f["gross"] - f["fees"] + c["funding"], delta=tol, msg=row["cycle_id"])
                 self.assertAlmostEqual(float(row["Net bps"]), float(row["Net"] / row["Notional"] * 10000), places=6)
                 checked += 1
         known = [c for c in cycles.values() if c["status"] != "open" and c["funding_known"] and c["end_reason"] != "no_fill" and c["cycle_id"] in fills]
         p = psql_json(fill(board.Q_PNL, v))[0]
-        net = psql_json(fill(board.Q_NET, v))
-        self.assertEqual(-(p["Fees"] or 0), sum(fills[c["cycle_id"]]["fees"] for c in known))
-        self.assertEqual(net[-1]["Net"], sum(fills[c["cycle_id"]]["gross"] - fills[c["cycle_id"]]["fees"] + c["funding"] for c in known))
+        net = psql_json(fill(board.Q_CUM_NET, v))
+        want = sum(fills[c["cycle_id"]]["gross"] - fills[c["cycle_id"]]["fees"] + c["funding"] for c in known)
+        tol = sum(Decimal("0.0002") * fills[c["cycle_id"]]["fills"] for c in known if c["live"])
+        self.assertAlmostEqual(-(p["Fees"] or 0), sum(fills[c["cycle_id"]]["fees"] for c in known), delta=tol)
+        self.assertAlmostEqual(p["Net"], want, delta=tol)
+        self.assertEqual(net[-1]["Net"], p["Net"])
+        self.assertEqual(p["Trips"], len([c for c in cycles.values() if c["status"] != "open" and c["end_reason"] != "no_fill"]))
+        points = psql_json(fill(board.Q_TRIP_GAIN, v)) + psql_json(fill(board.Q_TRIP_LOSS, v))
+        self.assertEqual(sorted(r["cycle_id"] for r in points), sorted(c["cycle_id"] for c in known))
 
 
 if __name__ == "__main__":
