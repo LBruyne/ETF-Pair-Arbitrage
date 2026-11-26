@@ -1020,6 +1020,29 @@ func TestLoadStateThinLegFirst(t *testing.T) {
 	if n := query1[int64](t, check, "SELECT count(*) FROM trade.lot WHERE end_state IS NULL AND lot_id = 'c-thin-3'"); n != 1 {
 		t.Errorf("a lot without an end state: %d rows with end_state NULL, want 1", n)
 	}
+	if st.EntryDecision != nil {
+		t.Errorf("entry decision %+v, want none: no lot is building", st.EntryDecision)
+	}
+
+	// A lot still building (a batch in pairing): its entry decision is read
+	// back, with the anchors and F in its detail; another lot's and the
+	// other mode's are not.
+	if err := s.WriteSync(lot("c-thin-4", 4, "building", "", "", 8000),
+		DecisionRow{TsMs: 3000, CycleID: "c-thin", LotID: "c-thin-3", Kind: "entry", Detail: []byte(`{"anchor_bull":"1"}`)},
+		DecisionRow{TsMs: 8000, CycleID: "c-thin", LotID: "c-thin-4", Kind: "entry", Detail: []byte(`{"anchor_bull":"40","anchor_bear":"60","f":"0.998685"}`)},
+		DecisionRow{TsMs: 8001, CycleID: "c-thin", LotID: "c-thin-4", Kind: "pair", Detail: []byte(`{"action":"fill"}`)},
+	); err != nil {
+		t.Fatal(err)
+	}
+	if err := live.WriteSync(DecisionRow{TsMs: 9000, CycleID: "c-thin", LotID: "c-thin-4", Kind: "entry", Detail: []byte(`{"anchor_bull":"2"}`)}); err != nil {
+		t.Fatal(err)
+	}
+	if st, err = s.LoadState(ctx, "2026-11-25"); err != nil {
+		t.Fatal(err)
+	}
+	if e := st.EntryDecision; e == nil || e.LotID != "c-thin-4" || e.Kind != "entry" || e.TsMs != 8000 || !strings.Contains(string(e.Detail), `"f": "0.998685"`) {
+		t.Errorf("entry decision %+v, want c-thin-4's entry with its detail", st.EntryDecision)
+	}
 }
 
 // What the ledger needs from LoadState beside the unfinished cycle: every

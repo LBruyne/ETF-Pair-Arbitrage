@@ -596,6 +596,7 @@ func newRig(t *testing.T, now time.Time, opts rigOptions) *rig {
 	r.m.UseStore(sink)
 	r.m.Restore(state.MinuteBars, state.AnchorFacts, state.LastEntry, opts.perp)
 	r.m.RestoreExitStage(state.ExitStage)
+	r.m.RestoreEntryDecision(state.EntryDecision)
 	r.m.timing.clock = r.clock
 
 	// cex runs its own loops; its first reference pass reads the rules, the

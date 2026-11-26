@@ -54,9 +54,11 @@ func (m *ExecManager) step(now time.Time) (done bool) {
 	m.noteBatchDone(r)
 
 	// Holding: the forced exit, the gap, the line exit. A round that waits
-	// there still lets the routine comparison run.
+	// there still lets the routine comparison run, except while a batch is
+	// pairing or an exit batch is open: the read takes up to readTimeout,
+	// and the batch compares once at its end.
 	if r.cycle != nil && m.holding(r) {
-		if m.idleReason != "" && m.compareDue(r) {
+		if m.idleReason != "" && m.compareDue(r) && m.activePair() == nil && m.activeExit() == nil {
 			m.reconcile(r)
 		}
 		return false

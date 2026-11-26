@@ -138,7 +138,8 @@ func vwap(value, qty decimal.Decimal) decimal.Decimal {
 // pairInput gathers the facts of one PairStep: the round's books, the
 // ledger's quota without the unpaired thin leg, and CloseNet bound to the
 // batch's lot. While the mean warms up again the last ready mean stands in,
-// as for the exit (PRD 9.7).
+// and while F is stale its last valid value does, as for the exit (PRD 9.7);
+// either blocks a top-up (topUpBlocked).
 func (m *ExecManager) pairInput(r *round, p *pairState) strategy.PairInput {
 	stats := m.stats
 	if !stats.Ready {
@@ -147,11 +148,25 @@ func (m *ExecManager) pairInput(r *round, p *pairState) strategy.PairInput {
 	_, _, left := m.inv.Quota()
 	in := strategy.PairInput{Batch: p.batch, Pairing: m.pairing, Books: r.books.ByLeg, Rules: r.rules, F: r.fx.Price.InexactFloat64(),
 		Anchors: m.anchors, PairAnchors: r.cycle.PairAnchors, Stats: stats, QuotaLeft: left, Value: m.closeValuer(m.batch.lotID),
-		Stopping: m.stop.stopping, Forced: m.forced != "", NoNewEntries: m.stop.noEntries || p.noTopUps, Now: r.now}
+		Stopping: m.stop.stopping, Forced: m.forced != "", NoNewEntries: m.stop.noEntries || p.noTopUps, TopUpBlocked: m.topUpBlocked(r), Now: r.now}
 	for _, leg := range cex.Legs {
 		in.DepthOK[leg] = r.books.DepthOK(leg, r.now)
 	}
 	return in
+}
+
+// topUpBlocked reports whether what blocks a new entry now blocks a top-up
+// in this round (PRD 5.10, 5.11): the checks of steps 1 to 3 of PRD 5.13
+// (entryBlocked) and the warm-up. The pairing goes on. Left out are the new
+// depth after the batch's last result, for which a repeat of the thin leg
+// waits on its own frame (mayRepeat, SPEC 12.12 item 3), and the backoff
+// after a refusal, which is about the next batch.
+func (m *ExecManager) topUpBlocked(r *round) bool {
+	switch m.entryBlocked(r) {
+	case "", strategy.ReasonAwaitDepth, strategy.ReasonRejectedBackoff:
+		return !m.stats.Ready
+	}
+	return true
 }
 
 // doPair carries out one PairStep action (SPEC 12.9). The first thick order
@@ -312,8 +327,10 @@ func (m *ExecManager) pairDetail(r *round, p *pairState, a *strategy.PairAction)
 // handOver ends the batch in pairing, or the line exit batch, that the stop
 // or the forced exit takes over (SPEC 12.4 step 2, 12.7 step 3): the forced
 // exit then flattens both legs' actual holdings. The entry batch ends in the
-// state its fills say now (entry_failed when its thin order filled nothing),
-// so that its lot is settled before the cycle closes.
+// state its fills say now (entry_failed when its thin order filled nothing;
+// built_partial or unwound_stop while part of its thin leg is unpaired,
+// strategy.PairBatch.HandOverEnd), so that its lot is settled before the
+// cycle closes.
 func (m *ExecManager) handOver(r *round) {
 	why := strategy.ReasonForced
 	if m.stop.stopping {
@@ -323,7 +340,7 @@ func (m *ExecManager) handOver(r *round) {
 		m.refreshPair(r, p)
 		end := inventory.LotEndEntryFailed
 		if p.batch.ThinQty.IsPositive() {
-			end = inventory.LotEnd(p.batch.End())
+			end = inventory.LotEnd(p.batch.HandOverEnd(p.thin, r.cycle.PairAnchors, r.rules[p.thick].QtyStep))
 		}
 		m.endPair(r, p, end, why, nil, map[string]any{"hand_over": true})
 	}

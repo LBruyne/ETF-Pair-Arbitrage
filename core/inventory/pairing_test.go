@@ -405,3 +405,33 @@ func TestSettlePairedLotEndStates(t *testing.T) {
 		})
 	}
 }
+
+// A fill whose fee is not reported yet (FeeKnown false) carries the fee
+// reported so far, often none (cex.OrderRecord.Fee). CloseNet estimates it
+// as the taker fee on the fill's value, so example 7's exit1 test is +0.2896
+// as with the fees known; the ledger's booking keeps the fee as reported.
+func TestCloseNetEstimatesAFeeNotReportedYet(t *testing.T) {
+	r := newRig(t, "1000", "10")
+	c := r.openExampleCycle(t, strategy.Long)
+	lot := r.openLot(t)
+	unreported := fill(ord(c.ID, 2, cex.Bear, cex.PurposeEntry, cex.SideBuy, lot.ID, "59.869", "8.04"), "8.04", "481.34676", "0.01")
+	unreported.FeeKnown = false // 0.01 of 0.0312875 reported so far
+	r.m.Sync([]cex.OrderRecord{
+		fill(ord(c.ID, 1, cex.Bull, cex.PurposeEntry, cex.SideBuy, lot.ID, "33.26", "15.60"), "15.60", "518.856", fee("518.856")),
+		unreported,
+	})
+	r.m.SettleLot(lot.ID, true, r.clock.Now())
+
+	net := closeNet(t, r.m, cex.PurposeExit, "", leg("15.60", "33.24"), leg("8.04", "59.96"))
+	if got := net.Round(4); !got.Equal(dec("0.2896")) {
+		t.Errorf("exit1 profit test = %s (%s), want +0.2896 with the unreported fee estimated", got, net)
+	}
+	trim := closeNet(t, r.m, cex.PurposeTrim, lot.ID, CloseLeg{}, leg("8.04", "59.96"))
+	want := dec("8.04").Mul(dec("59.96").Sub(dec("59.869"))).Sub(dec(fee("481.34676"))).Sub(dec(fee("482.0784")))
+	if !trim.Equal(want) {
+		t.Errorf("trim of SOXS = %s, want %s with the unreported fee estimated", trim, want)
+	}
+	if got := r.m.Cycle().Lots[0].Legs[cex.Bear].EntryFee; !got.Equal(dec("0.01")) {
+		t.Errorf("the ledger's SOXS entry fee %s, want 0.01 as reported", got)
+	}
+}

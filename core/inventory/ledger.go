@@ -335,6 +335,11 @@ func (l *LotLeg) addExit(part share) {
 //     result is the increment of this close alone: an older lot's profit
 //     cannot make it pass (SPEC 12.5 example 11).
 //
+// A fill whose fee is not reported yet (cex.OrderRecord.FeeKnown false)
+// counts its fee as feeRate on its value, or as what was reported so far if
+// that is more: the ledger books the fee as reported, which would make the
+// valuation look better than it is.
+//
 // It refuses another purpose, a trim without a lot of the cycle, and a close
 // of more than the cycle holds on a leg.
 func (m *InventoryManager) CloseNet(purpose cex.OrderPurpose, lot LotID, close [2]CloseLeg, feeRate decimal.Decimal) (decimal.Decimal, error) {
@@ -344,6 +349,9 @@ func (m *InventoryManager) CloseNet(purpose cex.OrderPurpose, lot LotID, close [
 		return decimal.Zero, errNoCycle
 	}
 	c := m.cycle.clone() // booked on a copy: the ledger is not touched
+	if orders, estimated := m.feesEstimated(feeRate); estimated {
+		rebuild(c.Lots, orders, m.assigned)
+	}
 	var into *Lot
 	switch purpose {
 	case cex.PurposeExit, cex.PurposeForced:
@@ -378,6 +386,26 @@ func (m *InventoryManager) CloseNet(purpose cex.OrderPurpose, lot LotID, close [
 		return c.Gross.Sub(c.Fees).Sub(before), nil
 	}
 	return c.Gross.Sub(c.Fees).Add(c.Funding), nil
+}
+
+// feesEstimated returns the kept orders as sent with the fee of each fill
+// not reported yet estimated at feeRate on its value (never below what was
+// reported), and whether there was such a fill. The caller holds mu.
+func (m *InventoryManager) feesEstimated(feeRate decimal.Decimal) ([]cex.OrderRecord, bool) {
+	estimated := false
+	for _, o := range m.orders {
+		estimated = estimated || (o.CumExecQty.IsPositive() && !o.FeeKnown)
+	}
+	if !estimated {
+		return nil, false
+	}
+	orders := m.ordersAsSent()
+	for i, o := range orders {
+		if o.CumExecQty.IsPositive() && !o.FeeKnown {
+			orders[i].Fee = decimal.Max(o.Fee, o.CumExecValue.Mul(feeRate))
+		}
+	}
+	return orders, true
 }
 
 // --- results and statuses ---

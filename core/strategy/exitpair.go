@@ -26,13 +26,15 @@ func (s *Strategy) ExitPrecheck(in ExitInput, qty, price [2]decimal.Decimal) (ne
 // thick leg's protection travel with the batch; exec adds the fills.
 func NewExitBatch(dir Direction, plan *ExitPlan) ExitBatch {
 	return ExitBatch{
-		Dir:         dir,
-		Line:        plan.Line,
-		DecisionD:   plan.D,
-		ExpectedNet: plan.ExpectedNet,
-		D1:          plan.D1,
-		Protect:     plan.Protect,
-		Fills:       Fills{ThinQty: decimal.Zero, ThinVWAP: decimal.Zero, ThickQty: decimal.Zero, ThickVWAP: decimal.Zero},
+		Dir:             dir,
+		Line:            plan.Line,
+		DecisionD:       plan.D,
+		DecisionAnchors: plan.Anchors,
+		DecisionF:       plan.F,
+		ExpectedNet:     plan.ExpectedNet,
+		D1:              plan.D1,
+		Protect:         plan.Protect,
+		Fills:           Fills{ThinQty: decimal.Zero, ThinVWAP: decimal.Zero, ThickQty: decimal.Zero, ThickVWAP: decimal.Zero},
 	}
 }
 
@@ -74,7 +76,8 @@ func (s *Strategy) ExitPairStep(in ExitPairInput) ExitPairAction {
 		return act
 	}
 	if in.DepthOK[thick] {
-		if d, ok := s.IdealSpread(closing, thin, b.Fills, in.Books[thick], in.F, in.Anchors, in.PairAnchors); ok {
+		a, f := decisionBasis(b.DecisionAnchors, b.DecisionF, in.Anchors, in.F)
+		if d, ok := s.IdealSpread(closing, thin, b.Fills, in.Books[thick], f, a, in.PairAnchors); ok {
 			act.DIdeal = d
 		}
 	}

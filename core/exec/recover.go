@@ -2,6 +2,7 @@ package exec
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"math"
@@ -349,9 +350,40 @@ func (m *ExecManager) restoreBatch(c *inventory.Cycle, now time.Time) {
 	logger.GlobalLogger.Info("exec: batch taken up", "lot", lot.ID, "orders", len(b.orders), "sent", showTime(b.sentAt))
 }
 
+// RestoreEntryDecision takes the entry decision of the unfinished cycle's
+// lot still building, as the previous run stored it, before Run; nil when
+// there is none. A batch in pairing taken up from its orders reads from it
+// the anchors and F its D_dec was taken under (restorePair).
+func (m *ExecManager) RestoreEntryDecision(row *store.DecisionRow) {
+	m.restoredEntry = row
+}
+
+// decisionBasis is the anchors and F the entry decision of lot was taken
+// under, from its stored detail (anchor_bull, anchor_bear, f); ok is false
+// without that record or with a number missing from it.
+func (m *ExecManager) decisionBasis(lot inventory.LotID) (a cex.Anchors, f float64, ok bool) {
+	row := m.restoredEntry
+	if row == nil || inventory.LotID(row.LotID) != lot {
+		return cex.Anchors{}, 0, false
+	}
+	var d struct {
+		Kind       cex.AnchorKind      `json:"anchor_kind"`
+		AnchorBull decimal.NullDecimal `json:"anchor_bull"`
+		AnchorBear decimal.NullDecimal `json:"anchor_bear"`
+		F          decimal.NullDecimal `json:"f"`
+	}
+	if err := json.Unmarshal(row.Detail, &d); err != nil || !d.AnchorBull.Valid || !d.AnchorBear.Valid || !d.F.Valid ||
+		!d.AnchorBull.Decimal.IsPositive() || !d.AnchorBear.Decimal.IsPositive() || !d.F.Decimal.IsPositive() {
+		return cex.Anchors{}, 0, false
+	}
+	return cex.Anchors{SessionID: m.session.ID, Kind: d.Kind, Bull: d.AnchorBull.Decimal, Bear: d.AnchorBear.Decimal}, d.F.Decimal.InexactFloat64(), true
+}
+
 // restorePair takes up a thin-leg-first batch in pairing from its order
 // records (SPEC 12.9 "重启", PRD 5.19): the decision from the lot (x_dec,
-// mu, C) and the thin order (qS); S, v_S, L, v_L from the orders each round
+// mu, C) and the thin order (qS), and the anchors and F of D_dec from the
+// entry decision's record (without it the spread stop falls back to the
+// current ones); S, v_S, L, v_L from the orders each round
 // (refreshPair); the first fill's time from the arrival of the thin order's
 // final state. Inside the window the pairing goes on, after it the next
 // round unwinds S_open at once. The x of a top-up is not in the order
@@ -360,6 +392,10 @@ func (m *ExecManager) restoreBatch(c *inventory.Cycle, now time.Time) {
 func (m *ExecManager) restorePair(b *batchState, lot *inventory.Lot) {
 	thin := m.pairing.Thin
 	plan := &strategy.EntryPlan{Direction: lot.Direction, X: lot.X, Mu: lot.Mu, Sigma: lot.Sigma, FeeD: lot.FeeD}
+	basis := false
+	if a, f, ok := m.decisionBasis(lot.ID); ok {
+		plan.Anchors, plan.F, basis = a, f, true
+	}
 	p := &pairState{plan: plan, thin: thin, thick: otherLeg(thin)}
 	thinFills := 0
 	for _, o := range m.cex.CycleOrders(string(lot.CycleID)) {
@@ -391,7 +427,8 @@ func (m *ExecManager) restorePair(b *batchState, lot *inventory.Lot) {
 	if m.lastEntry == nil || m.lastEntry.At.Before(lot.OpenedAt) {
 		m.lastEntry = &strategy.LastEntry{At: lot.OpenedAt, E: lot.X, Direction: lot.Direction}
 	}
-	logger.GlobalLogger.Info("exec: pairing taken up", "lot", lot.ID, "thin_order", p.thinID, "started", p.started, "first_fill", showTime(p.batch.FirstFill), "top_ups_stopped", p.noTopUps)
+	logger.GlobalLogger.Info("exec: pairing taken up", "lot", lot.ID, "thin_order", p.thinID, "started", p.started, "first_fill", showTime(p.batch.FirstFill), "top_ups_stopped", p.noTopUps,
+		"decision_anchors_read", basis, "decision_bull_usd", plan.Anchors.Bull, "decision_bear_usd", plan.Anchors.Bear, "decision_f", plan.F)
 }
 
 // restoreExit takes up a thin-leg-first line exit batch whose thick leg had

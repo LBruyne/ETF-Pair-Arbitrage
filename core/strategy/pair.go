@@ -22,14 +22,16 @@ func (p *EntryPlan) ThinOrder(thin cex.Leg) LegOrder {
 // pair window runs from it. The top-up reference starts at the decision's x.
 func NewPairBatch(plan *EntryPlan, thin cex.Leg, qty, vwap decimal.Decimal, firstFill time.Time) PairBatch {
 	return PairBatch{
-		Dir:        plan.Direction,
-		DecisionD:  plan.X + plan.Mu,
-		XRef:       plan.X,
-		FeeD:       plan.FeeD,
-		PlanThin:   plan.Qty[thin],
-		Fills:      Fills{ThinQty: qty, ThinVWAP: vwap, ThickQty: decimal.Zero, ThickVWAP: decimal.Zero},
-		ThinClosed: decimal.Zero,
-		FirstFill:  firstFill,
+		Dir:             plan.Direction,
+		DecisionD:       plan.X + plan.Mu,
+		DecisionAnchors: plan.Anchors,
+		DecisionF:       plan.F,
+		XRef:            plan.X,
+		FeeD:            plan.FeeD,
+		PlanThin:        plan.Qty[thin],
+		Fills:           Fills{ThinQty: qty, ThinVWAP: vwap, ThickQty: decimal.Zero, ThickVWAP: decimal.Zero},
+		ThinClosed:      decimal.Zero,
+		FirstFill:       firstFill,
 	}
 }
 
@@ -70,8 +72,7 @@ func (s *Strategy) PairStep(in PairInput) PairAction {
 	// A_thick / A_thin.
 	ratio := anchorOf(in.PairAnchors, thin).Div(anchorOf(in.PairAnchors, thick))
 	held := b.ThinQty.Sub(b.ThinClosed)
-	thickStep := in.Rules[thick].QtyStep
-	need := floorToStep(held.Mul(ratio), thickStep).Sub(b.ThickQty)
+	need := b.need(thin, in.PairAnchors, in.Rules[thick].QtyStep)
 	open := decimal.Max(decimal.Zero, held.Sub(b.ThickQty.Div(ratio)))
 	unwind, priced := s.unwindOrder(in, open)
 
@@ -102,12 +103,15 @@ func (s *Strategy) PairStep(in PairInput) PairAction {
 	if in.DepthOK[thick] {
 		fills := b.Fills
 		fills.ThinQty = held
-		if d, ok := s.IdealSpread(b.Dir, thin, fills, in.Books[thick], in.F, in.Anchors, in.PairAnchors); ok {
+		a, f := decisionBasis(b.DecisionAnchors, b.DecisionF, in.Anchors, in.F)
+		if d, ok := s.IdealSpread(b.Dir, thin, fills, in.Books[thick], f, a, in.PairAnchors); ok {
 			act.DIdeal = d
 		}
 	}
 
-	// 3 and 4: the window and the spread stop unwind S_open.
+	// 3 and 4: the window and the spread stop unwind S_open. The stop
+	// compares D_ideal with D_dec under the decision's anchors and F; P* and
+	// x below stay on the current ones.
 	if !in.Now.Before(b.FirstFill.Add(p.Window)) {
 		return act.startUnwind(b, ReasonWindow, unwind, priced, thin)
 	}
@@ -128,7 +132,7 @@ func (s *Strategy) PairStep(in PairInput) PairAction {
 
 	// 6: a top-up while x is strictly deeper than x_ref and at the line.
 	xOK := !math.IsNaN(act.X) && sigma > 0
-	if xOK && !noMoreTopUps && deeper(b.Dir, act.X, b.XRef) && s.AtEntryLine(b.Dir, act.X, sigma) {
+	if xOK && !noMoreTopUps && !in.TopUpBlocked && deeper(b.Dir, act.X, b.XRef) && s.AtEntryLine(b.Dir, act.X, sigma) {
 		if q, limit, quotaAt, ok := s.topUpOrder(in, levels, open, ratio); ok {
 			return act.order(PairSendThin, "", thin, b.Dir.Side(), limit, q, quotaAt)
 		}
@@ -360,6 +364,35 @@ func (s *Strategy) unwindOrder(in PairInput, open decimal.Decimal) (o *LegOrder,
 	return &LegOrder{Side: closing.Side(), Price: price, Qty: qty}, true
 }
 
+// HandOverEnd is the end state of a batch the stop or the forced exit takes
+// over (SPEC 12.4 step 2), as its fills stand at that moment: with part of
+// the thin leg still unpaired (the thick target, floored to thickStep, not
+// reached) built_partial when some of it was paired and unwound_stop when
+// none was, for the forced exit closes the rest; otherwise End. thin is the
+// thin leg and pair the cycle's pairing anchors; without a step (the rules
+// not read) the target is not floored.
+func (b PairBatch) HandOverEnd(thin cex.Leg, pair cex.Anchors, thickStep decimal.Decimal) PairEnd {
+	switch {
+	case !b.need(thin, pair, thickStep).IsPositive():
+		return b.End()
+	case b.ThickQty.IsPositive():
+		return PairEndBuiltPartial
+	default:
+		return PairEndUnwoundStop
+	}
+}
+
+// need is what the thick leg still has to pair: the target floor(held x
+// A_thin / A_thick) at the pairing anchors, less L; unfloored without a
+// step.
+func (b PairBatch) need(thin cex.Leg, pair cex.Anchors, thickStep decimal.Decimal) decimal.Decimal {
+	target := b.ThinQty.Sub(b.ThinClosed).Mul(anchorOf(pair, thin)).Div(anchorOf(pair, otherLeg(thin)))
+	if thickStep.IsPositive() {
+		target = floorToStep(target, thickStep)
+	}
+	return target.Sub(b.ThickQty)
+}
+
 // End is the end state the batch's fills say (SPEC 12.4 table): built while
 // part was paired and nothing of the thin leg was closed again (the unpaired
 // rest is dust), built_partial when part was paired and the rest closed, and
@@ -446,6 +479,16 @@ func anchorOf(a cex.Anchors, l cex.Leg) decimal.Decimal {
 		return a.Bull
 	}
 	return a.Bear
+}
+
+// decisionBasis is the anchors and F a batch's decision spread is under,
+// a and f; the current ones, cur and curF, when the batch does not carry
+// them (restored without its decision record).
+func decisionBasis(a cex.Anchors, f float64, cur cex.Anchors, curF float64) (cex.Anchors, float64) {
+	if !a.Bull.IsPositive() || !a.Bear.IsPositive() || !(f > 0) {
+		return cur, curF
+	}
+	return a, f
 }
 
 // lineStats is the mean and sigma under the anchors a, and whether they are

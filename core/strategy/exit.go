@@ -103,7 +103,7 @@ func (s *Strategy) DecideExit(in ExitInput) ExitDecision {
 	if !ok { // neither leg has an order the venue would take
 		return ExitDecision{Reason: ReasonTooSmall, Stage: stage}
 	}
-	plan := &ExitPlan{Side: closing.Side(), Price: price, Qty: qty, X: x, Mu: mu, Sigma: sigma, Line: line, D: x + mu}
+	plan := &ExitPlan{Side: closing.Side(), Price: price, Qty: qty, X: x, Mu: mu, Sigma: sigma, Line: line, D: x + mu, Anchors: in.Anchors, F: in.F}
 
 	// The batch's pre-check (SPEC 12.7 step 0): at exit1, and for every
 	// line batch with the thin leg first.

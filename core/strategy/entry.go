@@ -113,6 +113,8 @@ func (s *Strategy) EvaluateEntry(in EntryInput) (*EntryPlan, Reason) {
 			FeeD:       feeD,
 			FeeUSDT:    s.feeRate().Mul(notional).Mul(decimal.NewFromInt(2)),
 			K:          k,
+			Anchors:    in.Anchors,
+			F:          in.F,
 		}, ""
 	}
 	return nil, reason

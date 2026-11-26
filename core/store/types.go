@@ -432,6 +432,11 @@ type State struct {
 	AnchorFacts []AnchorFactRow    // the given session's anchor facts, in the order they were learned
 	LastEntry   *LotRow            // the most recently opened lot that was built (status open or closed), or that sent a thin order first however it ended (an end state is set); nil when there is none
 	ExitStage   *ExitStageRow      // the unfinished cycle's half target of exit1; nil when none was set
+	// EntryDecision is the entry decision of the unfinished cycle's lot still
+	// building (with the thin leg first, the batch in pairing): its detail
+	// holds the anchors and F the decision's spread was taken under. nil when
+	// no lot is building or its decision was not written.
+	EntryDecision *DecisionRow
 
 	// What the ledger needs beyond the unfinished cycle.
 	Funding        []FundingRow // every funding record booked, oldest first: a record is booked once, by its record_id

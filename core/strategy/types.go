@@ -344,6 +344,8 @@ type EntryPlan struct {
 	FeeD         float64            // the round-trip fee at these limit prices, in spread units
 	FeeUSDT      decimal.Decimal    // the round-trip fee of the planned sizes at these limit prices, in USDT
 	K            decimal.Decimal    // the anchored amount per leg before rounding to the quantity step, in USD
+	Anchors      cex.Anchors        // the anchors X and Mu are under: the current anchors of the decision
+	F            float64            // the F X and Mu are under
 }
 
 // --- exit ---
@@ -377,8 +379,10 @@ type ExitPlan struct {
 	Price, Qty   [2]decimal.Decimal // per leg: the limit (the price of the leg's pricing level) and the size
 	X, Mu, Sigma float64            // the executable deviation, the mean and sigma, in spread units under the current anchors
 
-	Line ExitLine // the line reached
-	D    float64  // the spread at the decision, X + Mu: the reference of the exit's spread stop
+	Line    ExitLine    // the line reached
+	D       float64     // the spread at the decision, X + Mu: the reference of the exit's spread stop
+	Anchors cex.Anchors // the anchors D is under: the current anchors of the decision
+	F       float64     // the F D is under
 	// ExpectedNet is the batch's pre-check (SPEC 12.7 step 0): the round's
 	// expected net in USDT were this batch closed at these limits. It is
 	// computed at exit1 and with a thin leg first; zero otherwise.
@@ -517,11 +521,17 @@ type Fills struct {
 // from the batch's orders. It starts at NewPairBatch.
 type PairBatch struct {
 	Dir       Direction
-	DecisionD float64         // D_dec: the spread at both legs' pricing levels at the decision, under the anchors of that moment
-	XRef      float64         // the top-up reference: x_dec, then the x of the last top-up that filled
-	FeeD      float64         // C: the round-trip fee at the decision's limits, in spread units (EntryPlan.FeeD)
-	PlanThin  decimal.Decimal // qS: the planned thin quantity
-	Fills                     // the opening fills of both legs so far: S, v_S, L, v_L
+	DecisionD float64 // D_dec: the spread at both legs' pricing levels at the decision, under the anchors of that moment
+	// DecisionAnchors and DecisionF are what D_dec is under; the spread stop
+	// takes D_ideal under them too, so that an anchor switch inside the pair
+	// window (PRD 11.4's jump) neither fires nor masks it. Zero (a batch
+	// restored without its decision record) falls back to the current ones.
+	DecisionAnchors cex.Anchors
+	DecisionF       float64
+	XRef            float64         // the top-up reference: x_dec, then the x of the last top-up that filled
+	FeeD            float64         // C: the round-trip fee at the decision's limits, in spread units (EntryPlan.FeeD)
+	PlanThin        decimal.Decimal // qS: the planned thin quantity
+	Fills                           // the opening fills of both legs so far: S, v_S, L, v_L
 	// ThinClosed is the thin quantity the batch closed again: profit closes
 	// and unwinds of the unpaired part.
 	ThinClosed decimal.Decimal
@@ -550,6 +560,11 @@ type PairInput struct {
 	Stopping     bool // a stop signal: the round is taken over
 	Forced       bool // inside the forced exit before the close: the round is taken over
 	NoNewEntries bool // the signal that stops new entries: no top-up, the pairing goes on
+	// TopUpBlocked says what blocks a new entry now (PRD 5.10, 5.11: F
+	// stale, an action window, the regular hours, the account's settings,
+	// the warm-up, ...) blocks a top-up in this frame; the pairing goes on,
+	// and unlike NoNewEntries a later frame may still top up.
+	TopUpBlocked bool
 	Now          time.Time
 }
 
@@ -602,15 +617,20 @@ type PairAction struct {
 // ExitBatch is the state of one line exit batch with a thin leg first, as
 // exec keeps it from the batch's orders. It starts at NewExitBatch.
 type ExitBatch struct {
-	Dir         Direction // of the cycle; the orders close it
-	Line        ExitLine
-	DecisionD   float64         // the spread at the exit decision: the reference of the spread stop
-	ExpectedNet decimal.Decimal // the pre-check at the decision, for the record
-	D1          bool            // the pre-check failed and the batch exits all the same
-	Protect     decimal.Decimal // with D1: the thick leg's pricing-level price at the decision, the limit of every thick order of the batch
-	Fills                       // the batch's closing fills: thin closed and its VWAP, thick closed and its VWAP
-	FirstFill   time.Time       // local arrival of the batch's first thin closing fill: exit_pair_window runs from here and is not reset
-	HardEnd     Reason          // set by exec when ExitPairStep starts the hard close (exit_window, exit_stop_d)
+	Dir       Direction // of the cycle; the orders close it
+	Line      ExitLine
+	DecisionD float64 // the spread at the exit decision: the reference of the spread stop
+	// DecisionAnchors and DecisionF are what DecisionD is under; the ideal
+	// closing spread is taken under them (as PairBatch's). Zero falls back to
+	// the current ones.
+	DecisionAnchors cex.Anchors
+	DecisionF       float64
+	ExpectedNet     decimal.Decimal // the pre-check at the decision, for the record
+	D1              bool            // the pre-check failed and the batch exits all the same
+	Protect         decimal.Decimal // with D1: the thick leg's pricing-level price at the decision, the limit of every thick order of the batch
+	Fills                           // the batch's closing fills: thin closed and its VWAP, thick closed and its VWAP
+	FirstFill       time.Time       // local arrival of the batch's first thin closing fill: exit_pair_window runs from here and is not reset
+	HardEnd         Reason          // set by exec when ExitPairStep starts the hard close (exit_window, exit_stop_d)
 }
 
 // ExitPairInput is every fact one step of an exit batch's thick leg reads.
