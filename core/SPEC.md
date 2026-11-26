@@ -1,6 +1,6 @@
 # core 架构与设计方案
 
-版本：0.11 · 2026-11-25（UTC+8） · 状态：**设计稿；审计五次批复后分步实施中：第 0–4 步已实现并提交；第 5 步（cex 订单与纸面、Bitget 账户侧）和第 5.3 步（延迟相关的改动、WSS 下单通道）已实现并通过测试，未提交；第 6 步起未开始。** 0.11 之后的补充（2026-11-25 晚）：审计第 6 步之后 exec 和 inventory 的修改（用户第 65、66 条）见 5.4c；用户第 61 条：5.6 新增只供 Live Monitor 显示的三项落库（`funding_rate` 表、`inventory_sample` 的标记价等八列、`signal_sample` 的两腿中价）。0.11 落实用户第 56、57 条：取价不再归档（SOXL 第 2 个、SOXS 第 5 个原始价位，5.2 末尾“取价档”），下单默认改用 WSS 并用真实订单验证（5.7 末尾）。0.10 落实第 53–55 条（SOXS 改 `books5`、延迟设计 L1–L4 和 WSS 下单的实现与实测）。规则在 PRD 3.9。0.9 写入第 5 步的做法和延迟研究；0.8、0.7 落实审计第五、四次意见（5.4b、5.4a）。各轮审计原文、检查报告和 0.1–0.10 的副本在 `experiments/decisions_20261123/spec_core_20261124/`。
+版本：0.11 · 2026-11-25（UTC+8）；2026-11-26 补充：第 8 步回放与选参已实现（5.8、第 9 节第 8 行），铃锚点的 F 只取 Coinbase 收盘前一分钟 1 分钟 K 线的收盘（用户第 69 条，5.1“锚点”、5.4a），纸面成交的手续费逐笔截断到 8 位（审计第 70 条，5.1“纸面”） · 状态：**设计稿；审计五次批复后分步实施中：第 0–4 步已实现并提交；第 5 步（cex 订单与纸面、Bitget 账户侧）和第 5.3 步（延迟相关的改动、WSS 下单通道）已实现并通过测试，未提交；第 6 步起未开始。** 0.11 之后的补充（2026-11-25 晚）：审计第 6 步之后 exec 和 inventory 的修改（用户第 65、66 条）见 5.4c；用户第 61 条：5.6 新增只供 Live Monitor 显示的三项落库（`funding_rate` 表、`inventory_sample` 的标记价等八列、`signal_sample` 的两腿中价）。0.11 落实用户第 56、57 条：取价不再归档（SOXL 第 2 个、SOXS 第 5 个原始价位，5.2 末尾“取价档”），下单默认改用 WSS 并用真实订单验证（5.7 末尾）。0.10 落实第 53–55 条（SOXS 改 `books5`、延迟设计 L1–L4 和 WSS 下单的实现与实测）。规则在 PRD 3.9。0.9 写入第 5 步的做法和延迟研究；0.8、0.7 落实审计第五、四次意见（5.4b、5.4a）。各轮审计原文、检查报告和 0.1–0.10 的副本在 `experiments/decisions_20261123/spec_core_20261124/`。
 
 core 是 ETF Pair Arbitrage 的交易进程：读 Bitget 上 SOXLUSDT / SOXSUSDT 两个永续合约的盘口，按锚点算出价差、均线和 σ，在非盘中两条腿同时偏离均线足够远时用 IOC 限价单同时买入（或同时卖出）两条腿，价差回到平仓线时平仓，每个美股常规收盘前全部平掉。
 
@@ -72,7 +72,7 @@ core/
   inventory/     types.go manager.go ledger.go quota.go reconcile.go store.go *_test.go
   exec/          types.go manager.go step.go bars.go orders.go recover.go store.go *_test.go
   store/         types.go store.go schema.sql *_test.go
-  cmd/replay/    main.go
+  cmd/replay/    main.go tape.go reference.go sim.go report.go *_test.go
 ```
 
 ## 3. 数值与标识
@@ -326,7 +326,8 @@ type VenueError struct{ Code, Message string; Kind ErrorKind } // rate_limited, 
 #### 对 exec 和 inventory 的读写接口
 
 ```go
-func NewManager(cfg Config, venue Venue, index IndexSource, fx FXSource, issuer IssuerSource) (*CexManager, error)
+func NewManager(cfg Config, venue Venue, index IndexSource, fx FXSource, issuer IssuerSource, opts ...Option) (*CexManager, error) // opts: WithClock, Synchronous (replay only, 5.8)
+func (m *CexManager) StartSynchronous(ctx context.Context) error // replay only: Run without its loops (5.8)
 func (m *CexManager) UseStore(s store.Sink)
 func (m *CexManager) Restore(facts []AnchorFact, orders []OrderRecord) // before Run: this Session's anchor state and the open cycle's orders; those without a final state become Unknown and are queried
 func (m *CexManager) Run(ctx context.Context)
@@ -366,7 +367,7 @@ func (m *CexManager) RecoverOrders(ctx context.Context, cycleID string) ([]Order
 func (m *CexManager) SetOrderLot(id ClientOrderID, lotID string) // stores the lot the ledger gave a recognised order (record and row)
 func NewClientOrderID(cycleAt time.Time, seq int, leg Leg, purpose OrderPurpose) ClientOrderID // ids are made and parsed in cex; the cycle id is derived from the id
 func OrderRecordsFromRows(rows []store.OrderRow) []OrderRecord // start-up: the rows read back by store.LoadState
-func NewPaperVenue(real Venue, cfg PaperConfig) *PaperVenue // PaperConfig{Pair, Latency [2]time.Duration, TakerFeeBps, Leverage}; UseStore(store.Sink); SeedPositions(qty [2]decimal.Decimal)
+func NewPaperVenue(real Venue, cfg PaperConfig) *PaperVenue // PaperConfig{Pair, Latency [2]time.Duration, TakerFeeBps, Leverage, DepthMaxAge, Clock (nil: wall clock; a replay's virtual clock, 5.8)}; UseStore(store.Sink); SeedPositions(qty [2]decimal.Decimal)
 func (m *CexManager) MarkNeverArrived(id ClientOrderID)   // exec's verdict once the three evidences are in (PRD 13.3)
 ```
 
@@ -472,7 +473,7 @@ func (b *legBook) publish(symbol Symbol, connected bool) *Book {
 
 #### F（`fx.go`，PRD 3.5）
 
-每 5 秒（`timings.fxPoll`）读一次 Coinbase 的 `ticker`，F = (bid + ask) / 2；`ReceivedAt` 是这次应答到达的时刻，超过 `fx_max_age`（60 秒）没有新的成功读数就算失效；读失败或读到无效值（非正数、买一高于卖一）不更新 `ReceivedAt`。`fx.go` 自己留着最近 10 分钟里每分钟的最后一个有效值，供铃锚点用（不依赖 exec）。
+每 5 秒（`timings.fxPoll`）读一次 Coinbase 的 `ticker`，F = (bid + ask) / 2；`ReceivedAt` 是这次应答到达的时刻，超过 `fx_max_age`（60 秒）没有新的成功读数就算失效；读失败或读到无效值（非正数、买一高于卖一）不更新 `ReceivedAt`。这个读数只供开仓、平仓和分钟 bar 用；铃锚点的 F 不用它，而是 Coinbase 收盘前一分钟那根 1 分钟 K 线的收盘（下面“锚点”，用户第 69 条；2026-11-26 起，原先每分钟留最后一个读数、铃锚点优先用它的做法已删）。
 
 取 REST 轮询而不是 WebSocket：推送在安静时段多久来一次没有量过（PRD 18.4），轮询的新鲜度只取决于自己，这一项不用再量。看板的采集器也是轮询。
 
@@ -498,7 +499,7 @@ func (c *Calendar) Carrier(day string) time.Time    // 04:00 New York of that tr
 Session 开始（常规收盘）              Kind = ""                      # 没有锚点：不开仓
   ↓ 收盘后 1 分钟读 Binance 指数（收盘前一分钟那根 K 线的收盘；返回的 openTime 不对就是没读到）
   ↓ 没读到：每 5 分钟（timings.anchorPoll）再读
-铃锚点                               Kind = bell，A = F × 指数      # F：fx.go 在那一分钟记下的最后一个有效值；没有就取 Coinbase 那一分钟 K 线的收盘
+铃锚点                               Kind = bell，A = F × 指数      # F：Coinbase 那一分钟 1 分钟 K 线的收盘（第 69 条），没有或读失败就 5 秒后再读（referenceRetry），指数没有就每 5 分钟再读
   ↓ 从收盘起每 5 分钟每只基金读一次 NAV（用户授权的节奏）（开始这个 Session 的那个交易日的）
   ↓ 两条腿的数字都读到、各自从第一次读到起满 nav_settle_delay（1 小时）没有变过（变了重新计时）
 NAV                                  Kind = nav，A = NAV            # 之后不再读，到下一次收盘
@@ -534,7 +535,7 @@ NAV                                  Kind = nav，A = NAV            # 之后不
 `exec.live: false` 时 `main` 用 `cex.NewPaperVenue(real Venue, cfg)` 包住真实的 Bitget 客户端（用空的 `Credentials` 构造，所以它发不出任何签名请求）：公开数据的方法原样转发，账户侧全部在本地。
 
 - 盘口：`SubscribeBooks` 转发事件的同时，`PaperVenue` 用同一个 `legBook` 自己维护一份两条腿的原始盘口，撮合只用它。
-- `PlaceOrder`：立即返回受理；过这条腿的 `sim_order_latency` 后按**到单规则**撮合（`cex/arrival.go`）：先由 `ArrivalLevels(book, side, depth_max_age)` 决定这张单能吃哪一部分盘口，再由 `MatchIOC` 在限价以内逐档吃到订单数量为止——吃满是 `filled`，吃不满是 `cancelled` 加部分成交，一档都吃不到是 `cancelled` 零成交；`reduceOnly` 的数量不超过纸面持仓。结果作为 `order` 和 `fill` 事件走与实盘相同的回调。手续费 = 成交额 × `taker_fee_bps`。`PaperConfig.DepthMaxAge` 由 `main` 从 `cex.depth_max_age` 抄入（不是新的配置项；每个构造纸面交易所的地方都显式传入）。
+- `PlaceOrder`：立即返回受理；过这条腿的 `sim_order_latency` 后按**到单规则**撮合（`cex/arrival.go`）：先由 `ArrivalLevels(book, side, depth_max_age)` 决定这张单能吃哪一部分盘口，再由 `MatchIOC` 在限价以内逐档吃到订单数量为止——吃满是 `filled`，吃不满是 `cancelled` 加部分成交，一档都吃不到是 `cancelled` 零成交；`reduceOnly` 的数量不超过纸面持仓。结果作为 `order` 和 `fill` 事件走与实盘相同的回调。手续费 = 成交额 × `taker_fee_bps`，每笔成交截断（朝零）到 8 位小数，订单的手续费是它各笔成交手续费之和（2026-11-26，审计第 70 条：与真实通道 `convert.go` 的 8 位截断一致；交易所是逐笔截断还是对订单合计截断一次，要用一张多笔成交的真实订单确认，11-26 11:36 起的小额实盘会产生这样的订单）。`PaperConfig.DepthMaxAge` 由 `main` 从 `cex.depth_max_age` 抄入（不是新的配置项；每个构造纸面交易所的地方都显式传入）。
 - `Positions`：纸面持仓（两条腿带符号的数量）。重启时 `main` 在 `inventory.Restore` 之后调用 `PaperVenue.SeedPositions`，把账本的持仓回填进去。
 - `AccountSettings`：返回期望值（纸面不检查账户设置）。`OrderByClientID`、`RecentOrders`、`Fills`：答本地的纸面订单。
 - `FinancialRecords`：每个结算时刻过后读 `FundingHistory` 的结算费率，资金费 = −持仓数量（带符号）× 那一刻的中价 × 费率，生成一条纸面流水（费率为 0 时金额为 0）。
@@ -1513,7 +1514,7 @@ func (m *ExecManager) forcedExit(now time.Time, unknown bool) (done bool) {
 
 **每一拍一次读取两腿盘口**（cex，5.1 的读接口已改）：`Books()` 一次取出两条腿，新鲜度（`DepthUsable`）、能否用于开仓 / 按线平仓 / 补齐（`DepthOK` = 可用且无冲突）、有没有价格（`HasPrice`）、取价档、回吐估价和订单限价都从这同一份得出；`observe`、`entryInput`、`exitInput`、`gapInput`、强制平仓都用 `step` 开头取的那一份。原先分开的 `Book(leg)`、`DepthUsable(leg, now)`、`HasPrice(leg, now)` 已删除——两次读取之间来一帧，通过检查的深度和参与计算的深度就不是同一版。纸面撮合（第 5.1 步）要把决策所用的快照和模拟成交所用的后续盘口都记下，便于解释成交差异。
 
-**铃锚点的 F 固定**（cex）：收盘前一分钟的有效 F 第一次取到时，就为这个 Session 固定数值和来源——程序自己记下的优先（`own`），当时没在运行才用 Coinbase 那一分钟的 K 线（`candle`）——并写一条 `anchor_fact`（kind `bell_f`，每条腿一行）。之后的重试只读缺的指数；重启先读回它。例：自记 F = 1.000、K 线 0.999，两条腿的指数 40、50 第 11 分钟才到 → 锚点 40 / 50（原先本地缓存已淘汰那一分钟，会算成 39.96 / 49.95）。
+**铃锚点的 F 固定**（cex）：收盘前一分钟的 F 第一次取到时，就为这个 Session 固定数值和来源，并写一条 `anchor_fact`（kind `bell_f`，每条腿一行）。之后的重试只读缺的指数；重启先读回它。**2026-11-26 起（用户第 69 条：“汇率 F 统一用 Coinbase 收盘前一分钟 1 分钟 K 线的收盘价”）F 只取那根 K 线的收盘（来源 `candle`）**，不再优先用程序自己在那一分钟读到的值（原来的 `own`、`fxAtMinute` 和每分钟留值的 `fxMinutes` / `fxKeep` 已删）；重启时读回的旧 `bell_f`（来源可能是 `own`）照旧沿用。K 线还没有或读失败时 5 秒（`referenceRetry`）后再读，不等 5 分钟（独立复核 2026-11-26：一次超时原来会把铃锚点和开仓推后 5 分钟；测试 `TestAnchorBellFIsReadAgainSoon`）；没有 K 线就没有铃锚点不变。例：K 线 0.999 在收盘后 1 分钟读到并固定，两条腿的指数 40、50 第 11 分钟才到、K 线其间被修订为 0.998 → 锚点 39.96 / 49.95（测试 `TestAnchorBellFixesTheCandleFWhenTheIndexIsLate`、`TestAnchorBellUsesTheCandleCloseOfTheMinute`、`TestAnchorBellKeepsItsFAcrossARestart`）。
 
 **回吐的估价与限价用同一份盘口**（strategy，`GapInput.DepthOK [2]bool`）：这条腿深度可用且无冲突时逐档估；深度过期或冲突、但最优价还新鲜时，整笔按那个最优价估（限价本来就由它定）。例：做空，SOXL 要买回 15.30 份，开仓均价 40.44；旧深度卖一 40.47，新的 `books1` 卖一 40.60 × 300。按旧深度估回吐 0.5395 USDT，小于补齐的 0.714，会选回吐；按看得见的 40.60 估是 2.5286，应当补齐。少的那条腿的补齐门槛（`CanComplete`）不变。
 
@@ -1800,6 +1801,51 @@ func (s *Store) LoadState(ctx context.Context, sessionID string) (State, error) 
 
 门控的实测命令（都在 `core/` 下，`core/README.md` 有全文）：`TestLiveBookConnections`、`TestLiveRESTWarmth`、`TestLivePrivateConnectionChoice`、`TestLiveTradeConnection`（只读）；`TestLiveOrderLatency`、`TestLiveWSOrderRoundTrip`（**发真实订单**，后者还会开一个最小仓位再平掉，要 `BITGET_ORDER_LATENCY_TEST=1` 和 `BITGET_ORDER_LATENCY_AUTHORISED=owner-authorised` 两个变量，只在用户授权那一次时设）。
 
+### 5.8 回放与选参（`cmd/replay`，第 9 节第 8 步，2026-11-26）
+
+依据：用户第 65–70 条（第 69 条：“参数先用 EMA 30/30 min，din/dout为2和0.5，试试。完成完整的选参和回测程序，可以分别测试不同总名义额度 N（例如1000/10000/100000U），如果使用峰值不到N，收益率都按最大使用值来给出”；第 70 条转来的审计意见：不按在线纸面去拟合回放的延迟，逐单对齐用那次运行自己的配置，5–100 ms 只作压力测试）；方案原稿 `experiments/step8_prep_20261126/PLAN.md`。回放驱动的是交易程序自己的组件：cex 的盘口合并和订单表、`PaperVenue` 的到单规则、strategy、inventory 和 exec 的循环，全部在一个虚拟时钟上、由一个 goroutine 推进；审计回放用测试覆盖文件替换的四处改成了生产代码里的显式接口（只在回放里用，进程不传）。
+
+**生产代码里加的接口**（进程不传任何选项，行为不变）
+
+| 包 | 接口 | 作用 |
+|---|---|---|
+| `cex` | `type Clock interface{ Now() time.Time; AfterFunc(d, f) }` | 一个组件读时间和设一次性定时器的地方；进程用墙钟 |
+| `cex` | `NewManager(..., opts ...Option)`；`WithClock(Clock)`、`Synchronous()` | `Synchronous`：交易所报来的每一帧和断线在报告它的 goroutine 上立即合并（不经 `Run` 的 inbox），`PlaceOrders` 在调用内把单交给交易所（不另开 goroutine）；盘口合并本身不变 |
+| `cex` | `(*CexManager).StartSynchronous(ctx)` | `Synchronous` 管理器代替 `Run` 的启动：订阅两腿盘口和私有流，读一次合约规则、账户设置、持仓；不起任何循环（F、锚点、资金费、订单表的超时和查询都不跟） |
+| `cex` | `PaperConfig.Clock` | 纸面交易所的时钟和定时器；nil 是墙钟 |
+| `inventory` | `NewManager(..., opts ...Option)`；`WithClock(cex.Clock)` | 账本读时间的地方 |
+| `exec` | `NewManager(..., opts ...Option)`；`WithClock(cex.Clock)` | 循环读时间的地方 |
+| `exec` | `Start(ctx) (leave, err)`、`Advance(now) bool`、`NextTick()` | `Start` 是 `Run` 进入循环之前的部分（`Run` 现在调用它）；`Advance` 是由驱动方拥有时钟时的 `Run` 循环：第一次调用、在上一轮之前取的四个通道（盘口、订单、账户、参考数据）有一个被关闭、或到了从 `Start` 起按 `step`（200 ms）计的 tick，就跑一轮，一轮自己的发布又唤醒时立即再跑（与 `Run` 相同，最多 16 轮），跳过多个 tick 只跑一轮（与 `time.Ticker` 丢 tick 相同）；**循环的每个 tick 都来自虚拟时钟**（审计第 70 条） |
+| `config` | `Parse([]byte)` | 不读密钥文件地解析并校验配置：`config.yaml`，或一次运行存在 `process_run.config` 里的 JSON；`Load` 改为用它 |
+
+内存存储、只在回放用的交易所（`replayVenue`：给合约规则、承载录下的帧，没有账户）、F 和锚点按得知时刻发布的读视图（`replayCex`：覆盖 `FX`、`Anchors`、`ReferenceChanged`，其余是 cex 的）和虚拟时钟都在 `cmd/replay` 里，不进生产包。
+
+**输入**
+
+- 盘口：录制服务的原始帧（`experiments/book_tape/bitget/<日>/<合约>.<频道>.<首条接收毫秒>.jsonl.gz`），每条腿深度 + `books1`，按本机接收时刻合并成一条时间线；同一毫秒里不同频道的先后录制没有记下，按 `seq`、深度先于 `books1`、bull 先于 bear 排。SOXS 的深度：录到 `books5`（2026-11-25 18:00:07.412 UTC+8 起）就用 `books5`，之前用 `books50` 截到前 5 档代替（结果里标明 `bear_depth`）。录制服务那条连接的断线（`events.jsonl` 的 `disconnected`）作为两条腿的断线送入。录制只有一条连接，`book_connections` 在回放里固定为 1。正在写的最后一个文件末尾不完整时读到那里为止。
+- F 和锚点：一般回测读看板库（只读角色，密码取自 `dashboard/.env` 的 `ETFPAIR_DB_READER_PASSWORD`，程序内拼 DSN，不打印）：F 是 `fx_minute` 每分钟那次采样（按采样时刻生效，60 秒失效规则照旧），铃锚点是 `etf_bell`、NAV 是 `etf_nav` 每只基金第一次确认的值，两腿都知道时（较晚那条腿的得知时刻）生效；每个 Session 在它的收盘时刻先发布“无锚点”。看板库里 11-26 之前的铃锚点 F 是看板当时的 ticker 读数（旧规则），不是 K 线收盘，两者差约 1e-5，只影响换锚那一刻的价差水平。
+- 复现一次纸面运行（`-paper-run <run_id>`）：读 trade schema（只读 DSN 在 `core/.env.reader`）里那次运行的配置（`process_run.config`）、开始时刻、它每秒用的 F（`signal_sample.f`，作为那一秒的读数）、它的 `anchor_fact`（铃锚点、NAV 按得知时刻），以及它启动时读回的东西：同一 Session 开始前的 `minute_bar`、开始时已知的锚点事实、开始前最后一个仓位（开仓间隔）、R（账本起点之后、开始之前已结束各轮的净额）。
+- 日历是程序自己的（`cex.NewCalendar` 加所用配置的人工改动；复现纸面运行时用那次运行自己的配置）。
+- 复现纸面运行的前提（`checkRestart`，不满足就报错退出）：存的 `inventory_state` 的起点早于那次运行的开始（它是整行替换的状态行，起点更晚说明之后被换过，开始时的 R 不可知）；开始时没有跨着它的未结束的一轮（回放不恢复未结束的一轮）。
+- 循环的启动（`exec.Start`，含恢复）限 30 秒墙钟（`startWithin`）：恢复失败时按墙钟等待重试，回放里会一直转；按时返回的启动，它的 context 保留给之后的读取。`summary.json` 写明资金费不计。
+- 同步管理器不留每帧的延迟（`bookStream.delays` 只供 `Run` 的状态行读取和清空，同步模式不跑它；独立复核 S1，测试 `TestSynchronousManagerKeepsNoFrameDelays`）。
+
+**驱动**（每个模拟一个 goroutine；同一窗口的帧只解码一次，分块发给全部模拟，各自只看自己的输入，所以结果只取决于输入）：一帧到达时刻 t 之前，按时间先后依次处理到期的事件——F / 锚点的变化、纸面交易所的到单撮合（虚拟时钟的定时器）、循环的 tick——每个时刻先撮合再 `Advance`；同一毫秒的帧全部送完才处理这一毫秒的撮合和循环。资金费不计（`replayVenue` 没有结算费率；PRD 16.5 要求另列，这一版没有）。
+
+**输出**（`-out` 目录；每个窗口每个参数组一个子目录）：`orders.jsonl`、`fills.jsonl`、`cycles.jsonl`、`lots.jsonl`、`decisions.jsonl`、`minutes.jsonl`、`summary.json`（每个 Session 和整段各一份汇总），`-keep` 另有每秒的 `samples.csv` 和每张纸面单的 `paper_matches.jsonl`；全部窗口的汇总一行一组写进 `grid.csv`。汇总（PRD 16.5）：订单和成交数（按用途）；开仓批按两腿成交分为两腿都有、只有一腿、都没有，单腿率 = 只有一腿 ÷（两腿都有 + 只有一腿）；开仓单的成交率（成交量 ÷ 下单量）；补齐、回吐张数；手续费；轮数和按 `end_reason` 分的轮数（含 `dust_only`）；**轮净额**（已结束各轮的 `net`，只含已平部分）与**全成交现金账**（全部成交：卖出 − 买入 − 手续费）分开写，另写成交留下的两腿数量（零头）；**峰值名义** = 任一时刻两腿持有量按开仓成本的合计的最大值；**收益率**按 N（= M × L）和按实际用到的名义 min(N, 峰值)（用户第 69 条）两种给出。指纹 = 全部订单、成交、轮、仓位的最后一行和全部决策的哈希。
+
+**选参**（`-grid`）：`model`（ema / sma）、`x`、`y`（分钟）、`din`、`dout`（σ）、`lat`（两腿各自的下单延迟，bull/bear 毫秒）、`n`（N，USDT；M = N ÷ L）的全部组合；未给的键取配置里的值。
+
+**验收与结果**（2026-11-26；报告由 lead 存档，数据在 `experiments/step8_backtest_20261126/`）
+
+- 确定性：`TestReplayIsDeterministic`（合成的录制目录：同一段两遍——同一趟里两个模拟、另一趟再一个——订单序列和指纹相同，场景里有开仓、按线平仓、最后空仓；300 ms 延迟的另一组不同）；真实数据上 `-repeat 2` 对每组比较指纹（纸面复现、各 Session 的 EMA 30/30 都相同）。
+- 复现在线纸面运行（`1795629729414-backup-tk-huichao`，11-26 02:02:09 起，它自己的 15 / 15 ms 配置）：三轮开仓的时刻、方向都对上；第一轮和第三轮第一批的限价、数量逐单相同（决策晚 3 ms、29 ms）。**第一张分歧**：第一轮的 SOXS 开仓买单（`…-0002RE`，限价 62.415 × 2.67）——在线纸面零成交，回放成交 0.27。原因是帧的到达：在线进程在订单到达（发单后 15 ms）之前已收到 SOXS `books5 seq 708566853479`（11-26 06:33:51.050）和 `books1 seq 708566853819`（卖一 62.42，高于限价），录制服务分别晚到 12 ms（.062）和 ≥ 15 ms（.070），回放的订单到达时还是决策那一份深度加 `books1 seq 708566853282`（卖一 62.412 × 0.27）。按在线纸面每张撮合记下的深度序号查录制文件：37 个深度帧录制服务一律更晚收到，中位 31 ms，最大 1.8 s（在线进程每条腿三条连接取最先到的，录制服务一条连接承载 12 个合约）。μ、σ 从重启后第一个整分钟起就有差（中位 0.09 / 0.10 个 D 单位，最大约 1.1）：574 个有效分钟里 294 个两腿中价相同，其余分钟最后一次观测落在不同的帧上；SOXS 冲突标志逐秒只有 70% 相同。第二轮因此晚 4.5 秒、按不同的批量开仓。结论：回放的逻辑与在线一致，差别来自输入（录制的到达时刻），不能靠调延迟抹平；录制服务要多连接、或交易进程把自己收到的帧落盘，才能逐单对齐。
+- 延迟 5 / 15 / 25 / 50 / 100 ms 只作压力测试（成交率、单腿率、净额），不作标定；真实的到达延迟以真实订单为准（5.7）。
+- 压力测试（Session 2026-11-24，EMA 30/30、2 / −0.5、N = 10,000；SOXS 18:00 前为 `books50` 前 5 档）：两腿 5 / 15 / 25 / 50 / 100 ms 的轮净额 +11.37 / +5.61 / +4.29 / −1.80 / −5.14 USDT，单腿率 5.3% / 5.0% / 9.1% / 16.7% / 22.7%，开仓成交率 94.7% / 94.8% / 93.0% / 86.0% / 83.6%。
+- EMA 30/30、d_in 2、d_out −0.5（用户第 69 条）逐 Session 的轮净额（USDT；N = 1k / 10k / 100k）：2026-11-24（SOXS 18:00 前 `books50`）+2.85 / +5.61 / −62.27（100k 峰值 93.7k）；只用原生 `books5` 的 11-25 18:00:08 → 11-26 05:00 +0.71 / +3.21 / +1.44（100k 峰值 35.5k）；2026-11-25 到 11-26 12:00（未结束，原生）+0.30 / +3.59 / +0.60（100k 峰值 32.0k）；只核对流程（`books50` 前 5 档）：2026-11-19（录制 11-20 18:43 起）+0.61 / +0.72 / +0.72，2026-11-20（周末）+10.14 / +82.20 / +296.20，2026-11-23 +2.88 / +17.48 / +32.30。资金费不计。全部空仓结束，`-repeat 2` 指纹相同。
+- 小网格（model ema/sma × X 15/30/60 × d_in 1.5/2/2.5 × d_out −0.5/0，Y 30，N 10k）：训练 2026-11-24、验证 2026-11-25（到 12:00）。两段的排名相关只有 0.24（Spearman），训练第一（SMA 15、1.5 / 0）在验证里排第 6；完整的原生 Session 还没有一个，不足以冻结参数，只是程序走通。
+
+
 ## 6. 监控看板 ETF-Pair Live Monitor
 
 看板与交易程序一起实现（PRD 14.4）。面板、变量和查询的设计在 [../dashboard/SPEC.md](../dashboard/SPEC.md) 第 7 节（本次已按 5.6 的表更新），那里是看板的定稿处，本节只列要点：
@@ -1863,7 +1909,7 @@ func (s *Store) LoadState(ctx context.Context, sessionID string) (State, error) 
 | 6.4（已实现，2026-11-25；见 5.4 末尾“第 6.4 步实现时定下的”） | exec 恢复 | `main` 的读回顺序、`recover.go`；纸面持仓回填 | **旧进程带仓 → 恢复时读取失败 → 收到停止 → 读取恢复 → 减仓并核对后才退出**；V15、V16 末句；“第二条腿的通知被扣住”在重启时再跑一次：发单前后各一个崩溃点；按 `ClientOrderID` 认回本地没记下的单；补分钟优先用自己的；接管后重启接回仓位 |
 | 6.5（实施中：角色和 schema 已装，5 分钟试跑通过，2026-11-25 19:53 UTC+8 起长跑） | 纸面联调 | 正式库上建角色和 schema（`install.sh` 的新段；用户第 60 条已授权：“两个都同意，不用等我，直接进行测试和调试”）；对真实行情跑纸面：先 1 小时，再跨一个真实收盘 | 1 小时内状态行、`signal_sample`、`minute_bar` 连续；跨收盘那次收盘前确实持有仓位并在收盘前结清（PRD 第 17 节末段）；从 `cex_order` 重算的每轮合计与 `cycle` 一致（PRD 14.3） |
 | 7 | Live Monitor 看板 | `dashboard/grafana/live_monitor_board.py`、`boardkit`（数据源改为传入、`BOARDS` 加一项）、`gen_dashboard.py`、数据源的 provisioning；`dashboard/SPEC.md` 第 7 节、`dashboard/README.md` | V19：`test_boards.py` 的结构检查；私有 Grafana 上截图几轮审阅；页面数字与表逐项对照。发布另行授权；**已实现并发布**：2026-11-26 00:02:05 UTC+8（`51fe429`、`aad3a60`、`40c9a22`；看板 md5 `d9ec0ca0…`，Summary 与按成交重算一致） |
-| 8 | 回放与选参 | `cmd/replay`：自己读录制服务的原始帧文件（`experiments/book_tape`，格式见 dashboard/SPEC.md 附录 A；不引用 `dashboard/` 的 Go 包），按接收时间回放，驱动同一套盘口合并、strategy、inventory、exec 和 `PaperVenue`（每条腿各自的下单延迟）；历史的锚点（按得知时刻）、F 和日历从看板库读，只读。输出 PRD 16.5 的分项。回放驱动的就是 `PaperVenue`（经它的 `SubscribeBooks` 送入录下的帧，每条腿各自的下单延迟），所以到单规则与纸面是同一份代码。`legBook` 是 `cex` 包内的类型，`cmd/replay` 不能自己建；回放要绕开 `PaperVenue` 直接调 `ArrivalLevels` / `MatchIOC` 的话，那部分代码要放在 `cex` 包里。`PaperVenue` 的时钟和定时器目前不能从包外注入（`paperTimings` 未导出），第 8 步要加一个导出的注入口。选参：模型、X、Y、d_in、d_out 的网格在前一段完整 Session 上跑，参数冻结后在之后的 Session 上验证（PRD 16.2） | 固定原始帧、接收顺序和注入的时钟，回放两次的订单序列和账本相同；一个 Session 的回放与同期纸面运行的成交一致；回测方案和结果写成报告交用户定参数；**延迟敏感性**（5.7 的 L5）：每条腿 5 / 15 / 25 / 50 / 100 ms 各跑一遍，报成交率、只成交一条腿的比例和净额；**实施方案（2026-11-26 草稿，`experiments/step8_prep_20261126/PLAN.md`）**：审计回放用测试覆盖替换的时钟、帧输入、同步下单和内存存储，改为生产代码里的显式接口（`cex` / `inventory` 的时钟选项、只在回放用的 `ReplayVenue`、订单表的同步发送选项、`store` 的内存实现）；选参与逐单对齐只用 2026-11-25 18:00 之后（SOXS 原生 `books5`）的录制，第一个完整的原生 Session 是 11-26 05:00 → 11-28 02:00 UTC+8（11-26 感恩节休市、11-27 提前收盘）；验收顺序：确定性 → 与在线纸面逐单对齐（从审计第三轮修复后那次重启起）→ 两腿延迟校准 → 训练 / 验证 Session 选参 |
+| 8（已实现，2026-11-26；见 5.8） | 回放与选参 | `cmd/replay`：自己读录制服务的原始帧文件（`experiments/book_tape`，格式见 dashboard/SPEC.md 附录 A；不引用 `dashboard/` 的 Go 包），按接收时间回放，驱动同一套盘口合并、strategy、inventory、exec 和 `PaperVenue`（每条腿各自的下单延迟），全部在一个虚拟时钟上、由一个 goroutine 推进（循环的每个 tick 都来自虚拟时钟）；历史的锚点（按得知时刻）、F 和日历从看板库读，只读；复现一次纸面运行时读那次运行自己的配置、F、锚点事实和启动时读回的分钟、R。审计回放的四处覆盖改成生产代码里的显式接口：`cex.Clock` 与 `WithClock`、`cex.Synchronous` 与 `StartSynchronous`（帧在投递的 goroutine 上合并、订单在 `PlaceOrders` 内交给交易所）、`PaperConfig.Clock`、`inventory.WithClock`、`exec.WithClock` 与 `Start` / `Advance` / `NextTick`；内存存储、`replayVenue`、按得知时刻发布 F 和锚点的读视图在 `cmd/replay` 里。输出 PRD 16.5 的分项，轮净额与全成交现金账分开，峰值名义和按 N、按 min(N, 峰值) 的收益率（用户第 69 条）。网格：模型、X、Y、d_in、d_out、两腿延迟、N | 固定原始帧、接收顺序和注入的时钟，回放两次的订单序列和账本相同（`TestReplayIsDeterministic`；真实数据 `-repeat 2`）；**与在线纸面的对照按审计第 70 条改为**：用那次纸面运行自己的配置（15 / 15 ms）、它重启时读回的分钟和 R、它当时知道的锚点和 F，复现 2026-11-26 02:02:09 起的运行，先比两条腿在决策和模拟到达时看到的盘口序号，再比 μ、σ、订单、成交，指出分歧的那一帧（结果见 5.8：录制服务收到同一帧比在线进程晚中位 31 ms，第一张分歧是第一轮的 SOXS 开仓单）；**不按在线纸面拟合回放延迟**；每条腿 5 / 15 / 25 / 50 / 100 ms 只作压力测试（成交率、单腿率、净额），真实到达延迟以真实订单为准（5.7）；EMA 30/30、d_in 2、d_out −0.5 在 N = 1,000 / 10,000 / 100,000 USDT 下逐 Session 回测；选参的训练 / 验证要等有足够的完整原生 `books5` Session（第一个是 11-26 05:00 → 11-28 02:00 UTC+8）；回测报告交用户定参数 |
 | 9 | 实盘前 | 用户定交易账户（第 7 节末项），在那个账户上重新确认权限、持仓模式、杠杆和两个合约的实际费率（0.65 bps 是所查账户当时的读数）；下单应答与订单最终状态分开验收；交易程序自己读到的指数、NAV、分红、日历与看板库逐项对照；参数由用户确认；**小额实盘要用户明确授权、有人值守**：核对第 7 节各项（零成交 IOC 的状态、资金费流水、下单延迟），账本与交易所流水逐笔对上 | PRD 第 17 节末段的三项；**延迟核对**（5.7 的 L6，下真实订单，另行授权）：REST 热连接对 ping 选出的 WebSocket 连接各发几张，比发出到建单的时间，并量 `order` 推送比建单晚多少 |
 
 第 5.2 步之前不需要交易所的密钥：0–5.1 全部用公开数据和假实现（第 2.4 步的门控测试读 NAV 要 Direxion 的密钥）。第 5.2 步的只读测试用 `core/.env` 的密钥，只发 GET。
