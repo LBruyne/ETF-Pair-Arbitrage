@@ -2681,6 +2681,14 @@ func (m *Manager) onPairTick(now time.Time) {
    - `trade.lot.end_state` 记五种结束状态。
 10. **一点没配上、只剩零头的批**：记 `unwound_stop`，原因为 too_small，零头照第 47 条记下。这一条推翻了 10.4 的 `built`。
 
+**上线前独立审查之后的修复**（`experiments/seq_taker_design_20261126/REVIEW_10_10.md`，提交 `e8bf4f6`；PRD 5.9、5.21）：
+1. D_ideal（入场与出场）按这一批**决定时的锚点和 F** 计算：`PairBatch.DecisionAnchors/DecisionF`、`ExitBatch.DecisionAnchors/DecisionF`、`decisionBasis`。P\*、x 和界限照旧用当前的锚点。重启时从 `State.EntryDecision`（还在 building 的 lot 最近一行 `kind='entry'` 决策的 detail：`anchor_bull`、`anchor_bear`、`f`）读回；读不到就用当前值，并记一条警告。
+2. `PairInput.TopUpBlocked`：有 PRD 5.10 的任一种不开仓情形或正在预热时，这一拍不补单。不算“本批已不能再补”。
+3. 新深度：薄腿的补单和盈利平与厚腿重发相同，要 200 ms 加这条腿的新帧。回吐只要 200 ms。
+4. `CloseNet` 在 `FeeKnown=false` 时按 taker_fee_bps × 成交额估算手续费，账本不变。
+5. `PairBatch.HandOverEnd`：接管时还没配完，配上过一部分记 built_partial，一点没配上记 unwound_stop。
+6. 批进行中不做例行持仓比对（`step.go`）。
+
 **10.1 写 PRD 4.0 时定下的实现细则**（写 PRD 的 agent 提出，lead 定）：
 1. **出场的理想平仓价差**：已平的厚腿按实际成交额计，剩下的按厚腿取价档的价（出场做多看买二、做空看卖二）配齐，再算本批价差。与入场的 `IdealSpread` 是同一个函数，只是取的盘口方向相反。
 2. **`thin_leg: ""` 又写了 exit2**（回放第 2 组）：两腿照现在的做法同时下单；exit1 的一半同样先做整轮利润判断和本批预核；exit2 照 PRD 9.2 会亏也平。
