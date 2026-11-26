@@ -77,6 +77,52 @@ func TestExampleFilesLoad(t *testing.T) {
 	if got := cfg.Cex.CorporateActions; len(got) != 2 || got[0].ExDate != "2026-12-22" {
 		t.Errorf("cex.corporate_actions = %+v, want two actions on 2026-12-22", got)
 	}
+	// Today's behaviour (SPEC 12.8): both legs together and one exit line.
+	if e := cfg.Exec; e.ThinLeg != "" || e.PairWindow != 30*time.Second || e.PairStopD != 10 || !e.ThinTopupMax.Equal(decimal.NewFromInt(2)) || e.ExitPairWindow != 30*time.Second {
+		t.Errorf("exec thin-leg keys = %q %s %v %s %s, want \"\" 30s 10 2 30s", e.ThinLeg, e.PairWindow, e.PairStopD, e.ThinTopupMax, e.ExitPairWindow)
+	}
+	if _, ok := cfg.Exec.Thin(); ok {
+		t.Error("the example must not take a thin leg first")
+	}
+	if cfg.Strategy.Exit2 != nil {
+		t.Errorf("strategy.exit2 = %v, want absent", *cfg.Strategy.Exit2)
+	}
+}
+
+// The keys the example leaves at their defaults keep them when they are not
+// written at all, so a config.yaml from before section 12 loads with the same
+// behaviour; written, thin_leg and exit2 read as given.
+func TestThinLegAndExit2(t *testing.T) {
+	bare, err := loadTexts(t, exampleWith(t, edit{`  thin_leg: ""`, ""}, edit{"  pair_window: 30s", ""}, edit{"  pair_stop_d: 10", ""},
+		edit{`  thin_topup_max: "2"`, ""}, edit{"  exit_pair_window: 30s", ""}), envFull)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bare.Exec.ThinLeg != "" || bare.Exec.PairWindow != 30*time.Second || bare.Exec.PairStopD != 10 || !bare.Exec.ThinTopupMax.Equal(decimal.NewFromInt(2)) || bare.Exec.ExitPairWindow != 30*time.Second {
+		t.Errorf("defaults = %+v", bare.Exec)
+	}
+
+	cfg, err := loadTexts(t, exampleWith(t, edit{`thin_leg: ""`, "thin_leg: bear"}, edit{"  # exit2: -1 ", "  exit2: -1 "}, edit{`thin_topup_max: "2"`, "thin_topup_max: 2"}), envFull)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if leg, ok := cfg.Exec.Thin(); !ok || leg != cex.Bear {
+		t.Errorf("Thin() = %v %t, want bear", leg, ok)
+	}
+	if cfg.Strategy.Exit2 == nil || *cfg.Strategy.Exit2 != -1 {
+		t.Errorf("strategy.exit2 = %v, want -1", cfg.Strategy.Exit2)
+	}
+	if !cfg.Exec.ThinTopupMax.Equal(decimal.NewFromInt(2)) {
+		t.Errorf("thin_topup_max unquoted = %s, want 2", cfg.Exec.ThinTopupMax)
+	}
+	if got := string(cfg.Effective()); !strings.Contains(got, `"exit2":-1`) || !strings.Contains(got, `"thin_leg":"bear"`) {
+		t.Errorf("effective config lacks exit2 or thin_leg:\n%s", got)
+	}
+	// Without exit2 the stored configuration has no such key (the board reads
+	// its absence as one exit line).
+	if got := string(bare.Effective()); strings.Contains(got, "exit2") || got == "null" {
+		t.Errorf("effective config without exit2 = %s", got)
+	}
 }
 
 func TestLoad(t *testing.T) {
@@ -89,13 +135,13 @@ func TestLoad(t *testing.T) {
 		{name: "example with full secrets", env: envFull},
 		{name: "paper mode needs no exchange key", env: envNoBitget},
 		{name: "paper mode does not look at the bitget section", env: envGarbage},
-		{name: "d_out equal to minus d_in is allowed", edits: []edit{{"d_out: -0.5 ", "d_out: -2 "}}, env: envFull},
-		{name: "d_out written as zero is not missing", edits: []edit{{"d_out: -0.5 ", "d_out: 0 "}}, env: envFull},
+		{name: "entry_out equal to minus entry_in is allowed", edits: []edit{{"entry_out: -0.5 ", "entry_out: -2 "}}, env: envFull},
+		{name: "entry_out written as zero is not missing", edits: []edit{{"entry_out: -0.5 ", "entry_out: 0 "}}, env: envFull},
 		{name: "taker_fee_bps written as zero is not missing", edits: []edit{{"taker_fee_bps: 0.65", "taker_fee_bps: 0"}}, env: envFull},
 		{name: "live with the full key", edits: []edit{{"live: false", "live: true"}}, env: envFull},
 
-		{name: "missing d_out", edits: []edit{{"  d_out: -0.5 ", "  # d_out: -0.5 "}}, env: envFull,
-			wantErr: []string{"strategy.d_out is required"}},
+		{name: "missing entry_out", edits: []edit{{"  entry_out: -0.5 ", "  # entry_out: -0.5 "}}, env: envFull,
+			wantErr: []string{"strategy.entry_out is required"}},
 		{name: "missing mean_minutes", edits: []edit{{"  mean_minutes: 30", "  # mean_minutes: 30"}}, env: envFull,
 			wantErr: []string{"strategy.mean_minutes is required"}},
 		{name: "missing mean_model", edits: []edit{{"  mean_model: ema", "  # mean_model: ema"}}, env: envFull,
@@ -110,15 +156,47 @@ func TestLoad(t *testing.T) {
 			wantErr: []string{"exec.sim_order_latency.bull is required", "exec.sim_order_latency.bear is required"}},
 		{name: "missing pair", edits: []edit{{"    bull: {", "    # bull: {"}}, env: envFull,
 			wantErr: []string{"cex.pair.bull.symbol is required"}},
-		{name: "every problem is reported together", edits: []edit{{"  d_out: -0.5 ", "  # d_out: -0.5 "}, {`  leverage: "10"`, `  leverage: "0"`}}, env: envNoDSN,
-			wantErr: []string{"strategy.d_out is required", "inventory.leverage", ".env store.dsn is required"}},
+		{name: "every problem is reported together", edits: []edit{{"  entry_out: -0.5 ", "  # entry_out: -0.5 "}, {`  leverage: "10"`, `  leverage: "0"`}}, env: envNoDSN,
+			wantErr: []string{"strategy.entry_out is required", "inventory.leverage", ".env store.dsn is required"}},
 
-		{name: "d_out equal to d_in", edits: []edit{{"d_out: -0.5 ", "d_out: 2 "}}, env: envFull,
-			wantErr: []string{"strategy.d_out must satisfy -d_in <= d_out < d_in"}},
-		{name: "d_out above d_in", edits: []edit{{"d_out: -0.5 ", "d_out: 3 "}}, env: envFull,
-			wantErr: []string{"strategy.d_out must satisfy -d_in <= d_out < d_in"}},
-		{name: "d_out below minus d_in", edits: []edit{{"d_out: -0.5 ", "d_out: -2.5 "}}, env: envFull,
-			wantErr: []string{"strategy.d_out must satisfy -d_in <= d_out < d_in"}},
+		{name: "entry_out equal to entry_in", edits: []edit{{"entry_out: -0.5 ", "entry_out: 2 "}}, env: envFull,
+			wantErr: []string{"strategy.entry_out must satisfy -entry_in <= entry_out < entry_in"}},
+		{name: "entry_out above entry_in", edits: []edit{{"entry_out: -0.5 ", "entry_out: 3 "}}, env: envFull,
+			wantErr: []string{"strategy.entry_out must satisfy -entry_in <= entry_out < entry_in"}},
+		{name: "entry_out below minus entry_in", edits: []edit{{"entry_out: -0.5 ", "entry_out: -2.5 "}}, env: envFull,
+			wantErr: []string{"strategy.entry_out must satisfy -entry_in <= entry_out < entry_in"}},
+		// SPEC 12.8: d_in and d_out were renamed; the old keys are refused, not read.
+		{name: "the old d_in is refused", edits: []edit{{"  entry_in: 2 ", "  d_in: 2 "}}, env: envFull,
+			wantErr: []string{"field d_in not found"}},
+		{name: "the old d_out is refused", edits: []edit{{"  entry_out: -0.5 ", "  d_out: -0.5 "}}, env: envFull,
+			wantErr: []string{"field d_out not found"}},
+
+		// exit2: optional; -entry_in <= exit2 <= entry_out (SPEC 12.6).
+		{name: "exit2 written", edits: []edit{{"  # exit2: -1 ", "  exit2: -1 "}}, env: envFull},
+		{name: "exit2 equal to entry_out is allowed", edits: []edit{{"  # exit2: -1 ", "  exit2: -0.5 "}}, env: envFull},
+		{name: "exit2 equal to minus entry_in is allowed", edits: []edit{{"  # exit2: -1 ", "  exit2: -2 "}}, env: envFull},
+		{name: "exit2 before entry_out", edits: []edit{{"  # exit2: -1 ", "  exit2: 0 "}}, env: envFull,
+			wantErr: []string{"strategy.exit2 must satisfy -entry_in <= exit2 <= entry_out, got exit2 0 with entry_in 2 and entry_out -0.5"}},
+		{name: "exit2 beyond minus entry_in", edits: []edit{{"  # exit2: -1 ", "  exit2: -2.5 "}}, env: envFull,
+			wantErr: []string{"strategy.exit2 must satisfy -entry_in <= exit2 <= entry_out"}},
+
+		// The thin-leg-first execution (SPEC 12.4, 12.7, 12.8).
+		{name: "thin_leg bear", edits: []edit{{`thin_leg: ""`, "thin_leg: bear"}}, env: envFull},
+		{name: "thin_leg bull", edits: []edit{{`thin_leg: ""`, "thin_leg: bull"}}, env: envFull},
+		{name: "thin_leg left out keeps both legs together", edits: []edit{{`  thin_leg: ""`, `  # thin_leg: ""`}}, env: envFull},
+		{name: "thin_leg not a leg", edits: []edit{{`thin_leg: ""`, "thin_leg: soxs"}}, env: envFull,
+			wantErr: []string{`exec.thin_leg must be bull, bear or "", got "soxs"`}},
+		{name: "pair_window zero without a thin leg is not used", edits: []edit{{"pair_window: 30s", "pair_window: 0s"}}, env: envFull},
+		{name: "pair_window zero with a thin leg", edits: []edit{{`thin_leg: ""`, "thin_leg: bear"}, {"pair_window: 30s", "pair_window: 0s"}}, env: envFull,
+			wantErr: []string{"exec.pair_window must be positive when exec.thin_leg is set, got 0s"}},
+		{name: "pair_stop_d zero", edits: []edit{{"pair_stop_d: 10", "pair_stop_d: 0"}}, env: envFull,
+			wantErr: []string{"exec.pair_stop_d must be positive, got 0"}},
+		{name: "thin_topup_max one is allowed", edits: []edit{{`thin_topup_max: "2"`, `thin_topup_max: "1"`}}, env: envFull},
+		{name: "thin_topup_max below one", edits: []edit{{`thin_topup_max: "2"`, `thin_topup_max: "0.5"`}}, env: envFull,
+			wantErr: []string{"exec.thin_topup_max must be at least 1, got 0.5"}},
+		{name: "exit_pair_window zero", edits: []edit{{"exit_pair_window: 30s", "exit_pair_window: 0s"}}, env: envFull,
+			wantErr: []string{"exec.exit_pair_window must be positive, got 0s"}},
+
 		{name: "pricing_level left out keeps the default", edits: []edit{{"  pricing_level: {", "  # pricing_level: {"}}, env: envFull},
 		{name: "pricing_level of one leg written", edits: []edit{{"pricing_level: { bull: 2, bear: 5 }", "pricing_level: { bear: 4 }"}}, env: envFull},
 		{name: "pricing_level out of range", edits: []edit{{"pricing_level: { bull: 2, bear: 5 }", "pricing_level: { bull: 0, bear: 6 }"}}, env: envFull,
@@ -236,7 +314,7 @@ func TestEffectiveHoldsNoSecrets(t *testing.T) {
 			t.Errorf("effective config carries %q:\n%s", secret, got)
 		}
 	}
-	for _, want := range []string{`"d_in":2`, `"d_out":-0.5`, `"mean_model":"ema"`, `"depth_max_age":"10s"`, `"capital":"1000"`, `"live":true`, `"symbol":"SOXLUSDT"`, `"bull":"15ms"`} {
+	for _, want := range []string{`"entry_in":2`, `"entry_out":-0.5`, `"thin_leg":""`, `"pair_window":"30s"`, `"pair_stop_d":10`, `"thin_topup_max":"2"`, `"exit_pair_window":"30s"`, `"mean_model":"ema"`, `"depth_max_age":"10s"`, `"capital":"1000"`, `"live":true`, `"symbol":"SOXLUSDT"`, `"bull":"15ms"`} {
 		if !strings.Contains(got, want) {
 			t.Errorf("effective config lacks %s:\n%s", want, got)
 		}
@@ -249,19 +327,23 @@ func TestEffectiveHoldsNoSecrets(t *testing.T) {
 // values are refused.
 func TestParseReadsAStoredRunConfig(t *testing.T) {
 	stored := `{"log_level":"info","cex":{"pair":{"bull":{"symbol":"SOXLUSDT","ticker":"SOXL","book_topic":"books5"},"bear":{"symbol":"SOXSUSDT","ticker":"SOXS","book_topic":"books5"}},"book_connections":3,"depth_max_age":"10s","fx_max_age":"1m0s"},
-"strategy":{"mean_model":"ema","mean_minutes":30,"sigma_minutes":30,"d_in":2,"d_out":-0.5,"taker_fee_bps":0.65},"inventory":{"capital":"1000","leverage":"10"},
+"strategy":{"mean_model":"ema","mean_minutes":30,"sigma_minutes":30,"entry_in":2,"entry_out":-0.5,"taker_fee_bps":0.65},"inventory":{"capital":"1000","leverage":"10"},
 "exec":{"live":false,"stop_alarm_after":"1m0s","sim_order_latency":{"bear":"15ms","bull":"15ms"}}}`
 	cfg, err := Parse([]byte(stored))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg.Exec.SimOrderLatency.Bear != 15*time.Millisecond || cfg.Cex.FXMaxAge != time.Minute || !cfg.Inventory.Capital.Equal(decimal.RequireFromString("1000")) || cfg.Strategy.DOut != -0.5 || cfg.Cex.BookConnections != 3 {
+	if cfg.Exec.SimOrderLatency.Bear != 15*time.Millisecond || cfg.Cex.FXMaxAge != time.Minute || !cfg.Inventory.Capital.Equal(decimal.RequireFromString("1000")) || cfg.Strategy.EntryOut != -0.5 || cfg.Cex.BookConnections != 3 {
 		t.Errorf("parsed %+v", cfg)
 	}
-	if _, err := Parse([]byte(`{"strategy":{"d_inn":2}}`)); err == nil {
+	if _, err := Parse([]byte(`{"strategy":{"entry_inn":2}}`)); err == nil {
 		t.Error("an unknown key was accepted")
 	}
-	if _, err := Parse([]byte(strings.Replace(stored, `"d_out":-0.5`, `"d_out":3`, 1))); err == nil {
-		t.Error("d_out >= d_in was accepted")
+	if _, err := Parse([]byte(strings.Replace(stored, `"entry_out":-0.5`, `"entry_out":3`, 1))); err == nil {
+		t.Error("entry_out >= entry_in was accepted")
+	}
+	// A run stored before the rename is refused rather than read without its lines.
+	if _, err := Parse([]byte(strings.Replace(stored, `"entry_in":2,"entry_out":-0.5`, `"d_in":2,"d_out":-0.5`, 1))); err == nil || !strings.Contains(err.Error(), "d_in") {
+		t.Errorf("a stored config with d_in = %v, want it refused", err)
 	}
 }

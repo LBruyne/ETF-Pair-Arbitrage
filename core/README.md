@@ -105,7 +105,7 @@ go build -o /tmp/replay ./cmd/replay
 
 ## 配置
 
-- `config.yaml`：公开参数，从 `config.example.yaml` 复制后修改；每个键的含义、单位和影响写在示例的注释里。`mean_model`、`mean_minutes`、`sigma_minutes`、`d_in`、`d_out`、`taker_fee_bps`、`capital`、`leverage`、`sim_order_latency` 没有默认值，必须写。未知的键会被拒绝。
+- `config.yaml`：公开参数，从 `config.example.yaml` 复制后修改；每个键的含义、单位和影响写在示例的注释里。`mean_model`、`mean_minutes`、`sigma_minutes`、`entry_in`、`entry_out`、`taker_fee_bps`、`capital`、`leverage`、`sim_order_latency` 没有默认值，必须写。未知的键会被拒绝；旧键 `d_in`、`d_out`（2026-11-26 改名，SPEC 12.8）也按未知键拒绝。`strategy.exit2` 可选，不写时只有一条出场线；`exec.thin_leg`（`bull` / `bear` / `""`，默认 `""` 即两腿同时下单）和 `pair_window`、`pair_stop_d`、`thin_topup_max`、`exit_pair_window` 有默认值，见示例。
 - 密钥文件（JSON，形状见 `.env.example`），路径由 `-env` 给出。`store.dsn` 是写入角色 `etfpair_trade` 的连接串，必填；`direxion.site_api_key` 为空时只用铃锚点。密钥和连接串不进日志，也不进数据库。
   - 纸面模式（`exec.live: false`）：不给 `-env` 时读当前目录的 `.env`。`bitget` 一段不解析，可以没有，写成什么都不影响；纸面服务的文件建议只放 `store`（和可选的 `direxion`）。
   - 实盘（`exec.live: true`）：必须在命令行显式给 `-env`，指向服务的凭据文件，不会去读默认的 `.env`；`bitget` 的三项必须齐全。

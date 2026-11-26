@@ -178,7 +178,8 @@ func (m *ExecManager) Start(ctx context.Context) (leave bool, err error) {
 		return leave, err
 	}
 	logger.GlobalLogger.Info("exec: running", "live", m.cfg.Live, "mean_model", m.scfg.MeanModel, "mean_minutes", m.scfg.MeanMinutes, "sigma_minutes", m.scfg.SigmaMinutes,
-		"d_in", m.scfg.DIn, "d_out", m.scfg.DOut, "taker_fee_bps", m.scfg.TakerFeeBps, "leverage", m.leverage,
+		"entry_in", m.scfg.EntryIn, "entry_out", m.scfg.EntryOut, "exit2", m.scfg.Exit2Text(), "taker_fee_bps", m.scfg.TakerFeeBps, "leverage", m.leverage,
+		"thin_leg", m.cfg.ThinLeg, "pair_window", m.cfg.PairWindow, "pair_stop_d", m.cfg.PairStopD, "thin_topup_max", m.cfg.ThinTopupMax, "exit_pair_window", m.cfg.ExitPairWindow,
 		"session", m.session.ID, "regular_open", showTime(m.session.RegularOpen), "session_end", showTime(m.session.End))
 	return false, nil
 }

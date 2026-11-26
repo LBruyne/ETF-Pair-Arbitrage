@@ -10,10 +10,10 @@ import (
 // returns one pair of orders for all positions together (one order when the
 // other leg has nothing the venue would take), or nil and the reason.
 //
-// The exit line sits on the entry's axis: a short opened at +d_in x sigma
-// closes when x <= d_out x sigma, a long opened at -d_in x sigma closes when
-// x >= -d_out x sigma, so a negative d_out is past the mean. x is taken at
-// the two legs' pricing levels on the side the exit takes (pricingLevel).
+// The exit line sits on the entry's axis: a short opened at +entry_in x
+// sigma closes when x <= entry_out x sigma, a long opened at -entry_in x
+// sigma closes when x >= -entry_out x sigma, so a negative entry_out is past
+// the mean. x is taken at the two legs' pricing levels on the side the exit takes (pricingLevel).
 // There is one line for all positions, from the current mean and sigma, and
 // no fee or entry price in the test: it exits at a loss too.
 //
@@ -51,7 +51,7 @@ func (s *Strategy) EvaluateExit(in ExitInput) (*ExitPlan, Reason) {
 	}
 	price := [2]decimal.Decimal{levels[cex.Bull].Price, levels[cex.Bear].Price}
 	x := levelSpread(levels, in.F, in.Anchors) - mu
-	if (in.Direction == Short && x > s.cfg.DOut*sigma) || (in.Direction == Long && x < -s.cfg.DOut*sigma) {
+	if (in.Direction == Short && x > s.cfg.EntryOut*sigma) || (in.Direction == Long && x < -s.cfg.EntryOut*sigma) {
 		return nil, ReasonNoSignal
 	}
 

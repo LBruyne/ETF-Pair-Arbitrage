@@ -161,7 +161,7 @@ func TestEvaluateEntry_Conditions(t *testing.T) {
 			want: ReasonCostNotCovered},
 		{name: "the margin adds to the fee: 10 >= 2.60 + 7", edit: func(c *Config) { c.CostMarginD = 7 }, books: shortBooks(), f: 1, sigma: 4,
 			wantDir: Short, wantX: 10, wantFeeD: 2.601733333333333, wantFeeUSDT: "1.09585008"},
-		{name: "a narrower exit line: (2 - 1.5) x 4 < 2.60", edit: func(c *Config) { c.DOut = 1.5 }, books: shortBooks(), f: 1, sigma: 4,
+		{name: "a narrower exit line: (2 - 1.5) x 4 < 2.60", edit: func(c *Config) { c.EntryOut = 1.5 }, books: shortBooks(), f: 1, sigma: 4,
 			want: ReasonCostNotCovered},
 		{name: "sigma 0", books: shortBooks(), f: 1, sigma: 0, want: ReasonZeroSigma},
 	}
@@ -394,7 +394,7 @@ func TestEvaluateEntry_OnTheLine(t *testing.T) {
 	in := entryInput(shortBooks())
 	in.Stats = statsAt(5)
 	x := Spread(1, 40.44, 40, 59.42, 60) - in.Stats.Mu(in.Anchors)
-	line := s.cfg.DIn * in.Stats.Sigma(in.Anchors)
+	line := s.cfg.EntryIn * in.Stats.Sigma(in.Anchors)
 	if math.Abs(x-line) > 1e-9 || math.Abs(x-10) > 1e-9 {
 		t.Fatalf("x = %.17g, line = %.17g: the case is not on the line", x, line)
 	}
@@ -556,12 +556,12 @@ func TestEntryDeviationBitIdentical(t *testing.T) {
 }
 
 // BenchmarkEvaluateEntryNoSignal is the decision of almost every round:
-// both directions priced and neither at the line (d_in = 3: example 1's
+// both directions priced and neither at the line (entry_in = 3: example 1's
 // short x = +10 is under 3 x 4).
 func BenchmarkEvaluateEntryNoSignal(b *testing.B) {
 	cfg := DefaultConfig
 	cfg.MeanModel, cfg.MeanMinutes, cfg.SigmaMinutes = MeanEMA, 30, 30
-	cfg.DIn, cfg.DOut, cfg.TakerFeeBps = 3, -0.5, 0.65
+	cfg.EntryIn, cfg.EntryOut, cfg.TakerFeeBps = 3, -0.5, 0.65
 	s, err := New(cfg)
 	if err != nil {
 		b.Fatal(err)

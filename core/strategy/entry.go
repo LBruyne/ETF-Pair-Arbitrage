@@ -61,8 +61,8 @@ func (s *Strategy) EvaluateEntry(in EntryInput) (*EntryPlan, Reason) {
 		price := [2]decimal.Decimal{levels[cex.Bull].Price, levels[cex.Bear].Price}
 		pBull, pBear := price[cex.Bull].InexactFloat64(), price[cex.Bear].InexactFloat64()
 
-		// Step 6: condition 1. A long needs x <= -d_in x sigma, a short
-		// x >= +d_in x sigma.
+		// Step 6: condition 1. A long needs x <= -entry_in x sigma, a short
+		// x >= +entry_in x sigma.
 		x := Spread(in.F, pBull, aBull, pBear, aBear) - mu
 		if !s.AtEntryLine(dir, x, sigma) {
 			reason = ReasonNoSignal
@@ -76,7 +76,7 @@ func (s *Strategy) EvaluateEntry(in EntryInput) (*EntryPlan, Reason) {
 		// line pays the round-trip fee at these limit prices plus the margin,
 		// all in spread units. The exit is estimated at the same prices.
 		feeD := 2 * s.cfg.TakerFeeBps * in.F * (pBull/aBull + pBear/aBear)
-		if (s.cfg.DIn-s.cfg.DOut)*sigma < feeD+s.cfg.CostMarginD {
+		if (s.cfg.EntryIn-s.cfg.EntryOut)*sigma < feeD+s.cfg.CostMarginD {
 			return nil, ReasonCostNotCovered
 		}
 
@@ -118,14 +118,14 @@ func (s *Strategy) EvaluateEntry(in EntryInput) (*EntryPlan, Reason) {
 	return nil, reason
 }
 
-// AtEntryLine is condition 1 of PRD 5.2: a long at x <= -d_in x sigma, a
-// short at x >= +d_in x sigma, x being the executable deviation of that
+// AtEntryLine is condition 1 of PRD 5.2: a long at x <= -entry_in x sigma, a
+// short at x >= +entry_in x sigma, x being the executable deviation of that
 // direction. No fee is in it.
 func (s *Strategy) AtEntryLine(dir Direction, x, sigma float64) bool {
 	if dir == Long {
-		return x <= -s.cfg.DIn*sigma
+		return x <= -s.cfg.EntryIn*sigma
 	}
-	return x >= s.cfg.DIn*sigma
+	return x >= s.cfg.EntryIn*sigma
 }
 
 // spacingOK reports whether an entry in direction dir at deviation x may

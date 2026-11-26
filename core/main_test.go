@@ -59,7 +59,7 @@ func assertNoSecrets(t *testing.T, what, text, dsn string) {
 			t.Errorf("%s carries %q from the secrets file:\n%s", what, secret, text)
 		}
 	}
-	if !strings.Contains(text, "d_in") || !strings.Contains(text, "SOXLUSDT") {
+	if !strings.Contains(text, "entry_in") || !strings.Contains(text, "SOXLUSDT") {
 		t.Errorf("%s lacks the configuration:\n%s", what, text)
 	}
 }

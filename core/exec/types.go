@@ -8,6 +8,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 	"time"
 
 	"github.com/shopspring/decimal"
@@ -25,6 +26,25 @@ type Config struct {
 	Live            bool          `yaml:"live"`              // false: paper mode, no order leaves the process
 	SimOrderLatency LegLatency    `yaml:"sim_order_latency"` // paper and replay: an order meets its leg's book this long after it is sent
 	StopAlarmAfter  time.Duration `yaml:"stop_alarm_after"`  // not flat this long after a stop signal: alarm, and again every interval
+
+	// The thin leg first (SPEC 12.4, 12.7). ThinLeg "" sends both legs of a
+	// batch together, as before section 12; the other keys are then unused.
+	ThinLeg        string          `yaml:"thin_leg"`         // bull, bear or "": the leg an entry batch and a line exit batch take first
+	PairWindow     time.Duration   `yaml:"pair_window"`      // entry: how long the other leg may be chased, from the thin leg's first fill
+	PairStopD      float64         `yaml:"pair_stop_d"`      // entry and exit: the ideally paired spread this many spread units worse than at the decision ends the chase
+	ThinTopupMax   decimal.Decimal `yaml:"thin_topup_max"`   // the thin leg's fills of one batch stay within this multiple of its planned quantity
+	ExitPairWindow time.Duration   `yaml:"exit_pair_window"` // exit: how long the other leg may wait for its break-even bound, from the thin leg's first closing fill
+}
+
+// Thin returns the leg taken first; ok is false when both legs go together.
+func (c Config) Thin() (leg cex.Leg, ok bool) {
+	switch c.ThinLeg {
+	case "bull":
+		return cex.Bull, true
+	case "bear":
+		return cex.Bear, true
+	}
+	return 0, false
 }
 
 // LegLatency is one duration per leg.
@@ -34,9 +54,10 @@ type LegLatency struct {
 }
 
 // DefaultConfig holds the values a key left out of config.yaml keeps: paper
-// mode and the stop alarm. sim_order_latency has no default and must be
-// written.
-var DefaultConfig = Config{StopAlarmAfter: 60 * time.Second}
+// mode, the stop alarm, both legs together and the windows and limits of
+// SPEC 12.8. sim_order_latency has no default and must be written.
+var DefaultConfig = Config{StopAlarmAfter: 60 * time.Second,
+	PairWindow: 30 * time.Second, PairStopD: 10, ThinTopupMax: decimal.NewFromInt(2), ExitPairWindow: 30 * time.Second}
 
 // Validate rejects a configuration the manager could not run with. Every
 // problem is reported, each starting with its yaml path.
@@ -50,6 +71,22 @@ func (c Config) Validate() error {
 	}
 	if c.StopAlarmAfter <= 0 {
 		errs = append(errs, fmt.Errorf("exec.stop_alarm_after must be positive, got %s", c.StopAlarmAfter))
+	}
+	_, thin := c.Thin()
+	if !thin && c.ThinLeg != "" {
+		errs = append(errs, fmt.Errorf(`exec.thin_leg must be bull, bear or "", got %q`, c.ThinLeg))
+	}
+	if thin && c.PairWindow <= 0 {
+		errs = append(errs, fmt.Errorf("exec.pair_window must be positive when exec.thin_leg is set, got %s", c.PairWindow))
+	}
+	if !(c.PairStopD > 0) || math.IsInf(c.PairStopD, 0) {
+		errs = append(errs, fmt.Errorf("exec.pair_stop_d must be positive, got %v", c.PairStopD))
+	}
+	if c.ThinTopupMax.LessThan(decimal.NewFromInt(1)) {
+		errs = append(errs, fmt.Errorf("exec.thin_topup_max must be at least 1, got %s", c.ThinTopupMax))
+	}
+	if c.ExitPairWindow <= 0 {
+		errs = append(errs, fmt.Errorf("exec.exit_pair_window must be positive, got %s", c.ExitPairWindow))
 	}
 	return errors.Join(errs...)
 }

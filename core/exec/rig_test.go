@@ -508,7 +508,7 @@ type rig struct {
 func testStrategy() strategy.Config {
 	cfg := strategy.DefaultConfig
 	cfg.MeanModel, cfg.MeanMinutes, cfg.SigmaMinutes = strategy.MeanSMA, 2, 2
-	cfg.DIn, cfg.DOut, cfg.TakerFeeBps = 2, -0.5, 0.65
+	cfg.EntryIn, cfg.EntryOut, cfg.TakerFeeBps = 2, -0.5, 0.65
 	return cfg
 }
 

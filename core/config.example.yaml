@@ -34,23 +34,24 @@ cex:
     - { ticker: SOXL, ex_date: 2026-12-22, kind: dividend, source: "..." }
     - { ticker: SOXS, ex_date: 2026-12-22, kind: dividend, source: "..." }
 
-# The signal and the sizes. mean_model, mean_minutes, sigma_minutes, d_in,
-# d_out and taker_fee_bps have no default and must be written; the values
-# here are examples.
+# The signal and the sizes. mean_model, mean_minutes, sigma_minutes,
+# entry_in, entry_out and taker_fee_bps have no default and must be written;
+# the values here are examples. The old names d_in and d_out are refused.
 strategy:
   mean_model: ema             # ema | sma: how the mean of the spread is taken
   mean_minutes: 30            # X: the span of the mean, in minutes
   sigma_minutes: 30           # Y: the window of the standard deviation, in minutes
-  d_in: 2                     # entry line, in sigmas from the mean
-  d_out: -0.5                 # exit line on the entry's axis, in sigmas; -0.5 is half a sigma past the mean. Must satisfy -d_in <= d_out < d_in
+  entry_in: 2                 # entry line, in sigmas from the mean
+  entry_out: -0.5             # exit line on the entry's axis, in sigmas; -0.5 is half a sigma past the mean. Must satisfy -entry_in <= entry_out < entry_in. With exit2 it is exit1: half of the position closes there while the round is in profit
+  # exit2: -1                 # optional second exit line on the same axis, in sigmas, where all that is left closes. Must satisfy -entry_in <= exit2 <= entry_out. Left out: one exit line, entry_out
   taker_fee_bps: 0.65         # the trading account's taker fee per leg, of the traded notional; it enters the entry condition and the fee estimates
-  cost_margin_d: 0            # extra the entry asks on top of the round-trip fee, in spread units
+  cost_margin_d: 0            # in spread units, the one margin of every break-even test: what the entry asks on top of the round-trip fee and, with thin_leg set, the bound of the other leg, the thin leg's profit close and the exit bound
   pricing_level: { bull: 2, bear: 5 }   # per leg, 1 to 5: the N-th level of the book as received (1 = the best) on the side an entry or a line exit takes. Its price is the order's limit and the leg's price in the spread; levels 1 to N are the quantity counted. A side with fewer than N levels gives no such order
   take_ratio: "0.5"           # the share of the quantity down to that level one batch takes
   min_batch_notional: "100"  # USDT, both legs together at their limit prices: a smaller entry batch is not sent
   entry_spacing: 60s          # a same-side entry sooner than this needs entry_step_d more
   entry_step_d: 1             # in spread units
-  completion_window: 5s       # this long after a batch is sent, its short leg may still be completed; later it is trimmed back
+  completion_window: 5s       # this long after a batch is sent, its short leg may still be completed; later it is trimmed back. Used only while exec.thin_leg is ""
   forced_slip_bps: 10         # forced exits and trims give up this much past the best price, of each leg's price
   forced_exit_before_close: 1m   # positions are closed this long before the regular close
   rewarm_on_anchor_change: false # true: the mean and sigma warm up again after the anchor changes from bell to NAV
@@ -65,3 +66,11 @@ exec:
   live: false                 # false: paper mode, no order leaves the process and the exchange key is not read; true needs -env pointing at the service's credentials file
   sim_order_latency: { bull: 15ms, bear: 15ms }   # paper and replay: an order meets its leg's book this long after it is sent; must be written
   stop_alarm_after: 60s       # not flat this long after a stop signal: alarm, and again every interval
+  # The thin leg first. thin_leg "" sends both legs of a batch together; bear
+  # (e.g. thin_leg: bear) takes SOXS first and pairs SOXL with what filled,
+  # on entry and at the exit lines. The keys below are used with a thin leg only.
+  thin_leg: ""                # bull | bear | "": the leg an entry and a line exit take first
+  pair_window: 30s            # entry: how long the other leg may be chased, from the thin leg's first fill; then the unpaired part is closed
+  pair_stop_d: 10             # entry and exit, in spread units: the ideally paired spread this much worse than at the decision ends the chase
+  thin_topup_max: "2"         # the thin leg's fills of one batch stay within this multiple of its planned quantity; at least 1
+  exit_pair_window: 30s       # exit: how long the other leg may wait for its break-even bound, from the thin leg's first closing fill; then it closes at the forced price

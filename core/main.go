@@ -94,9 +94,9 @@ func initConfig() (cfg *config.Config, configPath, envPath string) {
 // loaded: the values a start should be checked against, and no secret.
 func configCheckLine(configPath, envPath string, cfg *config.Config) string {
 	s := cfg.Strategy
-	return fmt.Sprintf("config %s ok (secrets file %s): live=%t pair=%s/%s mean_model=%s mean_minutes=%d sigma_minutes=%d d_in=%v d_out=%v taker_fee_bps=%v capital=%s leverage=%s",
+	return fmt.Sprintf("config %s ok (secrets file %s): live=%t pair=%s/%s mean_model=%s mean_minutes=%d sigma_minutes=%d entry_in=%v entry_out=%v exit2=%s thin_leg=%q taker_fee_bps=%v capital=%s leverage=%s",
 		configPath, envPath, cfg.Exec.Live, cfg.Cex.Pair.Bull.Symbol, cfg.Cex.Pair.Bear.Symbol,
-		s.MeanModel, s.MeanMinutes, s.SigmaMinutes, s.DIn, s.DOut, s.TakerFeeBps, cfg.Inventory.Capital, cfg.Inventory.Leverage)
+		s.MeanModel, s.MeanMinutes, s.SigmaMinutes, s.EntryIn, s.EntryOut, s.Exit2Text(), cfg.Exec.ThinLeg, s.TakerFeeBps, cfg.Inventory.Capital, cfg.Inventory.Leverage)
 }
 
 // run wires the store and the managers and blocks on the execution manager.

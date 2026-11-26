@@ -264,7 +264,8 @@ type gridPoint struct {
 
 // parseGrid expands the grid over the base configuration; an empty grid is
 // the base alone. Keys: model (ema, sma), x and y (minutes), din and dout
-// (sigmas), lat (bull/bear in ms) and n (N in USDT: M = N / L).
+// (sigmas: strategy.entry_in and strategy.entry_out; the grid keeps the short
+// names), lat (bull/bear in ms) and n (N in USDT: M = N / L).
 func parseGrid(spec string, base *config.Config) ([]gridPoint, error) {
 	values := map[string][]string{}
 	order := []string{"model", "x", "y", "din", "dout", "lat", "n"}
@@ -282,7 +283,7 @@ func parseGrid(spec string, base *config.Config) ([]gridPoint, error) {
 	s, e := base.Strategy, base.Exec.SimOrderLatency
 	n := base.Inventory.Capital.Mul(base.Inventory.Leverage)
 	defaults := map[string][]string{"model": {string(s.MeanModel)}, "x": {strconv.Itoa(s.MeanMinutes)}, "y": {strconv.Itoa(s.SigmaMinutes)},
-		"din": {fmtFloat(s.DIn)}, "dout": {fmtFloat(s.DOut)}, "lat": {fmt.Sprintf("%d/%d", e.Bull.Milliseconds(), e.Bear.Milliseconds())}, "n": {n.String()}}
+		"din": {fmtFloat(s.EntryIn)}, "dout": {fmtFloat(s.EntryOut)}, "lat": {fmt.Sprintf("%d/%d", e.Bull.Milliseconds(), e.Bear.Milliseconds())}, "n": {n.String()}}
 	for k, v := range defaults {
 		if _, set := values[k]; !set {
 			values[k] = v
@@ -315,10 +316,10 @@ func parseGrid(spec string, base *config.Config) ([]gridPoint, error) {
 		if st.SigmaMinutes, err = strconv.Atoi(p["y"]); err != nil {
 			return nil, fmt.Errorf("-grid y: %w", err)
 		}
-		if st.DIn, err = strconv.ParseFloat(p["din"], 64); err != nil {
+		if st.EntryIn, err = strconv.ParseFloat(p["din"], 64); err != nil {
 			return nil, fmt.Errorf("-grid din: %w", err)
 		}
-		if st.DOut, err = strconv.ParseFloat(p["dout"], 64); err != nil {
+		if st.EntryOut, err = strconv.ParseFloat(p["dout"], 64); err != nil {
 			return nil, fmt.Errorf("-grid dout: %w", err)
 		}
 		if err := st.Validate(); err != nil {
@@ -563,7 +564,7 @@ func gridRow(w window, name string, s *sim, sum summary, print string) []string 
 		reasons = append(reasons, fmt.Sprintf("%s:%d", k, v))
 	}
 	sort.Strings(reasons)
-	return []string{w.label, name, sum.Session, bearDepth(w.tape), string(st.MeanModel), strconv.Itoa(st.MeanMinutes), strconv.Itoa(st.SigmaMinutes), fmtFloat(st.DIn), fmtFloat(st.DOut),
+	return []string{w.label, name, sum.Session, bearDepth(w.tape), string(st.MeanModel), strconv.Itoa(st.MeanMinutes), strconv.Itoa(st.SigmaMinutes), fmtFloat(st.EntryIn), fmtFloat(st.EntryOut),
 		strconv.FormatInt(lat.Bull.Milliseconds(), 10), strconv.FormatInt(lat.Bear.Milliseconds(), 10), sum.Notional.String(),
 		sum.RoundTripNet.String(), sum.CashNet.String(), sum.Fees.String(), strconv.Itoa(sum.Orders), strconv.Itoa(sum.Fills),
 		strconv.Itoa(sum.EntryBatches), strconv.Itoa(sum.BothLegs), strconv.Itoa(sum.OneLeg), strconv.Itoa(sum.NoFill), fmtFloat(sum.OneLegRate), fmtFloat(sum.EntryFillRate),

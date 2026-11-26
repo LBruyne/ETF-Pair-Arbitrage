@@ -12,8 +12,8 @@ import (
 )
 
 // The tests use the setting of the PRD's appendix A: anchors 40 / 60 USD,
-// F = 1, the mean at leg prices 40.40 / 59.42 USDT (mu = 3.3333), d_in = 2,
-// d_out = -0.5, pricing levels 2 (bull) and 5 (bear), take ratio 1/2,
+// F = 1, the mean at leg prices 40.40 / 59.42 USDT (mu = 3.3333), entry_in = 2,
+// entry_out = -0.5, pricing levels 2 (bull) and 5 (bear), take ratio 1/2,
 // quantity step 0.01, taker fee 0.65 bps, no margin. One cent on the bull
 // leg moves the spread by 2.5 units, one cent on the bear leg by 1.6667.
 // The expected numbers come from the appendix, its script and hand
@@ -38,7 +38,7 @@ func newStrategy(t *testing.T, edit func(*Config)) *Strategy {
 	t.Helper()
 	cfg := DefaultConfig
 	cfg.MeanModel, cfg.MeanMinutes, cfg.SigmaMinutes = MeanEMA, 30, 30
-	cfg.DIn, cfg.DOut, cfg.TakerFeeBps = 2, -0.5, 0.65
+	cfg.EntryIn, cfg.EntryOut, cfg.TakerFeeBps = 2, -0.5, 0.65
 	if edit != nil {
 		edit(&cfg)
 	}

@@ -116,15 +116,15 @@ func TestGridExpandsTheCombinations(t *testing.T) {
 		t.Fatalf("%d points, want 8", len(points))
 	}
 	p := points[len(points)-1]
-	if p.cfg.Strategy.MeanModel != "sma" || p.cfg.Strategy.DIn != 2 || p.cfg.Exec.SimOrderLatency.Bull.Milliseconds() != 5 || p.cfg.Exec.SimOrderLatency.Bear.Milliseconds() != 25 ||
+	if p.cfg.Strategy.MeanModel != "sma" || p.cfg.Strategy.EntryIn != 2 || p.cfg.Exec.SimOrderLatency.Bull.Milliseconds() != 5 || p.cfg.Exec.SimOrderLatency.Bear.Milliseconds() != 25 ||
 		!p.cfg.Inventory.Capital.Equal(d("10000")) || p.cfg.Strategy.MeanMinutes != base.Strategy.MeanMinutes {
 		t.Errorf("last point %s: %+v %+v %s", p.name, p.cfg.Strategy, p.cfg.Exec.SimOrderLatency, p.cfg.Inventory.Capital)
 	}
-	if !base.Inventory.Capital.Equal(d("2000")) || base.Strategy.DIn != 2 {
+	if !base.Inventory.Capital.Equal(d("2000")) || base.Strategy.EntryIn != 2 {
 		t.Error("the grid changed the base configuration")
 	}
 	if _, err := parseGrid("din=2;dout=3", base); err == nil {
-		t.Error("d_out >= d_in was accepted")
+		t.Error("entry_out >= entry_in was accepted")
 	}
 }
 

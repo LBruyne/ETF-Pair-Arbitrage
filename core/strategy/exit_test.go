@@ -51,9 +51,9 @@ func TestEvaluateExit_AppendixExample2(t *testing.T) {
 	wantDec(t, "bear remainder", in.Hold[cex.Bear].Sub(plan.Qty[cex.Bear]), "10.20")
 }
 
-// V10: the exit line is on the entry's axis. With d_out = -0.5 and sigma 4 a
+// V10: the exit line is on the entry's axis. With entry_out = -0.5 and sigma 4 a
 // short exits at x <= -2 and a long at x >= +2: half a sigma past the mean.
-// d_out = +0.5 puts the line half a sigma before the mean.
+// entry_out = +0.5 puts the line half a sigma before the mean.
 func TestEvaluateExit_Line(t *testing.T) {
 	// The pricing level of the side the exit takes, per leg: the second
 	// bull level and the fifth bear level. The levels are deep enough to
@@ -85,18 +85,18 @@ func TestEvaluateExit_Line(t *testing.T) {
 		{"long, more than half a sigma past the mean", Long, -0.5, bids("40.41", "59.42"), "", cex.SideSell, 2.5},
 		{"long, at the mean", Long, -0.5, bids("40.40", "59.42"), ReasonNoSignal, "", 0},
 		{"long, still on the entry's side", Long, -0.5, bids("40.39", "59.42"), ReasonNoSignal, "", 0},
-		// d_out = +0.5: the lines are at +2 for a short and -2 for a long.
-		{"short, d_out +0.5, half a sigma before the mean", Short, 0.5, asks("40.38", "59.44"), "", cex.SideBuy, -5.0 / 3},
-		{"short, d_out +0.5, not yet", Short, 0.5, asks("40.41", "59.42"), ReasonNoSignal, "", 0}, // x = +2.5
-		{"long, d_out +0.5, half a sigma before the mean", Long, 0.5, bids("40.40", "59.43"), "", cex.SideSell, 5.0 / 3},
-		{"long, d_out +0.5, not yet", Long, 0.5, bids("40.39", "59.42"), ReasonNoSignal, "", 0}, // x = -2.5
+		// entry_out = +0.5: the lines are at +2 for a short and -2 for a long.
+		{"short, entry_out +0.5, half a sigma before the mean", Short, 0.5, asks("40.38", "59.44"), "", cex.SideBuy, -5.0 / 3},
+		{"short, entry_out +0.5, not yet", Short, 0.5, asks("40.41", "59.42"), ReasonNoSignal, "", 0}, // x = +2.5
+		{"long, entry_out +0.5, half a sigma before the mean", Long, 0.5, bids("40.40", "59.43"), "", cex.SideSell, 5.0 / 3},
+		{"long, entry_out +0.5, not yet", Long, 0.5, bids("40.39", "59.42"), ReasonNoSignal, "", 0}, // x = -2.5
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			in := exitInput()
 			in.Direction, in.Books = tc.dir, tc.books
 			in.Hold = [2]decimal.Decimal{dec("105.30"), dec("70.20")}
-			plan, reason := newStrategy(t, func(c *Config) { c.DOut = tc.dOut }).EvaluateExit(in)
+			plan, reason := newStrategy(t, func(c *Config) { c.EntryOut = tc.dOut }).EvaluateExit(in)
 			if reason != tc.want {
 				t.Fatalf("reason = %q, want %q", reason, tc.want)
 			}
@@ -322,7 +322,7 @@ func TestEvaluateExit_InvalidNumbers(t *testing.T) {
 
 // A deviation exactly on the exit line, as for the entry: the comparison is
 // made on the computed float64 values, which lie about 1e-12 spread units
-// off the exact ones. With sigma 10 and d_out = -0.5 the lines are at -5 and
+// off the exact ones. With sigma 10 and entry_out = -0.5 the lines are at -5 and
 // +5. A short whose asks are at 40.38 / 59.42 is at exactly -5: computed, x
 // is -4.9999999999972 against a line of -4.9999999999994, and it does not
 // exit. A long whose bids are at 40.42 / 59.42 is at exactly +5: computed,
@@ -336,7 +336,7 @@ func TestEvaluateExit_OnTheLine(t *testing.T) {
 	long := short
 	long.Direction = Long
 	long.Books = [2]*cex.Book{book(lv("40.43x300", "40.42x400"), nil), book(lv("59.43x100", "59.428x20", "59.425x20", "59.422x20", "59.42x100"), nil)}
-	mu, half := short.Stats.Mu(testAnchors), -s.cfg.DOut*short.Stats.Sigma(testAnchors)
+	mu, half := short.Stats.Mu(testAnchors), -s.cfg.EntryOut*short.Stats.Sigma(testAnchors)
 
 	xShort := Spread(1, 40.38, 40, 59.42, 60) - mu
 	xLong := Spread(1, 40.42, 40, 59.42, 60) - mu

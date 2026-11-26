@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"strconv"
 	"time"
 
 	"github.com/shopspring/decimal"
@@ -25,8 +26,11 @@ type Config struct {
 	MeanModel    MeanModel `yaml:"mean_model"`    // how the mean of the spread is taken
 	MeanMinutes  int       `yaml:"mean_minutes"`  // X: the span of the mean, in minutes
 	SigmaMinutes int       `yaml:"sigma_minutes"` // Y: the window of the standard deviation, in minutes
-	DIn          float64   `yaml:"d_in"`          // entry line: this many sigmas from the mean
-	DOut         float64   `yaml:"d_out"`         // exit line on the entry's axis, in sigmas; negative is past the mean
+	EntryIn      float64   `yaml:"entry_in"`      // entry line: this many sigmas from the mean
+	EntryOut     float64   `yaml:"entry_out"`     // exit line on the entry's axis, in sigmas; negative is past the mean. With Exit2 it is exit1, the line of the half close (SPEC 12.6)
+	// Exit2 is the second exit line on the entry's axis, in sigmas, where all
+	// that is left closes (SPEC 12.6); nil is one exit line, EntryOut.
+	Exit2 *float64 `yaml:"exit2,omitempty"`
 
 	TakerFeeBps float64 `yaml:"taker_fee_bps"` // the trading account's taker fee per leg, of the traded notional
 	CostMarginD float64 `yaml:"cost_margin_d"` // what an entry must clear on top of the round-trip fee, in spread units
@@ -46,11 +50,11 @@ type Config struct {
 }
 
 // DefaultConfig holds the values a key left out of config.yaml keeps. The
-// model, the two windows, d_in, d_out and the taker fee have no default and
-// must be written; DOut and TakerFeeBps start as NaN so that a missing key
-// differs from a written 0.
+// model, the two windows, entry_in, entry_out and the taker fee have no
+// default and must be written; EntryOut and TakerFeeBps start as NaN so that
+// a missing key differs from a written 0. exit2 is absent by default.
 var DefaultConfig = Config{
-	DOut:                  math.NaN(),
+	EntryOut:              math.NaN(),
 	TakerFeeBps:           math.NaN(),
 	PricingLevel:          LegLevels{Bull: 2, Bear: 5},
 	TakeRatio:             decimal.RequireFromString("0.5"),
@@ -60,6 +64,15 @@ var DefaultConfig = Config{
 	CompletionWindow:      5 * time.Second,
 	ForcedSlipBps:         10,
 	ForcedExitBeforeClose: time.Minute,
+}
+
+// Exit2Text is the second exit line for a log line: the number as written,
+// or "none" for one exit line.
+func (c Config) Exit2Text() string {
+	if c.Exit2 == nil {
+		return "none"
+	}
+	return strconv.FormatFloat(*c.Exit2, 'f', -1, 64)
 }
 
 // LegLevels is a level number per leg, 1 for the best level.
@@ -102,17 +115,24 @@ func (c Config) Validate() error {
 		errs = append(errs, fmt.Errorf("strategy.sigma_minutes is required and must be positive, got %d", c.SigmaMinutes))
 	}
 
-	// The two lines: -d_in <= d_out < d_in, so the exit is never beyond the
-	// opposite entry line and never at or outside the entry line itself.
-	dInOK := c.DIn > 0 && !math.IsInf(c.DIn, 0)
-	if !dInOK {
-		errs = append(errs, fmt.Errorf("strategy.d_in is required and must be positive, got %v", c.DIn))
+	// The lines: -entry_in <= exit2 <= entry_out < entry_in, so an exit is
+	// never beyond the opposite entry line and never at or outside the entry
+	// line itself, and the second exit line is not before the first.
+	inOK := c.EntryIn > 0 && !math.IsInf(c.EntryIn, 0)
+	if !inOK {
+		errs = append(errs, fmt.Errorf("strategy.entry_in is required and must be positive, got %v", c.EntryIn))
 	}
+	outOK := false
 	switch {
-	case math.IsNaN(c.DOut):
-		errs = append(errs, errors.New("strategy.d_out is required"))
-	case dInOK && (c.DOut < -c.DIn || c.DOut >= c.DIn):
-		errs = append(errs, fmt.Errorf("strategy.d_out must satisfy -d_in <= d_out < d_in, got d_out %v with d_in %v", c.DOut, c.DIn))
+	case math.IsNaN(c.EntryOut):
+		errs = append(errs, errors.New("strategy.entry_out is required"))
+	case inOK && (c.EntryOut < -c.EntryIn || c.EntryOut >= c.EntryIn):
+		errs = append(errs, fmt.Errorf("strategy.entry_out must satisfy -entry_in <= entry_out < entry_in, got entry_out %v with entry_in %v", c.EntryOut, c.EntryIn))
+	default:
+		outOK = inOK
+	}
+	if x := c.Exit2; x != nil && outOK && !(*x >= -c.EntryIn && *x <= c.EntryOut) {
+		errs = append(errs, fmt.Errorf("strategy.exit2 must satisfy -entry_in <= exit2 <= entry_out, got exit2 %v with entry_in %v and entry_out %v", *x, c.EntryIn, c.EntryOut))
 	}
 
 	// The fee is the trading account's own rate: it enters the entry
