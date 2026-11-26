@@ -5,6 +5,9 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
+
+	"github.com/shopspring/decimal"
 
 	"etf-pair-arbitrage/core/cex"
 	"etf-pair-arbitrage/core/strategy"
@@ -237,5 +240,28 @@ func TestEffectiveHoldsNoSecrets(t *testing.T) {
 		if !strings.Contains(got, want) {
 			t.Errorf("effective config lacks %s:\n%s", want, got)
 		}
+	}
+}
+
+// Parse reads a configuration without a secrets file: the yaml of
+// config.yaml, or the JSON a run stored in process_run.config (the replay
+// reads both). Defaults fill what is left out; unknown keys and invalid
+// values are refused.
+func TestParseReadsAStoredRunConfig(t *testing.T) {
+	stored := `{"log_level":"info","cex":{"pair":{"bull":{"symbol":"SOXLUSDT","ticker":"SOXL","book_topic":"books5"},"bear":{"symbol":"SOXSUSDT","ticker":"SOXS","book_topic":"books5"}},"book_connections":3,"depth_max_age":"10s","fx_max_age":"1m0s"},
+"strategy":{"mean_model":"ema","mean_minutes":30,"sigma_minutes":30,"d_in":2,"d_out":-0.5,"taker_fee_bps":0.65},"inventory":{"capital":"1000","leverage":"10"},
+"exec":{"live":false,"stop_alarm_after":"1m0s","sim_order_latency":{"bear":"15ms","bull":"15ms"}}}`
+	cfg, err := Parse([]byte(stored))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Exec.SimOrderLatency.Bear != 15*time.Millisecond || cfg.Cex.FXMaxAge != time.Minute || !cfg.Inventory.Capital.Equal(decimal.RequireFromString("1000")) || cfg.Strategy.DOut != -0.5 || cfg.Cex.BookConnections != 3 {
+		t.Errorf("parsed %+v", cfg)
+	}
+	if _, err := Parse([]byte(`{"strategy":{"d_inn":2}}`)); err == nil {
+		t.Error("an unknown key was accepted")
+	}
+	if _, err := Parse([]byte(strings.Replace(stored, `"d_out":-0.5`, `"d_out":3`, 1))); err == nil {
+		t.Error("d_out >= d_in was accepted")
 	}
 }

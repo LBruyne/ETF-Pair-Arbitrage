@@ -735,3 +735,28 @@ func TestRun(t *testing.T) {
 		t.Errorf("the ledger after the run = %+v, want one lot with 1 share bought for 40", got)
 	}
 }
+
+// replayClock is a fixed clock in the shape a replay passes (cex.Clock).
+type replayClock struct{ now time.Time }
+
+func (c replayClock) Now() time.Time                  { return c.now }
+func (c replayClock) AfterFunc(time.Duration, func()) {}
+
+// WithClock makes the ledger read the time from the given clock: a new
+// ledger starts at the clock's time, not the wall clock's.
+func TestManagerWithClockStartsTheLedgerOnIt(t *testing.T) {
+	at := time.Date(2026, 11, 26, 5, 0, 0, 0, time.UTC)
+	sink := &store.Fake{}
+	m, err := NewManager(Config{Capital: dec("1000"), Leverage: dec("10")}, testPair, newFakeCex(), WithClock(replayClock{at}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	m.UseStore(sink)
+	if err := m.Restore(store.State{}, nil); err != nil {
+		t.Fatal(err)
+	}
+	rows := sink.Rows("inventory_state")
+	if len(rows) != 1 || rows[0].(store.InventoryStateRow).SinceMs != at.UnixMilli() {
+		t.Fatalf("inventory_state rows %+v, want one starting at the clock's %d", rows, at.UnixMilli())
+	}
+}

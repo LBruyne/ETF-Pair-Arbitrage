@@ -55,21 +55,14 @@ type Config struct {
 // mode it is not looked at: it may be missing or hold anything, and the
 // exchange key is never in the process.
 func Load(configPath, envPath string) (*Config, error) {
-	// The defaults, which a key left out of the yaml keeps.
-	cfg := &Config{LogLevel: "info", Cex: cex.DefaultConfig, Strategy: strategy.DefaultConfig, Exec: exec.DefaultConfig}
-
-	// The yaml, with unknown keys refused. An empty file decodes to the
-	// defaults and fails validation on the keys that have none.
 	b, err := os.ReadFile(configPath)
 	if err != nil {
 		return nil, err
 	}
-	dec := yaml.NewDecoder(bytes.NewReader(b))
-	dec.KnownFields(true)
-	if err := dec.Decode(cfg); err != nil && !errors.Is(err, io.EOF) {
+	cfg, err := decode(b)
+	if err != nil {
 		return nil, fmt.Errorf("%s: %w", configPath, err)
 	}
-	cfg.Store.Live = cfg.Exec.Live
 
 	// The secrets file. Live mode takes no default.
 	if envPath == "" {
@@ -98,15 +91,49 @@ func Load(configPath, envPath string) (*Config, error) {
 	}
 
 	// Every section validates itself.
-	var level slog.Level
-	levelErr := level.UnmarshalText([]byte(cfg.LogLevel))
-	if levelErr != nil {
-		levelErr = fmt.Errorf("log_level must be debug, info, warn or error, got %q", cfg.LogLevel)
-	}
-	if err := errors.Join(levelErr, cfg.Cex.Validate(), cfg.Strategy.Validate(), cfg.Inventory.Validate(), cfg.Exec.Validate(), cfg.Env.Validate(cfg.Exec.Live)); err != nil {
+	if err := errors.Join(cfg.validate(), cfg.Env.Validate(cfg.Exec.Live)); err != nil {
 		return nil, err
 	}
 	return cfg, nil
+}
+
+// Parse reads a configuration without a secrets file and validates its
+// sections: the yaml of config.yaml, or the JSON a run stored in
+// process_run.config (JSON is yaml). The replay (cmd/replay) reads its
+// configuration this way; the process uses Load.
+func Parse(b []byte) (*Config, error) {
+	cfg, err := decode(b)
+	if err != nil {
+		return nil, err
+	}
+	if err := cfg.validate(); err != nil {
+		return nil, err
+	}
+	return cfg, nil
+}
+
+// decode reads the yaml over the defaults, which a key left out keeps, with
+// unknown keys refused. An empty text decodes to the defaults and fails
+// validation on the keys that have none.
+func decode(b []byte) (*Config, error) {
+	cfg := &Config{LogLevel: "info", Cex: cex.DefaultConfig, Strategy: strategy.DefaultConfig, Exec: exec.DefaultConfig}
+	dec := yaml.NewDecoder(bytes.NewReader(b))
+	dec.KnownFields(true)
+	if err := dec.Decode(cfg); err != nil && !errors.Is(err, io.EOF) {
+		return nil, err
+	}
+	cfg.Store.Live = cfg.Exec.Live
+	return cfg, nil
+}
+
+// validate checks the log level and every section but the secrets.
+func (c *Config) validate() error {
+	var level slog.Level
+	levelErr := level.UnmarshalText([]byte(c.LogLevel))
+	if levelErr != nil {
+		levelErr = fmt.Errorf("log_level must be debug, info, warn or error, got %q", c.LogLevel)
+	}
+	return errors.Join(levelErr, c.Cex.Validate(), c.Strategy.Validate(), c.Inventory.Validate(), c.Exec.Validate())
 }
 
 // Effective is the configuration as loaded, without anything from the

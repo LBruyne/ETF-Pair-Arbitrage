@@ -71,14 +71,25 @@ type InventoryManager struct {
 	nextSample, nextStatus time.Time
 }
 
+// Option changes how a manager runs. The process passes none.
+type Option func(*InventoryManager)
+
+// WithClock makes the manager read the time from c instead of the wall
+// clock: a replay's virtual clock (cmd/replay).
+func WithClock(c cex.Clock) Option { return func(m *InventoryManager) { m.timing.clock = c.Now } }
+
 // NewManager validates cfg and builds the manager for the two legs of pair
 // on the exchange facts of c.
-func NewManager(cfg Config, pair cex.Pair, c cexSource) (*InventoryManager, error) {
+func NewManager(cfg Config, pair cex.Pair, c cexSource, opts ...Option) (*InventoryManager, error) {
 	if err := cfg.Validate(); err != nil {
 		return nil, err
 	}
-	return &InventoryManager{cfg: cfg, symbols: [2]cex.Symbol{pair.Bull.Symbol, pair.Bear.Symbol}, cex: c, timing: defaultTimings,
-		capital: cfg.Capital, fundingBooked: map[string]bool{}}, nil
+	m := &InventoryManager{cfg: cfg, symbols: [2]cex.Symbol{pair.Bull.Symbol, pair.Bear.Symbol}, cex: c, timing: defaultTimings,
+		capital: cfg.Capital, fundingBooked: map[string]bool{}}
+	for _, opt := range opts {
+		opt(m)
+	}
+	return m, nil
 }
 
 // Restore takes what the previous run stored, before Run: R and the dust,
