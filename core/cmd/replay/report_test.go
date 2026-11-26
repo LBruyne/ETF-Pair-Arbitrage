@@ -2,9 +2,11 @@ package main
 
 import (
 	"testing"
+	"time"
 
 	"github.com/shopspring/decimal"
 
+	"etf-pair-arbitrage/core/cex"
 	"etf-pair-arbitrage/core/store"
 )
 
@@ -45,11 +47,12 @@ func exampleSink() *memSink {
 }
 
 // The summary of a run: the round-trip net (the cycles') and the full cash
-// account (every fill) kept apart, the peak notional held at entry prices,
-// and the return on N and on the peak actually used when it stays below N
-// (owner item 69).
+// account (every fill) kept apart, the peak notional the ledger held (given:
+// the simulation reads it from the inventory), and the return on N and on
+// the peak actually used when it stays below N (owner item 69). A run that
+// ends flat is valued by its fills alone.
 func TestSummaryOfARun(t *testing.T) {
-	s := summarize(exampleSink(), "", d("10000"))
+	s := summarize(exampleSink(), "", d("10000"), d("700"), nil)
 	if !s.RoundTripNet.Equal(d("19.379226")) {
 		t.Errorf("round-trip net %s, want 19.8 - 0.420774", s.RoundTripNet)
 	}
@@ -58,7 +61,10 @@ func TestSummaryOfARun(t *testing.T) {
 		t.Errorf("cash net %s, fees %s; want 19.486926 and 0.113074", s.CashNet, s.Fees)
 	}
 	if !s.PeakNotional.Equal(d("700")) {
-		t.Errorf("peak notional %s, want 700 (both legs of lot A1)", s.PeakNotional)
+		t.Errorf("peak notional %s, want the ledger's 700", s.PeakNotional)
+	}
+	if s.WindowValue != valueFlat || !s.WindowNet.Equal(s.CashNet) || !s.WindowReturnOnUsed.Equal(s.CashNet.Div(d("700"))) {
+		t.Errorf("a flat run: window %s, net %s, return on used %s; want flat, the cash net, its return", s.WindowValue, s.WindowNet, s.WindowReturnOnUsed)
 	}
 	if !s.UsedNotional.Equal(d("700")) || !s.ReturnOnN.Equal(d("0.0019379226")) || !s.ReturnOnUsed.Equal(s.RoundTripNet.Div(d("700"))) {
 		t.Errorf("used %s, return on N %s, on used %s", s.UsedNotional, s.ReturnOnN, s.ReturnOnUsed)
@@ -77,11 +83,96 @@ func TestSummaryOfARun(t *testing.T) {
 		t.Errorf("open quantity %v, want flat", s.OpenQty)
 	}
 	// A peak above N is capped at N for the return.
-	if big := summarize(exampleSink(), "", d("500")); !big.UsedNotional.Equal(d("500")) || !big.ReturnOnUsed.Equal(big.ReturnOnN) {
+	if big := summarize(exampleSink(), "", d("500"), d("700"), nil); !big.UsedNotional.Equal(d("500")) || !big.ReturnOnUsed.Equal(big.ReturnOnN) {
 		t.Errorf("with N 500: used %s, return on used %s, on N %s", big.UsedNotional, big.ReturnOnUsed, big.ReturnOnN)
 	}
 	// Another Session has nothing.
-	if other := summarize(exampleSink(), "2026-11-26", d("10000")); other.Cycles != 0 || other.Orders != 0 || !other.CashNet.IsZero() {
+	if other := summarize(exampleSink(), "2026-11-26", d("10000"), decimal.Zero, nil); other.Cycles != 0 || other.Orders != 0 || !other.CashNet.IsZero() {
 		t.Errorf("another Session: %+v", other)
+	}
+}
+
+// A window cut while a cycle still holds: the closed cycles' net stays the
+// round-trip net, but the window's result takes the position left as closed
+// on the books at the end (sell the long at the bids, buy back the short at
+// the asks), less the taker fee of those orders, and the ranking return is
+// that over the peak used. Books that cannot take the quantity, a book in
+// conflict or one too old leave the window without a value, never dropped.
+func TestWindowValueOfATruncatedWindow(t *testing.T) {
+	s := exampleSink()
+	order := func(id, side, qty, value, fee string) {
+		s.Record(store.OrderRow{ClientOrderID: id, CycleID: "cC", LotID: "cC-1", Leg: map[string]string{"c1": "bull", "c2": "bear"}[id], Purpose: "entry", Side: side,
+			Qty: d(qty), CumExecQty: d(qty), CumExecValue: d(value), Fee: d(fee), Status: "filled", SubmittedMs: 5000})
+	}
+	// Cycle C, short, still open at the end: sold 10 bull at 40 and 5 bear at 60.
+	order("c1", "sell", "10", "400", "0.026")
+	order("c2", "sell", "5", "300", "0.0195")
+	s.Record(store.FillRow{ExecID: "fc1", ClientOrderID: "c1", Side: "sell", Price: d("40"), Qty: d("10"), Value: d("400"), Fee: d("0.026"), ExecMs: 5015},
+		store.FillRow{ExecID: "fc2", ClientOrderID: "c2", Side: "sell", Price: d("60"), Qty: d("5"), Value: d("300"), Fee: d("0.0195"), ExecMs: 5015})
+	s.Record(store.CycleRow{CycleID: "cC", SessionID: "2026-11-25", Status: "open"})
+
+	end := time.UnixMilli(9000)
+	book := func(asks ...cex.BookLevel) *cex.Book {
+		return &cex.Book{Asks: asks, Bids: []cex.BookLevel{{Price: d("1"), Qty: d("1")}}, Connected: true, DepthReceivedAt: end.Add(-time.Second)}
+	}
+	close := &closeout{at: end, feeRate: d("0.000065"), books: cex.Books{MaxAge: 10 * time.Second, ByLeg: [2]*cex.Book{
+		book(cex.BookLevel{Price: d("40.1"), Qty: d("6")}, cex.BookLevel{Price: d("40.2"), Qty: d("10")}), // 6 x 40.1 + 4 x 40.2 = 401.4
+		book(cex.BookLevel{Price: d("59.9"), Qty: d("5")}),                                                // 5 x 59.9 = 299.5
+	}}}
+	sum := summarize(s, "", d("10000"), d("700"), close)
+	if !sum.RoundTripNet.Equal(d("19.379226")) {
+		t.Errorf("round-trip net %s, want the closed cycles' 19.379226", sum.RoundTripNet)
+	}
+	// Cash: 19.486926 + 700 - 0.0455 = 719.441426; closing: buy back 401.4 + 299.5,
+	// fees 0.65 bps of each, truncated to 8 decimals.
+	want := d("719.441426").Sub(d("401.4")).Sub(d("299.5")).Sub(d("401.4").Mul(d("0.000065")).Truncate(8)).Sub(d("299.5").Mul(d("0.000065")).Truncate(8))
+	if sum.WindowValue != valueOnBook || !sum.WindowNet.Equal(want) {
+		t.Errorf("window %s net %s, want closed on the book and %s", sum.WindowValue, sum.WindowNet, want)
+	}
+	if sum.WindowNet.Equal(sum.RoundTripNet) || !sum.WindowReturnOnUsed.Equal(want.Div(d("700"))) || !sum.ReturnOnUsed.Equal(sum.RoundTripNet.Div(d("700"))) {
+		t.Errorf("window return %s and closed-net return %s must differ and be on the peak used", sum.WindowReturnOnUsed, sum.ReturnOnUsed)
+	}
+
+	// The program's books5 too thin, the deeper books50 recorded at the end
+	// takes the rest: valued on it and labelled so.
+	thin := *close
+	thin.books.ByLeg[0] = book(cex.BookLevel{Price: d("40.1"), Qty: d("6")})
+	thin.deep = func(leg cex.Leg) ([]cex.BookLevel, []cex.BookLevel, bool) {
+		if leg != cex.Bull {
+			return nil, nil, false
+		}
+		return nil, []cex.BookLevel{{Price: d("40.1"), Qty: d("6")}, {Price: d("40.15"), Qty: d("1")}, {Price: d("40.2"), Qty: d("10")}}, true
+	}
+	deep := summarize(s, "", d("10000"), d("700"), &thin) // 6 x 40.1 + 1 x 40.15 + 3 x 40.2 = 401.35
+	wantDeep := d("719.441426").Sub(d("401.35")).Sub(d("299.5")).Sub(d("401.35").Mul(d("0.000065")).Truncate(8)).Sub(d("299.5").Mul(d("0.000065")).Truncate(8))
+	if deep.WindowValue != valueOnBooks50 || !deep.WindowNet.Equal(wantDeep) {
+		t.Errorf("thin books5, deep books50: window %s net %s, want %s and %s", deep.WindowValue, deep.WindowNet, valueOnBooks50, wantDeep)
+	}
+
+	for name, change := range map[string]func(){
+		"too thin": func() { close.books.ByLeg[0] = book(cex.BookLevel{Price: d("40.1"), Qty: d("6")}) },
+		"conflict": func() {
+			b := *book(cex.BookLevel{Price: d("40.1"), Qty: d("20")})
+			b.Conflict = true
+			close.books.ByLeg[0] = &b
+		},
+		"too old": func() {
+			b := *book(cex.BookLevel{Price: d("40.1"), Qty: d("20")})
+			b.DepthReceivedAt = end.Add(-time.Minute)
+			close.books.ByLeg[0] = &b
+		},
+		"no books": func() { close = nil },
+	} {
+		saved := *close
+		change()
+		got := summarize(s, "", d("10000"), d("700"), close)
+		if got.WindowValue != valueNone || !got.WindowNet.IsZero() || !got.WindowReturnOnUsed.IsZero() {
+			t.Errorf("%s: window %s net %s return %s; want no value", name, got.WindowValue, got.WindowNet, got.WindowReturnOnUsed)
+		}
+		if close == nil {
+			close = &saved
+		} else {
+			*close = saved
+		}
 	}
 }

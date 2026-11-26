@@ -429,10 +429,15 @@ func writeSim(dir string, s *sim, w window, print string) ([]summary, error) {
 	}
 	n := s.sc.cfg.Inventory.Capital.Mul(s.sc.cfg.Inventory.Leverage)
 	var sums []summary
-	for _, id := range sessionsOf(s.sink) {
-		sums = append(sums, summarize(s.sink, id, n))
+	sessions := sessionsOf(s.sink)
+	for i, id := range sessions {
+		var end *closeout // a Session before the last one ended before the window did
+		if i == len(sessions)-1 {
+			end = s.closeout(w.tape)
+		}
+		sums = append(sums, summarize(s.sink, id, n, s.peak(id), end))
 	}
-	total := summarize(s.sink, "", n)
+	total := summarize(s.sink, "", n, s.peak(""), s.closeout(w.tape))
 	total.Session = "all"
 	sums = append(sums, total)
 	meta := map[string]any{"name": s.sc.name, "funding": "excluded: the replay books no funding", "window": w.label, "from": showMs(w.tape.from), "to": showMs(w.tape.to), "fingerprint": print,
@@ -547,7 +552,8 @@ func writeSamples(path string, rows []store.SignalSampleRow) error {
 
 var gridHeader = []string{"window", "sim", "session", "bear_depth", "model", "x", "y", "d_in", "d_out", "lat_bull_ms", "lat_bear_ms", "n_usdt",
 	"round_trip_net", "cash_net", "fees", "orders", "fills", "entry_batches", "both_legs", "one_leg", "no_fill", "one_leg_rate", "entry_fill_rate",
-	"completions", "trims", "cycles", "end_reasons", "peak_notional", "used_notional", "return_on_n", "return_on_used", "open_bull", "open_bear", "fingerprint"}
+	"completions", "trims", "cycles", "end_reasons", "peak_notional", "used_notional", "return_on_n", "return_on_used", "open_bull", "open_bear",
+	"window_value", "window_net", "window_return_on_n", "window_return_on_used", "fingerprint"}
 
 // gridRow is one summary as a row of grid.csv.
 func gridRow(w window, name string, s *sim, sum summary, print string) []string {
@@ -562,7 +568,18 @@ func gridRow(w window, name string, s *sim, sum summary, print string) []string 
 		sum.RoundTripNet.String(), sum.CashNet.String(), sum.Fees.String(), strconv.Itoa(sum.Orders), strconv.Itoa(sum.Fills),
 		strconv.Itoa(sum.EntryBatches), strconv.Itoa(sum.BothLegs), strconv.Itoa(sum.OneLeg), strconv.Itoa(sum.NoFill), fmtFloat(sum.OneLegRate), fmtFloat(sum.EntryFillRate),
 		strconv.Itoa(sum.Completions), strconv.Itoa(sum.Trims), strconv.Itoa(sum.Cycles), strings.Join(reasons, " "),
-		sum.PeakNotional.String(), sum.UsedNotional.String(), sum.ReturnOnN.StringFixed(8), sum.ReturnOnUsed.StringFixed(8), sum.OpenQty[0].String(), sum.OpenQty[1].String(), print}
+		sum.PeakNotional.String(), sum.UsedNotional.String(), sum.ReturnOnN.StringFixed(8), sum.ReturnOnUsed.StringFixed(8), sum.OpenQty[0].String(), sum.OpenQty[1].String(),
+		sum.WindowValue, windowNumber(sum, sum.WindowNet.String()), windowNumber(sum, sum.WindowReturnOnN.StringFixed(8)), windowNumber(sum, sum.WindowReturnOnUsed.StringFixed(8)), print}
+}
+
+// windowNumber is a window result as written in grid.csv: empty when the
+// window has no value (a position the books at the end could not close),
+// so that it cannot be ranked as a zero.
+func windowNumber(sum summary, text string) string {
+	if sum.WindowValue == valueNone {
+		return ""
+	}
+	return text
 }
 
 func writeGrid(path string, rows [][]string) error {

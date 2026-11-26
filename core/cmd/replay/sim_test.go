@@ -144,9 +144,14 @@ func TestReplayIsDeterministic(t *testing.T) {
 		t.Fatal(err)
 	}
 	a := first[0].sink
-	sum := summarize(a, "", decimal.NewFromInt(20000))
+	sum := summarize(a, "", decimal.NewFromInt(20000), first[0].peak(""), first[0].closeout(spec))
 	if sum.OrdersByPurpose["entry"] == 0 || sum.OrdersByPurpose["exit"] == 0 || sum.EndReasons["exit_line"] == 0 {
 		t.Fatalf("the scenario did not trade as designed: %+v", sum)
+	}
+	// The peak is what the ledger held, read after the loop's steps; the
+	// run ends flat, so its window result is its cash.
+	if !sum.PeakNotional.IsPositive() || !first[0].peak("2026-11-25").Equal(sum.PeakNotional) || sum.WindowValue != valueFlat || !sum.WindowNet.Equal(sum.CashNet) {
+		t.Errorf("peak %s (Session %s), window %s %s, cash %s", sum.PeakNotional, first[0].peak("2026-11-25"), sum.WindowValue, sum.WindowNet, sum.CashNet)
 	}
 	if !sum.OpenQty[0].IsZero() || !sum.OpenQty[1].IsZero() || first[0].inv.Cycle() != nil {
 		t.Errorf("not flat at the end: open %v, cycle %v", sum.OpenQty, first[0].inv.Cycle())

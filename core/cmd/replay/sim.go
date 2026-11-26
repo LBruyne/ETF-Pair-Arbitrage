@@ -324,6 +324,13 @@ type sim struct {
 	cur   time.Time // the moment the inputs delivered last arrived
 	ref   int       // refs[:ref] are applied
 	steps int64     // Advance calls
+
+	// The entry value the ledger holds (inventory HeldNotional), read after
+	// every step, and its peak by Session: the held value belongs to the
+	// Session of the cycle open when it last changed.
+	held    decimal.Decimal
+	session string
+	peaks   map[string]decimal.Decimal
 }
 
 // newSim builds the components at the window's start and starts them as
@@ -332,7 +339,7 @@ type sim struct {
 func newSim(sc simConfig) (*sim, error) {
 	cfg := *sc.cfg
 	cfg.Cex.BookConnections = 1 // the recording is one stream per topic: since 2026-11-26 the recorder keeps the first of its connections' copies
-	s := &sim{sc: sc, clock: &vclock{now: sc.start}, sink: newMemSink(sc.keepSamples), cur: sc.start}
+	s := &sim{sc: sc, clock: &vclock{now: sc.start}, sink: newMemSink(sc.keepSamples), cur: sc.start, peaks: map[string]decimal.Decimal{}}
 	pair := cfg.Cex.Pair
 	s.venue = &replayVenue{rules: bitgetRules(pair.Bull.Symbol, pair.Bear.Symbol), onEvent: map[cex.Symbol]func(cex.BookEvent){}, onDown: map[cex.Symbol]func(error){}}
 	s.paper = cex.NewPaperVenue(s.venue, cex.PaperConfig{Pair: pair,
@@ -447,10 +454,42 @@ func (s *sim) runUntil(t time.Time) {
 	}
 }
 
-// advance runs the loop at t.
+// advance runs the loop at t, then notes what the ledger holds.
 func (s *sim) advance(t time.Time) {
 	s.steps++
 	s.loop.Advance(t)
+	if h := s.inv.HeldNotional(); !h.Equal(s.held) {
+		s.held = h
+		if c := s.inv.Cycle(); c != nil {
+			s.session = c.SessionID
+		}
+		if h.GreaterThan(s.peaks[s.session]) {
+			s.peaks[s.session] = h
+		}
+	}
+}
+
+// peak is the most the ledger held in the Session ("": the whole window).
+func (s *sim) peak(session string) decimal.Decimal {
+	if session != "" {
+		return s.peaks[session]
+	}
+	most := decimal.Zero
+	for _, p := range s.peaks {
+		most = decimal.Max(most, p)
+	}
+	return most
+}
+
+// closeout values what is held at the window's end on the books there,
+// with the tape's books50 at the end as the deeper book.
+func (s *sim) closeout(tape tapeSpec) *closeout {
+	books := s.cmgr.Books()
+	symbols := [2]cex.Symbol{tape.bull, tape.bear}
+	return &closeout{books: books, at: s.sc.end, feeRate: decimal.NewFromFloat(s.sc.cfg.Strategy.TakerFeeBps).Div(decimal.NewFromInt(10000)),
+		deep: func(leg cex.Leg) ([]cex.BookLevel, []cex.BookLevel, bool) {
+			return lastBook(tape.dir, leg, symbols[leg], cex.TopicBooks50, s.sc.end, books.MaxAge)
+		}}
 }
 
 // finish runs the replay to its end.

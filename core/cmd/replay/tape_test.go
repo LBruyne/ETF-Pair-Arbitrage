@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"etf-pair-arbitrage/core/cex"
 )
@@ -124,5 +125,24 @@ func TestGridExpandsTheCombinations(t *testing.T) {
 	}
 	if _, err := parseGrid("din=2;dout=3", base); err == nil {
 		t.Error("d_out >= d_in was accepted")
+	}
+}
+
+// lastBook gives every level of the newest frame received within maxAge
+// before the moment, none when the newest is older or there is no file.
+func TestLastBookReadsTheNewestFrameWhole(t *testing.T) {
+	dir := t.TempDir()
+	bids, asks := side(d("60"), "0.001", 50, true), side(d("60.001"), "0.001", 50, false)
+	writeFile(t, dir, "SOXSUSDT.books50.1000.jsonl.gz", tapeLine(1000, "SOXSUSDT", "books50", 1, bids, asks), tapeLine(4000, "SOXSUSDT", "books50", 2, bids[1:], asks[1:]),
+		tapeLine(9000, "SOXSUSDT", "books50", 3, bids, asks))
+	b, a, ok := lastBook(dir, cex.Bear, "SOXSUSDT", cex.TopicBooks50, time.UnixMilli(5000), 10*time.Second)
+	if !ok || len(b) != 49 || len(a) != 49 || !a[0].Price.Equal(d("60.002")) {
+		t.Fatalf("at 5000: ok %t, %d bids, %d asks (first %v); want the frame of 4000 whole", ok, len(b), len(a), a)
+	}
+	if _, _, ok := lastBook(dir, cex.Bear, "SOXSUSDT", cex.TopicBooks50, time.UnixMilli(8500), 2*time.Second); ok {
+		t.Error("the newest frame before 8500 is 4.5 s old; with a 2 s max age there is none")
+	}
+	if _, _, ok := lastBook(dir, cex.Bull, "SOXLUSDT", cex.TopicBooks50, time.UnixMilli(5000), 10*time.Second); ok {
+		t.Error("no SOXL books50 files: none")
 	}
 }

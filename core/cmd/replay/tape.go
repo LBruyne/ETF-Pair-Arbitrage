@@ -210,6 +210,26 @@ func tapeDisconnects(spec tapeSpec) ([]input, error) {
 	return out, nil
 }
 
+// lastBook reads the newest frame of a symbol's topic received in
+// [at - maxAge, at] from the raw files, every level of it; false when there
+// is none or the files cannot be read.
+func lastBook(dir string, leg cex.Leg, symbol cex.Symbol, topic string, at time.Time, maxAge time.Duration) (bids, asks []cex.BookLevel, ok bool) {
+	from, to := at.Add(-maxAge).UnixMilli(), at.UnixMilli()+1
+	files, err := tapeFiles(dir, symbol, topic, from, to)
+	if err != nil || len(files) == 0 {
+		return nil, nil, false
+	}
+	s := &stream{leg: leg, symbol: symbol, topic: topic, asTopic: topic, from: from, to: to, files: files, numbers: map[string]decimal.Decimal{}}
+	var last *input
+	for in := s.next(); in != nil; in = s.next() {
+		last = in
+	}
+	if s.err != nil || last == nil {
+		return nil, nil, false
+	}
+	return last.ev.Bids, last.ev.Asks, true
+}
+
 // next returns the stream's next input in its window, nil at its end.
 func (s *stream) next() *input {
 	for {
