@@ -5,8 +5,12 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"slices"
 	"sort"
+	"strings"
 	"time"
+
+	"github.com/shopspring/decimal"
 
 	"etf-pair-arbitrage/core/cex"
 	"etf-pair-arbitrage/core/inventory"
@@ -314,6 +318,9 @@ func (m *ExecManager) restoreBatch(c *inventory.Cycle, now time.Time) {
 		}
 	}
 	if lot == nil {
+		if m.pairing.ThinFirst {
+			m.restoreExit(c)
+		}
 		return
 	}
 	b := &batchState{kind: cex.PurposeEntry, lotID: lot.ID, direction: c.Direction, x: lot.X, sentAt: lot.OpenedAt}
@@ -336,5 +343,109 @@ func (m *ExecManager) restoreBatch(c *inventory.Cycle, now time.Time) {
 		return
 	}
 	m.batch = b
+	if m.pairing.ThinFirst {
+		m.restorePair(b, lot)
+	}
 	logger.GlobalLogger.Info("exec: batch taken up", "lot", lot.ID, "orders", len(b.orders), "sent", showTime(b.sentAt))
+}
+
+// restorePair takes up a thin-leg-first batch in pairing from its order
+// records (SPEC 12.9 "重启", PRD 5.19): the decision from the lot (x_dec,
+// mu, C) and the thin order (qS); S, v_S, L, v_L from the orders each round
+// (refreshPair); the first fill's time from the arrival of the thin order's
+// final state. Inside the window the pairing goes on, after it the next
+// round unwinds S_open at once. The x of a top-up is not in the order
+// records: after one filled the batch tops up no more. The batch is the last
+// entry for the spacing.
+func (m *ExecManager) restorePair(b *batchState, lot *inventory.Lot) {
+	thin := m.pairing.Thin
+	plan := &strategy.EntryPlan{Direction: lot.Direction, X: lot.X, Mu: lot.Mu, Sigma: lot.Sigma, FeeD: lot.FeeD}
+	p := &pairState{plan: plan, thin: thin, thick: otherLeg(thin)}
+	thinFills := 0
+	for _, o := range m.cex.CycleOrders(string(lot.CycleID)) {
+		if !slices.Contains(b.orders, o.Request.ClientOrderID) || o.Request.Purpose == cex.PurposeTrim {
+			continue
+		}
+		p.sent[o.Request.Leg] = true
+		if o.Request.Leg != thin {
+			continue
+		}
+		if p.thinID == "" {
+			p.thinID = o.Request.ClientOrderID
+			plan.Qty[thin], plan.Price[thin] = o.Request.Qty, o.Request.Price
+		}
+		if o.CumExecQty.IsPositive() {
+			thinFills++
+		}
+		if o.Request.ClientOrderID == p.thinID && o.Status.Terminal() && o.CumExecQty.IsPositive() {
+			first := o.FinalAt
+			if first.IsZero() {
+				first = o.SubmittedAt
+			}
+			p.batch = strategy.NewPairBatch(plan, thin, o.CumExecQty, vwap(o.CumExecValue, o.CumExecQty), first)
+			p.started = true
+		}
+	}
+	p.noTopUps = thinFills > 1
+	b.pair = p
+	if m.lastEntry == nil || m.lastEntry.At.Before(lot.OpenedAt) {
+		m.lastEntry = &strategy.LastEntry{At: lot.OpenedAt, E: lot.X, Direction: lot.Direction}
+	}
+	logger.GlobalLogger.Info("exec: pairing taken up", "lot", lot.ID, "thin_order", p.thinID, "started", p.started, "first_fill", showTime(p.batch.FirstFill), "top_ups_stopped", p.noTopUps)
+}
+
+// restoreExit takes up a thin-leg-first line exit batch whose thick leg had
+// not matched its thin leg's closing fills when the previous process ended
+// (PRD 9.13): the last thin exit order with a fill and the thick exit
+// orders after it, when nothing but those orders came after it. Its fills
+// come from those orders, exit_pair_window runs from the arrival of the thin
+// order's final state; the decision's spread and D1 are not in the order
+// records, so the spread stop does not apply and the thick leg is held to
+// its break-even bound until the window ends it.
+func (m *ExecManager) restoreExit(c *inventory.Cycle) {
+	thin := m.pairing.Thin
+	orders := m.cex.CycleOrders(string(c.ID))
+	slices.SortFunc(orders, func(a, b cex.OrderRecord) int {
+		return strings.Compare(string(a.Request.ClientOrderID), string(b.Request.ClientOrderID))
+	})
+	var b *batchState
+	for _, o := range orders {
+		switch {
+		case o.Request.Purpose == cex.PurposeExit && o.Request.Leg == thin && (o.CumExecQty.IsPositive() || !o.Status.Terminal()):
+			e := &exitState{thinID: o.Request.ClientOrderID, base: m.stageOf(c).Closed,
+				batch: strategy.ExitBatch{Dir: c.Direction, DecisionD: nan, Fills: strategy.Fills{ThinQty: decimal.Zero, ThinVWAP: decimal.Zero, ThickQty: decimal.Zero, ThickVWAP: decimal.Zero}}}
+			e.sent[thin] = true
+			if o.Status.Terminal() {
+				e.started, e.batch.FirstFill = true, o.FinalAt
+				if e.batch.FirstFill.IsZero() {
+					e.batch.FirstFill = o.SubmittedAt
+				}
+			}
+			b = &batchState{kind: cex.PurposeExit, sentAt: o.SubmittedAt, orders: []cex.ClientOrderID{o.Request.ClientOrderID}, exit: e}
+		case o.Request.Purpose == cex.PurposeExit && o.Request.Leg != thin && b != nil:
+			b.orders = append(b.orders, o.Request.ClientOrderID)
+			b.exit.sent[o.Request.Leg] = true
+		default:
+			b = nil
+		}
+	}
+	if b == nil {
+		return
+	}
+	// A batch whose thick leg matched its thin leg already ended.
+	var q [2]decimal.Decimal
+	for _, o := range orders {
+		if slices.Contains(b.orders, o.Request.ClientOrderID) {
+			q[o.Request.Leg] = q[o.Request.Leg].Add(o.CumExecQty)
+		}
+	}
+	thick := otherLeg(thin)
+	if rule, ok := m.cex.Rule(thick); ok && b.exit.started {
+		target := q[thin].Mul(anchorOf(c.PairAnchors, thin)).Div(anchorOf(c.PairAnchors, thick)).Div(rule.QtyStep).Floor().Mul(rule.QtyStep)
+		if !target.GreaterThan(q[thick]) {
+			return
+		}
+	}
+	m.batch = b
+	logger.GlobalLogger.Info("exec: exit batch taken up", "cycle", c.ID, "orders", len(b.orders), "first_fill", showTime(b.exit.batch.FirstFill))
 }

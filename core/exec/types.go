@@ -109,6 +109,12 @@ type batchState struct {
 	x         float64             // entry batches: the executable deviation at the decision, the e of the spacing rule
 	settled   bool                // entry batches: the lot was settled, built or void
 	compared  bool                // the venue's positions were compared with the ledger after its results
+
+	// The thin leg first (SPEC 12.4, 12.7) and the two-stage exit (12.6).
+	pair    *pairState        // a thin-leg-first entry batch; nil otherwise
+	exit    *exitState        // a thin-leg-first line exit batch; nil otherwise
+	line    strategy.ExitLine // exit batches: the line it closes at; empty for other batches and a restored one
+	counted bool              // an exit1 batch of both legs together: its fills were counted towards the half target
 }
 
 // observation is the last usable moment of the open minute: both legs'

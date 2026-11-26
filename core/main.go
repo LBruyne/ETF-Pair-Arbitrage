@@ -145,7 +145,13 @@ func run(cfg *config.Config, signals chan os.Signal) error {
 	if err != nil {
 		return err
 	}
-	imgr, err := inventory.NewManager(cfg.Inventory, cfg.Cex.Pair, cmgr)
+	// With a thin leg first the quota leaves out the unpaired thin leg of a
+	// batch in pairing (SPEC 12.4 "额度").
+	var invOpts []inventory.Option
+	if thin, ok := cfg.Exec.Thin(); ok {
+		invOpts = append(invOpts, inventory.WithThinLeg(thin))
+	}
+	imgr, err := inventory.NewManager(cfg.Inventory, cfg.Cex.Pair, cmgr, invOpts...)
 	if err != nil {
 		return err
 	}
@@ -192,10 +198,12 @@ func run(cfg *config.Config, signals chan os.Signal) error {
 	if paper != nil {
 		paper.SeedPositions(imgr.LedgerPositions())
 	}
-	// The loop's own: the Session's minutes, the last built entry, and the
-	// recorder's per-second rows for the minutes it did not record. Its
+	// The loop's own: the Session's minutes, the last built entry, the half
+	// target of exit1, and the recorder's per-second rows for the minutes it
+	// did not record. Its
 	// recovery (reading the venue's orders and positions) runs in Run.
 	emgr.Restore(state.MinuteBars, state.AnchorFacts, state.LastEntry, st)
+	emgr.RestoreExitStage(state.ExitStage)
 	log.Info("ETF-arbitrage core state loaded", "session", sessionID, "anchor_facts", len(state.AnchorFacts),
 		"unfinished_cycle", state.Cycle != nil, "orders", len(orders), "funding_records", len(state.Funding), "minute_bars", len(state.MinuteBars))
 

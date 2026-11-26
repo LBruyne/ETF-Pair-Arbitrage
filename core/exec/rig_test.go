@@ -453,6 +453,9 @@ type rigOptions struct {
 	exchange *exchange     // the exchange of an earlier process, which keeps its orders and positions; nil makes a new one, whose positions are seeded from the ledger
 	sink     store.Sink    // where the rows go besides the rig's fake; nil: the fake alone
 	perp     minuteSource  // the recorder's minutes for the loop's recovery
+	thin     string        // exec.thin_leg: "" sends both legs together (the default), bear takes SOXS first
+	exit2    *float64      // strategy.exit2; nil is one exit line
+	stopD    float64       // exec.pair_stop_d; 0 keeps the default 10
 }
 
 // exchange is what outlives a process: the venue behind the paper venue,
@@ -546,7 +549,17 @@ func newRig(t *testing.T, now time.Time, opts rigOptions) *rig {
 		t.Fatal(err)
 	}
 	r.cex.UseStore(sink)
-	if r.inv, err = inventory.NewManager(inventory.Config{Capital: dec(opts.capital), Leverage: dec("10")}, pair, r.cex); err != nil {
+	cfg := DefaultConfig
+	cfg.SimOrderLatency = LegLatency{Bull: time.Millisecond, Bear: time.Millisecond}
+	cfg.ThinLeg = opts.thin
+	if opts.stopD != 0 {
+		cfg.PairStopD = opts.stopD
+	}
+	var invOpts []inventory.Option
+	if leg, ok := cfg.Thin(); ok {
+		invOpts = append(invOpts, inventory.WithThinLeg(leg))
+	}
+	if r.inv, err = inventory.NewManager(inventory.Config{Capital: dec(opts.capital), Leverage: dec("10")}, pair, r.cex, invOpts...); err != nil {
 		t.Fatal(err)
 	}
 	r.inv.UseStore(sink)
@@ -567,7 +580,9 @@ func newRig(t *testing.T, now time.Time, opts rigOptions) *rig {
 	if !shared {
 		r.paper.SeedPositions(r.inv.LedgerPositions())
 	}
-	strat, err := strategy.New(testStrategy())
+	scfg := testStrategy()
+	scfg.Exit2 = opts.exit2
+	strat, err := strategy.New(scfg)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -575,13 +590,12 @@ func newRig(t *testing.T, now time.Time, opts rigOptions) *rig {
 	session := r.cex.Session(now)
 	r.src.setAnchors(cex.Anchors{SessionID: session.ID, Kind: cex.AnchorBell, Bull: dec("40"), Bear: dec("60"), KnownAt: now})
 	r.src.setFX("1", now)
-	cfg := DefaultConfig
-	cfg.SimOrderLatency = LegLatency{Bull: time.Millisecond, Bear: time.Millisecond}
 	if r.m, err = NewManager(cfg, r.src, r.inv, strat, r.signals); err != nil {
 		t.Fatal(err)
 	}
 	r.m.UseStore(sink)
 	r.m.Restore(state.MinuteBars, state.AnchorFacts, state.LastEntry, opts.perp)
+	r.m.RestoreExitStage(state.ExitStage)
 	r.m.timing.clock = r.clock
 
 	// cex runs its own loops; its first reference pass reads the rules, the

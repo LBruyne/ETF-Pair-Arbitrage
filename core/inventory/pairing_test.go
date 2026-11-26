@@ -392,8 +392,12 @@ func TestSettlePairedLotEndStates(t *testing.T) {
 			if got.Status != tc.status || got.VoidReason != tc.voidReason || got.End != tc.end {
 				t.Errorf("lot = %s %q %s, want %s %q %s", got.Status, got.VoidReason, got.End, tc.status, tc.voidReason, tc.end)
 			}
-			if row := lastLotRow(t, r.sink, lot.ID); row.Status != string(tc.status) || row.VoidReason != tc.voidReason {
-				t.Errorf("lot row = %s %q, want %s %q", row.Status, row.VoidReason, tc.status, tc.voidReason)
+			if row := lastLotRow(t, r.sink, lot.ID); row.Status != string(tc.status) || row.VoidReason != tc.voidReason || row.EndState != string(tc.end) {
+				t.Errorf("lot row = %s %q %q, want %s %q %s", row.Status, row.VoidReason, row.EndState, tc.status, tc.voidReason, tc.end)
+			}
+			// A restart reads the end state back from the lot's row (10.7).
+			if back := r.restart(t, "1000", "10").lot(t, 1); back.End != tc.end || back.Status != tc.status {
+				t.Errorf("after a restart the lot is %s %s, want %s %s", back.Status, back.End, tc.status, tc.end)
 			}
 			if tc.status == LotVoid && got.ClosedAt.IsZero() {
 				t.Error("a void lot has its closing time")

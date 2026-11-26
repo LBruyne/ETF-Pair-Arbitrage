@@ -44,32 +44,40 @@ func (m *ExecManager) openBatch(r *round, plan *strategy.EntryPlan) {
 
 	m.batch = &batchState{kind: cex.PurposeEntry, sentAt: r.now, lotID: lot.ID, direction: plan.Direction, planPrice: plan.Price, x: plan.X}
 	var reqs []cex.OrderRequest
-	for _, leg := range cex.Legs {
-		req := m.orderRequest(c, r.orders, leg, cex.PurposeEntry, plan.Direction.Side(), plan.Price[leg], plan.Qty[leg], r.rules[leg].Symbol)
-		req.QuotaPrice, req.LotID = plan.QuotaPrice[leg], string(lot.ID)
-		reqs = append(reqs, req)
+	if m.pairing.ThinFirst {
+		reqs = m.openThinBatch(r, c, lot, plan) // the thin leg alone (SPEC 12.4)
+	} else {
+		for _, leg := range cex.Legs {
+			req := m.orderRequest(c, r.orders, leg, cex.PurposeEntry, plan.Direction.Side(), plan.Price[leg], plan.Qty[leg], r.rules[leg].Symbol)
+			req.QuotaPrice, req.LotID = plan.QuotaPrice[leg], string(lot.ID)
+			reqs = append(reqs, req)
+		}
 	}
 	m.atLine = ""
 	log.Info("exec: entry", "cycle", c.ID, "lot", lot.ID, "direction", plan.Direction, "x_d", plan.X, "mu_d", plan.Mu, "sigma_d", plan.Sigma,
 		"fee_d", plan.FeeD, "fee_est_usdt", plan.FeeUSDT, "k_usd", plan.K, "price_bull", plan.Price[cex.Bull], "qty_bull", plan.Qty[cex.Bull],
-		"price_bear", plan.Price[cex.Bear], "qty_bear", plan.Qty[cex.Bear], "anchor_kind", string(m.anchors.Kind))
-	m.recordDecision(r.now, "entry", c, lot.ID, plan.Direction, "", map[string]any{
+		"price_bear", plan.Price[cex.Bear], "qty_bear", plan.Qty[cex.Bear], "anchor_kind", string(m.anchors.Kind), "thin_leg", m.cfg.ThinLeg)
+	detail := map[string]any{
 		"x_d": finite(plan.X), "mu_d": finite(plan.Mu), "sigma_d": finite(plan.Sigma), "fee_d": finite(plan.FeeD), "fee_usdt": plan.FeeUSDT, "k_usd": plan.K,
 		"price_bull": plan.Price[cex.Bull], "price_bear": plan.Price[cex.Bear], "qty_bull": plan.Qty[cex.Bull], "qty_bear": plan.Qty[cex.Bear],
 		"quota_price_bull": plan.QuotaPrice[cex.Bull], "quota_price_bear": plan.QuotaPrice[cex.Bear], "f": r.fx.Price,
 		"anchor_kind": m.anchors.Kind, "anchor_bull": m.anchors.Bull, "anchor_bear": m.anchors.Bear, "pair_anchor_bull": c.PairAnchors.Bull, "pair_anchor_bear": c.PairAnchors.Bear,
 		"pricing_level_bull": m.scfg.PricingLevel.Bull, "pricing_level_bear": m.scfg.PricingLevel.Bear,
-		"depth_seq_bull": r.books.ByLeg[cex.Bull].DepthSeq, "depth_seq_bear": r.books.ByLeg[cex.Bear].DepthSeq, "client_order_ids": ids(reqs)})
+		"depth_seq_bull": r.books.ByLeg[cex.Bull].DepthSeq, "depth_seq_bear": r.books.ByLeg[cex.Bear].DepthSeq, "client_order_ids": ids(reqs)}
+	if m.pairing.ThinFirst {
+		detail["thin_leg"] = m.pairing.Thin.String()
+	}
+	m.recordDecision(r.now, "entry", c, lot.ID, plan.Direction, "", detail)
 	m.send(r, reqs...)
 }
 
 // settle ends the building of the entry batch, once, when its results are in
 // and no gap order can be sent for the cycle: built when both legs filled
 // (PRD 8.1), which resets the entry spacing (PRD 5.8); void otherwise, which
-// does not.
+// does not. A thin-leg-first batch is settled by its pairing (endPair).
 func (m *ExecManager) settle(r *round) {
 	b := m.batch
-	if b == nil || b.kind != cex.PurposeEntry || b.settled || b.doneAt.IsZero() {
+	if b == nil || b.kind != cex.PurposeEntry || b.settled || b.doneAt.IsZero() || b.pair != nil {
 		return
 	}
 	b.settled = true
@@ -135,7 +143,7 @@ func (m *ExecManager) sendGap(r *round, a strategy.GapAction, byPositions bool) 
 // gives nothing gets no order (PRD 9.6 as narrowed: its remainder is dust).
 func (m *ExecManager) sendExit(r *round, plan *strategy.ExitPlan, in strategy.ExitInput) {
 	c := r.cycle
-	m.batch = &batchState{kind: cex.PurposeExit, sentAt: r.now}
+	m.batch = &batchState{kind: cex.PurposeExit, sentAt: r.now, line: plan.Line}
 	var reqs []cex.OrderRequest
 	for _, leg := range cex.Legs {
 		if plan.Qty[leg].IsPositive() {
@@ -144,19 +152,37 @@ func (m *ExecManager) sendExit(r *round, plan *strategy.ExitPlan, in strategy.Ex
 			reqs = append(reqs, req)
 		}
 	}
-	statsStale := !m.stats.Ready
-	logger.GlobalLogger.Info("exec: exit", "cycle", c.ID, "direction", c.Direction, "x_d", plan.X, "mu_d", plan.Mu, "sigma_d", plan.Sigma,
+	m.logExit(r, plan, in)
+	m.recordDecision(r.now, "exit", c, "", c.Direction, exitReason(plan), m.exitDetail(r, plan, in, reqs))
+	m.send(r, reqs...)
+}
+
+// logExit writes the line of an exit decision.
+func (m *ExecManager) logExit(r *round, plan *strategy.ExitPlan, in strategy.ExitInput) {
+	logger.GlobalLogger.Info("exec: exit", "cycle", r.cycle.ID, "direction", r.cycle.Direction, "x_d", plan.X, "mu_d", plan.Mu, "sigma_d", plan.Sigma,
 		"price_bull", plan.Price[cex.Bull], "qty_bull", plan.Qty[cex.Bull], "price_bear", plan.Price[cex.Bear], "qty_bear", plan.Qty[cex.Bear],
-		"hold_bull", in.Hold[cex.Bull], "hold_bear", in.Hold[cex.Bear], "stats_stale", statsStale, "stats_as_of", showTime(in.Stats.AsOf), "fx_fresh", r.fxFresh)
-	m.recordDecision(r.now, "exit", c, "", c.Direction, "", map[string]any{
+		"hold_bull", in.Hold[cex.Bull], "hold_bear", in.Hold[cex.Bear], "stats_stale", !m.stats.Ready, "stats_as_of", showTime(in.Stats.AsOf), "fx_fresh", r.fxFresh,
+		"line", string(plan.Line), "expected_net", plan.ExpectedNet, "d1", plan.D1)
+}
+
+// exitDetail is the decision detail of an exit at the line. With exit2 or
+// the thin leg first it also carries the line, the decision's spread (the
+// reference of D2's spread stop), the batch's pre-check (its expected net)
+// and D1 with the thick leg's protection (SPEC 12.7).
+func (m *ExecManager) exitDetail(r *round, plan *strategy.ExitPlan, in strategy.ExitInput, reqs []cex.OrderRequest) map[string]any {
+	c := r.cycle
+	detail := map[string]any{
 		"x_d": finite(plan.X), "mu_d": finite(plan.Mu), "sigma_d": finite(plan.Sigma),
 		"price_bull": plan.Price[cex.Bull], "price_bear": plan.Price[cex.Bear], "qty_bull": plan.Qty[cex.Bull], "qty_bear": plan.Qty[cex.Bear],
 		"hold_bull": in.Hold[cex.Bull], "hold_bear": in.Hold[cex.Bear],
 		// PRD 9.7: an exit on the last ready mean, or on the last valid F, says so.
-		"stats_stale": statsStale, "stats_as_of_ms": in.Stats.AsOf.UnixMilli(), "f": r.fx.Price, "f_fresh": r.fxFresh, "f_received_ms": r.fx.ReceivedAt.UnixMilli(),
+		"stats_stale": !m.stats.Ready, "stats_as_of_ms": in.Stats.AsOf.UnixMilli(), "f": r.fx.Price, "f_fresh": r.fxFresh, "f_received_ms": r.fx.ReceivedAt.UnixMilli(),
 		"anchor_kind": m.anchors.Kind, "anchor_bull": m.anchors.Bull, "anchor_bear": m.anchors.Bear, "pair_anchor_bull": c.PairAnchors.Bull, "pair_anchor_bear": c.PairAnchors.Bear,
-		"depth_seq_bull": r.books.ByLeg[cex.Bull].DepthSeq, "depth_seq_bear": r.books.ByLeg[cex.Bear].DepthSeq, "client_order_ids": ids(reqs)})
-	m.send(r, reqs...)
+		"depth_seq_bull": r.books.ByLeg[cex.Bull].DepthSeq, "depth_seq_bear": r.books.ByLeg[cex.Bear].DepthSeq, "client_order_ids": ids(reqs)}
+	if m.scfg.Exit2 != nil || m.pairing.ThinFirst {
+		detail["line"], detail["d_dec"], detail["expected_net"], detail["d1"], detail["protect"] = string(plan.Line), finite(plan.D), plan.ExpectedNet, plan.D1, plan.Protect
+	}
+	return detail
 }
 
 // --- forced exit ---
@@ -301,6 +327,7 @@ func (m *ExecManager) forcedExit(r *round, byPositions bool) (done bool) {
 func (m *ExecManager) whileUnknown(r *round, unknown []cex.OrderRecord) bool {
 	m.chase(r, unknown)
 	if c := r.cycle; c != nil && m.forcedDue(c, r.now, true) {
+		m.handOver(r)
 		return m.forcedExit(r, true)
 	}
 	if m.unknownFor(r.now) >= m.timing.unknownAlarm && m.gapByPositions(r) {
@@ -525,8 +552,8 @@ func (m *ExecManager) endReason(r *round) string {
 		switch {
 		case lot.Status != inventory.LotVoid:
 			allVoid = false
-		case lot.VoidReason == inventory.VoidOneLeg:
-			oneLeg = true
+		case lot.VoidReason == inventory.VoidOneLeg || lot.End == inventory.LotEndUnwoundProfit || lot.End == inventory.LotEndUnwoundStop:
+			oneLeg = true // a thin-leg-first batch that unwound its thin leg filled one leg too
 		}
 	}
 	forced, exit := false, false

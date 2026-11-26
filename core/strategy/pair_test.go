@@ -436,16 +436,18 @@ func TestPairStep_TooSmall(t *testing.T) {
 	if a := s.PairStep(in); a.Kind != PairSendThin || !a.Qty.Equal(dec("3.04")) {
 		t.Errorf("too small, x deeper: %s %s, want send_thin 3.04", a.Kind, a.Qty)
 	}
-	// No more top-ups: dust that can never pair ends the batch.
+	// No more top-ups: dust that can never pair ends the batch. Nothing of
+	// it was paired, so it ends as unwound_stop for too_small (the lead's
+	// override of 10.4 deviation 7) and its dust is recorded.
 	in.NoNewEntries = true
-	if a := s.PairStep(in); a.Kind != PairDone || a.End != PairEndBuilt {
-		t.Errorf("too small, no more top-ups: %s %s, want done built", a.Kind, a.End)
+	if a := s.PairStep(in); a.Kind != PairDone || a.End != PairEndUnwoundStop || a.Why != ReasonTooSmall {
+		t.Errorf("too small, no more top-ups: %s %s %s, want done unwound_stop too_small", a.Kind, a.End, a.Why)
 	}
 	// The window passes: the unwind cannot be sent either, so done.
 	in.NoNewEntries = false
 	in.Now = t0.Add(31 * time.Second)
-	if a := s.PairStep(in); a.Kind != PairDone || a.End != PairEndBuilt {
-		t.Errorf("too small, window: %s %s, want done built", a.Kind, a.End)
+	if a := s.PairStep(in); a.Kind != PairDone || a.End != PairEndUnwoundStop || a.Why != ReasonTooSmall {
+		t.Errorf("too small, window: %s %s %s, want done unwound_stop too_small", a.Kind, a.End, a.Why)
 	}
 
 	// A sendable thin remainder whose thick target is too small (SOXL's

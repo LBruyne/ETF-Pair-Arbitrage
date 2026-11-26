@@ -24,8 +24,9 @@ type ExecManager struct {
 	cex      cexSource
 	inv      *inventory.InventoryManager
 	strat    *strategy.Strategy
-	scfg     strategy.Config // the strategy's parameters, read by the loop
-	leverage int             // L, which the account settings must show on both contracts
+	scfg     strategy.Config  // the strategy's parameters, read by the loop
+	pairing  strategy.Pairing // exec's thin-leg-first keys as strategy reads them; the zero value sends both legs together
+	leverage int              // L, which the account settings must show on both contracts
 	timing   timings
 
 	// bound by UseStore, before Run
@@ -54,6 +55,11 @@ type ExecManager struct {
 	orderSeq     int                 // the sequence number of that cycle's last order
 	lastSentAt   [2]time.Time        // by leg: when the last reducing or completion order was sent
 	nextCloseTry time.Time           // a cycle whose close failed is not tried again before this
+
+	// owned by Run: the half target of exit1 (SPEC 12.6), of cycle stageCycle
+	stage                   strategy.ExitStage
+	stageCycle              inventory.CycleID
+	stageSetAt, stageDoneAt time.Time
 
 	// bound by Restore, before Run
 	restoredBars  []store.MinuteBarRow  // the Session's minutes the previous run recorded
@@ -114,6 +120,9 @@ func NewManager(cfg Config, c cexSource, inv *inventory.InventoryManager, strat 
 	}
 	m := &ExecManager{cfg: cfg, cex: c, inv: inv, strat: strat, scfg: strat.Config(), leverage: inv.Leverage(), timing: defaultTimings, signals: signals,
 		unknown: map[cex.ClientOrderID]*unknownOrder{}}
+	if thin, ok := cfg.Thin(); ok {
+		m.pairing = strategy.Pairing{ThinFirst: true, Thin: thin, Window: cfg.PairWindow, StopD: cfg.PairStopD, TopupMax: cfg.ThinTopupMax, ExitWindow: cfg.ExitPairWindow}
+	}
 	for _, opt := range opts {
 		opt(m)
 	}

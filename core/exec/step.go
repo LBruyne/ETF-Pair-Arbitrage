@@ -82,9 +82,19 @@ func (m *ExecManager) step(now time.Time) (done bool) {
 func (m *ExecManager) holding(r *round) (ended bool) {
 	c := r.cycle
 	if m.forcedDue(c, r.now, !c.Flat()) {
+		m.handOver(r) // a thin-leg-first batch is taken over: the forced exit flattens both legs
 		m.forcedExit(r, false)
 		return true
 	}
+	// A thin-leg-first batch runs to its end before anything else: no gap,
+	// no line exit and no entry while it is open (SPEC 12.3 point 4).
+	if p := m.activePair(); p != nil && m.workPair(r, p) {
+		return true
+	}
+	if e := m.activeExit(); e != nil && m.workExitPair(r, e) {
+		return true
+	}
+	m.countExit(r)
 	if m.workGap(r) {
 		return true
 	}
@@ -270,12 +280,18 @@ func orderIn(orders []cex.OrderRecord, id cex.ClientOrderID) (cex.OrderRecord, b
 
 // freshDepthSince reports whether both legs' depth arrived after the last
 // batch's results (PRD 5.9): the book the loop holds then is no longer the
-// one the batch traded on. It holds before the first batch.
+// one the batch traded on. It holds before the first batch. After a
+// thin-leg-first batch that ended entry_failed only the thin leg's depth is
+// waited for: no order of the other leg was sent (SPEC 12.12 item 4).
 func (m *ExecManager) freshDepthSince(r *round) bool {
 	if m.batch == nil || m.batch.doneAt.IsZero() {
 		return true
 	}
-	for _, leg := range cex.Legs {
+	legs := cex.Legs[:]
+	if p := m.batch.pair; p != nil && p.end == inventory.LotEndEntryFailed {
+		legs = []cex.Leg{p.thin}
+	}
+	for _, leg := range legs {
 		if !r.books.ByLeg[leg].DepthReceivedAt.After(m.batch.doneAt) {
 			return false
 		}
@@ -375,17 +391,29 @@ func (m *ExecManager) gapInput(r *round) strategy.GapInput {
 
 // --- the exit at the line ---
 
-// exitAtLine sends the exit pair when the open cycle is at the exit line;
-// it reports whether it sent one.
+// exitAtLine sends the exit at the line when the open cycle is at an exit
+// line; it reports whether it sent one. With exit2 a half target set at
+// exit1 is kept (and stored) even when no batch goes (SPEC 12.6). With the
+// thin leg first the batch's thin order goes alone and the thick leg follows
+// its fills (workExitPair); a batch whose thin leg has nothing sendable
+// sends its other leg as an exit of both legs together.
 func (m *ExecManager) exitAtLine(r *round) bool {
 	if !r.rulesOK {
 		return false
 	}
 	in := m.exitInput(r)
-	plan, reason := m.strat.EvaluateExit(in)
+	d := m.strat.DecideExit(in)
+	if d.Stage != nil {
+		m.setStage(r, *d.Stage)
+	}
+	plan := d.Plan
 	if plan == nil {
-		logger.GlobalLogger.Debug("exec: no exit at the line", "cycle", r.cycle.ID, "reason", string(reason))
+		logger.GlobalLogger.Debug("exec: no exit at the line", "cycle", r.cycle.ID, "reason", string(d.Reason))
 		return false
+	}
+	if m.pairing.ThinFirst && plan.Qty[m.pairing.Thin].IsPositive() {
+		m.sendThinExit(r, plan, in)
+		return true
 	}
 	m.sendExit(r, plan, in)
 	return true
@@ -394,7 +422,8 @@ func (m *ExecManager) exitAtLine(r *round) bool {
 // exitInput gathers the facts of one exit decision (PRD 9.7): while the
 // mean warms up again the last ready mean and sigma stand in, and while F is
 // stale its last valid value does; both are expressed under the current
-// anchors.
+// anchors. The two-stage exit and the thin leg first read the half target,
+// the number of built batches and CloseNet (SPEC 12.6, 12.7).
 func (m *ExecManager) exitInput(r *round) strategy.ExitInput {
 	c := r.cycle
 	stats := m.stats
@@ -402,7 +431,8 @@ func (m *ExecManager) exitInput(r *round) strategy.ExitInput {
 		stats = m.lastReady
 	}
 	in := strategy.ExitInput{Direction: c.Direction, Hold: c.Hold(), Books: r.books.ByLeg, Rules: r.rules, F: r.fx.Price.InexactFloat64(),
-		Anchors: m.anchors, PairAnchors: c.PairAnchors, Stats: stats}
+		Anchors: m.anchors, PairAnchors: c.PairAnchors, Stats: stats,
+		Pairing: m.pairing, Stage: m.stageOf(c), BuiltLots: builtLots(c), Value: m.closeValuer("")}
 	for _, leg := range cex.Legs {
 		in.DepthOK[leg] = r.books.DepthOK(leg, r.now)
 	}

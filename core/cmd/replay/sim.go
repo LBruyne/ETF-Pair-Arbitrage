@@ -356,7 +356,11 @@ func newSim(sc simConfig) (*sim, error) {
 		return nil, err
 	}
 	s.view = &replayCex{CexManager: s.cmgr, fxMaxAge: cfg.Cex.FXMaxAge, changed: make(chan struct{})}
-	if s.inv, err = inventory.NewManager(cfg.Inventory, pair, s.cmgr, inventory.WithClock(s.clock)); err != nil {
+	invOpts := []inventory.Option{inventory.WithClock(s.clock)}
+	if thin, ok := cfg.Exec.Thin(); ok {
+		invOpts = append(invOpts, inventory.WithThinLeg(thin)) // the quota leaves out the unpaired thin leg, as in the process
+	}
+	if s.inv, err = inventory.NewManager(cfg.Inventory, pair, s.cmgr, invOpts...); err != nil {
 		return nil, err
 	}
 	s.inv.UseStore(s.sink)

@@ -39,6 +39,13 @@ type process struct {
 // the first.
 func dbProcess(t *testing.T, now time.Time, ex *exchange) *process {
 	t.Helper()
+	return dbProcessWith(t, now, ex, rigOptions{})
+}
+
+// dbProcessWith is dbProcess with the rig's options (thin_leg, exit2,
+// pair_stop_d, latency); its exchange, store and recorder are set here.
+func dbProcessWith(t *testing.T, now time.Time, ex *exchange, opts rigOptions) *process {
+	t.Helper()
 	st, err := store.New(store.Config{}, store.RunID(fmt.Sprintf("test-%d", time.Now().UnixNano())), dbtest.DSN(t))
 	if err != nil {
 		t.Fatal(err)
@@ -48,7 +55,7 @@ func dbProcess(t *testing.T, now time.Time, ex *exchange) *process {
 	var once sync.Once
 	closeStore := func() { once.Do(func() { st.Close(); cancel() }) }
 	t.Cleanup(closeStore)
-	opts := rigOptions{exchange: ex, sink: st, perp: st}
+	opts.exchange, opts.sink, opts.perp = ex, st, st
 	if ex != nil {
 		calendar, _ := cex.NewCalendar(nil)
 		state, err := st.LoadState(ctx, calendar.SessionAt(now).ID)

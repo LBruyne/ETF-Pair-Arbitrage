@@ -360,12 +360,18 @@ func (s *Strategy) unwindOrder(in PairInput, open decimal.Decimal) (o *LegOrder,
 	return &LegOrder{Side: closing.Side(), Price: price, Qty: qty}, true
 }
 
-// end is the end state the batch's fills say (SPEC 12.4 table): built while
-// nothing of the thin leg was closed again (the unpaired rest is paired or
-// dust), built_partial when part was paired and the rest closed, and with
-// nothing paired unwound_profit or unwound_stop by whether an unwind ran.
-func (b PairBatch) end() PairEnd {
+// End is the end state the batch's fills say (SPEC 12.4 table): built while
+// part was paired and nothing of the thin leg was closed again (the unpaired
+// rest is dust), built_partial when part was paired and the rest closed, and
+// with nothing paired unwound_profit or unwound_stop by whether an unwind
+// ran. A batch that paired nothing and closed nothing holds only dust of the
+// thin leg: unwound_stop (the lead's override in 10.6 of 10.4 deviation 7).
+// exec reads it too when the stop or the forced exit takes a batch over: it
+// ends in the state its fills say at that moment.
+func (b PairBatch) End() PairEnd {
 	switch {
+	case b.neverPaired():
+		return PairEndUnwoundStop
 	case !b.ThinClosed.IsPositive():
 		return PairEndBuilt
 	case b.ThickQty.IsPositive():
@@ -384,9 +390,20 @@ func (a PairAction) wait(why Reason) PairAction {
 	return a
 }
 
+// done ends the batch in the state its fills say; a batch left with only
+// dust of a thin leg it never paired gives the reason too_small.
 func (a PairAction) done(b PairBatch) PairAction {
-	a.Kind, a.End = PairDone, b.end()
+	a.Kind, a.End = PairDone, b.End()
+	if b.neverPaired() {
+		a.Why = ReasonTooSmall
+	}
 	return a
+}
+
+// neverPaired reports whether the batch paired nothing and closed nothing:
+// all it holds is a thin leg too small to pair or to close.
+func (b PairBatch) neverPaired() bool {
+	return !b.ThickQty.IsPositive() && !b.ThinClosed.IsPositive()
 }
 
 func (a PairAction) order(kind PairKind, why Reason, leg cex.Leg, side cex.Side, price, qty, quotaAt decimal.Decimal) PairAction {

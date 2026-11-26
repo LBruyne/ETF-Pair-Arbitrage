@@ -66,7 +66,7 @@ func cycleRow(c *Cycle) store.CycleRow {
 // lotRow is the lot's row.
 func lotRow(l *Lot) store.LotRow {
 	bull, bear := l.Legs[cex.Bull], l.Legs[cex.Bear]
-	return store.LotRow{LotID: string(l.ID), CycleID: string(l.CycleID), Seq: l.Seq, Status: string(l.Status), VoidReason: l.VoidReason, Direction: string(l.Direction),
+	return store.LotRow{LotID: string(l.ID), CycleID: string(l.CycleID), Seq: l.Seq, Status: string(l.Status), VoidReason: l.VoidReason, EndState: string(l.End), Direction: string(l.Direction),
 		XD: l.X, MuD: l.Mu, SigmaD: l.Sigma, FeeD: l.FeeD, FeeUSDTEst: l.FeeUSDTEst,
 		EntryQtyBull: bull.EntryQty, EntryValueBull: bull.EntryValue, EntryFeeBull: bull.EntryFee, ExitQtyBull: bull.ExitQty, ExitValueBull: bull.ExitValue, ExitFeeBull: bull.ExitFee,
 		EntryQtyBear: bear.EntryQty, EntryValueBear: bear.EntryValue, EntryFeeBear: bear.EntryFee, ExitQtyBear: bear.ExitQty, ExitValueBear: bear.ExitValue, ExitFeeBear: bear.ExitFee,
@@ -82,7 +82,7 @@ func cycleFromRow(row store.CycleRow, lots []store.LotRow) *Cycle {
 		OpenedAt: time.UnixMilli(row.OpenedMs), EndReason: row.EndReason}
 	for _, r := range lots {
 		c.Lots = append(c.Lots, &Lot{ID: LotID(r.LotID), CycleID: CycleID(r.CycleID), Seq: r.Seq, Status: LotStatus(r.Status), VoidReason: r.VoidReason,
-			Direction: strategy.Direction(r.Direction),
+			End: LotEnd(r.EndState), Direction: strategy.Direction(r.Direction),
 			Legs: [2]LotLeg{
 				cex.Bull: {EntryQty: r.EntryQtyBull, EntryValue: r.EntryValueBull, EntryFee: r.EntryFeeBull, ExitQty: r.ExitQtyBull, ExitValue: r.ExitValueBull, ExitFee: r.ExitFeeBull},
 				cex.Bear: {EntryQty: r.EntryQtyBear, EntryValue: r.EntryValueBear, EntryFee: r.EntryFeeBear, ExitQty: r.ExitQtyBear, ExitValue: r.ExitValueBear, ExitFee: r.ExitFeeBear}},
