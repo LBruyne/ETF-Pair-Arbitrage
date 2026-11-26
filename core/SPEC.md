@@ -2663,6 +2663,24 @@ func (m *Manager) onPairTick(now time.Time) {
 
 - 没有待定事项。D1、D2 已由第 95 条定下，审计两次意见的处理都记在 12.0。
 
+**10.6 / 10.7 实现时的取舍**（提交 `2e27f77`、`43be9b2`；lead 认可）：
+1. **重启后的 x_ref**：补单当时的 x 不在订单记录里。重启前有补单成交过的批，重启后不再补，按停新仓处理，配平照常。
+2. **出场批中重启**：决策时价差、D1 和保护价不在订单记录里。所以重启后价差止损不生效；厚腿按保本界限等，最长等到 30 s 时窗再硬平。恢复的批不知道属于哪条线，之后厚腿的成交不计入 H。
+3. **重启后的 FirstFill** 取薄腿订单的 `final_ms`。实盘中它和执行循环用的是同一个本机时钟。
+4. **回吐的第一张单**要等薄腿上一张单满 200 ms（同一条腿的间隔），不在薄腿成交的那一拍发出。
+5. **配平期间均值重新预热**时，用最近一次就绪的统计（与 PRD 9.7 相同）。
+6. **出场时薄腿没有可发的量、厚腿有**：这一批按两腿一起出场，只发厚腿。
+7. **停止或强平接管一个一点没配上的批**：记 `unwound_stop`。这一轮的结束原因按现有的优先级记 one_leg。
+8. **额度**：发单之后盘口变好、厚腿的成交价比预留价更有利时，额度可能小额超出，这是 PRD 6.4 本来就允许的。
+9. **记录**：
+   - decision 新增 kind `pair`，action 取值：fill、wait、send_thick、send_thin、close_thin、unwind、risk_exit、done。
+   - 新增 kind `exit_pair`，action 取值：fill、wait、send_thick、hard_close、risk_exit、done。
+   - detail 记 x、x_ref、d_ideal、vwap_cap（P\*）、p_star、break_even（b\*）、expected_net、actual_net、bound 和 reason。
+   - 薄腿批的 `entry` 决策只带薄腿那一张单；厚腿配平单的 purpose 是 `complete`，回吐和盈利平是 `trim`。
+   - `trade.exit_stage` 的列：cycle_id、set_ms、built_lots、target_bull / bear、closed_bull / bear、done_ms。
+   - `trade.lot.end_state` 记五种结束状态。
+10. **一点没配上、只剩零头的批**：记 `unwound_stop`，原因为 too_small，零头照第 47 条记下。这一条推翻了 10.4 的 `built`。
+
 **10.1 写 PRD 4.0 时定下的实现细则**（写 PRD 的 agent 提出，lead 定）：
 1. **出场的理想平仓价差**：已平的厚腿按实际成交额计，剩下的按厚腿取价档的价（出场做多看买二、做空看卖二）配齐，再算本批价差。与入场的 `IdealSpread` 是同一个函数，只是取的盘口方向相反。
 2. **`thin_leg: ""` 又写了 exit2**（回放第 2 组）：两腿照现在的做法同时下单；exit1 的一半同样先做整轮利润判断和本批预核；exit2 照 PRD 9.2 会亏也平。
