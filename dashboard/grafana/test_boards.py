@@ -62,7 +62,7 @@ def substitute(q, sel, now_ms, end_ms=None):
     escaping of a single-value variable for an SQL data source); the range ending at end_ms (now_ms by default, moved ahead
     hours later by sel["ahead"]) and now() read as now_ms where the board takes now in milliseconds."""
     to_ms = (end_ms if end_ms is not None else now_ms) + sel.get("ahead", 0) * 3600_000
-    values = dict(dict(sigma_minutes="60"), **sel, __from=str(int(to_ms - sel["hours"] * 3600_000)), __to=str(int(to_ms)))
+    values = dict(dict(sigma_minutes="60", d_bps=""), **sel, __from=str(int(to_ms - sel["hours"] * 3600_000)), __to=str(int(to_ms)))
     q = q.replace(board.NOW_MS, "%d::bigint" % now_ms)
 
     def fill(m):
@@ -207,18 +207,27 @@ class Boards(unittest.TestCase):
         ids = [p["id"] for p in b["panels"]]
         self.assertEqual(len(ids), len(set(ids)))
         names = [v["name"] for v in b["templating"]["list"]]
-        self.assertEqual(names[:7], ["combo", "venue", "ma", "ma_minutes", "sigma_minutes", "d", "notional"])
+        self.assertEqual(names[:8], ["combo", "venue", "ma", "ma_minutes", "sigma_minutes", "d", "d_bps", "notional"])
         # A list's default is one of its options: Grafana replaces one that is not by the first option (3.5 opened on Entry 0.5σ).
         for v in b["templating"]["list"]:
             if v["type"] == "custom":
                 self.assertIn(v["current"]["value"], [o["value"] for o in v["options"]], v["name"])
-        self.assertEqual(next(v for v in b["templating"]["list"] if v["name"] == "d")["current"]["value"], "10")
+        # 3.6 (owner item 69): Entry picks 0.5σ to 3σ only, written so, default 2σ, nothing typed into it; a number of bps goes in
+        # the box Entry (bps), empty by default.
+        entry = next(v for v in b["templating"]["list"] if v["name"] == "d")
+        self.assertEqual(entry["current"]["value"], "2σ")
+        self.assertEqual([(o["text"], o["value"]) for o in entry["options"]],
+                         [(t.replace("σ", "\u200aσ"), t) for t in ("0.5σ", "1σ", "1.5σ", "2σ", "2.5σ", "3σ")])
+        self.assertFalse(entry["allowCustomValue"])
+        box = next(v for v in b["templating"]["list"] if v["name"] == "d_bps")
+        self.assertEqual((box["type"], box["label"], box["current"]["value"]), ("textbox", "Entry (bps)", ""))
+        self.assertEqual((b["refresh"], b["timepicker"]["refresh_intervals"][0]), ("1s", "1s"))
         for title, q in queries(b):
             # Every variable a query uses is one the board defines; the typed settings only as a whole quoted literal (the text
             # parsed in SQL, never pasted into it).
             for var in re.findall(r"\$\{?(\w+)", q):
                 self.assertIn(var, names + ["__from", "__to"], title)
-            for var in ("notional", "d", "ma_minutes", "sigma_minutes"):
+            for var in ("notional", "d", "d_bps", "ma_minutes", "sigma_minutes"):
                 self.assertEqual(len(re.findall(r"\$\{?%s\b" % var, q)), q.count("'$%s'" % var), (title, var))
         # No panel overlaps another on the grid.
         cells = set()
@@ -316,7 +325,7 @@ class Boards(unittest.TestCase):
         chart = by_title(b, "Deviation · Bps")
         props, names = props_of(chart), fields(b, chart)
         sigma_lines = [name for name, _ in board.DEVIATION_SIGMAS]
-        self.assertEqual([n for n in names if n != "time"][:18], ["Band Top", "Band Bottom"] + sigma_lines + [
+        self.assertEqual([n for n in names if n != "time"][:len(sigma_lines) + 8], ["Band Top", "Band Bottom"] + sigma_lines + [
             "Deviation", "Real Long Deviation", "Real Short Deviation", "+Entry", "−Entry", "Past T"])
         self.assertNotIn("sortBy", chart["options"]["legend"])
         for name, color, width in (("Deviation", boardkit.PURPLE, 2), ("Real Long Deviation", boardkit.BLUE, 1), ("Real Short Deviation", boardkit.ORANGE, 1),
@@ -341,7 +350,7 @@ class Boards(unittest.TestCase):
             self.assertNotIn("< r.mu_bps", q, name)
             self.assertNotIn("> r.mu_bps", q, name)
         self.assertEqual([name for name, _ in board.DEVIATION_CHART], SIGNED)
-        # 3.4 (owner item 61): the sigma lines ±1, 1.5, 2, 2.5, 3 σ (Mean ± k σ on the Spread chart, + k σ on Entry Points), columns
+        # 3.4 (owner item 61; 3.6, item 69: from 0.5σ) the sigma lines ±0.5 … 3 σ every 0.5 (Mean ± k σ on the Spread chart, + k σ on Entry Points), columns
         # of the Spread query since 3.5.1 (NULL where Sigma or the Mean is), grey, whole σ dashed and half σ dotted,
         # drawn before the data (behind it), in neither the legend nor the tooltip; Sigma itself a legend row without a line.
         for title, expected in (("Spread · Bps", [name for name, _ in board.SPREAD_SIGMAS]), ("Deviation · Bps", sigma_lines),
@@ -349,13 +358,15 @@ class Boards(unittest.TestCase):
             chart_s = by_title(b, title)
             props_s, names_s = props_of(chart_s), fields(b, chart_s)
             self.assertEqual([n for n in names_s if "σ" in n and "Step" not in n], expected, title)
-            self.assertEqual(len(expected), 10 if title != "Entry Points · Bps" else 5)
+            self.assertEqual(len(expected), 12 if title != "Entry Points · Bps" else 6)
             first_data = min(names_s.index(n) for n in ("Spread", "Deviation") if n in names_s)
             for name in expected:
                 k = float(name.split(" ")[-1].lstrip("+−").rstrip("σ"))
                 self.assertLess(names_s.index(name), first_data, name)
                 self.assertEqual(props_s[name]["custom.hideFrom"], {"legend": True, "tooltip": True, "viz": False}, name)
                 self.assertEqual(props_s[name]["custom.lineStyle"]["dash"], [6, 4] if k == int(k) else [2, 3], name)
+                # told apart (3.6): fainter the nearer the mean, a half fainter than the whole multiples around it
+                self.assertEqual(props_s[name]["color"]["fixedColor"], boardkit.GREY + "%02X" % board.sigma_alpha(k), name)
                 self.assertIn(name, dict(board.SIGMA_COLUMNS), name)
             if "Sigma" in props_s and title != "Entry Points · Bps":
                 self.assertEqual((props_s["Sigma"]["custom.lineWidth"], props_s["Sigma"]["custom.axisPlacement"]), (0, "hidden"))
@@ -519,8 +530,15 @@ class Boards(unittest.TestCase):
                    "0.0": "", "-5": "", "+5": "", "1'; SELECT 1; --": "", "10%": "", "1e1": "", ".5": "", "5.": "", "10 bp": ""}
         scales = {"60": "60", "30min": "30", "30 m": "30", "３０": "30", "030": "30", "999999": "999999", "abc": "", "": "", "0": "", "30.5": "",
                   "-30": "", "1234567": "", "30h": "", "30 minutes": "", "1'; SELECT 1; --": ""}
-        got = {t: psql("SELECT coalesce((%s)::text, '')" % typed(board.ENTRY, "d", t), "-At").strip() for t in entries}
+        # 3.6: typed into the box Entry (bps), which wins over Entry's sigma; with the box empty a bare number in d (a link of
+        # 3.5 or before) is bps, a multiple of sigma there is k (ENTRY_K), none while the box holds anything.
+        got = {t: psql("SELECT coalesce((%s)::text, '')" % typed(typed(board.ENTRY, "d_bps", t), "d", "2σ"), "-At").strip() for t in entries}
         self.assertEqual(got, entries)
+        got = {t: psql("SELECT coalesce((%s)::text, '')" % typed(typed(board.ENTRY, "d_bps", ""), "d", t), "-At").strip() for t in entries}
+        self.assertEqual(got, entries)
+        ks = {("", "2σ"): "2", ("", "0.5σ"): "0.5", ("", "2sigma"): "2", ("", "10"): "", ("10", "2σ"): "", ("abc", "2σ"): "", ("", "abc"): ""}
+        got = {(box, d): psql("SELECT coalesce((%s)::text, '')" % typed(typed(board.ENTRY_K, "d_bps", box), "d", d), "-At").strip() for box, d in ks}
+        self.assertEqual(got, ks)
         got = {t: psql("SELECT coalesce((%s)::text, '')" % typed(board.MEAN_SCALE, "ma_minutes", t), "-At").strip() for t in scales}
         self.assertEqual(got, scales)
         # Sigma Scale (3.4) reads as Mean Scale.
@@ -560,6 +578,12 @@ class Boards(unittest.TestCase):
                           [("sigma_minutes", v) for v in ("60", "60min", "abc", "", "0", "30.5")]:
             runs[key, value] = run_all(dict(base, **{key: value}))
         ok, codes = runs["d", "10"], {v: k for k, v in board.SIGNALS.items()}
+        # 3.6: the box Entry (bps) gives the same as that number in d, and wins over a sigma picked in Entry; anything else in
+        # it gives No Entry, as anything else in d did.
+        self.assertEqual(run_all(dict(base, d="2σ", d_bps="10")), ok)
+        self.assertEqual(run_all(dict(base, d="2σ", d_bps="10bps")), ok)
+        self.assertEqual(run_all(dict(base, d="2σ", d_bps="abc")), runs["d", "abc"])
+        self.assertEqual(run_all(dict(base, d="2σ", d_bps="1'; SELECT 1; --")), runs["d", "abc"])
         spread, last, fees = "Spread · Bps", "Prices · Latest Second", "Fee Levels · ${venue:text} · Bps"
         entry_columns = ("Mean + Entry", "Mean − Entry", "+Entry", "−Entry")
         self.assertEqual(runs["d", "10bps"], ok)

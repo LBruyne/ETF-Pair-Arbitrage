@@ -47,17 +47,28 @@ def typed(var):
     return "regexp_replace(lower(normalize('$%s', NFKC)), '[[:space:]_]', '', 'g')" % var
 
 
-# Entry d in bps, as typed: a number without a sign, a decimal part allowed, bps after it allowed (10, 7.5, 10bps, １０);
-# NULL for anything else and for 0, for which the Signal reads No Entry and Mean ± Entry and +Entry are not drawn.
-ENTRY = "(SELECT CASE WHEN m[1]::numeric > 0 THEN m[1]::numeric END FROM regexp_match(%s, '^([0-9]+(?:[.][0-9]+)?)(?:bps)?$') m)" % typed("d")
+def bps_of(text):
+    """A number of bps as typed: a number without a sign, a decimal part allowed, bps after it allowed (10, 7.5, 10bps, １０);
+    NULL for anything else and for 0."""
+    return "(SELECT CASE WHEN m[1]::numeric > 0 THEN m[1]::numeric END FROM regexp_match(%s, '^([0-9]+(?:[.][0-9]+)?)(?:bps)?$') m)" % text
+
+
+# Entry (3.6, owner item 69: "entry 的选项用 1.5σ 这样的写法，10不需要作为选项。输入数字固定代表bps"): two controls, since Grafana's
+# picker cannot hold both (its Enter takes the first option whose text contains what is typed, so a typed 2 would pick 2σ:
+# dashboard/SPEC.md 5.1). Entry (d) picks a multiple of sigma, 0.5σ to 3σ; Entry (bps) (d_bps) is a box for a number of bps
+# that, when not empty, is the Entry whatever Entry picks. Entry d in bps: the box's number (NULL when it holds anything
+# else, for which the Signal reads No Entry and Mean ± Entry and +Entry are not drawn); with the box empty, a bare number in
+# d (a link of 3.5 or before, var-d=7.5) is bps too.
+BOX = typed("d_bps")
+ENTRY = "(CASE WHEN %s <> '' THEN %s ELSE %s END)" % (BOX, bps_of(BOX), bps_of(typed("d")))
 # Mean Scale n, the mean's minutes, as typed: a whole number of at most six digits, min or m after it allowed (60, 60min,
 # 60m); NULL for anything else and for 0, for which the board has no mean (No Mean).
 MEAN_SCALE = "(SELECT CASE WHEN m[1]::integer > 0 THEN m[1]::integer END FROM regexp_match(%s, '^([0-9]{1,6})(?:min|m)?$') m)" % typed("ma_minutes")
+# Entry as a multiple k of sigma (3.5, owner item 64): with the box empty, Entry's 0.5σ to 3σ (also 2sigma); the Entry of each
+# point is then k × that point's sigma (the Sigma Scale's, per minute as the sigma lines), none where sigma is not ready.
+ENTRY_K = ("(CASE WHEN %s = '' THEN (SELECT CASE WHEN m[1]::numeric > 0 THEN m[1]::numeric END "
+           "FROM regexp_match(%s, '^([0-9]+(?:[.][0-9]+)?)(?:σ|sigma)$') m) END)" % (BOX, typed("d")))
 # Entry and Mean Scale as the titles show them, whatever was typed (10bps, 30min): the value in use, ? when there is none.
-# Entry as a multiple k of sigma (3.5, owner item 64): a positive number with σ or sigma after it (2σ, 0.5σ, 2sigma); the Entry
-# of each point is then k × that point's sigma (the Sigma Scale's, per minute as the sigma lines), none where sigma is not
-# ready. NULL for anything else, when Entry (bps) above reads the typed text.
-ENTRY_K = "(SELECT CASE WHEN m[1]::numeric > 0 THEN m[1]::numeric END FROM regexp_match(%s, '^([0-9]+(?:[.][0-9]+)?)(?:σ|sigma)$') m)" % typed("d")
 D_TEXT = ("SELECT coalesce(rtrim(rtrim(to_char(%s, 'FM999,999,990.999999'), '0'), '.') || ' bps', "
           "rtrim(rtrim(to_char(%s, 'FM999,990.999999'), '0'), '.') || 'σ', '?')" % (ENTRY, ENTRY_K))
 MA_TEXT = "SELECT coalesce((%s)::text, '?')" % MEAN_SCALE
@@ -67,8 +78,9 @@ SIGMA_TEXT = "SELECT coalesce((%s)::text, '?')" % SIGMA_SCALE
 # The typed settings, read once per query (one row v): N, Entry, Mean Scale and Sigma Scale; every figure of a query takes them
 # from it.
 SETTINGS = "(SELECT %s AS n, %s AS d, %s AS k, %s AS ma_n, %s AS sig_n) v" % (NOTIONAL, ENTRY, ENTRY_K, MEAN_SCALE, SIGMA_SCALE)
-# The sigma multiples drawn around the Mean (Spread chart) and zero (Deviation chart, + only on Entry Points), owner item 61.
-SIGMAS = (1, 1.5, 2, 2.5, 3)
+# The sigma multiples drawn around the Mean (Spread chart) and zero (Deviation chart, + only on Entry Points), owner item 61;
+# 0.5σ since 3.6 (item 69: "0.5-3sigma，每隔0.5一根，可以区分一下").
+SIGMAS = (0.5, 1, 1.5, 2, 2.5, 3)
 # The end of the range, or now when the range runs into the future.
 END_MS = "least($__to, (extract(epoch FROM now()) * 1000)::bigint)"
 NOW_MS = "(extract(epoch FROM now()) * 1000)::bigint"
@@ -568,12 +580,19 @@ DEVIATION_FIELDS = ["time", "Signed Deviation", "Signed Real Long Deviation", "S
 DEVIATION_BAND = [copy_field("+Entry", "Band Top"), copy_field("−Entry", "Band Bottom")]
 
 
-# The sigma lines (owner item 61) are drawn behind the data, grey and thin, whole multiples dashed and halves dotted, none in the
-# legend (its Sigma row gives σ itself) nor the tooltip.
+# The sigma lines (owner item 61; 3.6, item 69: every 0.5 from 0.5σ to 3σ, told apart) are drawn behind the data, grey and 1 px,
+# whole multiples dashed and halves dotted (counting out from the mean: dotted 0.5, dashed 1, dotted 1.5, ...), fainter the
+# nearer the mean, where they crowd the data: opacity 0.35 + 0.13 k (0.5σ 42 %, 1σ 48 %, 1.5σ 55 %, 2σ 61 %, 2.5σ 68 %, 3σ 74 %;
+# round 3: the first try, halves at four fifths of their neighbours, was not monotonic and 0.5σ at 30 % vanished on the light
+# theme); none in the legend (its Sigma row gives σ itself) nor the tooltip.
+def sigma_alpha(k):
+    return round(255 * (0.35 + 0.13 * k))
+
+
 def sigma_line(name, legend=False):
     k = float(name.split(" ")[-1].lstrip("+−±").rstrip("σ"))
     whole = k == int(k)
-    return series(name, GREY + ("C0" if whole else "90"), width=1, dash=[6, 4] if whole else [2, 3], legend=legend, tooltip=False)
+    return series(name, GREY + "%02X" % sigma_alpha(k), width=1, dash=[6, 4] if whole else [2, 3], legend=legend, tooltip=False)
 
 
 DEVIATION_ORDER = (DEVIATION_FIELDS[:1] + ["Band Top", "Band Bottom"] + [name for name, _ in DEVIATION_SIGMAS] + DEVIATION_FIELDS[1:7] +
@@ -603,17 +622,24 @@ def price_fields(name):
     return [keep_fields(["time"] + columns), organize(["time"] + columns, rename={c: c[len(name) + 1:] for c in columns})]
 
 
-# Entry's options (3.5, owner item 64): multiples of sigma; a typed number is bps. The halves are written ½ in the picker (their
-# values, the URL and the titles keep 0.5σ, 1.5σ, 2.5σ): Enter picks the first option whose text contains what is typed, so a
-# typed 5, 0.5, 1.5 or 2.5 would otherwise pick a sigma option instead of bps; only 1, 2 and 3 still do. The default, 10 bps, is
-# an option too: Grafana replaces a default that is not one by the first option (3.5 opened on 0.5σ; 3.5.1).
-ENTRY_OPTIONS = [("10 bps", "10")] + [(t, v + "σ") for t, v in (("½σ", "0.5"), ("1σ", "1"), ("1½σ", "1.5"), ("2σ", "2"), ("2½σ", "2.5"),
-                                                                ("3σ", "3"))]
+# Entry's options (3.6, owner item 69): the multiples of sigma, written 0.5σ to 3σ (3.5 wrote the halves ½σ and had 10 bps
+# first); no custom value, so typing in it only finds an option: a number of bps goes in Entry (bps). A hair space (U+200A,
+# 1.3 px in Grafana's Inter) stands between the number and σ in the shown text only (the values, the URL and the titles read
+# 2σ): Grafana ranks the options a typed text finds (uFuzzy) and Enter takes the first; with it a typed 2 finds 2σ first, without
+# it 2.5σ (round 1, picker.txt). The default 2σ (the trading program's d_in) is an option: Grafana replaces a default that is
+# not one by the first option.
+ENTRY_OPTIONS = [("%g\u200aσ" % k, "%gσ" % k) for k in SIGMAS]
 # The Notional's options, fixed sizes from 100 U (item 61) to 100k: written in k from 1,000 on, so that a typed amount (Grafana
 # picks the first option whose text contains what is typed, on Enter) never picks one unless it is 1 to 99.
 NOTIONAL_OPTIONS = [("100", "100"), ("500", "500")] + [("%dk" % (v // 1000), str(v)) for v in (1000, 5000, 10000, 50000, 100000)]
 # A leg's pricing levels (etfpair.pricing_levels of its tick), for the names of its depths.
 LEVELS = "SELECT etfpair.pricing_levels(%s_tick) FROM etfpair.combo_market WHERE combo_id = '$combo' AND venue = '$venue'"
+
+
+# The page's refresh (3.6, owner item 69: "Last second 数据默认每1s刷新一次，图表可以每10s/30s一次"): Grafana refreshes a whole
+# board at one interval, every query in view at each tick; 1 s by default, the shared Grafana's min_refresh_interval (dashboard/SPEC.md 5.4).
+REFRESH = "1s"
+REFRESH_INTERVALS = ["1s", "5s", "10s", "30s", "1m", "5m"]
 
 
 def build():
@@ -629,11 +655,12 @@ def build():
         textbox_var("sigma_minutes", "Sigma Scale (min)", "60", "Minutes sigma covers: the population standard deviation of the "
                     "minute bars' spread over that many minutes, a whole number from 1 to 999,999 (60, 60min); it restarts with the mean · "
                     "anything else: no sigma lines, Sigma reads No Sigma."),
-        custom_var("d", "Entry", ENTRY_OPTIONS, "10",
-                   "Long: Real Long Spread ≤ Mean − Entry · Short: Real Short Spread ≥ Mean + Entry · pick 10 bps or a multiple of sigma (½σ to 3σ: "
-                   "each point's Entry is k × its sigma, the Sigma Scale's, as the sigma lines; none until sigma is ready: No Sigma) or type a "
-                   "number of bps and press Enter (10, 7.5, 10bps) · Enter picks the first option whose text contains what is typed, so 1, 2 "
-                   "and 3 need bps after them (2bps) · anything else: No Entry, no Entry lines.", allow_custom=True),
+        custom_var("d", "Entry", ENTRY_OPTIONS, "2σ",
+                   "Long: Real Long Spread ≤ Mean − Entry · Short: Real Short Spread ≥ Mean + Entry · a multiple of sigma, 0.5σ to 3σ: "
+                   "each point's Entry is k × its sigma (the Sigma Scale's, as the sigma lines; none until sigma is ready: No Sigma) · "
+                   "a number typed in Entry (bps) is the Entry instead while that box is not empty · the titles show the Entry in use."),
+        textbox_var("d_bps", "Entry (bps)", "", "A number typed here is the Entry in bps (10, 7.5, 10bps) and Entry's sigma is not "
+                    "used; empty it (and press Enter) to go back to Entry's sigma · anything else: No Entry, no Entry lines."),
         custom_var("notional", "Notional (USDT)", NOTIONAL_OPTIONS, "10000",
                    "N, both legs together: the Real spreads and the Signal fill N through both legs' pricing levels (2 at a 0.01 tick, 5 "
                    "at 0.001), on their totals where they hold less (Partial) · pick one or type any amount and press Enter: 2000, "
@@ -696,10 +723,10 @@ def build():
         ("Real Short Deviation", "|Real Short Spread − Mean| while Real Short Spread is above the Mean, the side a Short fills on · "
          "Other Side: at or below the Mean · Real Short Spread: selling both legs for N through their pricing levels' bids (open "
          "Short, close Long).", dict(bps2, **why)),
-        ("Long Fill", "USDT of N the asks of both legs' pricing levels fill (${bull} 1–${bull_levels}, ${bear} 1–${bear_levels}), the "
+        ("Long Fill", "USDT (of N) the asks of both legs' pricing levels fill (${bull} 1–${bull_levels}, ${bear} 1–${bear_levels}), the "
          "quantities making q·A equal on both legs · Full: all of N · less where those levels hold less (Partial): the real spread is "
-         "then on their totals, as Book · Latest Second shows them.", dict(usdt, mappings=[NO_FIGURE, FILLED])),
-        ("Short Fill", "The same on the pricing levels' bids.", dict(usdt, mappings=[NO_FIGURE, FILLED])),
+         "then on their totals, as Book · Latest Second shows them.", dict(usdt, mappings=[NO_FIGURE, FILLED], displayName="Long Fill · USDT")),
+        ("Short Fill", "USDT (of N) the same on the pricing levels' bids.", dict(usdt, mappings=[NO_FIGURE, FILLED], displayName="Short Fill · USDT")),
         ("Signal", "Long: Real Long Spread ≤ Mean − Entry · Short: Real Short Spread ≥ Mean + Entry · Partial: that side filled less "
          "than N (its pricing levels hold less) · None: inside · No Anchor: not ready · No Mean: not ready, or Mean Scale is not a whole number of minutes from 1 to 999,999 · No Book: "
          "not on both legs' books (trade prices, as before the recorder) · No Notional: the typed notional is not a positive number "
@@ -780,9 +807,9 @@ def build():
         "Spread = 10⁴ × (F·P_bull ÷ A_bull + F·P_bear ÷ A_bear − 2) · P: both legs' mid prices, else both last trades · Real Long, Real "
         "Short Spread: the same on the average prices of buying, selling both legs for the notional N through their pricing levels' "
         "asks, bids · σ: the population standard deviation of the minute bars' spread over the Sigma Scale · Long: Real Long Spread ≤ "
-        "Mean − Entry · Short: Real Short Spread ≥ Mean + Entry · Entry: the bps typed, or k × σ (0.5σ … 3σ) at each point\n\n"
+        "Mean − Entry · Short: Real Short Spread ≥ Mean + Entry · Entry: the bps typed in Entry (bps), else k × σ (Entry's 0.5σ … 3σ) at each point\n\n"
         "Drawn: Spread, Mean, the band Mean ± Entry (teal, dashed; not drawn when Entry is not a positive number: the Signal reads No "
-        "Entry) and Mean ± 1, 1.5, 2, 2.5, 3 σ (grey: whole σ dashed, half σ dotted; none until sigma is ready); the drawn Spread "
+        "Entry) and Mean ± 0.5, 1, 1.5, 2, 2.5, 3 σ (grey, every 0.5 σ, fainter nearer the Mean: whole σ dashed, half σ dotted, so out from the Mean dotted 0.5, dashed 1, dotted 1.5, dashed 2 ...; none until sigma is ready); the drawn Spread "
         "crossing a line is not a signal (see Deviation · Bps and Entry Points · Bps) · legend Sigma: σ's last, lowest and highest · "
         "tooltip, in this order: Spread, Real Long Spread, Real Short Spread, Mean, Sigma, Deviation, Real Long Deviation, Real Short "
         "Deviation, Signal, each leg's bid and ask depth of its pricing levels in ct (contracts) and USDT; each row is that second's "
@@ -826,12 +853,12 @@ def build():
                            transformations=[keep_fields(DEVIATION_FIELDS + [name for name, _ in DEVIATION_SIGMAS])] + DEVIATION_BAND +
                            [organize(DEVIATION_ORDER, rename=DEVIATION_NAMES)], description=(
         "Deviation = Spread − Mean · Real Long / Short Deviation = Real Long / Short Spread − Mean · Long: Real Long Deviation ≤ −Entry "
-        "· Short: Real Short Deviation ≥ +Entry · ±k σ: k times sigma, k = 1, 1.5, 2, 2.5, 3\n\n"
+        "· Short: Real Short Deviation ≥ +Entry · ±k σ: k times sigma, k = 0.5, 1, 1.5, 2, 2.5, 3\n\n"
         "The Spread chart with its Mean at zero, with signs · purple: Deviation on the mids (trades where there is no book; the only line "
         "before the recorder) · blue: Real Long Deviation, buying both legs for N through their pricing levels' asks, never below purple "
         "· orange: Real Short Deviation, selling through the bids, never above it · a Long needs blue at or under −Entry (blue dashed), a "
         "Short orange at or over +Entry (orange dashed), Partial included; blue over +Entry or orange under −Entry is no signal · grey: "
-        "±1, 1.5, 2, 2.5, 3 σ (whole σ dashed, half σ dotted), the trading program's lines are d_in·σ: where blue reaches −2σ, x ≤ "
+        "±0.5, 1, 1.5, 2, 2.5, 3 σ (whole σ dashed, half σ dotted, fainter nearer zero), the trading program's lines are d_in·σ: where blue reaches −2σ, x ≤ "
         "−2σ · legend Min of blue, Max of orange: how far each side came toward or past its Entry (Entry Points' Best); Sigma: σ's last, "
         "lowest and highest, k σ is k times it · tooltip: each second's value or why it has none, σ, and the Signal · Past T (amber): no signal until the "
         "dividend's amount is known · no band with No Entry, no σ lines with No Sigma · absolute values and signal dots: Entry Points · Bps."))
@@ -871,7 +898,7 @@ def build():
         "All three are absolute (with their signs: Deviation · Bps); each real line is bright on the side of the Mean its real spread can fill on and faded on the other: "
         "Real Long Deviation (blue) bright while Real Long Spread is below the Mean, Real Short Deviation (orange) bright while Real "
         "Short Spread is above it, so a bright line above Entry (teal dashed) is a signal of its side and a faded one is none (Signal · "
-        "Latest Second shows a faded side as Other Side) · grey: 1, 1.5, 2, 2.5, 3 σ (whole σ dashed, half σ dotted) · Long Points, "
+        "Latest Second shows a faded side as Other Side) · grey: 0.5, 1, 1.5, 2, 2.5, 3 σ (whole σ dashed, half σ dotted, fainter nearer zero) · Long Points, "
         "Short Points: a dot on the blue, orange line at each drawn second whose Signal is Long, Short (Partial included), counted in "
         "the legend · Real Long, Real Short Deviation: buying, selling both legs for the notional through their pricing levels, the "
         "Signal's spreads; none without both legs' books · Deviation (grey): on the basis prices, the only line before the recorder · "
@@ -987,7 +1014,7 @@ def build():
             "annotations": {"list": [bands(name, phase_marks(name), color) for name, color in PHASES.items()] +
                                     [marks("Corporate Actions", Q_MARKS, PURPLE, [spread["id"]]),
                                      marks("Anchor Changes", Q_ANCHOR_CHANGES, PURPLE, [p["id"] for p in panels if p["type"] == "timeseries"])]},
-            "links": [reset_link("combo-spread", templating, "now-6h", "30s", keep=("combo", "venue"),
+            "links": [reset_link("combo-spread", templating, "now-6h", REFRESH, keep=("combo", "venue"),
                                  tooltip="Settings, time range and refresh back to defaults; Combo and CEX stay.")],
-            "time": {"from": "now-6h", "to": "now"}, "refresh": "30s", "timepicker": {"refresh_intervals": ["10s", "30s", "1m", "5m"]}, "tags": [],
+            "time": {"from": "now-6h", "to": "now"}, "refresh": REFRESH, "timepicker": {"refresh_intervals": REFRESH_INTERVALS}, "tags": [],
             "description": "Basket spread of a bull and a bear ETF perp on one exchange, against its moving mean and the entry band, session by session."}
