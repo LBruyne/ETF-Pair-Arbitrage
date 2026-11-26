@@ -124,7 +124,7 @@ func TestScriptedSession(t *testing.T) {
 	}
 	eqDec(t, "lot 1 entry value bull", l1.EntryValueBull, "4259.385")
 	eqDec(t, "lot 1 entry value bear", l1.EntryValueBear, "4172.0292")
-	eqDec(t, "lot 1 entry fee bear", l1.EntryFeeBear, "0.271181898")
+	eqDec(t, "lot 1 entry fee bear", l1.EntryFeeBear, "0.27118189") // paper fees are cut to 8 decimals per fill
 	r.quotaLeft("11568.5858")
 
 	// 05:03:10: SOXS's pricing level moves to 59.423, x = 13.8333 - 3.3333
@@ -199,8 +199,8 @@ func TestScriptedSession(t *testing.T) {
 		t.Errorf("lot 1 status %s, want closed", l1.Status)
 	}
 	eqDec(t, "lot 1 gross", l1.Gross, "11.6262")
-	eqDec(t, "lot 1 fees", l1.Fees, "1.095328153")
-	eqDec(t, "lot 1 net", l1.Net, "10.530871847")
+	eqDec(t, "lot 1 fees", l1.Fees, "1.09532814")
+	eqDec(t, "lot 1 net", l1.Net, "10.53087186")
 	l2 = r.lastLot(lot2)
 	eqDec(t, "lot 2 gross so far", l2.Gross, "8.30675")
 	eqDec(t, "lot 2 fees so far", l2.Fees, "0.46518749")
@@ -274,8 +274,8 @@ func TestScriptedSession(t *testing.T) {
 		t.Errorf("cycle %s %s %s, want %s closed close_window", c.CycleID, c.Status, c.EndReason, cycleID)
 	}
 	eqDec(t, "cycle gross", c.Gross, "24.7142")
-	eqDec(t, "cycle fees", c.Fees, "1.719614923")
-	eqDec(t, "cycle net", c.Net, "22.994585077")
+	eqDec(t, "cycle fees", c.Fees, "1.71961491")
+	eqDec(t, "cycle net", c.Net, "22.99458509")
 	r.quotaLeft("20000")
 	if total, _, _ := r.inv.Quota(); !total.Equal(dec("20000")) {
 		t.Errorf("quota total %s, want 20000 (a profit does not raise it)", total)

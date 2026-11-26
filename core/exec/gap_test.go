@@ -142,7 +142,7 @@ func TestAppendixExample3(t *testing.T) {
 			t.Errorf("lot %s, SOXL closed %s; want open with 15.30 trimmed", l.Status, l.ExitQtyBull)
 		}
 		eqDec(t, "trimmed gross", l.Gross, "-0.459")
-		eqDec(t, "trimmed fees", l.Fees, "0.080464995")
+		eqDec(t, "trimmed fees", l.Fees, "0.08046499") // paper fees are cut to 8 decimals per fill
 		if _, hold := r.inv.Holdings(); !hold[cex.Bull].Equal(dec("90")) || !hold[cex.Bear].Equal(dec("60")) {
 			t.Errorf("held %v, want 90 / 60", hold)
 		}

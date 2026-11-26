@@ -78,19 +78,46 @@ type ExecManager struct {
 	// owned by Run: the record of each step
 	idleReason             strategy.Reason // why this step sent nothing; empty when it sent an order
 	nextSample, nextStatus time.Time
+
+	// owned by Advance: Run's waiting, for a driver that owns the clock
+	driven drivenWait
 }
+
+// drivenWait is what Run's select waits on, kept between two Advance calls:
+// the channels taken before the last round and the next tick.
+type drivenWait struct {
+	started                           bool
+	books, orders, account, reference <-chan struct{}
+	nextTick                          time.Time
+}
+
+// maxDrivenRounds bounds the rounds one Advance call runs back to back
+// while each round's publications wake the next; the next call goes on.
+const maxDrivenRounds = 16
+
+// Option changes how a manager runs. The process passes none.
+type Option func(*ExecManager)
+
+// WithClock makes the loop read the time from c instead of the wall clock:
+// a replay's virtual clock (cmd/replay), with Start and Advance in place of
+// Run.
+func WithClock(c cex.Clock) Option { return func(m *ExecManager) { m.timing.clock = c.Now } }
 
 // NewManager validates cfg and builds the manager on the three components it
 // drives. signals is the channel main registered for the process signals
 // before anything else started: it is buffered, so a signal that arrived
 // during start-up is still in it and is handled when Run begins. Signals do
 // not cancel Run's context: the loop decides when the process may exit.
-func NewManager(cfg Config, c cexSource, inv *inventory.InventoryManager, strat *strategy.Strategy, signals <-chan os.Signal) (*ExecManager, error) {
+func NewManager(cfg Config, c cexSource, inv *inventory.InventoryManager, strat *strategy.Strategy, signals <-chan os.Signal, opts ...Option) (*ExecManager, error) {
 	if err := cfg.Validate(); err != nil {
 		return nil, err
 	}
-	return &ExecManager{cfg: cfg, cex: c, inv: inv, strat: strat, scfg: strat.Config(), leverage: inv.Leverage(), timing: defaultTimings, signals: signals,
-		unknown: map[cex.ClientOrderID]*unknownOrder{}}, nil
+	m := &ExecManager{cfg: cfg, cex: c, inv: inv, strat: strat, scfg: strat.Config(), leverage: inv.Leverage(), timing: defaultTimings, signals: signals,
+		unknown: map[cex.ClientOrderID]*unknownOrder{}}
+	for _, opt := range opts {
+		opt(m)
+	}
+	return m, nil
 }
 
 // Run runs the loop until the process may exit and returns nil, or until
@@ -101,26 +128,10 @@ func NewManager(cfg Config, c cexSource, inv *inventory.InventoryManager, strat 
 // held and lets the process leave once it is flat with no order unresolved;
 // a signal received before Run started counts like one received now.
 func (m *ExecManager) Run(ctx context.Context) error {
-	log := logger.GlobalLogger
-	m.ctx = ctx
-	now := m.timing.clock()
-	m.start(now)
-	// Signals that came during start-up count before the first decision.
-	for drained := false; !drained; {
-		select {
-		case sig := <-m.signals:
-			m.onSignal(sig, now)
-		default:
-			drained = true
-		}
-	}
-	if leave, err := m.recover(ctx); err != nil || leave {
+	if leave, err := m.Start(ctx); err != nil || leave {
 		return err
 	}
-	log.Info("exec: running", "live", m.cfg.Live, "mean_model", m.scfg.MeanModel, "mean_minutes", m.scfg.MeanMinutes, "sigma_minutes", m.scfg.SigmaMinutes,
-		"d_in", m.scfg.DIn, "d_out", m.scfg.DOut, "taker_fee_bps", m.scfg.TakerFeeBps, "leverage", m.leverage,
-		"session", m.session.ID, "regular_open", showTime(m.session.RegularOpen), "session_end", showTime(m.session.End))
-	defer log.Info("exec: stopped")
+	defer logger.GlobalLogger.Info("exec: stopped")
 	tick := time.NewTicker(m.timing.step)
 	defer tick.Stop()
 	for {
@@ -142,6 +153,75 @@ func (m *ExecManager) Run(ctx context.Context) error {
 		case <-tick.C:
 		}
 	}
+}
+
+// Start is what Run does before its loop: the first round's state, the
+// signals that came during start-up, and the recovery (PRD 13.4). leave is
+// true when the process may exit already (a takeover or a stop during the
+// recovery). Run calls it; a driver that owns the clock (cmd/replay) calls
+// it and then Advance, in place of Run.
+func (m *ExecManager) Start(ctx context.Context) (leave bool, err error) {
+	m.ctx = ctx
+	now := m.timing.clock()
+	m.start(now)
+	m.driven.nextTick = now.Add(m.timing.step)
+	// Signals that came during start-up count before the first decision.
+	for drained := false; !drained; {
+		select {
+		case sig := <-m.signals:
+			m.onSignal(sig, now)
+		default:
+			drained = true
+		}
+	}
+	if leave, err := m.recover(ctx); err != nil || leave {
+		return leave, err
+	}
+	logger.GlobalLogger.Info("exec: running", "live", m.cfg.Live, "mean_model", m.scfg.MeanModel, "mean_minutes", m.scfg.MeanMinutes, "sigma_minutes", m.scfg.SigmaMinutes,
+		"d_in", m.scfg.DIn, "d_out", m.scfg.DOut, "taker_fee_bps", m.scfg.TakerFeeBps, "leverage", m.leverage,
+		"session", m.session.ID, "regular_open", showTime(m.session.RegularOpen), "session_end", showTime(m.session.End))
+	return false, nil
+}
+
+// Advance is Run's loop for a driver that owns the clock (cmd/replay),
+// after Start: the driver calls it at each moment it delivered something
+// and at each NextTick. A round runs at now when Run's would: at the first
+// call, when a publication of the books, the orders, the account or the
+// reference data closed a channel taken before the last round, or at a tick
+// of the step interval, counted from Start on the manager's clock (a call
+// past several ticks runs one round, as a ticker drops the ticks a busy
+// loop missed). A round whose own publications close those channels is
+// followed at once by another, as in Run. Signals are not read. It reports
+// whether the process may exit.
+func (m *ExecManager) Advance(now time.Time) (done bool) {
+	d := &m.driven
+	due := !d.started || !now.Before(d.nextTick)
+	for !now.Before(d.nextTick) {
+		d.nextTick = d.nextTick.Add(m.timing.step)
+	}
+	for rounds := 0; rounds < maxDrivenRounds && (due || closedAny(d.books, d.orders, d.account, d.reference)); rounds++ {
+		due, d.started = false, true
+		d.books, d.account, d.reference, d.orders = m.cex.BookChanged(), m.cex.AccountChanged(), m.cex.ReferenceChanged(), m.cex.OrdersChanged()
+		if m.step(now) {
+			return true
+		}
+	}
+	return false
+}
+
+// NextTick is when Advance's next tick is due.
+func (m *ExecManager) NextTick() time.Time { return m.driven.nextTick }
+
+// closedAny reports whether one of the channels is closed.
+func closedAny(chans ...<-chan struct{}) bool {
+	for _, c := range chans {
+		select {
+		case <-c:
+			return true
+		default:
+		}
+	}
+	return false
 }
 
 // start sets the loop's state at the first round: the Session, the open

@@ -280,10 +280,10 @@ func TestExitAtTheLineAtALoss(t *testing.T) {
 		t.Fatalf("cycle %s %s, want closed exit_line", c.Status, c.EndReason)
 	}
 	eqDec(t, "gross", c.Gross, "-9.8752")
-	eqDec(t, "fees", c.Fees, "1.096725734")
-	eqDec(t, "net", c.Net, "-10.971925734")
-	if total, _, _ := r.inv.Quota(); !total.Equal(dec("8390.28074266")) {
-		t.Errorf("quota total %s, want 8390.28074266", total)
+	eqDec(t, "fees", c.Fees, "1.09672572") // paper fees are cut to 8 decimals per fill
+	eqDec(t, "net", c.Net, "-10.97192572")
+	if total, _, _ := r.inv.Quota(); !total.Equal(dec("8390.2807428")) {
+		t.Errorf("quota total %s, want 8390.2807428", total)
 	}
 }
 
