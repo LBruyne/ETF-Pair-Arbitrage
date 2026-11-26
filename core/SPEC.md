@@ -1,6 +1,6 @@
 # core 架构与设计方案
 
-版本：0.11 · 2026-11-25（UTC+8）；2026-11-26 新增第 12 节（新任务的设计稿：薄腿先行的双 Taker 入场与两段出场，待审计，用户第 85–92 条；同日按第 93 条的答复和外部实现的调研改为第 2 版，按审计意见（第 94 条）改为第 3 版）；2026-11-26 补充：第 8 步回放与选参已实现（5.8、第 9 节第 8 行），铃锚点的 F 只取 Coinbase 收盘前一分钟 1 分钟 K 线的收盘（用户第 69 条，5.1“锚点”、5.4a），纸面成交的手续费逐笔截断到 8 位（审计第 70 条，5.1“纸面”），文档订正（用户第 79 条转来的审计意见第 3 点：“文档应让读者在规则所在章节就能看到实际行为”）：第 1 节的下单通道只写一种说法“默认 WSS，连接不可用时走 REST；已发出但结果未知的订单按原编号查询”，第 6 节（看板）改为两块看板已实现并发布、变量和各行照 Live Monitor 4.1，规则改指 PRD 3.10（1.4 节的首版收窄已写进 PRD 正文；5.2 的“5 秒从哪一刻起”和第 10 节收窄表的表头随之注明 PRD 一栏是原正文） · 状态：**设计稿；审计五次批复后分步实施中：第 0–4 步已实现并提交；第 5 步（cex 订单与纸面、Bitget 账户侧）和第 5.3 步（延迟相关的改动、WSS 下单通道）已实现并通过测试，未提交；第 6 步起未开始。** 0.11 之后的补充（2026-11-25 晚）：审计第 6 步之后 exec 和 inventory 的修改（用户第 65、66 条）见 5.4c；用户第 61 条：5.6 新增只供 Live Monitor 显示的三项落库（`funding_rate` 表、`inventory_sample` 的标记价等八列、`signal_sample` 的两腿中价）。0.11 落实用户第 56、57 条：取价不再归档（SOXL 第 2 个、SOXS 第 5 个原始价位，5.2 末尾“取价档”），下单默认改用 WSS 并用真实订单验证（5.7 末尾）。0.10 落实第 53–55 条（SOXS 改 `books5`、延迟设计 L1–L4 和 WSS 下单的实现与实测）。规则在 PRD 3.9。0.9 写入第 5 步的做法和延迟研究；0.8、0.7 落实审计第五、四次意见（5.4b、5.4a）。各轮审计原文、检查报告和 0.1–0.10 的副本在 `experiments/decisions_20261123/spec_core_20261124/`。
+版本：0.11 · 2026-11-25（UTC+8）；2026-11-26 新增第 12 节（新任务的设计稿：薄腿先行的双 Taker 入场与两段出场，待审计，用户第 85–92 条；同日按第 93 条的答复和外部实现的调研改为第 2 版，按审计意见（第 94 条）改为第 3 版，按第 95 条和审计第二次意见改为第 4 版，实现中）；2026-11-26 补充：第 8 步回放与选参已实现（5.8、第 9 节第 8 行），铃锚点的 F 只取 Coinbase 收盘前一分钟 1 分钟 K 线的收盘（用户第 69 条，5.1“锚点”、5.4a），纸面成交的手续费逐笔截断到 8 位（审计第 70 条，5.1“纸面”），文档订正（用户第 79 条转来的审计意见第 3 点：“文档应让读者在规则所在章节就能看到实际行为”）：第 1 节的下单通道只写一种说法“默认 WSS，连接不可用时走 REST；已发出但结果未知的订单按原编号查询”，第 6 节（看板）改为两块看板已实现并发布、变量和各行照 Live Monitor 4.1，规则改指 PRD 3.10（1.4 节的首版收窄已写进 PRD 正文；5.2 的“5 秒从哪一刻起”和第 10 节收窄表的表头随之注明 PRD 一栏是原正文） · 状态：**设计稿；审计五次批复后分步实施中：第 0–4 步已实现并提交；第 5 步（cex 订单与纸面、Bitget 账户侧）和第 5.3 步（延迟相关的改动、WSS 下单通道）已实现并通过测试，未提交；第 6 步起未开始。** 0.11 之后的补充（2026-11-25 晚）：审计第 6 步之后 exec 和 inventory 的修改（用户第 65、66 条）见 5.4c；用户第 61 条：5.6 新增只供 Live Monitor 显示的三项落库（`funding_rate` 表、`inventory_sample` 的标记价等八列、`signal_sample` 的两腿中价）。0.11 落实用户第 56、57 条：取价不再归档（SOXL 第 2 个、SOXS 第 5 个原始价位，5.2 末尾“取价档”），下单默认改用 WSS 并用真实订单验证（5.7 末尾）。0.10 落实第 53–55 条（SOXS 改 `books5`、延迟设计 L1–L4 和 WSS 下单的实现与实测）。规则在 PRD 3.9。0.9 写入第 5 步的做法和延迟研究；0.8、0.7 落实审计第五、四次意见（5.4b、5.4a）。各轮审计原文、检查报告和 0.1–0.10 的副本在 `experiments/decisions_20261123/spec_core_20261124/`。
 
 core 是 ETF Pair Arbitrage 的交易进程：读 Bitget 上 SOXLUSDT / SOXSUSDT 两个永续合约的盘口，按锚点算出价差、均线和 σ，在非盘中两条腿同时偏离均线足够远时用 IOC 限价单同时买入（或同时卖出）两条腿，价差回到平仓线时平仓，每个美股常规收盘前全部平掉。
 
@@ -1911,7 +1911,7 @@ func (s *Store) LoadState(ctx context.Context, sessionID string) (State, error) 
 | 7 | Live Monitor 看板 | `dashboard/grafana/live_monitor_board.py`、`boardkit`（数据源改为传入、`BOARDS` 加一项）、`gen_dashboard.py`、数据源的 provisioning；`dashboard/SPEC.md` 第 7 节、`dashboard/README.md` | V19：`test_boards.py` 的结构检查；私有 Grafana 上截图几轮审阅；页面数字与表逐项对照。发布另行授权；**已实现并发布**：2026-11-26 00:02:05 UTC+8（`51fe429`、`aad3a60`、`40c9a22`；看板 md5 `d9ec0ca0…`，Summary 与按成交重算一致） |
 | 8（已实现，2026-11-26；见 5.8） | 回放与选参 | `cmd/replay`：自己读录制服务的原始帧文件（`experiments/book_tape`，格式见 dashboard/SPEC.md 附录 A；不引用 `dashboard/` 的 Go 包），按接收时间回放，驱动同一套盘口合并、strategy、inventory、exec 和 `PaperVenue`（每条腿各自的下单延迟），全部在一个虚拟时钟上、由一个 goroutine 推进（循环的每个 tick 都来自虚拟时钟）；历史的锚点（按得知时刻）、F 和日历从看板库读，只读；复现一次纸面运行时读那次运行自己的配置、F、锚点事实和启动时读回的分钟、R。审计回放的四处覆盖改成生产代码里的显式接口：`cex.Clock` 与 `WithClock`、`cex.Synchronous` 与 `StartSynchronous`（帧在投递的 goroutine 上合并、订单在 `PlaceOrders` 内交给交易所）、`PaperConfig.Clock`、`inventory.WithClock`、`exec.WithClock` 与 `Start` / `Advance` / `NextTick`；内存存储、`replayVenue`、按得知时刻发布 F 和锚点的读视图在 `cmd/replay` 里。输出 PRD 16.5 的分项，轮净额与全成交现金账分开，峰值名义和按 N、按 min(N, 峰值) 的收益率（用户第 69 条）。网格：模型、X、Y、d_in、d_out、两腿延迟、N | 固定原始帧、接收顺序和注入的时钟，回放两次的订单序列和账本相同（`TestReplayIsDeterministic`；真实数据 `-repeat 2`）；**与在线纸面的对照按审计第 70 条改为**：用那次纸面运行自己的配置（15 / 15 ms）、它重启时读回的分钟和 R、它当时知道的锚点和 F，复现 2026-11-26 02:02:09 起的运行，先比两条腿在决策和模拟到达时看到的盘口序号，再比 μ、σ、订单、成交，指出分歧的那一帧（结果见 5.8：录制服务收到同一帧比在线进程晚中位 31 ms，第一张分歧是第一轮的 SOXS 开仓单）；**不按在线纸面拟合回放延迟**；每条腿 5 / 15 / 25 / 50 / 100 ms 只作压力测试（成交率、单腿率、净额），真实到达延迟以真实订单为准（5.7）；EMA 30/30、d_in 2、d_out −0.5 在 N = 1,000 / 10,000 / 100,000 USDT 下逐 Session 回测；选参的训练 / 验证要等有足够的完整原生 `books5` Session（第一个是 11-26 05:00 → 11-28 02:00 UTC+8）；回测报告交用户定参数 |
 | 9 | 实盘前 | 用户定交易账户（第 7 节末项），在那个账户上重新确认权限、持仓模式、杠杆和两个合约的实际费率（0.65 bps 是所查账户当时的读数）；下单应答与订单最终状态分开验收；交易程序自己读到的指数、NAV、分红、日历与看板库逐项对照；参数由用户确认；**小额实盘要用户明确授权、有人值守**：核对第 7 节各项（零成交 IOC 的状态、资金费流水、下单延迟），账本与交易所流水逐笔对上 | PRD 第 17 节末段的三项；**延迟核对**（5.7 的 L6，下真实订单，另行授权）：REST 热连接对 ping 选出的 WebSocket 连接各发几张，比发出到建单的时间，并量 `order` 推送比建单晚多少 |
-| 10（设计第 3 版，待用户确认，2026-11-26；见第 12 节） | 薄腿先行的双 Taker 入场与两段出场 | 用户第 85–94 条：先 taker 流动性差的腿（`thin_leg`，现为 SOXS），再按成交量配厚腿，厚腿界限 p\*（整批）、配平时窗 30 s、理想配平价差 10 单位止损、补单上限 2 × 计划量（参照点随补单更新、按配齐后的额度）、单独盈利平带保本限价；出场也薄腿先行，本批预核 + 厚腿按 `CloseNet` 保本；两段出场 exit1（整体一半，分批平够）/ exit2；`d_in` / `d_out` 改名 `entry_in` / `entry_out`；待定 D1、D2 | 第 12 节 12.10、12.11；用户确认后实现，实盘需用户另行同意 |
+| 10（第 4 版，实现中，2026-11-26；见第 12 节） | 薄腿先行的双 Taker 入场与两段出场 | 用户第 85–94 条：先 taker 流动性差的腿（`thin_leg`，现为 SOXS），再按成交量配厚腿，厚腿界限 p\*（整批）、配平时窗 30 s、理想配平价差 10 单位止损、补单上限 2 × 计划量（参照点随补单更新、按配齐后的额度）、单独盈利平带保本限价；出场也薄腿先行，本批预核 + 厚腿按 `CloseNet` 保本；两段出场 exit1（整体一半，分批平够）/ exit2；`d_in` / `d_out` 改名 `entry_in` / `entry_out`；D1 照样平、D2 接受（第 95 条） | 第 12 节 12.10、12.11；第 95 条：直接实盘，N = 1000 U |
 
 第 5.2 步之前不需要交易所的密钥：0–5.1 全部用公开数据和假实现（第 2.4 步的门控测试读 NAV 要 Direxion 的密钥）。第 5.2 步的只读测试用 `core/.env` 的密钥，只发 GET。
 
@@ -1987,19 +1987,20 @@ func (s *Store) LoadState(ctx context.Context, sessionID string) (State, error) 
 
 **0.8 及以前写在这里、现已由第 5.2 步核实的**（原文保留备查）：私有 WS 的登录和频道字段、下单请求体的字段、限速数字、错误码。实现到第 5.2 步时按 `carefully-read-app-docs` 重读对应的官方页面，并把读的页面和日期补进本节。
 
-## 12. 新任务：薄腿先行的双 Taker 入场与两段出场（设计第 3 版，待用户确认）
+## 12. 新任务：薄腿先行的双 Taker 入场与两段出场（设计第 4 版，实现中）
 
-**状态**：设计稿第 3 版，2026-11-26（UTC+8）。
+**状态**：设计第 4 版，2026-11-26（UTC+8），按 12.11 实现中。
 
 | 版本 | 提交 | 起因 |
 |---|---|---|
 | 第 1 版 | — | 第 89、90 条 |
 | 第 2 版 | `8b11bd1` | 第 93 条答复了第 1 版的 7 个问题；同时吸收外部实现的调研 |
-| 第 3 版 | 本版 | 审计对第 2 版的意见（第 94 条），见 `experiments/seq_taker_design_20261126/AUDIT_v2.md` |
+| 第 3 版 | `9a1d3d6` | 审计对第 2 版的意见（第 94 条），见 `experiments/seq_taker_design_20261126/AUDIT_v2.md` |
+| 第 4 版 | 本版 | 用户第 95 条定下 D1、D2；审计第二次意见见 `AUDIT_v3.md` |
 
-- 审计同意两项改造的方向，也同意先把规则写进 PRD 4.0（12.11 的 10.1）。交易逻辑等第 3 版对齐后再实现。
-- 第 94 条：列出实现步骤，**用户确认后才开始实现**。
-- 实现之前，PRD 3.10 仍是现行规则。
+- 审计批复：可以开始分步实现，从 10.1 的 PRD 4.0 开始。审计第二次意见中的反例，作为 10.3–10.6 的验收输入。
+- 第 95 条：用户定下 D1、D2，要求实现并测试全部内容，每完成一项报告一次、不停下；**跳过纸面**，直接实盘运行：N = 1000 U、EMA 30/30、entry_in 1、exit1 −0.5、exit2 −1，并在实盘中检查换锚。
+- PRD 4.0 生效之前，PRD 3.10 仍是现行规则。
 
 **依据**（原话都在 `experiments/anchor_v4_20261120/OWNER.md`）：
 - 第 85 条：研究磨损；先 taker SOXS、再按成交量配 SOXL，价格不劣于（进出价差 − 手续费）；两段出场 dout1 / dout2。
@@ -2009,6 +2010,7 @@ func (s *Store) LoadState(ctx context.Context, sessionID string) (State, error) 
 - 第 91、92 条：参考外部量化项目已有的双 Taker 实现。
 - 第 93 条：对第 1 版 7 个问题的答复。
 - 第 94 条：按审计意见改方案，列出实现步骤，确认后实现。
+- 第 95 条：D1 “我建议照样平”，D2 “接受”；实现、测试，并直接上实盘。
 
 **证据**：
 - `experiments/friction_study_20261126/REPORT.md`：
@@ -2018,9 +2020,23 @@ func (s *Store) LoadState(ctx context.Context, sessionID string) (State, error) 
 - `experiments/seq_taker_design_20261126/`：
   - `calc.py`：本节所有算例，可用 `python3 -I calc.py` 复算；
   - `EXTERNAL_RESEARCH.md`：外部调研；
-  - `AUDIT_v2.md`：审计意见原文。
+  - `AUDIT_v2.md`、`AUDIT_v3.md`：审计两次意见的原文。
 
 ### 12.0 各版改了什么
+
+**第 4 版：用户第 95 条与审计第二次意见（AUDIT_v3.md）**
+
+| # | 意见 | 评估 | 第 4 版的规则 | 位置 |
+|---|---|---|---|---|
+| D1 | 用户：“我建议照样平” | 定稿 | exit2（或只有一条线时）预核不过，照样出场：先平 SOXS。SOXL 的保护价是**发本批 SOXS 之前那一拍**记下的 SOXL 取价档价：平多卖出不低于它，平空买入不高于它。重试沿用这个价 | 12.7 |
+| D2 | 用户：“接受” | 定稿 | SOXS 已平之后，SOXL 等满 30 s、或理想平仓价差恶化 10 单位，就对本批还没平的 SOXL 用 PRD 10.4 的价平掉。30 s 从本批 SOXS 第一笔平仓成交起算，之后的部分成交不重置时钟。停止和强平仍接管整轮 | 12.7 |
+| 记录 | D1 和 D2 要分开记 | 采纳 | 出场批的决策记录写**决策时预计净额**、实际净额和退出原因（`d1_loss`、`exit_window`、`exit_stop_d`）。D1 预计的亏损和之后的执行磨损由此分开 | 12.7、12.9 |
+| 1 | 已配齐的批次应先结束，再看补单；“这一帧不能补”和“本批不能再补”要分开 | 成立：照第 3 版的伪代码，配齐那一刻偏离加深就会被当成补单 | 判断顺序改为：在途 → 接管 → **未配量为零就结束（built）** → 时窗 → 止损 → 配厚腿 → 补单 → 盈利平 → 太小 → 等。“太小就结束”只在**本批已不能再补**时成立：补单已到上限，或收到停新仓信号。只是这一帧偏离没有更深时，继续等 | 12.4、12.9 |
+| 2 | `thickOrder` 会错过本来能配的 SOXL | 成立（例 10 复现） | 直接遍历 SOXL 已收到的档位。每一档价 p 能发的量 = min(剩余目标, 到这一档为止的累计量, 整批上限允许的量)，向下取整后校验最小单，取最大的一个。整批上限允许的量：p ≤ P_L\* 时不限；p > P_L\* 时为 L × (P_L\* − v_L) / (p − P_L\*)。做空镜像 | 12.4、12.9 |
+| 3 | `CloseNet` 要指定平的是哪部分仓位 | 成立：账本对 `PurposeTrim` 先记回本批（`ledger.go`） | `CloseNet(用途, lot, 腿, 数量, 价)` 沿用实际记账的分配顺序：正常出场按整轮 FIFO，算整轮预计净额；单独盈利平和回吐算**本批这次退出的增量净额**。用“旧批盈利、新批亏损”的例子验证（例 11） | 12.2、12.4、12.9 |
+| 额度 | 已有的 S_open 按实际成交额计，新增部分才按委托的额度价 | 成立 | 补单上限 = (剩余额度 − 已有 S_open 的实际成交额 − 它配齐所需的厚腿名义) ÷ (新增每份 SOXS 的额度价 + 配齐它所需的厚腿名义)。发 SOXL 之前再核一次 | 12.4 |
+| 速度 1 | 订单回报一到就评估 SOXL 首单 | 采纳 | SOXS 成交确认、SOXL 深度有效且没有冲突时，在同一拍按本地盘口算量、发单。200 ms 只用于同一条腿的连续重发，不加在首张 SOXL 单上。验收时分开量两段：“SOXS 成交回报到本机 → SOXL 发出”的 p50 / p90，以及“发出 → 交易所收到” | 12.4、12.10 |
+| 速度 2 | 不要每帧重建账本、重复写等待记录 | 采纳 | 一拍只取一次两腿盘口和账本快照。平仓数量固定后，FIFO 成本只算一次，直接解出保本价，取整到合法刻度后再用 `CloseNet` 验一次。决策记录只写发单、成交、原因变化和进入风险退出；重复的等待沿用现有的周期采样 | 12.9 |
 
 **第 3 版：按审计意见（AUDIT_v2.md）**
 
@@ -2042,7 +2058,7 @@ func (s *Store) LoadState(ctx context.Context, sessionID string) (State, error) 
 
 第 2 版 12.12 第 2 条（补单条件）由上表第 4 行取代，第 4 条（出场也用 30 s / 10 单位）成为待定 D2。
 
-**待用户确认的两项**（审计指出属于负责人的取舍）：
+**第 3 版时待用户确认的两项**（第 95 条已定：D1 照样平，D2 接受，见上面第 4 版的表）：
 - **D1：exit2 的本批预核不过时，怎么做？**
   - lead 建议：照样出场。薄腿照常先平，厚腿的界限放宽到“不劣于出场决策时的取价档价”。
   - 理由：PRD 9.2（第 36 条）“平仓的判断不含手续费；目前先会亏也平”；第 93 条第 3 点“整轮利润保本即可”说的是厚腿界限用哪一个。
@@ -2087,9 +2103,10 @@ func (s *Store) LoadState(ctx context.Context, sessionID string) (State, error) 
   │ 每来一帧、每有一个订单结果、每到一个时钟点，按顺序判断：                        │
   │ 1. 有在途单或结果未知的单              → 等它（先查清）                         │
   │ 2. 停止信号、强平窗口                  → 交给整轮的停止 / 强平                  │
+  │ 2a. 没配上的量为零                     → 结束（built）                          │
   │ 3. 时窗到了                            → 回吐没配上的部分                       │
   │ 4. D_ideal 比 D_dec 不利 ≥ 10 单位     → 回吐没配上的部分（止损）              │
-  │ 5. p* 以内可成交、够一张单             → 发 SOXL IOC（限价 p*）                │
+  │ 5. 逐档：整批上限内可成交、够一张单   → 发 SOXL IOC（首张不等 200 ms）          │
   │ 6. x 比参照点 x_ref 更深、信号仍成立，                                          │
   │    S < 2·qS，配齐后的额度够            → 补 SOXS IOC，x_ref ← 这次的 x          │
   │ 7. x 回到入场线以内，保本价以内可卖   → 按保护限价盈利平没配上的部分          │
@@ -2103,6 +2120,7 @@ func (s *Store) LoadState(ctx context.Context, sessionID string) (State, error) 
   x 到 exit1、整体有利润、还没定过目标       → 目标 H = 整体的一半
   每一批：本批预核（CloseNet ≥ 余量）→ 先平 SOXS → 按成交量平 SOXL，限价按 CloseNet 求的保本价
          → SOXS 已平一部分时，先处理完对应的 SOXL，才因 x 回到线内而暂停
+         → 预核不过：exit1 等；exit2 照样平，SOXL 保护价 = 发 SOXS 前那一拍的价（D1）
          → SOXL 等满 30 s 或恶化 10 单位 → 不看保本平掉（D2）
 ```
 
@@ -2127,8 +2145,10 @@ func (s *Store) LoadState(ctx context.Context, sessionID string) (State, error) 
   - 没配上的薄腿 S_open = S − L × A_L / A_S。
   - 决策时的价差 D_dec、偏离 x_dec，按两腿取价档价算。
   - 补单的参照点 x_ref，开始时等于 x_dec。
-- **`CloseNet(部分, 候选价)`**：设想把指定的数量按候选价平掉，算出这一轮的现金净额。
-  - 计入：这一轮已实现的净额 R，加上这些数量按 FIFO 对应的开仓成交额和开仓手续费，再算上候选价下的平仓成交额和平仓手续费。
+- **`CloseNet(用途, lot, 腿, 数量, 候选价)`**：设想把指定的数量按候选价平掉，算出现金净额。
+  - **按实际记账的分配顺序**（第 4 版，审计第二次意见第 3 条）：
+    - 正常出场（`exit`）：按整轮 FIFO，返回**整轮预计净额** = R + 这些数量的毛利 − 对应的开仓手续费 − 平仓手续费。
+    - 单独盈利平和回吐（`trim`、`unwind`）：先记回指定的 lot（与现有 `PurposeTrim` 相同），返回**这一批这次退出的增量净额**。
   - 已入账的成交只计一次。
   - 它是**唯一**的平仓估值函数，用于：exit1 的整轮利润判断、出场的本批预核、出场厚腿的保本界限（包括部分成交之后）、单独盈利平薄腿的保本价。
   - 这些数用 decimal 计算，与账本同一口径，不另建一套盈亏账本。
@@ -2160,6 +2180,7 @@ func (s *Store) LoadState(ctx context.Context, sessionID string) (State, error) 
 1. **在途或未知**：这一批有一张单还没有结果，就等；结果未知时先查清。回吐进行中时，只按还没回吐的实际数量继续。
 2. **整轮接管**：收到“停止”信号或进入收盘强平窗口时，由现有的停止 / 强平流程**接管整轮**（PRD 10），按两条腿的实际持有量一起平。没配上的 SOXS 也在其中。
    - “停新仓”信号只停补单，配平照常进行到结束。
+   - **已配齐就结束**：没配上的量为零（或只剩发不出单的零头且本批已不能再补），这一批立即结束为 `built`。偏离此时再加深，也只能按 12.3 的间距规则开下一批，不算本批的补单。
 3. **时窗到了**（从第一笔薄腿成交起过了 `pair_window`，30 s）：回吐 S_open。
 4. **价差止损**：理想配平价差 = 剩下的目标现在按 SOXL 取价档价配齐时，整批的价差：
    ```
@@ -2170,40 +2191,49 @@ func (s *Store) LoadState(ctx context.Context, sessionID string) (State, error) 
    - 入场做多时 D_ideal **上升**为不利，D_ideal − D_dec ≥ `pair_stop_d`（10）就回吐 S_open。入场做空时 D_dec − D_ideal ≥ 10。
    - 10 单位是触发线，实际回吐的损失看当时的盘口。
    - SOXS 自己不设止损线。
-5. **配厚腿**：读同一份 SOXL 盘口，依次做：
+5. **配厚腿**：读同一份 SOXL 盘口，依次做（第 4 版，审计第二次意见第 2 条）：
    ```
    q_need  = floor_step(T − L)                     这一批还要配的量
    D_need  = D_exit1 − C − m                       （做空：D_exit1 + C + m）
-   P_L*    = a_L × (2 + D_need / 10⁴ − v_S / a_S)  整批厚腿 VWAP 的上限
+   P_L*    = a_L × (2 + D_need / 10⁴ − v_S / a_S)  整批厚腿 VWAP 的上限（不取整）
    ```
-   - 逐档往下走 SOXL 卖盘，只取价格 ≤ 这张单限价的档位。限价 p\* = (P_L\* × (L + q) − L × v_L) / q，按刻度向下取整。q 和 p\* 互相依赖，所以从 q = q_need 开始，每少一档重算一次，取能满足的最大 q。
-   - q 向下取整到步长，再对最终的 q 和 p\* 校验最小数量和最小名义（q × p\* ≥ 5 USDT）。
-   - 通过就发 SOXL 的 IOC：数量 q，限价 p\*。不通过，这一帧不发。
+   - 逐档遍历 SOXL 卖盘上已收到的档位（books5，最多 5 档）。对每一档价 p_i：
+     ```
+     q_cap(p_i) = 不限                                 p_i ≤ P_L*
+                = L × (P_L* − v_L) / (p_i − P_L*)       p_i > P_L*（L = 0 或 v_L ≥ P_L* 时为 0）
+     q_i       = floor_step(min(q_need, 到 p_i 为止的累计量, q_cap(p_i)))
+     ```
+     q_i 要通过最小数量和最小名义校验（q_i × p_i ≥ 5 USDT）。取 q_i 最大的一档，以 p_i 为限价；q_i 相同时取价低的一档。
+   - 有这样一档就发 SOXL 的 IOC，否则这一帧不发。限价按 p_i 计算，所以成交均价不会差于它，整批 VWAP 也不会超过 P_L\*。
    - D_exit1 = μ − entry_out·σ，用当时的 μ、σ。
-   - 同一条腿两张单至少隔 200 ms（PRD 10.4）。
-   - IOC 只成交一部分时，按新的 L、v_L 在下一帧重算。
+   - **首张 SOXL 单不等**（速度 1）：SOXS 的成交回报一到，就在同一拍判断。前提是 SOXS 累计成交已确认、SOXL 深度有效且没有冲突。200 ms 的间隔（PRD 10.4）只用于同一条腿的连续重发。
+   - IOC 只成交一部分时，按新的 L、v_L 重算。
 6. **补薄腿**（“Spread 整体继续变大”）。以下全部成立才补：
    - 第 5 条这一帧没有发单；
    - x 用两腿当前取价档价算，**比 x_ref 更深**（做多 x < x_ref），并且入场信号仍成立；
    - S < `thin_topup_max` × qS；
    - 没有“停新仓”信号；
-   - **额度**：这一张补单与已有的 S_open 一起配齐后，整对新增的名义放得进剩余额度：
+   - **额度**：这一张补单与已有的 S_open 一起配齐后，整对新增的名义放得进剩余额度（第 4 版：已有部分按实际成交额）：
      ```
-     每份薄腿配齐所需 n1 = p_S,limit + (A_S / A_L) × p*            （做空时用 PRD 6.4 的额度价）
-     补单上限        q_max = (剩余额度 − S_open × n1) / n1
+     已有部分所需 = S_open × v_S + floor_step(S_open × A_S / A_L) × p_L,quota
+     新增每份所需 n1 = p_S,quota + (A_S / A_L) × p_L,quota
+     补单上限 q_max = (剩余额度 − 已有部分所需) / n1
      ```
+     p_quota 是 PRD 6.4 的额度价：买单按限价，卖单按原始买一。发 SOXL 之前再核一次它带来的整对新增名义。
 
    补单量 = min(当前盘口按 entrySize 给出的 SOXS 量, thin_topup_max × qS − S, q_max)，向下取整到步长，再校验最小单。补单有成交后，x_ref 更新为这次补单的 x，v_S、T、p\* 随之更新。
 7. **单独盈利平薄腿**（“Spread 整体变小”）：x 已回到入场线以内时：
-   - 保本卖价 b\* = 让 `CloseNet(S_open, b) ≥ m 折成 USDT` 成立的最低卖价，向上取整到刻度。
+   - 保本卖价 b\* = 让 `CloseNet(trim, 本批 lot, SOXS, 数量, b) ≥ m 折成 USDT` 成立的最低卖价，向上取整到刻度。这是**本批这次退出的增量净额**，旧批的利润不能替它放行（例 11）。
    - 卖单限价 = max(SOXS 第 5 档价, b\*)。
    - 数量 = SOXS 买盘上价格 ≥ 限价的量，与 S_open 取较小者，向下取整，校验最小单。通过就发。剩下的部分下一帧再判断。
    - 只有一部分配不上、其余已配平时，同样只平 S_open。
 8. **其余情况都等**，包括 SOXL 在 p\* 外、又没触到止损线的时候。
 
-**薄腿太小**：S_open 对应的厚腿量 floor_step(S_open × A_S / A_L) 够不上一张单（低于 0.01 份，或名义不足 5 USDT）时，不立即平，先在时窗里等补单累积。下面两种情况出现时才结束：
-- 时窗到了；
-- 已不能再补：x 不比 x_ref 深、已到补单上限，或者收到停新仓信号。
+**薄腿太小**：S_open 对应的厚腿量 floor_step(S_open × A_S / A_L) 够不上一张单（低于 0.01 份，或名义不足 5 USDT）时，不立即平，先在时窗里等补单累积。要分开两种情况（第 4 版）：
+- **这一帧不能补**（偏离没有比 x_ref 更深）：继续等，以后偏离加深还可以补。
+- **本批已不能再补**（补单已到上限，或者收到停新仓信号）：结束。
+
+时窗到了也结束。
 
 结束时 S_open 的平仓单发得出就回吐；发不出就按第 47 条记为零头。
 
@@ -2282,6 +2312,16 @@ func (s *Store) LoadState(ctx context.Context, sessionID string) (State, error) 
 - 补单上限 q_max = (1,000 − 700) / 124.425 = 2.41 份。
 - 单看一张新单会以为能补约 4 份（500 U），那样配齐后要 1,200 U，超出额度。
 
+**例 10：逐档配厚腿**（审计第二次意见第 2 条的反例）。做多，整批上限 P_L\* = 33.27；已买 SOXL 6 份 @ 33.26，还要配 10 份；SOXL 卖一 33.28 × 20。
+- 第 3 版的做法：按 10 份算出的限价是 33.276，取整为 33.27，界限内没有量，于是不发。
+- 第 4 版逐档：卖一 33.28 > 33.27，q_cap = 6 × (33.27 − 33.26) / (33.28 − 33.27) = 6 份。发 6 份 @ 33.28，整批均价 (6 × 33.26 + 6 × 33.28) / 12 = 33.27，正好在上限上。
+- 剩下的 4 份，等卖价回到 33.27 以内再配。
+
+**例 11：盈利平只看本批**（审计第二次意见第 3 条）。同方向有两批 SOXS 多头：旧批 5 份 @ 59.00（已配平），新批 5 份 @ 60.00（没配上）。现在 SOXS 买一 59.80。
+- 按整轮 FIFO 估算，会先“平”旧批：每份 +0.80，显示盈利。
+- 实际回吐的是新批：每份 −0.20，5 份共 −1.00 U，再加两笔手续费约 0.039 U。
+- 所以 `CloseNet(trim, 新批 lot, …)` 返回 −1.039 U，不放行盈利平。
+
 ### 12.6 两段出场（dout1 / dout2，第 85–88、90、93、94 条）
 
 - **两条线**：
@@ -2310,7 +2350,8 @@ func (s *Store) LoadState(ctx context.Context, sessionID string) (State, error) 
 0. **本批预核**（审计第 1 条）：发 SOXS 之前，用本批的两腿数量和 FIFO 成本，按两腿当前取价档价算 `CloseNet`。
    - 达到余量：发这一批。
    - exit1 预核不过：这一批不平，等下一帧。
-   - exit2（或唯一的一条线）预核不过：**待定 D1**。lead 建议照样出场，第 2 步厚腿的界限放宽为“不劣于出场决策时的 SOXL 取价档价”，按 PRD 9.2 会亏也平。
+   - exit2（或只有一条线时）预核不过：**D1，照样出场**（第 95 条）。发本批 SOXS 之前那一拍，记下 SOXL 的取价档价作为保护价：平多卖出不低于它，平空买入不高于它。第 2 步厚腿的限价用这个保护价，不用保本价，重试沿用本批的这个价。依据是 PRD 9.2：“目前先会亏也平”。
+   - 每一批都记下**决策时预计净额**（预核算出的那个数）。D1 主动接受的预计亏损，和之后 SOXL 成交更差多出来的执行磨损，由此分开。
 1. **先平薄腿**：SOXS 只减仓的 IOC，限价为取价档价，数量为本批的 SOXS 量。
    - 零成交：这一批没做，下一帧照出场规则再判断。
    - 结果未知：先查单。
@@ -2319,12 +2360,12 @@ func (s *Store) LoadState(ctx context.Context, sessionID string) (State, error) 
    - 限价 = 让 `CloseNet(本批已平部分 + 剩余厚腿按候选价) ≥ m 折成 USDT` 成立的最差合法刻度：卖单向上取整，买单向下取整。厚腿已部分成交时，已成交的那些按实际成交额计入，只对剩余量求价（审计第 2 条）。
    - 逐档取限价以内的量，按 12.4 第 5 条的顺序取整、校验后发出。
    - SOXS 已平了一部分时，即使 x 已回到线内，也先把对应的 SOXL 处理完，再暂停下一批。
-3. **厚腿的硬结束**（**待定 D2**）。下面任一成立，就不看保本，把剩下的厚腿按 PRD 10.4 的价平掉，没平完就用新盘口重发：
-   - 从本批薄腿第一笔平仓成交起，过了 `exit_pair_window`（30 s），由时钟检查；
+3. **厚腿的硬结束**（**D2**，第 95 条“接受”）。下面任一成立，就不看保本，把本批还没平的厚腿按 PRD 10.4 的价平掉，没平完就用新盘口重发：
+   - 从本批薄腿第一笔平仓成交起，过了 `exit_pair_window`（30 s），由时钟检查。之后的部分成交不重置时钟；
    - 理想平仓价差比出场决策时的 D 不利 `pair_stop_d`（10 单位）。出场做多（卖出）时下降为不利，出场做空（买入）时上升为不利；
    - 停止信号或强平窗口：整轮接管。
 
-   这条路径的实际净损失单独记录。
+   这条路径的实际净损失单独记录：决策的 `detail.reason` 为 `exit_window` 或 `exit_stop_d`（D1 的批次为 `d1_loss`），并写入决策时预计净额和实际净额。
 
 **例 7：没有部分成交时的保本界限。** 做多仓位：SOXL 15.60 @ 33.26，SOXS 8.04 @ 59.869，开仓价差 −8.34，开仓手续费 0.0650 U，R = 0，m = 0。
 - exit1 时（SOXL 买二 33.24、SOXS 买五 59.96，D = 0.04）：整体平掉的净额 +0.2896 > 0，定下 H（SOXS 4.02、SOXL 7.80）。
@@ -2408,20 +2449,32 @@ type PairBatch struct {
 	FirstFill time.Time       // the thin leg's first fill; the pair window runs from here
 }
 
-// thickOrder walks the thick leg's taking side and returns the largest
-// order the batch bound allows (12.4 step 5): book -> bound -> quantity
-// within it -> floor to step -> check the final quantity and limit. ok is
-// false when nothing sendable is within the bound.
+// thickOrder walks the levels received on the thick leg's taking side and
+// returns the largest order the batch bound allows (12.4 step 5): at level
+// price p the batch's VWAP cap allows any quantity when p <= cap, else
+// L x (cap - vL) / (p - cap); the quantity is also capped by what is left to
+// pair and by the depth down to p, floored to the step, and must pass the
+// venue's minimums at p. Ties go to the lower price.
 func (s *Strategy) thickOrder(in PairInput, need decimal.Decimal) (qty, limit decimal.Decimal, ok bool) {
-	for q := need; q.IsPositive(); {
-		limit = s.PairBound(in.Batch, q, in) // (P_L* (L + q) - L v_L) / q, to the tick against us
-		avail := floorToStep(takerQtyWithin(in.Books[in.Thick], in.Batch.Dir, limit), in.Rules[in.Thick].QtyStep)
-		if avail.GreaterThanOrEqual(q) {
-			return q, limit, in.Rules[in.Thick].Sendable(q, limit) // min qty and q x limit >= min notional
+	b, rule := in.Batch, in.Rules[in.Thick]
+	vwapCap := s.thickVWAPCap(in) // P_L*, not rounded
+	cum := decimal.Zero
+	for _, lv := range takerSide(in.Books[in.Thick], b.Dir) { // best first, at most the levels received
+		cum = cum.Add(lv.Qty)
+		q := decimal.Min(need, cum)
+		if worse(b.Dir, lv.Price, vwapCap) { // beyond the cap: only what earlier cheaper fills leave room for
+			room := b.ThickQty.Mul(vwapCap.Sub(b.ThickVWAP).Abs()).Div(lv.Price.Sub(vwapCap).Abs())
+			if !better(b.Dir, b.ThickVWAP, vwapCap) {
+				room = decimal.Zero
+			}
+			q = decimal.Min(q, room)
 		}
-		q = avail // retry with what the book holds within this limit; q only falls, so the loop ends
+		q = floorToStep(q, rule.QtyStep)
+		if q.GreaterThan(qty) && rule.Sendable(q, lv.Price) {
+			qty, limit, ok = q, lv.Price, true
+		}
 	}
-	return decimal.Zero, decimal.Zero, false
+	return qty, limit, ok
 }
 
 // PairStep decides one step of a batch in pairing: the checks of 12.4 in
@@ -2433,6 +2486,12 @@ func (s *Strategy) PairStep(in PairInput) PairAction {
 		return PairAction{Kind: PairWait}
 	case in.Stopping || in.ForcedWindow: // the whole round is taken over
 		return PairAction{Kind: PairHandOver}
+	}
+	noMoreTopUps := in.NoNewEntries || !b.ThinQty.LessThan(b.PlanThin.Mul(s.cfg.ThinTopupMax)) // for the batch, not this frame
+	if in.UnpairedNone || (in.UnpairedTooSmall && !in.UnpairedSendable && noMoreTopUps) {
+		return PairAction{Kind: PairDone} // paired (or dust that can never be paired): the batch ends here
+	}
+	switch {
 	case !in.Now.Before(b.FirstFill.Add(s.cfg.PairWindow)):
 		return unwind(ReasonWindow)
 	case adverseEntry(b.Dir, s.IdealSpread(in)-b.DecisionD) >= s.cfg.PairStopD:
@@ -2442,25 +2501,21 @@ func (s *Strategy) PairStep(in PairInput) PairAction {
 	if q, p, ok := s.thickOrder(in, need); ok {
 		return PairAction{Kind: PairSendThick, Qty: q, Price: p}
 	}
-	canTopUp := deeper(b.Dir, in.X, b.XRef) && s.AtEntryLine(b.Dir, in.X, in.Stats.Sigma) &&
-		!in.NoNewEntries && b.ThinQty.LessThan(b.PlanThin.Mul(s.cfg.ThinTopupMax))
-	if canTopUp {
+	topUpNow := !noMoreTopUps && deeper(b.Dir, in.X, b.XRef) && s.AtEntryLine(b.Dir, in.X, in.Stats.Sigma)
+	if topUpNow {
 		if q, p, ok := s.topUpOrder(in); ok { // capped by 2 x qS and by the quota of the full pairing
 			return PairAction{Kind: PairSendThin, Qty: q, Price: p}
 		}
 	}
 	if !s.AtEntryLine(b.Dir, in.X, in.Stats.Sigma) {
-		if q, p, ok := s.profitClose(in); ok { // limit max(level 5, break-even), the quantity within it
+		if q, p, ok := s.profitClose(in); ok { // CloseNet(trim, this lot): limit max(level 5, break-even)
 			return PairAction{Kind: PairCloseThin, Qty: q, Price: p, Why: ReasonProfit}
 		}
 	}
-	if in.UnpairedTooSmall && !canTopUp {
-		return unwind(ReasonTooSmall) // exec sends it if sendable, else records dust
+	if in.UnpairedTooSmall && noMoreTopUps { // sendable dust of a batch that can grow no more
+		return unwind(ReasonTooSmall)
 	}
-	if in.UnpairedNone {
-		return PairAction{Kind: PairDone}
-	}
-	return PairAction{Kind: PairWait}
+	return PairAction{Kind: PairWait} // includes "too small, but a later frame may still top up"
 }
 ```
 
@@ -2470,11 +2525,11 @@ exec 侧（示意）：
 // onPairTick runs on every depth frame, every order result and every tick
 // while a batch is in pairing; the tick makes the window end without new data.
 func (m *Manager) onPairTick(now time.Time) {
-	a := m.strategy.PairStep(m.pairInput(now))
-	m.recordPairDecision(a) // decision row: p*, D_ideal, x, x_ref, b*, action, reason
+	a := m.strategy.PairStep(m.pairInput(now)) // one snapshot of both books and the ledger per round
+	m.recordPairDecision(a) // only sends, fills, a changed reason or a risk exit; repeated waits follow the usual sampling
 	switch a.Kind {
 	case strategy.PairSendThick:
-		m.send(m.thick, a.Price, a.Qty, purposePair)
+		m.send(m.thick, a.Price, a.Qty, purposePair) // the first one goes in the round the thin fill arrives; 200 ms only between repeats
 	case strategy.PairSendThin:
 		m.send(m.thin, a.Price, a.Qty, purposeTopup)
 	case strategy.PairCloseThin:
@@ -2505,19 +2560,26 @@ func (m *Manager) onPairTick(now time.Time) {
     - 例 1 的 33.27 和第二张的 33.28；
     - 刻度取整。
   - `thickOrder`：
-    - 只吃界限内的档位；
+    - 只吃整批上限允许的量；
+    - 例 10：上限 33.27、已有 6 @ 33.26，卖一 33.28 时发 6 份 @ 33.28；
     - 裁剪后低于 5 U 时不发；
-    - 裁剪后界限放宽时重算。
+    - 量相同时取价低的一档。
   - `IdealSpread`：例 1 的 33.2952 和 33.3359；入场、出场两个方向的“不利”。
-  - `PairStep` 的每个分支，按顺序：在途、接管、时窗、止损、配厚腿、补单、盈利平、太小、完成、等待。补单分支要覆盖：
+  - `PairStep` 的每个分支，按顺序：在途、接管、已配齐、时窗、止损、配厚腿、补单、盈利平、太小、等待。审计第二次意见的两个反例：
+    - 配齐和偏离加深在同一帧发生：结束为 `built`，不补单；
+    - SOXS 成交 0.07 份，偏离先不变、随后加深：先等，加深后补单，不提前结束。
+
+    补单分支还要覆盖：
     - x_ref 更新后，相等不补；
     - 2 × qS 上限；
     - 例 6 的额度。
-  - 盈利平：例 3 的 59.882 和可卖 2.00；m = 0.5 时的 59.885。
+  - 盈利平：例 3 的 59.882 和可卖 2.00；m = 0.5 时的 59.885；例 11 旧批盈利、新批亏损时不放行。
   - `CloseNet`、`ExitPrecheck`、`ExitThickBound`：
     - 例 7 的 33.20 和 33.23；
     - 例 8 的 33.18；
-    - 例 9 的三行。
+    - 例 9 的三行；
+    - D1：预核不过时照样出场，SOXL 的保护价是发 SOXS 前那一拍的价，重试不变；
+    - D2：30 s 从第一笔 SOXS 平仓成交起算，部分成交不重置。
   - 两段出场：
     - 有利润和无利润；
     - 分批平到一半；
@@ -2535,7 +2597,10 @@ func (m *Manager) onPairTick(now time.Time) {
   - 配平中、出场批中重启（时窗内和时窗外）；
   - 停止、停新仓、强平窗口在配平中到来；
   - 性质测试：用随机的盘口序列，验证每一批必定走到一个结束状态，已配上的仓位不超过额度。
-- **inventory 单测**：`CloseNet` 与实际 `Close` 后的净额逐位相同；额度不计 S_open。
+- **inventory 单测**：
+  - `CloseNet` 与实际平仓后的净额逐位相同：`exit` 按整轮 FIFO，`trim` 按本批；
+  - 额度不计 S_open；
+  - 补单额度：已有部分按实际成交额（例 6 的 700 U 不被按新报价估低）。
 - **回放**（审计建议的四组，其余参数相同；用相同的完整录制时段和分腿到达延迟）：
 
   | 组 | 入场 | 出场 |
@@ -2556,27 +2621,28 @@ func (m *Manager) onPairTick(now time.Time) {
   - 整轮净额。
 
   这样能分辨“减少了回吐成本”和“只是少做了盈利交易”。
-- **纸面**：跑满一个完整 Session。新策略上实盘另要用户同意（审计：现有数字够进入验证，还不够批复实盘）。
+- **实盘**（第 95 条：跳过纸面，直接实盘）：N = 1000 U、EMA 30/30、entry_in 1、exit1 −0.5、exit2 −1。
+  - 量两段时延：“SOXS 成交回报到本机 → SOXL 发出”的 p50 / p90，以及“发出 → 交易所收到”。
+  - 运行要跨过一次换锚（新 Session 的铃锚点，以及 NAV 稳定后换成 NAV），检查换锚前后的信号、配比锚点和出场。
 
-### 12.11 实施步骤（用户确认后）
+### 12.11 实施步骤（第 95 条：逐项实现，每完成一项报告一次，不停下）
 
 | # | 内容 | 验收 |
 |---|---|---|
-| 10.1 | PRD 4.0：把 12.3–12.8 写进规则，含 D1、D2 的决定；dashboard/SPEC.md 的对应改动 | 用户、审计确认文字 |
+| 10.1 | PRD 4.0：把 12.3–12.8 写进规则，含 D1、D2；dashboard/SPEC.md 的对应改动 | 文字与第 85–95 条一致 |
 | 10.2 | config：改名与新增键，带校验 | config 单测；旧键报错 |
-| 10.3 | inventory：`CloseNet`、额度不计 S_open、lot 新状态 | inventory 单测（CloseNet 与 Close 逐位相同） |
-| 10.4 | strategy：入场的 `PairBound`、`thickOrder`、`IdealSpread`、`PairStep`、补单、盈利平；间距含 `entry_failed` | strategy 单测，算例逐位 |
-| 10.5 | strategy：出场的 `ExitPrecheck`、`ExitThickBound`、`ExitPairStep`、两段出场 | strategy 单测，算例逐位 |
-| 10.6 | exec：配平状态机、出场先后、两段出场状态、接管、tick、重启 | exec 单测与性质测试，`go vet` 和 `go test -race ./...` 全过 |
-| 10.7 | store：decision 的 detail、`trade.exit_stage`、新状态 | 开发库上的 store 测试 |
+| 10.3 | inventory：`CloseNet`（用途 + lot）、额度不计 S_open、补单额度按实际成交额、lot 新状态 | inventory 单测（CloseNet 与实际平仓逐位相同，例 11） |
+| 10.4 | strategy：入场的 `PairBound` / `thickOrder`（逐档）、`IdealSpread`、`PairStep`（第 4 版顺序）、补单、盈利平；间距含 `entry_failed` | strategy 单测，算例逐位，两个反例 |
+| 10.5 | strategy：出场的 `ExitPrecheck`、`ExitThickBound`、D1 保护价、D2、`ExitPairStep`、两段出场 | strategy 单测，算例逐位 |
+| 10.6 | exec：配平状态机、首张 SOXL 单同拍发出、出场先后、两段出场状态、接管、tick、重启、决策记录去重 | exec 单测与性质测试，`go vet` 和 `go test -race ./...` 全过 |
+| 10.7 | store：decision 的 detail（含决策时预计净额）、`trade.exit_stage`、新状态 | 开发库上的 store 测试 |
 | 10.8 | replay：四组对比与报告列 | 12.10 的回放表 |
-| 10.9 | Live Monitor：标记、悬停、Parameters | 看板测试与截图审查（第 78 条） |
-| 10.10 | 独立审查，再交审计；纸面跑一个完整 Session | 审计意见；之后实盘由用户决定 |
+| 10.9 | Live Monitor：标记、悬停、Parameters、预计与实际净额 | 看板测试与截图审查（第 78 条） |
+| 10.10 | 独立审查；按已提交的 HEAD 构建，直接实盘（N = 1000 U，1 / −0.5 / −1），跨过一次换锚 | 两段时延、各结束状态、换锚前后的记录 |
 
 ### 12.12 待定事项
 
-- **D1**、**D2**：见 12.0，请用户决定。
-- 其余第 2 版的问题，审计已逐条给出处理，记在 12.0。
+- 没有待定事项。D1、D2 已由第 95 条定下，审计两次意见的处理都记在 12.0。
 
 ### 12.13 参考：外部实现，以及采纳了什么
 
