@@ -143,7 +143,7 @@ class Shape(unittest.TestCase):
             if p["type"] != "row":
                 self.assertTrue(p["description"], p["title"])
         titles = [p["title"] for p in self.b["panels"] if p["type"] == "row"]
-        self.assertEqual([t.split(" · ")[0] for t in titles], ["Status", "Execution Summary", "Position and Entry", "Live Execution", "Round Trips",
+        self.assertEqual([t.split(" · ")[0] for t in titles], ["Status", "Execution Summary", "Position", "Live Execution", "Round Trips",
                                                                "Round Trip Detail", "Inventory", "Settings", "Execution Statistics", "System"])
         self.assertEqual(titles[0], "Status · Running Session · ${runtext}")
         self.assertEqual([p.get("collapsed") for p in self.b["panels"] if p["type"] == "row"], [False] * 8 + [True, True])
@@ -158,8 +158,8 @@ class Shape(unittest.TestCase):
                 break
             top.append(p)
         self.assertEqual([p["title"] for p in top], ["Status · Running Session · ${runtext}", "Execution", "Account", "Market · Prices",
-                                                     "Market · Spread and Signal", "Alerts"])
-        self.assertLessEqual(max(p["gridPos"]["y"] + p["gridPos"]["h"] for p in top), 20)
+                                                     "Market · Real Spread and Signal", "Alerts"])
+        self.assertLessEqual(max(p["gridPos"]["y"] + p["gridPos"]["h"] for p in top), 21)
         self.assertNotIn('AS "Close"', board.Q_STATUS_EXEC)   # owner item 76: no Close
         self.assertNotIn('AS "Anchor"', board.Q_STATUS_EXEC)   # the Anchor is in Market
         for p in top[1:3]:
@@ -204,31 +204,44 @@ class Shape(unittest.TestCase):
             self.assertIn(("^%s$" % word, board.PHASE_COLORS[name]), board.STATUS_WORDS)
 
     def test_execution_charts(self):
-        """One frame for both charts; the Spread chart shows the Deviation chart's result; every tooltip row is a tooltip-only
-        series (a drawn line is never in the tooltip) and the Deviation chart's tooltip hides zeros, the value of the marker
-        rows on rows without a decision near them."""
-        dev = next(p for p in self.b["panels"] if p["title"] == "Deviation from the Mean · σ")
-        spread = next(p for p in self.b["panels"] if p["title"] == "Spread · D")
-        self.assertEqual(len(dev["targets"]), 1)
-        self.assertEqual(spread["targets"][0]["panelId"], dev["id"])
-        self.assertTrue(dev["options"]["tooltip"]["hideZeros"])
-        for p in (dev, spread):
-            for o in p["fieldConfig"]["overrides"]:
-                props = {x["id"]: x["value"] for x in o["properties"]}
-                hide = props.get("custom.hideFrom", {})
+        """Owner items 80, 81: two charts, Spread · bps and Deviation · bps, after Combo Spread's; one frame (the Deviation chart
+        shows the Spread chart's result); no plain spread line on Spread (the Real Long / Short Spread lines); every tooltip row is
+        a tooltip-only series (a drawn line is never in the tooltip), the tooltips hide zeros; the decision rows come last but
+        each chart's own At; each long entry is a green triangle (a filled band), each short entry a red one, exits circles;
+        every frame column is kept by one chart or the other; a legend holds at most eight series."""
+        spread = next(p for p in self.b["panels"] if p["title"] == "Spread · bps")
+        dev = next(p for p in self.b["panels"] if p["title"] == "Deviation · bps")
+        self.assertEqual(len(spread["targets"]), 1)
+        self.assertEqual(dev["targets"][0]["panelId"], spread["id"])
+        kept = set()
+        for p in (spread, dev):
+            self.assertTrue(p["options"]["tooltip"]["hideZeros"])
+            names = p["transformations"][0]["options"]["include"]["names"]
+            kept |= set(names)
+            self.assertNotIn("Spread", names)   # no line on the mids' spread
+            props = {o["matcher"]["options"]: {x["id"]: x["value"] for x in o["properties"]} for o in p["fieldConfig"]["overrides"]}
+            for name, pr in props.items():
+                hide = pr.get("custom.hideFrom", {})
                 if not hide.get("viz") and hide.get("tooltip") is not True:
-                    self.fail("%s: drawn series %s in the tooltip" % (p["title"], o["matcher"]["options"]))
-        tips = [o["matcher"]["options"] for o in dev["fieldConfig"]["overrides"]
-                if any(x["id"] == "custom.hideFrom" and x["value"].get("viz") for x in o["properties"])]
-        self.assertEqual(tips[-len(board.MARKER_INFO):], [n for n, _ in board.MARKER_INFO])
-        # Every column of the frame is kept by one chart or the other; the legend holds at most eight series.
-        frame = [n for n, _ in board.ALL_COLUMNS]
-        kept = set(dev["transformations"][0]["options"]["include"]["names"]) | set(spread["transformations"][0]["options"]["include"]["names"])
-        self.assertEqual(set(frame) - kept, set())
-        in_legend = [n for n in dev["transformations"][1]["options"]["indexByName"] if n != "time" and not any(
-            o["matcher"]["options"] == n and any(x["id"] == "custom.hideFrom" and x["value"].get("legend") for x in o["properties"])
-            for o in dev["fieldConfig"]["overrides"])]
-        self.assertLessEqual(len(in_legend), 8, in_legend)
+                    self.fail("%s: drawn series %s in the tooltip" % (p["title"], name))
+            chart = "" if p is spread else " · Dev"
+            self.assertEqual(props["Long Entry" + chart]["color"]["fixedColor"], board.GOOD)
+            self.assertEqual(props["Long Entry" + chart]["custom.fillBelowTo"], "Long Entry · Base" + chart)
+            self.assertEqual(props["Short Entry" + chart]["color"]["fixedColor"], board.BAD)
+            self.assertEqual(props["Exit" + chart]["custom.drawStyle"], "points")
+            in_legend = [n for n in p["transformations"][1]["options"]["indexByName"] if n != "time" and not (props.get(n, {}).get("custom.hideFrom", {}) or {}).get("legend")]
+            self.assertLessEqual(len(in_legend), 8, (p["title"], in_legend))
+        self.assertEqual(set(n for n, _ in board.ALL_COLUMNS) - kept, set())
+
+    def test_no_spread_unit_d(self):
+        """Owner item 80: no "D" unit on the board: every spread figure in bps (titles, descriptions, units, tooltips, the texts
+        the queries write); F labelled USD/USDT."""
+        text = json.dumps(self.b, ensure_ascii=False)
+        for m in re.finditer(r"(?<![A-Za-z_\\$])D(?![A-Za-z_0-9])", text):
+            self.fail("a D at: %s" % text[max(0, m.start() - 60):m.end() + 20])
+        self.assertIn("F · USD/USDT", text)
+        self.assertNotIn("PnL per Round Trip", text)
+        self.assertNotIn("Entry · σ", text)
 
     def test_anchor_marks_on_every_chart(self):
         charts = [p["id"] for p in self.b["panels"] if p["type"] == "timeseries"]
@@ -318,11 +331,20 @@ class Queries(unittest.TestCase):
             s_, inv, cex = cfg["strategy"], cfg["inventory"], cfg["cex"]
             sig = lambda x: ("−" if Decimal(str(x)) < 0 else "+") + format(abs(Decimal(str(x))).normalize(), "f") + "σ"
             m, lev = Decimal(inv["capital"]), Decimal(inv["leverage"])
-            want = {"Mean": "%s %sm" % (s_["mean_model"].upper(), s_["mean_minutes"]), "σ Window": "%sm" % s_["sigma_minutes"],
-                    "Long In → Out": sig(-Decimal(str(s_["d_in"]))) + " → " + sig(-Decimal(str(s_["d_out"]))),
-                    "Short In → Out": sig(s_["d_in"]) + " → " + sig(s_["d_out"]),
-                    "Capital M": "{:,.0f}".format(m), "Leverage L": format(lev.normalize(), "f") + "×", "Notional N": "{:,.0f}".format(m * lev),
-                    "Mode": "Live" if c["live"] else "Paper", "Order Channel": cex["order_transport"].upper(),
+            for moved in ("Mean", "σ Window", "Long In → Out", "Short In → Out", "Capital M", "Leverage L", "Notional N"):
+                self.assertNotIn(moved, got, run)   # owner item 80: in Parameters, not twice
+            par = psql_json(fill(board.Q_PARAMS, self.values(1, run)))[0]
+            sigma = psql_json("SELECT sigma_d FROM trade.signal_sample WHERE run_id = '%s' ORDER BY ts_ms DESC LIMIT 1" % run)
+            sigma = sigma[0]["sigma_d"] if sigma else None
+            num = lambda x: format(Decimal(str(x)).normalize(), "f").replace("-", "−")
+            bps = lambda d: ("{:,.1f}".format(Decimal(str(d)) * Decimal(str(sigma))) + board.NBSP + "bps").replace("-", "−") if sigma is not None else "–" + board.NBSP + "bps"
+            if psql_json("SELECT stopped_ms FROM trade.process_run WHERE run_id = '%s'" % run)[0]["stopped_ms"]:   # a running Run's σ moves
+                self.assertEqual(par["Entry"], "%sσ · %s" % (num(s_["d_in"]), bps(s_["d_in"])), run)
+                self.assertEqual(par["Exit"], "%sσ · %s" % (num(s_["d_out"]), bps(s_["d_out"])), run)
+            self.assertEqual((par["Mean Model"], par["Volatility Scale"]), ("%s · %s%smin" % (s_["mean_model"].upper(), s_["mean_minutes"], board.NBSP),
+                                                                            "%s%smin" % (s_["sigma_minutes"], board.NBSP)), run)
+            self.assertEqual((par["Capital M"], par["Leverage L"], par["Notional N"]), (m, lev, m * lev), run)
+            want = {"Mode": "Live" if c["live"] else "Paper", "Order Channel": cex["order_transport"].upper(),
                     "Pricing Level": "%s / %s" % tuple("%d%s" % (n, {1: "st", 2: "nd", 3: "rd"}.get(n, "th")) for n in (
                         s_["pricing_level"]["bull"], s_["pricing_level"]["bear"])),
                     "Taker Fee": format(Decimal(str(s_["taker_fee_bps"])).normalize(), "f") + " bps", "Host": c["host"], "Run ID": run}
@@ -359,7 +381,14 @@ class Queries(unittest.TestCase):
             if psql_json(newest)[0]["ts_ms"] != s["ts_ms"]:
                 continue   # a new second came in between the reads
             one = lambda x: Decimal(str(math.floor(float(x) * 10 + 0.5) / 10)) if x is not None else None
-            self.assertEqual((m["Spread"], m["Mean"]), (one(s["mid_d"]), one(s["mu_d"])))
+            self.assertEqual((m["Mean"], m["Volatility"]), (one(s["mu_d"]), one(s["sigma_d"])))
+            fmt = lambda x: ("{:,.1f}".format(Decimal(str(x)).quantize(Decimal("0.1"), rounding="ROUND_HALF_UP") + 0) + board.NBSP + "bps").replace("-", "−")
+            if s["stats_ready"]:
+                rl = fmt(float(s["mu_d"]) + float(s["x_long_d"])) if s["x_long_d"] is not None else "–"
+                rs = fmt(float(s["mu_d"]) + float(s["x_short_d"])) if s["x_short_d"] is not None else "–"
+                self.assertEqual(m["Real Spread"], "Long%s%s / Short%s%s" % (board.NBSP, rl, board.NBSP, rs))
+                dev = float(s["mid_d"]) - float(s["mu_d"])
+                self.assertEqual(m["Deviation"], "%s · %s%sσ" % (fmt(dev), "{:.2f}".format(Decimal(str(dev / float(s["sigma_d"]))).quantize(Decimal("0.01"), rounding="ROUND_HALF_UP") + 0).replace("-", "−"), board.NBSP))
             self.assertEqual(float(m["F"]), float(s["f"]))
             self.assertEqual((m["Bull Anchor"], m["Bear Anchor"]), (s["anchor_bull"], s["anchor_bear"]))
             if s["mid_bull"] is not None:
@@ -511,6 +540,7 @@ class Queries(unittest.TestCase):
         running = r["stopped_ms"] is None
         tick = {"bull": "SOXL", "bear": "SOXS"}
         hms = lambda ms: utc8(ms).strftime("%H:%M:%S")
+        md = lambda ms: utc8(ms).strftime("%m-%d %H:%M:%S").replace("-", board.NBHY).replace(" ", board.NBSP)
         words = {c: w.replace("Bull ", "SOXL ").replace("Bear ", "SOXS ") for c, _, w in board.IDLE}
         cfg = r["config"] if isinstance(r["config"], dict) else json.loads(r["config"])
         d_in = float(cfg["strategy"]["d_in"])
@@ -548,15 +578,15 @@ class Queries(unittest.TestCase):
             dust = c["dust_bull"] != 0 or c["dust_bear"] != 0
             if c["end_reason"] in what or c["end_reason"] == "dust_only" or dust:
                 out.append((c["closed_ms"] or c["opened_ms"], "serious" if c["end_reason"] == "one_leg" else "warning",
-                            "Recorded" if c["end_reason"] == "dust_only" or dust else "Recovered", "Round Trip " + hms(c["opened_ms"]),
+                            "Recorded" if c["end_reason"] == "dust_only" or dust else "Recovered", "Execution " + md(c["opened_ms"]),
                             what.get(c["end_reason"], "Dust Left"), None))
             if isinstance(c["funding_awaited"], list) and c["funding_awaited"]:
-                out.append((c["closed_ms"], "warning", "In Progress" if running else "Open", "Round Trip " + hms(c["opened_ms"]), "Funding Awaited", None))
+                out.append((c["closed_ms"], "warning", "In Progress" if running else "Open", "Execution " + md(c["opened_ms"]), "Funding Awaited", None))
         by_id = {c["cycle_id"]: c for c in psql_json("SELECT * FROM trade.cycle WHERE live = %s" % r["live"])}
         for d in psql_json("SELECT * FROM trade.decision WHERE run_id = '%s' AND live = %s AND kind = 'forced'" % (run, r["live"])):
             c = by_id.get(d["cycle_id"])
             out.append((d["ts_ms"], "serious", "In Progress" if c and c["status"] == "open" and running else "Recovered",
-                        "Round Trip " + (hms(c["opened_ms"]) if c else "–"), "Forced Exit", None))
+                        "Execution " + (md(c["opened_ms"]) if c else "–"), "Forced Exit", None))
         for o in orders:
             if o["unknown"] or o["not_found"] or o["status"] in ("rejected", "not_sent", "never_arrived"):
                 w = ("Order Outcome Unknown" if o["unknown"] else "Order Not Found" if o["not_found"] else "Order Rejected" if o["status"] == "rejected"
@@ -613,7 +643,10 @@ class Queries(unittest.TestCase):
                                      (i["pos_" + l], i["ledger_" + l], i["mark_" + l], i["liq_" + l], i["upl_" + l]))
                     pos, mark, liq = i["pos_" + l], i["mark_" + l], i["liq_" + l]
                     want = None if not pos or mark is None or liq is None else 100 * ((liq - mark) if pos < 0 else (mark - liq)) / mark
-                    self.assertEqual(g["Liq Distance"], want)
+                    if want is None:
+                        self.assertIsNone(g["Liq Distance"])
+                    else:
+                        self.assertAlmostEqual(float(g["Liq Distance"]), float(want), places=9)
                     self.assertEqual(g["Age"] is None, r["stopped_ms"] is not None)
 
     def test_empty_tables_say_so(self):
@@ -621,7 +654,7 @@ class Queries(unittest.TestCase):
         Latency), not an empty panel; a Run with round trips has no such row."""
         v = self.values(1, "__none")
         for q, col, text in ((board.Q_BLOTTER, "End Reason", "No round trip in the Range"), (board.Q_ORDERS, "Status", "No order: no round trip in the Range"),
-                             (board.Q_END_REASONS, "End Reason", "No round trip closed in the Range"), (board.Q_BLOCKED, "Reason", "None in the Range"),
+                             (board.Q_END_REASONS, "End Reason", "None in the Range"), (board.Q_BLOCKED, "Reason", "None in the Range"),
                              (board.Q_LATENCY, "Stage", "No order in the Range")):
             self.assertEqual([r[col] for r in psql_json(fill(q, v))], [text])
         self.assertNotIn("No round trip in the Range", [r["End Reason"] for r in psql_json(fill(board.Q_BLOTTER, self.values(1, self.PAPER_RUN)))])
@@ -635,51 +668,99 @@ class Queries(unittest.TestCase):
         self.assertEqual(got, {"listed": "Trimmed to Dust", "other": "Brand New Reason", "open": "Open", "idle": "Regular Hours", "sent": "Order Sent"})
 
     def test_execution_frame(self):
-        """The execution charts' frame: a row is a break row (every column NULL) or has a value, possibly a hidden 0 or a code,
-        in every tooltip row; a break row sits right before the point it separates from what came before, after a run's last
-        decisions (none of which may follow it); each decision of the range is one dot."""
+        """The charts' frame: a row is a break row (every column NULL) or has a value, possibly a hidden 0 or a code, in every
+        tooltip row; a break row sits right before the point it separates from what came before, after a run's last decisions;
+        each decision of the range shows (its tooltip rows carry its instant) and its marker sits at its executable spread; a
+        triangle's apex is at the decision's instant, its corners half a width either side."""
         tips = [n for n, _ in board.TOOLTIP_COLUMNS + board.STATE_COLUMNS + board.MARKER_INFO]
-        dots = [n for n, _, _, _, _ in board.DOTS]
         for hours in (0.25, 6, 24, 168):
             v = self.values(hours, self.PAPER_RUN)
             rows = psql_json(fill(board.Q_EXECUTION, v))
-            drawn = 0
+            decided = set()
             for i, r in enumerate(rows):
                 values = [r[n] for n, _ in board.ALL_COLUMNS]
                 if all(x is None for x in values):
                     self.assertLess(i + 1, len(rows), "a break row ends the frame")
-                    after = rows[i + 1]
-                    self.assertIsNotNone(after["Spread · Tooltip"], "a break row right before a point")
-                    self.assertFalse(after["Action"] and after["Decided"] == round(datetime.fromisoformat(after["time"]).timestamp() * 1000),
-                                     "%s: a decision after a break row would join the lines across the gap" % after["time"])
+                    self.assertIsNotNone(rows[i + 1]["Mean · Tooltip"], "a break row right before a point")
                     continue
                 for n in tips:
                     self.assertIsNotNone(r[n], "%s h, %s: %s NULL" % (hours, r["time"], n))
-                drawn += sum(r[name] is not None for name in dots)
-            decisions = psql_json(fill("SELECT count(*) AS n FROM trade.decision d WHERE d.run_id = '%s' AND d.kind IN "
-                                       "('entry', 'exit', 'complete', 'trim', 'forced') AND d.ts_ms >= $__from AND d.ts_ms <= $__to" % self.PAPER_RUN, v))[0]["n"]
-            self.assertEqual(drawn, decisions, "%s h" % hours)
+                if r["Action"]:
+                    decided.add(r["Decided"])
+                for side in ("Long Entry", "Short Entry"):
+                    if r[side] is not None:
+                        self.assertIsNotNone(r[side + " · Base"])
+            decisions = psql_json(fill("SELECT d.ts_ms FROM trade.decision d WHERE d.run_id = '%s' AND d.kind IN "
+                                       "('entry', 'exit', 'complete', 'trim', 'forced') AND d.ts_ms >= $__from AND d.ts_ms <= $__to" % self.PAPER_RUN, v))
+            self.assertEqual(decided, {d["ts_ms"] for d in decisions}, "%s h" % hours)
+        # Owner item 83: every marker of a round trip carries its Execution ID, the round trip's opening (its row in Round Trips).
+        v = self.values(168, self.PAPER_RUN)
+        rows = psql_json(fill(board.Q_EXECUTION, v))
+        cycles = {r["ts_ms"]: r["opened_ms"] for r in psql_json(
+            "SELECT d.ts_ms, c.opened_ms FROM trade.decision d JOIN trade.cycle c ON c.live = d.live AND c.cycle_id = d.cycle_id "
+            "WHERE d.run_id = '%s' AND d.kind IN ('entry', 'exit', 'complete', 'trim', 'forced')" % self.PAPER_RUN)}
+        seen = {(r["Decided"], r["Execution"]) for r in rows if r["Action"]}
+        self.assertTrue(seen)
+        for decided, execution in seen:
+            self.assertEqual(execution, cycles[decided], decided)
+        trips = [r for r in psql_json(fill(board.Q_BLOTTER, v)) if r["cycle_id"]]
+        opened = {round(datetime.fromisoformat(r["Opened"]).timestamp() * 1000) for r in trips}
+        self.assertLessEqual({e for _, e in seen if e in opened}, opened)
+        self.assertTrue({e for _, e in seen} & opened)
+        # Each triangle is whole (no NULL row inside it breaks its two series) and none overlaps another: the entries of a
+        # triangle's width after its start are drawn by it (the round trip of 08:14:01-08:43:15 UTC+8 has short entries at
+        # 08:14:01, 08:14:03 and three at 08:17:14).
+        entries = [r["ts_ms"] for r in psql_json(
+            "SELECT d.ts_ms FROM trade.decision d JOIN trade.lot l ON l.live = d.live AND l.lot_id = d.lot_id WHERE d.run_id = '%s' "
+            "AND d.kind = 'entry' AND l.status <> 'void' ORDER BY d.ts_ms" % self.PAPER_RUN)]   # a void entry is a grey circle
+        for f0, f1 in ((1795651500000, 1795654200000), (1795651980000, 1795652340000), (1795629729414, 1795666000000)):
+            v = dict(self.values(1, self.PAPER_RUN), __from=f0, __to=f1)
+            half = psql_json(fill("SELECT greatest(%s, ($__to - $__from) / 130)::bigint AS half" % board.STEP_MS, v))[0]["half"]
+            starts = []
+            for ts in entries:
+                if not starts or ts > starts[-1] + 2 * half:
+                    starts.append(ts)
+            rows = psql_json(fill(board.Q_EXECUTION, v))
+            for r in rows:
+                ms = round(datetime.fromisoformat(r["time"]).timestamp() * 1000)
+                inside = [s for s in starts if abs(ms - s) <= half and f0 <= s <= f1]
+                drawn = r["Long Entry"] is not None or r["Short Entry"] is not None
+                if all(r[n] is None for n, _ in board.ALL_COLUMNS):
+                    continue
+                self.assertEqual(bool(inside), drawn, (f0, r["time"]))
+                self.assertLessEqual(len(inside), 1)
+        # The entry of 2026-11-26 10:59:32.154 (a Short, the first of three in 843 ms): its triangle's apex at its instant, at
+        # mu_d + x_d, pointing down.
+        d = psql_json("SELECT ts_ms, (detail ->> 'mu_d')::float8 + (detail ->> 'x_d')::float8 AS ys FROM trade.decision WHERE run_id = '%s' "
+                      "AND kind = 'entry' AND direction = 'short' AND ts_ms = 1795661972154" % self.PAPER_RUN)[0]
+        v = dict(self.values(1, self.PAPER_RUN), __from=d["ts_ms"] - 15 * 60000, __to=d["ts_ms"] + 15 * 60000)
+        apex = [r for r in psql_json(fill(board.Q_EXECUTION, v)) if r["Short Entry"] is not None
+                and round(datetime.fromisoformat(r["time"]).timestamp() * 1000) == d["ts_ms"]]
+        self.assertTrue(apex)
+        self.assertLess(float(apex[0]["Short Entry"]), float(d["ys"]))          # the apex below the decision's place: pointing down
+        self.assertGreater(float(apex[0]["Short Entry · Base"]), float(d["ys"]))
 
-    def test_no_executable_distance_on_an_unusable_book(self):
-        """Owner item 70 (the auditor's review): a sample whose leg's book conflicts (or whose depth is unusable) gives no
-        distance to an entry line and no Buy Both / Sell Both point, as the executor enters on none. The real paper sample of
-        2026-11-26 10:59:47.002 UTC+8: SOXS in conflict, Sell Both +2.0862σ past d_in 2: the distance reads — (it read At the
-        Line); the same sample with SOXS's book usable reads At the Line; the chart's Sell Both there is no point but the code
-        of Book Not OK, its raw deviation kept in the Entry strip's Sell Both."""
+    def test_no_entry_signal_on_an_unusable_book(self):
+        """Owner item 70 (the auditor's review): a sample whose leg's book conflicts (or whose depth is unusable) gives no entry
+        signal and no Buy Both / Sell Both point, as the executor enters on none. The real paper sample of 2026-11-26
+        10:59:47.002 UTC+8: SOXS in conflict, Sell Both +2.0862σ past d_in 2: Market's Signal reads No Book; the same sample with
+        SOXS's book usable reads Short; the chart's Sell Both there is no point but the code of Book Not OK."""
         ts = 1795661987002
-        cols = "s.run_id, s.stats_ready, s.sigma_d, s.x_long_d, s.x_short_d, s.depth_ok_bull, s.depth_ok_bear, s.conflict_bull"
-        q = ("SELECT %s AS d FROM (SELECT {cols}, {bear} AS conflict_bear FROM trade.signal_sample s WHERE s.live = false AND s.ts_ms = %d) s "
-             "JOIN trade.process_run sr ON sr.run_id = s.run_id AND sr.live = false") % (board.distance(board.TO_SHORT), ts)
+        cols = ("s.ts_ms, s.anchor_kind, s.stats_ready, s.sigma_d, s.x_long_d, s.x_short_d, s.depth_ok_bull, s.depth_ok_bear, "
+                "s.conflict_bull")
+        q = ("SELECT %s AS d FROM (SELECT {cols}, {bear} AS conflict_bear FROM trade.signal_sample s WHERE s.live = false AND s.ts_ms = %d) s"
+             % (board.market_signal("s", "2"), ts))
         sample = psql_json("SELECT conflict_bear, round((x_short_d / sigma_d)::numeric, 4) AS xs FROM trade.signal_sample "
                            "WHERE live = false AND ts_ms = %d" % ts)
         self.assertEqual(sample, [{"conflict_bear": True, "xs": Decimal("2.0862")}])
-        self.assertEqual(psql_json(q.format(cols=cols, bear="s.conflict_bear")), [{"d": "—"}])
-        self.assertEqual(psql_json(q.format(cols=cols, bear="false")), [{"d": "At the Line"}])
-        v = dict(self.values(0.25, self.PAPER_RUN), __from=ts - 20 * 60000, __to=ts + 5 * 60000)
-        row = [r for r in psql_json(fill(board.Q_EXECUTION, v)) if r["time"].startswith("2026-11-26T02:59:47") and r["Spread · Tooltip"] is not None]
+        self.assertEqual(psql_json(q.format(cols=cols, bear="s.conflict_bear")), [{"d": "No Book"}])
+        self.assertEqual(psql_json(q.format(cols=cols, bear="false")), [{"d": "Short"}])
+        # (a range of 10 min: the tooltip window around the entries of 10:59:32, a 90th of the range, ends before 10:59:47)
+        v = dict(self.values(0.25, self.PAPER_RUN), __from=ts - 5 * 60000, __to=ts + 5 * 60000)
+        row = [r for r in psql_json(fill(board.Q_EXECUTION, v)) if r["time"].startswith("2026-11-26T02:59:47") and r["Mean · Tooltip"] is not None]
         self.assertTrue(row, "the point of 10:59:47")
-        self.assertIsNone(row[0]["Sell Both"])
-        self.assertEqual(row[0]["Sell Both · Tooltip"], board.CODE["Book Not OK"])
+        self.assertIsNone(row[0]["Real Short Spread"])
+        self.assertEqual(row[0]["Real Short Spread · Tooltip"], board.CODE["Book Not OK"])
 
     def test_pnl_and_round_trips_from_the_fills(self):
         """PRD V19: the Net and P&L figures and the Round Trips table against the fills (sells' value - buys' value of a flat
@@ -714,15 +795,15 @@ class Queries(unittest.TestCase):
                 checked += 1
         known = [c for c in cycles.values() if c["status"] != "open" and c["funding_known"] and c["end_reason"] != "no_fill" and c["cycle_id"] in fills]
         p = psql_json(fill(board.Q_PNL, v))[0]
-        net = psql_json(fill(board.Q_CUM, v))
+        gross = psql_json(fill(board.Q_CUM_GROSS, v))
+        net = psql_json(fill(board.Q_CUM_PNL, v))
         want = sum(fills[c["cycle_id"]]["gross"] - fills[c["cycle_id"]]["fees"] + c["funding"] for c in known)
         tol = sum(Decimal("0.0002") * fills[c["cycle_id"]]["fills"] for c in known if c["live"])
         self.assertAlmostEqual(-(p["Fee"] or 0), sum(fills[c["cycle_id"]]["fees"] for c in known), delta=tol)
         self.assertAlmostEqual(p["PnL"], want, delta=tol)
         self.assertAlmostEqual(p["Gross"], sum(fills[c["cycle_id"]]["gross"] for c in known), delta=tol)
-        self.assertEqual((net[-1]["PnL"], net[-1]["Gross"]), (p["PnL"], p["Gross"]))   # owner item 77: the chart ends on the Summary
-        steps = [r for r in net[1:-1]]
-        self.assertEqual(len(steps), 2 * len(known))   # two points at each close: before and after
+        self.assertEqual((net[-1]["PnL"], gross[-1]["Gross"]), (p["PnL"], p["Gross"]))   # owner items 77, 80: each chart ends on the Summary
+        self.assertEqual((len(net) - 2, len(gross) - 2), (2 * len(known), 2 * len(known)))   # two points at each close: before and after
         closed = [c for c in cycles.values() if c["status"] != "open" and c["end_reason"] != "no_fill"]
         self.assertAlmostEqual(p["Notional"], sum((fills[c["cycle_id"]]["traded"] for c in closed if c["cycle_id"] in fills), Decimal(0)), delta=tol)
         peak = psql_json(fill("WITH %s SELECT max(quota_used) AS m FROM trade.inventory_sample i WHERE i.run_id = '%s' AND i.ts_ms >= (SELECT rg.from_ms FROM rg) "
@@ -730,8 +811,6 @@ class Queries(unittest.TestCase):
         self.assertEqual(p["Peak Used"], peak)
         if peak:
             self.assertAlmostEqual(float(p["Return"]), float(10000 * p["PnL"] / peak), places=6)
-        points = psql_json(fill(board.Q_TRIP_GAIN, v)) + psql_json(fill(board.Q_TRIP_LOSS, v))
-        self.assertEqual(sorted(r["cycle_id"] for r in points), sorted(c["cycle_id"] for c in known))
 
 
 if __name__ == "__main__":
