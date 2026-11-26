@@ -1,10 +1,10 @@
 # core 架构与设计方案
 
-版本：0.11 · 2026-11-25（UTC+8）；2026-11-26 补充：第 8 步回放与选参已实现（5.8、第 9 节第 8 行），铃锚点的 F 只取 Coinbase 收盘前一分钟 1 分钟 K 线的收盘（用户第 69 条，5.1“锚点”、5.4a），纸面成交的手续费逐笔截断到 8 位（审计第 70 条，5.1“纸面”） · 状态：**设计稿；审计五次批复后分步实施中：第 0–4 步已实现并提交；第 5 步（cex 订单与纸面、Bitget 账户侧）和第 5.3 步（延迟相关的改动、WSS 下单通道）已实现并通过测试，未提交；第 6 步起未开始。** 0.11 之后的补充（2026-11-25 晚）：审计第 6 步之后 exec 和 inventory 的修改（用户第 65、66 条）见 5.4c；用户第 61 条：5.6 新增只供 Live Monitor 显示的三项落库（`funding_rate` 表、`inventory_sample` 的标记价等八列、`signal_sample` 的两腿中价）。0.11 落实用户第 56、57 条：取价不再归档（SOXL 第 2 个、SOXS 第 5 个原始价位，5.2 末尾“取价档”），下单默认改用 WSS 并用真实订单验证（5.7 末尾）。0.10 落实第 53–55 条（SOXS 改 `books5`、延迟设计 L1–L4 和 WSS 下单的实现与实测）。规则在 PRD 3.9。0.9 写入第 5 步的做法和延迟研究；0.8、0.7 落实审计第五、四次意见（5.4b、5.4a）。各轮审计原文、检查报告和 0.1–0.10 的副本在 `experiments/decisions_20261123/spec_core_20261124/`。
+版本：0.11 · 2026-11-25（UTC+8）；2026-11-26 补充：第 8 步回放与选参已实现（5.8、第 9 节第 8 行），铃锚点的 F 只取 Coinbase 收盘前一分钟 1 分钟 K 线的收盘（用户第 69 条，5.1“锚点”、5.4a），纸面成交的手续费逐笔截断到 8 位（审计第 70 条，5.1“纸面”），文档订正（用户第 79 条转来的审计意见第 3 点：“文档应让读者在规则所在章节就能看到实际行为”）：第 1 节的下单通道只写一种说法“默认 WSS，连接不可用时走 REST；已发出但结果未知的订单按原编号查询”，第 6 节（看板）改为两块看板已实现并发布、变量和各行照 Live Monitor 4.1，规则改指 PRD 3.10（1.4 节的首版收窄已写进 PRD 正文；5.2 的“5 秒从哪一刻起”和第 10 节收窄表的表头随之注明 PRD 一栏是原正文） · 状态：**设计稿；审计五次批复后分步实施中：第 0–4 步已实现并提交；第 5 步（cex 订单与纸面、Bitget 账户侧）和第 5.3 步（延迟相关的改动、WSS 下单通道）已实现并通过测试，未提交；第 6 步起未开始。** 0.11 之后的补充（2026-11-25 晚）：审计第 6 步之后 exec 和 inventory 的修改（用户第 65、66 条）见 5.4c；用户第 61 条：5.6 新增只供 Live Monitor 显示的三项落库（`funding_rate` 表、`inventory_sample` 的标记价等八列、`signal_sample` 的两腿中价）。0.11 落实用户第 56、57 条：取价不再归档（SOXL 第 2 个、SOXS 第 5 个原始价位，5.2 末尾“取价档”），下单默认改用 WSS 并用真实订单验证（5.7 末尾）。0.10 落实第 53–55 条（SOXS 改 `books5`、延迟设计 L1–L4 和 WSS 下单的实现与实测）。规则在 PRD 3.9。0.9 写入第 5 步的做法和延迟研究；0.8、0.7 落实审计第五、四次意见（5.4b、5.4a）。各轮审计原文、检查报告和 0.1–0.10 的副本在 `experiments/decisions_20261123/spec_core_20261124/`。
 
 core 是 ETF Pair Arbitrage 的交易进程：读 Bitget 上 SOXLUSDT / SOXSUSDT 两个永续合约的盘口，按锚点算出价差、均线和 σ，在非盘中两条腿同时偏离均线足够远时用 IOC 限价单同时买入（或同时卖出）两条腿，价差回到平仓线时平仓，每个美股常规收盘前全部平掉。
 
-- **规则在 [../PRD.md](../PRD.md)（3.9）**，本文件只写怎么实现：模块、接口、数据结构、算法的参考代码、落库和实施步骤。两者不一致时以 PRD 为准并修本文件。文中“PRD 5.3”指 PRD 的第 5.3 节。
+- **规则在 [../PRD.md](../PRD.md)（3.10）**，本文件只写怎么实现：模块、接口、数据结构、算法的参考代码、落库和实施步骤。两者不一致时以 PRD 为准并修本文件。文中“PRD 5.3”指 PRD 的第 5.3 节。
 - **设计取舍**（用户第 41 条：“不要考虑 Corner Case，不要冗余设计”）：每条规则只有一个实现位置；不为 PRD 没写的故障情形加机制；PRD 写明的例外情形（订单结果未知、成交不齐、零头、重启）各用一个通用机制覆盖，集中在 5.4 的“例外情形”等三小节，不在主流程里逐个分支。第 10 节是 PRD 条款到实现位置的对照。
 - 代码、标识符、注释、日志用英文；架构、命名、日志、配置的形式沿用相邻仓库 `../dex-cex-arbitrage/arb-core`（第 8 节）。代码从头写，不复制相邻仓库或已归档的旧代码。
 - 监控看板 ETF-Pair Live Monitor 读本进程写的表（5.6），看板自身的设计在 [../dashboard/SPEC.md](../dashboard/SPEC.md) 第 7 节。
@@ -13,13 +13,13 @@ core 是 ETF Pair Arbitrage 的交易进程：读 Bitget 上 SOXLUSDT / SOXSUSDT
 
 | 项目 | 本方案 |
 |---|---|
-| 交易 | Bitget USDT 永续 `SOXLUSDT`、`SOXSUSDT`，UTA（统一账户）v3 接口。行情走公共 WebSocket；订单结果、成交、持仓走私有 WebSocket；下单走 REST（只有 IOC 限价单，没有撤单） |
+| 交易 | Bitget USDT 永续 `SOXLUSDT`、`SOXSUSDT`，UTA（统一账户）v3 接口。行情走公共 WebSocket；订单结果、成交、持仓走私有 WebSocket；下单默认 WSS，连接不可用时走 REST；已发出但结果未知的订单按原编号查询（`clientOid`，REST `order-info`），不重发（只有 IOC 限价单，没有撤单；通道见 5.7 末尾） |
 | 外部来源 | Binance（指数价 K 线、交易时段表，公开接口，只读）；Coinbase（USDT-USD 买一卖一，公开）；Direxion（NAV、分红，只读，密钥在 `.env`）。全部由本进程自己读，不读看板的表（PRD 3.3） |
 | 组合 | 一个进程一个组合（bull = SOXL，bear = SOXS）；组合写在配置里，代码里不写死代码名 |
 | 运行方式 | `exec.live: false` 纸面（默认；订单不出进程，由 `cex.PaperVenue` 按本地盘口撮合）；`true` 实盘（要用户另行授权） |
 | 账户 | 策略独占的账户，由用户提供（PRD 6.8）。`core/.env` 里现在的密钥是用户给来查询交易所事实的：2026-11-24 只读核实，统一账户、单向持仓，两个合约都是全仓、杠杆 10；**那个账户里还有别的合约的仓位**，实盘用哪个账户由用户定（第 7 节）。本进程在任何账户上都只读写 `SOXLUSDT`、`SOXSUSDT` 的订单和持仓，核对也只比这两个合约 |
 | 数据库 | `etfpair` 库的独立 schema `trade`（PRD 3.7），本进程用自己的写入角色；启动时只读录制服务的 `etfpair.perp_second` 补分钟 |
-| 首版不做 | 挂单、撤单、Binance 交易、多组合、跨收盘持仓、保证金率规则（看板只显示账户的保证金率，5.6 末尾）、自动选参（PRD 1.3、6.6）；任何 PRD 没写的重试、降级、熔断。下单通道：默认 WSS（`cex.order_transport: ws`，用户第 56 条；连接不在时那一张走 REST），REST 仍可选（5.7） |
+| 首版不做 | 挂单、撤单、Binance 交易、多组合、跨收盘持仓、保证金率规则（看板只显示账户的保证金率，5.6 末尾）、自动选参（PRD 1.3、6.6）；任何 PRD 没写的重试、降级、熔断。（下单通道见“交易”一行：配置 `cex.order_transport` 默认 `ws`，用户第 56 条；设成 `rest` 时每张单都走 REST，5.7） |
 | 进程 | 单进程；每个模块一个 manager，`NewManager(...)` + `Run(ctx)`；`main` 按依赖顺序启动 store、cex、inventory、exec，阻塞在 `ExecManager.Run` |
 
 ## 2. 模块划分
@@ -107,7 +107,7 @@ core/
 strategy.EvaluateEntry → EntryPlan（方向、两条腿的限价和数量）
   → inventory 开一轮、开一个仓位（两行同步写库）并预留额度；cex 同步写入两张 cex_order（status = pending）  # 发单之前落盘，PRD 13.5
   → 两个 goroutine 各发一张 IOC 限价单（cex.PlaceOrder）
-  → 结果经私有 WS 的 order 推送到达（REST 应答只表示受理）；到不了的按 ClientOrderID 查询
+  → 结果经私有 WS 的 order 推送到达（下单的应答——默认是下单连接上的 WSS 应答，连接不可用时是 REST 应答——只表示受理）；结果未知的按原 ClientOrderID 查询，不重发
   → 每一拍先取这一轮订单的快照并入账（inventory.Sync）；两张都有了最终状态 → strategy.EvaluateGap 看两条腿差多少
       → 差额发得出单：补齐或回吐（一次一张，有结果再判断）
       → 发不出：这一批建成，成为一个仓位（lot），重置开仓间隔
@@ -142,7 +142,7 @@ cex 是事实层：两条腿的盘口、合约规则、账户设置、持仓、�
 | Binance（公开） | 指数 K 线 `GET https://fapi.binance.com/fapi/v1/indexPriceKlines?pair=SOXLUSDT&interval=1m&startTime=<ms>&limit=1`，行 `[openTime, open, high, low, close, ...]`，必须检查返回的 `openTime` 等于要的那一分钟；时段表 `GET /fapi/v1/tradingSchedule`，取 `marketSchedules.EQUITY.sessions[]{startTime, endTime, type}` |
 | Coinbase（公开） | `GET https://api.exchange.coinbase.com/products/USDT-USD/ticker`（`bid`、`ask`）；分钟 K 线 `.../candles?granularity=60&start=&end=`，行 `[time, low, high, open, close, volume]` |
 | Direxion | `POST` AppSync GraphQL（地址和两条查询的文本与看板采集器相同，见 `dashboard/internal/scan/sources.go`），头 `X-Api-Key`。NAV：`getThirtyDayPrice(Ticker, TradeDate){Nav TradeDate}`；分红：`getKurtosysFunds(Ticker){Distributions{IncomeDividend ShortTermCapitalGain LongTermCapitalGain ReturnOfCapital ExDate}}`，同一除息日四项相加。按用户授权的节奏读（PRD 3.3） |
-| 本机到 Bitget † | 16 个签名 GET 的往返（每个都是新连接，含 TCP 和 TLS 握手）：最小 37 ms、中位 58 ms、最大 274 ms。下单走长连接，往返要到实盘才能量 |
+| 本机到 Bitget † | 16 个签名 GET 的往返（每个都是新连接，含 TCP 和 TLS 握手）：最小 37 ms、中位 58 ms、最大 274 ms。下单的往返已在 2026-11-25 用真实订单量过（5.7 末尾：WSS 是默认通道，REST 热连接作后备） |
 
 #### 包结构
 
@@ -916,7 +916,7 @@ func (s *Strategy) EvaluateGap(in GapInput) GapAction {
 - `capByLimit(book, dir, qty, quota, rule) (capQty, limit, fills)`：从吃单一侧最优价起逐档往下试，取“累计数量 × 这一档的价 ≤ `quota`”的最大数量（不超过 `qty`，取整到数量步长）。`limit` 是取到的最后一档的价：它既是这张补齐单的限价，也是预留额度用的价（数量 × `limit`）；`fills` 是每档取了多少，只用来算预期损失。盘口的档位加起来不够 `qty` 时返回 0：不补齐，回吐（PRD 8.4）。例（PRD 6.4）：剩余额度 200 USDT，卖盘 `9 × 10`、`11 × 10`，要补 20 份：只取第一档是 10 × 9 = 90；取到第二档时数量 × 11 ≤ 200 → 最多 18.18 份，限价 11，预留 199.98；逐档成交额 10 × 9 + 8.18 × 11 = 179.98 只用来比损失。
 - `walkOrLast(book, dir, qty)`：逐档取到 `qty` 为止，档位不够时剩下的按最后一档的价算。
 - `value(fills)`：Σ 价 × 量。`adverse(got, ref, dir)`：比参照差出的金额——买的时候 `got − ref`，卖的时候 `ref − got`。
-- **5 秒从哪一刻起**：PRD 8.2 写的是这一批第一笔成交的时刻。首版取这一批订单发出的本机时刻（`batch.sentAt`）：它不晚于第一笔成交，本机就能记下，重启后也能从这一批第一张订单的 `submitted_ms` 读回（第 10 节的收窄；窗口因此比 PRD 的写法短多少没有量过）。补齐、撤单、查询、重启都不刷新这个截止时刻。
+- **5 秒从哪一刻起**：PRD 8.2 的原正文（3.9 及以前）写的是这一批第一笔成交的时刻；首版取这一批订单发出的本机时刻（`batch.sentAt`），PRD 3.10 起正文就这样写：它不晚于第一笔成交，本机就能记下，重启后也能从这一批第一张订单的 `submitted_ms` 读回（第 10 节的收窄；窗口因此比原写法短多少没有量过）。补齐、撤单、查询、重启都不刷新这个截止时刻。
 - `GapWait`：补齐被允许、只差少的那条腿的新帧；这一拍不发单，窗口到点自然落到回吐。少的那条腿深度无效或冲突时不等，按 PRD 8.5 直接进回吐（`CanComplete[lag]` 为假）。`GapBlocked`：该回吐而这条腿没有价格；这一拍不发单，也不结清这一批。
 
 例（附录 A 例三，做空开仓，SOXL 成交 105.30、SOXS 成交 60）：差额 105.30 × 40 − 60 × 60 = 612 USD → 回吐 SOXL 15.30 份或补齐 SOXS 10.20 份。回吐：按 40.47 买回，比当初的 40.44 差 0.46，加手续费 0.65 bps × (618.73 + 619.19) = 0.08，共 0.54 USDT；补齐：按 59.418 卖出，比原计划的 59.42 差 0.02 USDT → 补齐。例四（最优档很薄）逐档算得回吐 0.99、补齐 0.50 → 补齐。两例都是测试。
@@ -1832,7 +1832,7 @@ func (s *Store) LoadState(ctx context.Context, sessionID string) (State, error) 
 
 **驱动**（每个模拟一个 goroutine；同一窗口的帧只解码一次，分块发给全部模拟，各自只看自己的输入，所以结果只取决于输入）：一帧到达时刻 t 之前，按时间先后依次处理到期的事件——F / 锚点的变化、纸面交易所的到单撮合（虚拟时钟的定时器）、循环的 tick——每个时刻先撮合再 `Advance`；同一毫秒的帧全部送完才处理这一毫秒的撮合和循环。资金费不计（`replayVenue` 没有结算费率；PRD 16.5 要求另列，这一版没有）。
 
-**输出**（`-out` 目录；每个窗口每个参数组一个子目录）：`orders.jsonl`、`fills.jsonl`、`cycles.jsonl`、`lots.jsonl`、`decisions.jsonl`、`minutes.jsonl`、`summary.json`（每个 Session 和整段各一份汇总），`-keep` 另有每秒的 `samples.csv` 和每张纸面单的 `paper_matches.jsonl`；全部窗口的汇总一行一组写进 `grid.csv`。汇总（PRD 16.5）：订单和成交数（按用途）；开仓批按两腿成交分为两腿都有、只有一腿、都没有，单腿率 = 只有一腿 ÷（两腿都有 + 只有一腿）；开仓单的成交率（成交量 ÷ 下单量）；补齐、回吐张数；手续费；轮数和按 `end_reason` 分的轮数（含 `dust_only`）；**轮净额**（已结束各轮的 `net`，只含已平部分）与**全成交现金账**（全部成交：卖出 − 买入 − 手续费）分开写，另写成交留下的两腿数量（零头）；**峰值名义** = 任一时刻两腿持有量按开仓成本的合计的最大值；**收益率**按 N（= M × L）和按实际用到的名义 min(N, 峰值)（用户第 69 条）两种给出。指纹 = 全部订单、成交、轮、仓位的最后一行和全部决策的哈希。
+**输出**（`-out` 目录；每个窗口每个参数组一个子目录）：`orders.jsonl`、`fills.jsonl`、`cycles.jsonl`、`lots.jsonl`、`decisions.jsonl`、`minutes.jsonl`、`summary.json`（每个 Session 和整段各一份汇总），`-keep` 另有每秒的 `samples.csv` 和每张纸面单的 `paper_matches.jsonl`；全部窗口的汇总一行一组写进 `grid.csv`。汇总（PRD 16.5）：订单和成交数（按用途）；开仓批按两腿成交分为两腿都有、只有一腿、都没有，单腿率 = 只有一腿 ÷（两腿都有 + 只有一腿）；开仓单的成交率（成交量 ÷ 下单量）；补齐、回吐张数；手续费；轮数和按 `end_reason` 分的轮数（含 `dust_only`）；**轮净额**（已结束各轮的 `net`，只含已平部分）与**全成交现金账**（全部成交：卖出 − 买入 − 手续费）分开写，另写成交留下的两腿数量（零头）；**峰值名义** = 每次循环推进（订单同步进库存账本）之后读 `inventory.HeldNotional()`（各仓位未平数量按开仓成本、先进先出，加零头按均价；不含未成交订单的预留，与实盘额度同一套账）的最大值，按 Session 记（审计第 79 条第 2 点：此前报告里另按整腿移动平均成本重建，部分平仓后与实盘账本不同）；**收益率**按 N（= M × L）和按实际用到的名义 min(N, 峰值)（用户第 69 条）两种给出。**窗口结果**（排名用，审计第 79 条第 1 点）：全成交现金账，加上截止时刻仍持有的仓位按截止时的盘口平掉的现金变化（多仓按买盘卖出、空仓按卖盘买回，逐档吃），减去这些平仓单的吃单手续费（截到 8 位）；`window_value` 写明估值方式：`flat`（截止时空仓，即现金账）、`closed_on_book`（按程序截止时的盘口）、`closed_on_books50`（程序的 `books5` 吃不下、改用截止前 `depth_max_age` 以内录到的 `books50` 全部档位：SOXS 刻度 0.001，`books5` 五档常只有十几份）、`no_value`（某条腿深度不可用、冲突，或两份盘口都吃不下；`grid.csv` 里这几列留空，不当 0 排名，也不剔除）；`window_return_on_n`、`window_return_on_used` 是它除以 N、除以实际用到的名义。轮净额保留，只用于解释已结束的轮。指纹 = 全部订单、成交、轮、仓位的最后一行和全部决策的哈希。
 
 **选参**（`-grid`）：`model`（ema / sma）、`x`、`y`（分钟）、`din`、`dout`（σ）、`lat`（两腿各自的下单延迟，bull/bear 毫秒）、`n`（N，USDT；M = N ÷ L）的全部组合；未给的键取配置里的值。
 
@@ -1850,11 +1850,11 @@ func (s *Store) LoadState(ctx context.Context, sessionID string) (State, error) 
 
 看板与交易程序一起实现（PRD 14.4）。面板、变量和查询的设计在 [../dashboard/SPEC.md](../dashboard/SPEC.md) 第 7 节（本次已按 5.6 的表更新），那里是看板的定稿处，本节只列要点：
 
-- 数据源：新的 `etfpair-trade`（角色 `etfpair_trade_reader`），只读 schema `trade`；不用 Combo Spread 的数据源和角色。`boardkit.py` 现在把数据源写死为 `etfpair`，实现时改成每块看板传入。
-- 变量 `mode`（`Paper` / `Live`，对应每张表的 `live` 列，两者从不合并；纸面时顶部有固定提示）和 `cycle`。
-- 八行：Status、Signal、Summary、Inventory、Cycles、Cycle Detail、Decisions、Anchors。各行的面板和来源表见 dashboard/SPEC.md 7.3。
+- 数据源：`etfpair-trade`（角色 `etfpair_trade_reader`），只读 schema `trade`；不用 Combo Spread 的数据源和角色。`boardkit.reset_ids(datasource)` 定每块看板的数据源（Live Monitor 是 `boardkit.TRADE`，Combo Spread 是 `boardkit.PG`）。
+- 变量：Run / Since / At / Until / At / Combo（dashboard/SPEC.md 7.2）。一个 Run 只有一种方式（纸面或实盘，对应每张表的 `live` 列，两者从不合并），所以没有单独的 Mode 变量；隐藏的 `cycle` 是所选的回合。
+- 各行（4.1）：Status · Running Session、Execution Summary、Position and Entry、Live Execution、Round Trips、Round Trip Detail、Inventory、Settings，折叠的 Execution Statistics、System。各行的面板和来源表见 dashboard/SPEC.md 7.3、7.4。
 - 资金费没到账的轮显示 `Pending`，不显示 0。
-- 代码 `dashboard/grafana/live_monitor_board.py`（现在不存在，第 9 节第 7 步写），与 Combo Spread 用同一套 `boardkit`。发布到共享的 Grafana 要用户另行授权；开发用 `dashboard/deploy/preview.sh` 的私有实例。
+- 代码：两块看板都已实现并发布在共享的 Grafana 上——Live Monitor `dashboard/grafana/live_monitor_board.py`（第 9 节第 7 步；4.1 于 2026-11-26 14:26:09 UTC+8 发布，dashboard/SPEC.md 第 7 节、第 9 节末），Combo Spread `dashboard/grafana/combo_spread_board.py`（3.6 于 2026-11-26 12:21:14 发布，dashboard/SPEC.md 第 5 节），两者用同一套 `boardkit`，由 `gen_dashboard.py` 生成。看板的改动和发布照 dashboard/SPEC.md 第 9 节，每次发布要用户授权；开发用 `dashboard/deploy/preview.sh` 的私有实例。
 
 ## 7. 待核验项
 
@@ -1936,7 +1936,7 @@ func (s *Store) LoadState(ctx context.Context, sessionID string) (State, error) 
 | 第 14 节 记录与监控 | 5.6 的表；第 6 节 |
 | 第 16 节 回测 | 第 9 节第 8 步 |
 
-**首版的收窄和简化**（PRD 1.4 节同步列出；审计 2026-11-24 的批复逐项见 `experiments/decisions_20261123/spec_core_20261124/external_audit_spec_20261124.md`。每一条都不改变正常日子的交易行为，要哪一条照原文实现请指出）：
+**首版的收窄和简化**（PRD 1.4 节同步列出；审计 2026-11-24 的批复逐项见 `experiments/decisions_20261123/spec_core_20261124/external_audit_spec_20261124.md`。每一条都不改变正常日子的交易行为，要哪一条照原文实现请指出。PRD 3.10 起这些做法已写进 PRD 正文，下表“PRD”一栏是 3.9 及以前的原正文，同 PRD 1.4 节一样留作出处）：
 
 | PRD | 首版怎么做 | 理由与审计意见 |
 |---|---|---|
