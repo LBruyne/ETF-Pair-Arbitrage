@@ -32,10 +32,12 @@ const (
 	binanceInstruments = "/fapi/v1/exchangeInfo"
 )
 
-// bitgetTopics are recorded for every Bitget contract after its book topics
-// (bitgetBooks). books1 (every change of the best bid and ask) is kept in the
-// files only; the per-second rows take their levels from the first book topic.
-var bitgetTopics = []string{"books1", "publicTrade", "ticker", "funding-rate"}
+// bitgetTopics are recorded for every Bitget contract on the combo's feed
+// of one connection; its book topics (bitgetBooks, then books1) go on the
+// combo's book feed of bookConnections. books1 (every change of the best bid
+// and ask) is kept in the files only; the per-second rows take their levels
+// from the first book topic.
+var bitgetTopics = []string{"publicTrade", "ticker", "funding-rate"}
 
 // binanceMarket are the channels binance-market carries for every contract:
 // the URL name after "<symbol>@" and the topic it is stored as.
@@ -52,8 +54,10 @@ var fineTick = decimal.New(1, -2)
 
 // --- feeds ---
 
-// feedsOf builds the feeds of the combos' markets: one Bitget feed per combo,
-// and binance-public and binance-market carrying every Binance contract.
+// feedsOf builds the feeds of the combos' markets: two Bitget feeds per
+// combo, bitget-<combo>-books (the book topics, on bookConnections
+// connections) and bitget-<combo> (the other topics), and binance-public and
+// binance-market carrying every Binance contract.
 // Contracts are bull, bear and ref in configuration order, without
 // duplicates. Each venue's instrument list is read once first: a contract's
 // price tick sets its book depth.
@@ -97,8 +101,12 @@ func feedsOf(ctx context.Context, combos []scan.Combo, ep endpoints, log *slog.L
 		if err != nil {
 			return nil, err
 		}
+		books := func(symbol string) []string { return append(bitgetBooks(levels[symbol]), "books1") }
+		other := func(string) []string { return bitgetTopics }
 		for _, m := range onBitget {
-			feeds = append(feeds, bitgetFeed(m.combo, m.symbols, levels, ep.bitgetWS))
+			name := "bitget-" + strings.ToLower(m.combo)
+			feeds = append(feeds, bitgetFeed(name+"-books", m.symbols, books, ep.bitgetWS, bookConnections),
+				bitgetFeed(name, m.symbols, other, ep.bitgetWS, 1))
 		}
 	}
 	if len(onBinance) > 0 {
@@ -221,19 +229,18 @@ type bitgetArg struct {
 	Symbol   string `json:"symbol"`
 }
 
-// bitgetFeed subscribes every topic of the combo's contracts in one frame:
-// the book topics of the contract's depth, then bitgetTopics.
-func bitgetFeed(comboID string, symbols []string, levels map[string]int, endpoint string) *feed {
+// bitgetFeed subscribes the topics of every contract in one frame, on
+// conns connections.
+func bitgetFeed(name string, symbols []string, topics func(symbol string) []string, endpoint string, conns int) *feed {
 	var args []bitgetArg
 	var streams []string
 	for _, symbol := range symbols {
-		for _, topic := range append(bitgetBooks(levels[symbol]), bitgetTopics...) {
+		for _, topic := range topics(symbol) {
 			args = append(args, bitgetArg{InstType: "usdt-futures", Topic: topic, Symbol: symbol})
 			streams = append(streams, symbol+"."+topic)
 		}
 	}
-	return &feed{name: "bitget-" + strings.ToLower(comboID), venue: "bitget", url: endpoint,
-		request: subscribeFrame(args), ping: []byte("ping"), streams: streams}
+	return &feed{name: name, venue: "bitget", url: endpoint, request: subscribeFrame(args), ping: []byte("ping"), streams: streams, conns: conns}
 }
 
 // bitgetBooks are the book topics of a depth; the per-second rows read the
@@ -266,7 +273,7 @@ func binanceFeed(name, route string, symbols []string, channels func(symbol stri
 			streams = append(streams, symbol+"."+c[1])
 		}
 	}
-	return &feed{name: name, venue: "binance", url: route + "?streams=" + strings.Join(names, "/"), streams: streams}
+	return &feed{name: name, venue: "binance", url: route + "?streams=" + strings.Join(names, "/"), streams: streams, conns: 1}
 }
 
 // binanceBook is the book channel of a depth (depth5 or depth10, at most
@@ -332,9 +339,16 @@ func routeBitget(payload []byte) (routed, error) {
 	var err error
 	switch f.Arg.Topic {
 	case "books5":
-		r.events, err = bitgetLevels(f.Data, levelsCoarse)
+		r.events, r.seq, err = bitgetLevels(f.Data, levelsCoarse)
 	case "books50":
-		r.events, err = bitgetLevels(f.Data, levelsFineBitget)
+		r.events, r.seq, err = bitgetLevels(f.Data, levelsFineBitget)
+	case "books1":
+		var d []struct {
+			Seq uint64 `json:"seq"`
+		}
+		if json.Unmarshal(f.Data, &d) == nil && len(d) > 0 {
+			r.seq = d[0].Seq
+		}
 	case "publicTrade":
 		r.events, err = bitgetFills(f.Data)
 	}
@@ -342,24 +356,26 @@ func routeBitget(payload []byte) (routed, error) {
 }
 
 // bitgetLevels: data[0].ts is the matching time of the book state, b and a
-// its levels best first, of which the first n are kept.
-func bitgetLevels(data json.RawMessage, n int) ([]event, error) {
+// its levels best first, of which the first n are kept, and seq its
+// sequence number (0 when it cannot be read).
+func bitgetLevels(data json.RawMessage, n int) ([]event, uint64, error) {
 	var d []struct {
 		Bids []level `json:"b"`
 		Asks []level `json:"a"`
 		Ts   string  `json:"ts"`
+		Seq  uint64  `json:"seq"`
 	}
 	if err := json.Unmarshal(data, &d); err != nil {
-		return nil, fmt.Errorf("book data: %w", err)
+		return nil, 0, fmt.Errorf("book data: %w", err)
 	}
 	if len(d) == 0 {
-		return nil, errors.New("book data is empty")
+		return nil, 0, errors.New("book data is empty")
 	}
 	ts, err := strconv.ParseInt(d[0].Ts, 10, 64)
 	if err != nil {
-		return nil, fmt.Errorf("book ts: %w", err)
+		return nil, d[0].Seq, fmt.Errorf("book ts: %w", err)
 	}
-	return []event{{exchangeMs: ts, bids: d[0].Bids[:min(len(d[0].Bids), n)], asks: d[0].Asks[:min(len(d[0].Asks), n)]}}, nil
+	return []event{{exchangeMs: ts, bids: d[0].Bids[:min(len(d[0].Bids), n)], asks: d[0].Asks[:min(len(d[0].Asks), n)]}}, d[0].Seq, nil
 }
 
 // bitgetFills: every fill (RPI fills included), newest first as sent; they

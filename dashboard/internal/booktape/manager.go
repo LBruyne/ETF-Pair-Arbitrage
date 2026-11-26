@@ -7,6 +7,7 @@ import (
 	"math"
 	"net/http"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -51,6 +52,8 @@ func newManager(feeds []*feed, pool *pgxpool.Pool, output string, log *slog.Logg
 	w := &writer{pool: pool, log: log, pending: map[rowKey]row{}}
 	for _, f := range feeds {
 		f.output, f.log, f.rows = output, log, w
+		f.conns = max(f.conns, 1)
+		f.links = make([]link, f.conns)
 		f.tapes = map[string]*tape{}
 		for _, stream := range f.streams {
 			s := &tape{}
@@ -131,117 +134,169 @@ func (m *Manager) Run(ctx context.Context) error {
 
 var dialer = websocket.Dialer{Proxy: http.ProxyFromEnvironment, HandshakeTimeout: writeWait}
 
-// run dials the feed again whenever its connection ends, until ctx ends. It
-// returns an error only for a file that cannot be written.
+// run records the feed until ctx ends: each of its connections dials,
+// subscribes and dials again whenever it ends, and hands what it receives to
+// this goroutine, which records the frames in arrival order. It returns an
+// error only for a file that cannot be written.
 func (f *feed) run(ctx context.Context) (err error) {
 	defer func() {
 		if cerr := f.closeFiles(); err == nil {
 			err = cerr
 		}
 	}()
+	linksCtx, stopLinks := context.WithCancel(ctx)
+	defer stopLinks()
+	in := make(chan input, 4096*f.conns)
+	var wg sync.WaitGroup
+	for k := range f.conns {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			f.dial(linksCtx, k, in)
+		}()
+	}
+	go func() {
+		wg.Wait()
+		close(in)
+	}()
 	flush, status := time.NewTicker(flushEvery), time.NewTicker(statusEvery)
 	defer flush.Stop()
 	defer status.Stop()
+	var fileErr error
+	for {
+		select {
+		case x, open := <-in:
+			if !open {
+				return fileErr
+			}
+			if fileErr == nil {
+				if fileErr = f.apply(x); fileErr != nil {
+					stopLinks()
+				}
+			}
+		case <-flush.C:
+			if fileErr == nil {
+				if fileErr = f.flushFiles(); fileErr != nil {
+					stopLinks()
+				}
+			}
+		case <-status.C:
+			f.status()
+		}
+	}
+}
+
+// apply records one input of a connection. The feed is connected from its
+// first connection's start to its last one's end; with several, each
+// connection's start and end are noted too.
+func (f *feed) apply(x input) error {
+	switch {
+	case x.up:
+		if f.up == 0 {
+			if err := f.beginConnection(x.atMs); err != nil {
+				return err
+			}
+		}
+		f.up++
+		f.log.Info("booktape: connected", "feed", f.name, "connection", x.conn, "connections_up", f.up, "streams", len(f.streams))
+		if f.conns > 1 {
+			return appendEvent(f.output, f.venue, x.atMs, linkEvent{eventHead: eventHead{x.atMs, f.name, "link_connected"}, Conn: x.conn})
+		}
+		return nil
+	case x.down:
+		f.up--
+		f.lastEndMs = max(f.lastEndMs, x.atMs)
+		if f.conns > 1 {
+			frames := f.links[x.conn].frames.Load()
+			if err := appendEvent(f.output, f.venue, x.atMs, linkEvent{eventHead{x.atMs, f.name, "link_disconnected"}, x.conn, x.cause, &frames}); err != nil {
+				return err
+			}
+		}
+		if f.up == 0 { // stamped with the latest end, which may not be the one handled last
+			return f.endConnection(f.lastEndMs, x.cause)
+		}
+		return nil
+	}
+	return f.process(x.fr)
+}
+
+// dial keeps connection k of the feed up until ctx ends.
+func (f *feed) dial(ctx context.Context, k int, in chan<- input) {
 	for {
 		conn, _, dialErr := dialer.DialContext(ctx, f.url, nil)
 		wait := redialIdle
 		if dialErr == nil {
-			cause, err := f.serve(ctx, conn, flush.C, status.C)
-			if err != nil || cause == shutdown {
-				return err
+			cause, frames := f.serve(ctx, k, conn, in)
+			if cause == shutdown {
+				return
 			}
-			if f.connFrames > 0 {
+			if frames > 0 {
 				wait = redialAfter
 			}
-			f.log.Warn("booktape: disconnected", "feed", f.name, "err", cause, "frames", f.connFrames, "redial_in", wait)
+			f.log.Warn("booktape: disconnected", "feed", f.name, "connection", k, "err", cause, "frames", frames, "redial_in", wait)
 		} else if ctx.Err() == nil {
-			f.log.Warn("booktape: dial failed", "feed", f.name, "err", dialErr, "redial_in", wait)
+			f.log.Warn("booktape: dial failed", "feed", f.name, "connection", k, "err", dialErr, "redial_in", wait)
 		}
 		select {
 		case <-ctx.Done():
-			return nil
+			return
 		case <-time.After(wait):
 		}
 	}
 }
 
-// serve records one connection until it ends and returns why it ended
-// ("shutdown" when ctx ended), and an error for a file that cannot be
-// written. It subscribes, then reads on one goroutine and writes the
-// heartbeats on another, while the frames are processed here.
-func (f *feed) serve(ctx context.Context, conn *websocket.Conn, flush, status <-chan time.Time) (string, error) {
-	startMs := time.Now().UnixMilli()
-	if err := f.beginConnection(startMs); err != nil {
-		conn.Close()
-		return "", err
-	}
+// serve runs connection k until it ends and returns why ("shutdown" when
+// ctx ended) and how many data frames it delivered. It reports the start,
+// subscribes, writes the heartbeats on another goroutine and hands every
+// frame received to the feed, then reports the end.
+func (f *feed) serve(ctx context.Context, k int, conn *websocket.Conn, in chan<- input) (string, int64) {
+	f.links[k].frames.Store(0)
+	in <- input{conn: k, up: true, atMs: time.Now().UnixMilli()}
 	var cause error
 	if f.request != nil {
 		conn.SetWriteDeadline(time.Now().Add(writeWait))
-		cause = conn.WriteMessage(websocket.TextMessage, f.request)
+		if cause = conn.WriteMessage(websocket.TextMessage, f.request); cause != nil {
+			conn.Close()
+		}
 	}
-	in := make(chan frame, 4096)
-	var endMs int64
-	var readErr error
-	go func() {
-		defer close(in)
-		endMs, readErr = read(conn, in)
-	}()
 	stop, stopped, failed := make(chan struct{}), make(chan struct{}), make(chan error, 1)
 	go func() {
 		defer close(stopped)
 		f.keepAlive(conn, stop, failed)
 	}()
-	if cause != nil {
-		conn.Close()
-	}
-
-	done := ctx.Done()
-	var fileErr error
-	for open := true; open; {
+	ended := make(chan struct{})
+	go func() {
 		select {
-		case fr, ok := <-in:
-			if !ok {
-				open = false
-			} else if fileErr == nil {
-				if fileErr = f.process(fr); fileErr != nil {
-					conn.Close()
-				}
-			}
-		case <-flush:
-			if fileErr == nil {
-				if fileErr = f.flushFiles(); fileErr != nil {
-					conn.Close()
-				}
-			}
-		case <-status:
-			f.status()
-		case <-done:
-			done = nil
-			cause = errors.New(shutdown)
+		case <-ctx.Done():
 			conn.WriteControl(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseNormalClosure, ""), time.Now().Add(time.Second))
 			conn.Close()
+		case <-ended:
 		}
-	}
+	}()
+	endMs, readErr := read(conn, k, in)
+	close(ended)
 	close(stop)
 	<-stopped
-	if cause == nil {
+	switch {
+	case ctx.Err() != nil:
+		cause = errors.New(shutdown)
+	case cause == nil:
 		select {
 		case cause = <-failed:
 		default:
 			cause = readErr
 		}
 	}
-	if fileErr != nil {
-		return "", fileErr
-	}
-	return cause.Error(), f.endConnection(endMs, cause.Error())
+	conn.Close()
+	in <- input{conn: k, down: true, atMs: endMs, cause: cause.Error()}
+	return cause.Error(), f.links[k].frames.Load()
 }
 
-// read forwards every frame of conn with its local receive time until a read
-// fails or times out, and returns when that happened and why. Anything that
-// arrives (a frame, a ping, a pong) pushes the read deadline forward.
-func read(conn *websocket.Conn, in chan<- frame) (int64, error) {
+// read forwards every frame of connection k with its local receive time
+// until a read fails or times out, and returns when that happened and why.
+// Anything that arrives (a frame, a ping, a pong) pushes the read deadline
+// forward.
+func read(conn *websocket.Conn, k int, in chan<- input) (int64, error) {
 	extend := func() { conn.SetReadDeadline(time.Now().Add(readTimeout)) }
 	extend()
 	answer := conn.PingHandler()
@@ -254,7 +309,7 @@ func read(conn *websocket.Conn, in chan<- frame) (int64, error) {
 			return receivedMs, err
 		}
 		extend()
-		in <- frame{receivedMs: receivedMs, binary: typ == websocket.BinaryMessage, payload: payload}
+		in <- input{conn: k, fr: frame{conn: k, receivedMs: receivedMs, binary: typ == websocket.BinaryMessage, payload: payload}}
 	}
 }
 
@@ -287,26 +342,28 @@ func (f *feed) heartbeat(conn *websocket.Conn) error {
 	return conn.WriteMessage(websocket.TextMessage, f.ping)
 }
 
-// beginConnection writes the connected event and starts the connection's
-// counts; the per-second state is already reset.
+// beginConnection writes the connected event of the feed's first
+// connection coming up and starts the feed's counts; the per-second state
+// is already reset.
 func (f *feed) beginConnection(startMs int64) error {
 	request := []byte("null")
 	if f.request != nil {
 		request = f.request
 	}
-	f.connFrames, f.warned = 0, false
+	f.connFrames, f.warned, f.lastEndMs = 0, false, 0
 	for _, s := range f.tapes {
 		s.seen = false
 	}
-	f.log.Info("booktape: connected", "feed", f.name, "streams", len(f.streams))
 	return appendEvent(f.output, f.venue, startMs, connectedEvent{eventHead{startMs, f.name, "connected"}, f.url, request})
 }
 
-// endConnection makes the pending seconds before endMs final with the
-// current values, forgets the per-second state (nothing is carried across a
+// endConnection, at the end of the feed's last connection, makes the pending
+// seconds before endMs final with the current values, forgets the
+// per-second state and the sequence numbers (nothing is carried across a
 // disconnection), writes the disconnected event and flushes the files.
 func (f *feed) endConnection(endMs int64, cause string) error {
 	for _, s := range f.tapes {
+		s.seq = 0
 		if s.tracker != nil {
 			f.out = s.tracker.finalize(endMs, f.out)
 			s.tracker.reset()
@@ -319,7 +376,10 @@ func (f *feed) endConnection(endMs int64, cause string) error {
 	return f.flushFiles()
 }
 
-// process stores one frame and updates the per-second rows with it.
+// process stores one frame and updates the per-second rows with it. On a
+// feed of several connections a book frame whose sequence number is not
+// newer than the stream's newest recorded one is a copy another connection
+// brought first, or an older state: it is counted and dropped.
 func (f *feed) process(fr frame) error {
 	if fr.binary {
 		return f.unreadable(fr)
@@ -337,6 +397,15 @@ func (f *feed) process(fr frame) error {
 			f.log.Error("booktape: the venue refused a request", "feed", f.name, "frame", string(fr.payload))
 		}
 		return appendEvent(f.output, f.venue, fr.receivedMs, controlEvent{eventHead{fr.receivedMs, f.name, "control"}, fr.payload})
+	}
+	f.links[fr.conn].frames.Add(1)
+	if f.conns > 1 && r.seq != 0 {
+		if r.seq <= s.seq {
+			f.copies++
+			return nil
+		}
+		s.seq = r.seq
+		f.links[fr.conn].first++
 	}
 	f.connFrames++
 	f.frames++
@@ -365,7 +434,7 @@ func (f *feed) process(fr frame) error {
 }
 
 // unreadable records a frame that is neither JSON nor a heartbeat answer;
-// it is logged once per connection.
+// it is logged once per time the feed is connected.
 func (f *feed) unreadable(fr frame) error {
 	text := string(fr.payload[:min(len(fr.payload), unreadableN)])
 	if !f.warned {
@@ -384,8 +453,10 @@ func (f *feed) queueRows() {
 }
 
 // status logs the feed's counts since the last status line and the streams
-// that have delivered no frame on the current connection: a wrong Binance
-// stream name is accepted silently and never pushes.
+// that have recorded no frame since the feed's first connection came up: a
+// wrong Binance stream name is accepted silently and never pushes. A feed of
+// several connections adds the connections up, the copies dropped and how
+// many of the recorded book frames each connection brought first.
 func (f *feed) status() {
 	var silent []string
 	for _, stream := range f.streams {
@@ -393,30 +464,40 @@ func (f *feed) status() {
 			silent = append(silent, stream)
 		}
 	}
-	f.log.Info("booktape: status", "feed", f.name, "frames", f.frames, "bytes", f.bytes,
-		"silent_streams", strings.Join(silent, ","), "late_events", f.late, "rows_queued", f.queued)
-	f.frames, f.bytes, f.late, f.queued = 0, 0, 0, 0
+	attrs := []any{"feed", f.name, "frames", f.frames, "bytes", f.bytes,
+		"silent_streams", strings.Join(silent, ","), "late_events", f.late, "rows_queued", f.queued}
+	if f.conns > 1 {
+		first := make([]string, len(f.links))
+		for k := range f.links {
+			first[k] = strconv.Itoa(f.links[k].first)
+			f.links[k].first = 0
+		}
+		attrs = append(attrs, "connections_up", f.up, "copies_dropped", f.copies, "first_by_connection", strings.Join(first, "/"))
+	}
+	f.log.Info("booktape: status", attrs...)
+	f.frames, f.bytes, f.late, f.queued, f.copies = 0, 0, 0, 0, 0
 }
 
 // --- per-second rows ---
 
-// tracker derives one kind of the per-second rows of one contract on the
-// current connection: the newest event by exchange time (ties: the larger
-// trade id, or the later book event) and the next second to emit. A second
-// T is emitted once, with the value then current, when an event stamped at
-// or after T arrives, when the clock passes T + 2 s, or when the connection
-// ends. Owned by its feed's goroutine.
+// tracker derives one kind of the per-second rows of one contract while
+// its feed is connected (from its first connection's start to its last
+// one's end): the newest event by exchange time (ties: the larger trade id,
+// or the later book event) and the next second to emit. A second T is
+// emitted once, with the value then current, when an event stamped at or
+// after T arrives, when the clock passes T + 2 s, or when the feed's last
+// connection ends. Owned by its feed's goroutine.
 type tracker struct {
 	venue, symbol string
 	kind          kind
-	value         *event // nil before the first event on the connection
+	value         *event // nil before the first event since the feed connected
 	next          int64  // the next second to emit; 0 while the kind is unknown
 	emitted       int64  // the newest second emitted; 0 for none
 }
 
 // observe applies one frame's events received at receivedMs and appends the
 // rows they make final to out. The kind is known from the receive time of
-// its first frame on the connection, so its first second is the next whole
+// its first frame since the feed connected, so its first second is the next whole
 // second. It also returns how many events were late: stamped before a
 // second already emitted, they update the value but no emitted row.
 func (t *tracker) observe(receivedMs int64, events []event, out []row) ([]row, int) {

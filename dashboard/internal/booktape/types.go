@@ -11,6 +11,7 @@ package booktape
 import (
 	"encoding/json"
 	"log/slog"
+	"sync/atomic"
 	"time"
 
 	"etf-pair-arbitrage/dashboard/internal/scan"
@@ -33,16 +34,21 @@ type endpoints struct {
 	bitgetWS, bitgetREST, binanceWS, binanceREST string
 }
 
-// feed is one WebSocket connection to a venue and the streams it carries,
-// dialled again whenever the connection ends. The fields after streams are
-// owned by the feed's goroutine (run) alone.
+// feed is a subscription to a venue and the streams it carries, on conns
+// WebSocket connections that each dial again whenever they end. With more
+// than one connection every stream records the copy of each sequence number
+// that arrives first, as the trading program reads its books (core/cex,
+// book_connections), and the feed is connected while any of them is. The
+// fields after streams are owned by the feed's goroutine (run) alone, but
+// for links[k].frames.
 type feed struct {
-	name    string   // bitget-<combo id in lower case>, binance-public or binance-market
+	name    string   // bitget-<combo id in lower case>[-books], binance-public or binance-market
 	venue   string   // bitget or binance
 	url     string   // the endpoint; Binance's names the streams
 	request []byte   // subscribe frame sent after each dial; nil when the URL names the streams
 	ping    []byte   // text heartbeat (Bitget "ping"); nil for a protocol ping
 	streams []string // "<SYMBOL>.<topic>", in subscription order
+	conns   int      // connections carrying the subscription; 0 means 1
 
 	output string // root of the raw files
 	log    *slog.Logger
@@ -51,23 +57,46 @@ type feed struct {
 	line   []byte           // the data line being built
 	out    []row            // rows emitted while processing one frame
 
-	// The current connection.
-	connFrames int  // data frames delivered
-	warned     bool // an unreadable frame or unreadable row fields were logged
+	links []link // by connection number
+	up    int    // connections up
+
+	// Since the feed's first connection came up.
+	lastEndMs  int64 // the latest end of one of its connections
+	connFrames int   // data frames recorded
+	warned     bool  // an unreadable frame or unreadable row fields were logged
 
 	// Counted since the last status line.
 	frames, bytes, late, queued int
+	copies                      int // data frames dropped: a sequence number another connection brought first, or an older one
+}
+
+// link is one of a feed's connections.
+type link struct {
+	frames atomic.Int64 // data frames delivered on its current connection; read by its dialling goroutine
+	first  int          // data frames it brought first, since the last status line
 }
 
 // tape is the recording state of one stream of a feed.
 type tape struct {
 	file    *tapeFile // the open data file; nil until the stream's first record
 	tracker *tracker  // its kind of the per-second rows; nil for a stream without one or kept in the files only
-	seen    bool      // a frame arrived on the current connection
+	seen    bool      // a frame was recorded since the feed's first connection came up
+	seq     uint64    // a feed of several connections: the newest sequence number recorded since then; 0 for none
+}
+
+// input is what a feed's connection hands its feed's goroutine: a frame, or
+// that the connection came up or ended (at, why).
+type input struct {
+	conn     int
+	up, down bool
+	atMs     int64
+	cause    string
+	fr       frame
 }
 
 // frame is one WebSocket message as the reader received it.
 type frame struct {
+	conn       int   // the feed's connection that received it
 	receivedMs int64 // local receive time
 	binary     bool
 	payload    []byte // the bytes as received
@@ -80,6 +109,7 @@ type routed struct {
 	refused bool    // a control frame reporting an error: Bitget refused a subscription
 	pong    bool    // Bitget's answer to the text heartbeat, not stored
 	events  []event // the frame's events of its per-second kind, ascending by (exchange time, id)
+	seq     uint64  // Bitget book topics: data[0].seq; 0 otherwise
 }
 
 // --- per-second rows ---
@@ -129,7 +159,7 @@ func (r row) key() rowKey { return rowKey{r.venue, r.symbol, r.secondMs, r.kind}
 type eventHead struct {
 	ReceivedMs int64  `json:"received_ms"`
 	Feed       string `json:"feed"`
-	Event      string `json:"event"` // connected, disconnected, control or unreadable
+	Event      string `json:"event"` // connected, disconnected, link_connected, link_disconnected, control or unreadable
 }
 
 // connectedEvent follows each dial; request is null when the URL names the streams.
@@ -139,12 +169,24 @@ type connectedEvent struct {
 	Request json.RawMessage `json:"request"`
 }
 
-// disconnectedEvent ends a connection: error is "shutdown" on a clean stop;
-// frames counts its data frames.
+// disconnectedEvent marks the end of the feed's last connection, at the
+// latest end of its connections: error is "shutdown" on a clean stop;
+// frames counts the data frames recorded since the feed was connected.
 type disconnectedEvent struct {
 	eventHead
 	Error  string `json:"error"`
 	Frames int    `json:"frames"`
+}
+
+// linkEvent notes one connection of a feed of several coming up
+// (link_connected) or ending (link_disconnected, with why and the data
+// frames it delivered); the feed's connected and disconnected events mark
+// its first connection coming up and its last one ending.
+type linkEvent struct {
+	eventHead
+	Conn   int    `json:"conn"`
+	Error  string `json:"error,omitempty"`
+	Frames *int64 `json:"frames,omitempty"`
 }
 
 // controlEvent is a venue's control frame (an acknowledgement or an error).
@@ -178,6 +220,12 @@ const (
 	levelsFineBitget  = 50               // books50
 	levelsFineBinance = 10               // depth10
 	restTimeout       = 15 * time.Second // one instrument request at start
+
+	// bookConnections carry each combo's Bitget book topics, as many as the
+	// trading program's book_connections (core/cex DefaultConfig): a replay
+	// of the recording then sees each frame about when the program does
+	// (the owner, 2026-11-26: "采集程序可以改成 3 条连接").
+	bookConnections = 3
 )
 
 // utc8 names the day directories; stored times are Unix milliseconds.

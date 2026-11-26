@@ -42,11 +42,12 @@ var testCombos = []scan.Combo{
 		{Venue: "bitget", BullSymbol: "TQQQUSDT", BearSymbol: "SQQQUSDT", RefSymbol: "QQQUSDT"}}},
 }
 
-// The configured combos give one Bitget feed per combo (every topic of
-// every contract in one frame, the book topics by the contract's price tick:
-// books5, or books50 and then books5) and two Binance feeds over every
-// contract once, in configuration order. Each venue's instrument list is
-// read once.
+// The configured combos give two Bitget feeds per combo, each subscribing
+// every contract in one frame: the books (the book topics by the
+// contract's price tick, books5 or books50 and then books5, and books1) on
+// bookConnections connections, and the other topics on one; and two
+// Binance feeds over every contract once, in configuration order. Each
+// venue's instrument list is read once.
 func TestFeedsOfCombos(t *testing.T) {
 	// Bitget lists SOXSUSDT with a 0.001 tick, as it does; the Binance
 	// SOXSUSDT tick of 0.001 is made up to show the rule on that venue.
@@ -62,38 +63,56 @@ func TestFeedsOfCombos(t *testing.T) {
 	for _, f := range feeds {
 		names = append(names, f.name)
 	}
-	if want := []string{"bitget-soxl-soxs", "bitget-tqqq-sqqq", "binance-public", "binance-market"}; !slices.Equal(names, want) {
+	if want := []string{"bitget-soxl-soxs-books", "bitget-soxl-soxs", "bitget-tqqq-sqqq-books", "bitget-tqqq-sqqq", "binance-public", "binance-market"}; !slices.Equal(names, want) {
 		t.Fatalf("feeds %v, want %v", names, want)
 	}
 	if requests["bitget"].Load() != 1 || requests["binance"].Load() != 1 {
 		t.Fatalf("instrument requests: bitget %d, binance %d, want one each", requests["bitget"].Load(), requests["binance"].Load())
 	}
 
-	soxl, tqqq := feeds[0], feeds[1]
-	var want []bitgetArg
+	soxlBooks, soxl, tqqqBooks := feeds[0], feeds[1], feeds[2]
+	args := func(f *feed) []bitgetArg {
+		var req struct {
+			Op   string      `json:"op"`
+			Args []bitgetArg `json:"args"`
+		}
+		if err := json.Unmarshal(f.request, &req); err != nil || req.Op != "subscribe" {
+			t.Fatalf("%s request %s: %v", f.name, f.request, err)
+		}
+		return req.Args
+	}
+	var wantBooks, wantOther []bitgetArg
 	for _, c := range []struct {
 		symbol string
 		books  []string
 	}{{"SOXLUSDT", []string{"books5"}}, {"SOXSUSDT", []string{"books50", "books5"}}, {"SOXXUSDT", []string{"books5"}}} {
-		for _, topic := range append(c.books, "books1", "publicTrade", "ticker", "funding-rate") {
-			want = append(want, bitgetArg{"usdt-futures", topic, c.symbol})
+		for _, topic := range append(c.books, "books1") {
+			wantBooks = append(wantBooks, bitgetArg{"usdt-futures", topic, c.symbol})
+		}
+		for _, topic := range []string{"publicTrade", "ticker", "funding-rate"} {
+			wantOther = append(wantOther, bitgetArg{"usdt-futures", topic, c.symbol})
 		}
 	}
-	var req struct {
-		Op   string      `json:"op"`
-		Args []bitgetArg `json:"args"`
+	if got := args(soxlBooks); !slices.Equal(got, wantBooks) {
+		t.Fatalf("bitget books request %v, want %v", got, wantBooks)
 	}
-	if err := json.Unmarshal(soxl.request, &req); err != nil || req.Op != "subscribe" || !slices.Equal(req.Args, want) {
-		t.Fatalf("bitget request %s: %v", soxl.request, err)
+	if got := args(soxl); !slices.Equal(got, wantOther) {
+		t.Fatalf("bitget request %v, want %v", got, wantOther)
 	}
-	if soxl.url != "wss://b" || string(soxl.ping) != "ping" || len(soxl.streams) != 16 || soxl.streams[5] != "SOXSUSDT.books50" ||
-		soxl.streams[6] != "SOXSUSDT.books5" || soxl.streams[7] != "SOXSUSDT.books1" {
+	if soxlBooks.url != "wss://b" || string(soxlBooks.ping) != "ping" || soxlBooks.conns != bookConnections || bookConnections != 3 ||
+		len(soxlBooks.streams) != 7 || soxlBooks.streams[2] != "SOXSUSDT.books50" || soxlBooks.streams[3] != "SOXSUSDT.books5" || soxlBooks.streams[4] != "SOXSUSDT.books1" {
+		t.Fatalf("bitget books feed %+v", soxlBooks)
+	}
+	if soxl.url != "wss://b" || string(soxl.ping) != "ping" || soxl.conns != 1 || len(soxl.streams) != 9 || soxl.streams[0] != "SOXLUSDT.publicTrade" {
 		t.Fatalf("bitget feed %+v", soxl)
 	}
-	if !strings.Contains(string(tqqq.request), `"topic":"books5","symbol":"QQQUSDT"`) || strings.Contains(string(tqqq.request), "books50") {
-		t.Fatalf("tqqq request %s", tqqq.request)
+	if !strings.Contains(string(tqqqBooks.request), `"topic":"books5","symbol":"QQQUSDT"`) || strings.Contains(string(tqqqBooks.request), "books50") {
+		t.Fatalf("tqqq request %s", tqqqBooks.request)
 	}
-	pub, mkt := feeds[2], feeds[3]
+	pub, mkt := feeds[4], feeds[5]
+	if pub.conns != 1 || mkt.conns != 1 {
+		t.Fatalf("binance feeds have one connection each: %d, %d", pub.conns, mkt.conns)
+	}
 	if pub.url != "wss://f/public/stream?streams=soxlusdt@depth5@100ms/soxlusdt@bookTicker/soxsusdt@depth10@100ms/soxsusdt@bookTicker/"+
 		"soxxusdt@depth5@100ms/soxxusdt@bookTicker/tqqqusdt@depth5@100ms/tqqqusdt@bookTicker/"+
 		"sqqqusdt@depth5@100ms/sqqqusdt@bookTicker/qqqusdt@depth5@100ms/qqqusdt@bookTicker" || pub.request != nil || pub.ping != nil ||
@@ -206,7 +225,7 @@ func TestRouteEveryFrameKind(t *testing.T) {
 // hour begins a new file; a flush makes the lines readable without the
 // trailer; control, unreadable and unsubscribed frames go to events.jsonl.
 func TestRawFilesAndRotation(t *testing.T) {
-	f, logs := testFeed(t, bitgetFeed("SOXL-SOXS", []string{"SOXLUSDT"}, map[string]int{"SOXLUSDT": 5}, "wss://b"))
+	f, logs := testFeed(t, oneFeed("SOXL-SOXS", []string{"SOXLUSDT"}, map[string]int{"SOXLUSDT": 5}, "wss://b"))
 	dir := f.output
 	h := midnight - hourMs // 23:00 UTC+8 of 2026-11-19
 	a := books5("SOXLUSDT", h+5, "1", "1", "2", "1")
@@ -269,7 +288,7 @@ func TestRawFilesAndRotation(t *testing.T) {
 // A fine-tick contract on Bitget records books50 frames whole, and its
 // per-second rows carry all 50 levels a side.
 func TestBooks50StoredWhole(t *testing.T) {
-	f, _ := testFeed(t, bitgetFeed("SOXL-SOXS", []string{"SOXSUSDT"}, map[string]int{"SOXSUSDT": levelsFineBitget}, "wss://b"))
+	f, _ := testFeed(t, oneFeed("SOXL-SOXS", []string{"SOXSUSDT"}, map[string]int{"SOXSUSDT": levelsFineBitget}, "wss://b"))
 	bids, asks := ladder(52.924, -0.001, 50), ladder(52.929, 0.001, 50)
 	mustBegin(t, f, midnight)
 	process(t, f, frame{receivedMs: midnight + 100, payload: booksFrame("books50", "SOXSUSDT", midnight+90, bids, asks)},
@@ -298,7 +317,7 @@ func TestBooks50StoredWhole(t *testing.T) {
 // book rows keep coming from books50 alone, while a coarse contract's books5
 // on the same feed still makes its rows.
 func TestFineTickBooks5FilesOnly(t *testing.T) {
-	f, _ := testFeed(t, bitgetFeed("SOXL-SOXS", []string{"SOXLUSDT", "SOXSUSDT"}, map[string]int{"SOXLUSDT": levelsCoarse, "SOXSUSDT": levelsFineBitget}, "wss://b"))
+	f, _ := testFeed(t, oneFeed("SOXL-SOXS", []string{"SOXLUSDT", "SOXSUSDT"}, map[string]int{"SOXLUSDT": levelsCoarse, "SOXSUSDT": levelsFineBitget}, "wss://b"))
 	for stream, tracked := range map[string]bool{"SOXLUSDT.books5": true, "SOXSUSDT.books50": true, "SOXSUSDT.books5": false, "SOXSUSDT.books1": false} {
 		if s := f.tapes[stream]; s == nil || (s.tracker != nil) != tracked {
 			t.Fatalf("%s: tape %+v, per-second rows %v", stream, s, tracked)
@@ -510,7 +529,7 @@ func TestBitgetFeedReconnectsAndShutsDown(t *testing.T) {
 			answerPings(c, got, -1)
 			got <- "closed"
 		})
-	f, logs := testFeed(t, bitgetFeed("SOXL-SOXS", []string{"SOXLUSDT", "SOXSUSDT"}, map[string]int{"SOXLUSDT": 5, "SOXSUSDT": levelsFineBitget}, wsURL(srv)))
+	f, logs := testFeed(t, oneFeed("SOXL-SOXS", []string{"SOXLUSDT", "SOXSUSDT"}, map[string]int{"SOXLUSDT": 5, "SOXSUSDT": levelsFineBitget}, wsURL(srv)))
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
 	go func() { done <- f.run(ctx) }()
@@ -571,6 +590,187 @@ func TestBitgetFeedReconnectsAndShutsDown(t *testing.T) {
 		if !strings.Contains(text, want) {
 			t.Errorf("log lacks %q:\n%s", want, text)
 		}
+	}
+}
+
+// A feed of several connections records each sequence number of a book
+// stream once, from the copy that arrives first: a later copy, or an older
+// sequence number, is dropped and counted, and the per-second rows see only
+// the recorded frames. Once the feed's last connection has ended the
+// numbers start afresh. A feed of one connection records every frame.
+func TestBookFeedRecordsTheFirstCopy(t *testing.T) {
+	books := func(string) []string { return []string{"books5", "books1"} }
+	a := books5("SOXLUSDT", midnight+700, "1", "1", "2", "1")
+	older := books5("SOXLUSDT", midnight+70, "0.9", "1", "2", "1")
+	b := books5("SOXLUSDT", midnight+1400, "1.1", "1", "2", "1")
+	top := booksFrame("books1", "SOXLUSDT", midnight+700, lv("1/1"), lv("2/1"))
+	in := []frame{{conn: 0, receivedMs: midnight + 710, payload: a}, {conn: 1, receivedMs: midnight + 712, payload: a},
+		{conn: 2, receivedMs: midnight + 713, payload: top}, {conn: 0, receivedMs: midnight + 714, payload: top},
+		{conn: 2, receivedMs: midnight + 720, payload: older}, {conn: 2, receivedMs: midnight + 1405, payload: b},
+		{conn: 0, receivedMs: midnight + 1430, payload: b}}
+	received := func(f *feed, stream string) (out []int64) {
+		for _, l := range streamLines(t, f.output, "bitget", stream) {
+			ms, err := strconv.ParseInt(string(l[15:bytes.IndexByte(l, ',')]), 10, 64)
+			if err != nil {
+				t.Fatal(err)
+			}
+			out = append(out, ms-midnight)
+		}
+		return out
+	}
+
+	group, logs := testFeed(t, bitgetFeed("bitget-soxl-soxs-books", []string{"SOXLUSDT"}, books, "wss://b", 3))
+	mustBegin(t, group, midnight+600)
+	process(t, group, in...)
+	if group.copies != 4 || group.links[0].first != 1 || group.links[1].first != 0 || group.links[2].first != 2 {
+		t.Errorf("copies %d, first by connection %d/%d/%d; want 4, 1/0/2", group.copies, group.links[0].first, group.links[1].first, group.links[2].first)
+	}
+	for _, r := range group.rows.queued {
+		if len(r.event.bids) > 0 && r.event.bids[0][0] == "0.9" {
+			t.Errorf("a row holds the dropped older frame: %+v", r)
+		}
+	}
+	group.status()
+	if !strings.Contains(logs.String(), "copies_dropped=4") || !strings.Contains(logs.String(), "first_by_connection=1/0/2") {
+		t.Errorf("the status line shows the copies and the first arrivals:\n%s", logs)
+	}
+	if err := group.endConnection(midnight+2000, "x"); err != nil { // the last connection ended
+		t.Fatal(err)
+	}
+	mustBegin(t, group, midnight+2100)
+	process(t, group, frame{conn: 1, receivedMs: midnight + 2110, payload: b})
+	if err := group.closeFiles(); err != nil {
+		t.Fatal(err)
+	}
+	if got := received(group, "SOXLUSDT.books5"); !slices.Equal(got, []int64{710, 1405, 2110}) {
+		t.Errorf("books5 recorded at %v, want 710, 1405 and, after the feed came back, 2110", got)
+	}
+	if got := received(group, "SOXLUSDT.books1"); !slices.Equal(got, []int64{713}) {
+		t.Errorf("books1 recorded at %v, want 713", got)
+	}
+
+	single, _ := testFeed(t, bitgetFeed("bitget-soxl-soxs", []string{"SOXLUSDT"}, books, "wss://b", 1))
+	mustBegin(t, single, midnight+600)
+	for _, fr := range in {
+		fr.conn = 0
+		process(t, single, fr)
+	}
+	if err := single.closeFiles(); err != nil {
+		t.Fatal(err)
+	}
+	if got := received(single, "SOXLUSDT.books5"); !slices.Equal(got, []int64{710, 712, 720, 1405, 1430}) || single.copies != 0 {
+		t.Errorf("one connection records every frame: %v, %d copies dropped", got, single.copies)
+	}
+}
+
+// The feed's disconnected event is stamped with the latest end of its
+// connections, whichever end is handled last: never before a frame it
+// recorded.
+func TestBookFeedEndsAtItsLatestConnectionEnd(t *testing.T) {
+	books := func(string) []string { return []string{"books5"} }
+	f, _ := testFeed(t, bitgetFeed("bitget-soxl-soxs-books", []string{"SOXLUSDT"}, books, "wss://b", 2))
+	for _, x := range []input{{conn: 0, up: true, atMs: midnight + 100}, {conn: 1, up: true, atMs: midnight + 101},
+		{conn: 1, fr: frame{conn: 1, receivedMs: midnight + 201, payload: books5("SOXLUSDT", midnight+190, "1", "1", "2", "1")}},
+		{conn: 1, down: true, atMs: midnight + 205, cause: "read: reset"}, // handled first, though it ended last
+		{conn: 0, down: true, atMs: midnight + 200, cause: "read: reset"}} {
+		if err := f.apply(x); err != nil {
+			t.Fatal(err)
+		}
+	}
+	events := readEvents(t, f.output, "bitget")
+	if last := events[len(events)-1]; last.Event != "disconnected" || last.ReceivedMs != midnight+205 {
+		t.Fatalf("the feed ended %+v, want disconnected at +205", last)
+	}
+}
+
+// The connections of a book feed dial, subscribe and redial each on its
+// own; the feed is connected from its first connection's start to its last
+// one's end (connected, disconnected), each connection's start and end are
+// noted with its number (link_connected, link_disconnected), and one
+// connection dropping while the others are up loses nothing. Every
+// sequence number is recorded once.
+func TestBookFeedConnections(t *testing.T) {
+	shortTimings(t)
+	now := time.Now().UnixMilli()
+	a, b, c := books5("SOXLUSDT", now, "1", "1", "2", "1"), books5("SOXLUSDT", now+7, "1.1", "1", "2", "1"), books5("SOXLUSDT", now+14, "1.2", "1", "2", "1")
+	sent, release := make(chan string, 8), make(chan struct{})
+	serve := func(c *websocket.Conn, frames ...[]byte) {
+		c.ReadMessage() // the subscribe frame
+		for _, p := range frames {
+			c.WriteMessage(websocket.TextMessage, p)
+		}
+	}
+	pong := func(c *websocket.Conn) {
+		for {
+			_, msg, err := c.ReadMessage()
+			if err != nil {
+				return
+			}
+			if string(msg) == "ping" {
+				c.WriteMessage(websocket.TextMessage, []byte("pong"))
+			}
+		}
+	}
+	kept := func(c *websocket.Conn, r *http.Request) { serve(c, a, b); sent <- "kept"; pong(c) }
+	srv := venueServer(t,
+		func(c *websocket.Conn, r *http.Request) {
+			serve(c, a, b)
+			sent <- "dropped"
+			<-release
+			c.NetConn().Close()
+		},
+		kept, kept,
+		func(conn *websocket.Conn, r *http.Request) { serve(conn, a, b, c); sent <- "redialled"; pong(conn) })
+	books := func(string) []string { return []string{"books5", "books1"} }
+	f, _ := testFeed(t, bitgetFeed("bitget-soxl-soxs-books", []string{"SOXLUSDT"}, books, wsURL(srv), 3))
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- f.run(ctx) }()
+	for range 3 { // all three connected and delivered a and b
+		select {
+		case <-sent:
+		case <-time.After(5 * time.Second):
+			t.Fatal("the three connections were not all served")
+		}
+	}
+	close(release)
+	expect(t, sent, "redialled")
+	path := ""
+	for deadline := time.Now().Add(5 * time.Second); time.Now().Before(deadline); time.Sleep(20 * time.Millisecond) {
+		found, _ := filepath.Glob(filepath.Join(f.output, "bitget", "*", "SOXLUSDT.books5.*.jsonl.gz"))
+		if len(found) == 1 {
+			path = found[0]
+			if len(partialLines(t, path)) == 3 {
+				break
+			}
+		}
+	}
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	var payloads []string
+	for _, l := range streamLines(t, f.output, "bitget", "SOXLUSDT.books5") {
+		payloads = append(payloads, string(l[bytes.Index(l, []byte(`,"payload":`))+11:len(l)-1]))
+	}
+	if want := []string{string(a), string(b), string(c)}; !slices.Equal(payloads, want) {
+		t.Errorf("recorded %q, want each frame once %q", payloads, want)
+	}
+	var kinds []string
+	for _, e := range readEvents(t, f.output, "bitget") {
+		kinds = append(kinds, e.Event)
+	}
+	want := []string{"connected", "link_connected", "link_connected", "link_connected", "link_disconnected", "link_connected",
+		"link_disconnected", "link_disconnected", "link_disconnected", "disconnected"}
+	if !slices.Equal(kinds, want) {
+		t.Fatalf("events %v, want %v", kinds, want)
+	}
+	events := readEvents(t, f.output, "bitget")
+	if string(events[0].Request) != string(f.request) || events[4].Frames != 2 || events[4].Error == "" || events[4].Conn != events[5].Conn {
+		t.Errorf("connected %+v; the dropped connection %+v and its redial %+v", events[0], events[4], events[5])
+	}
+	if last := events[len(events)-1]; last.Error != "shutdown" || last.Frames != 3 {
+		t.Errorf("the feed ends at shutdown with the 3 frames it recorded: %+v", last)
 	}
 }
 
@@ -789,15 +989,15 @@ func TestManagerRunWritesRows(t *testing.T) {
 			}
 		}
 	}
-	if len(ends) != 3 {
+	if len(ends) != 4 {
 		t.Fatalf("shutdown events %v\n%s", ends, logs)
 	}
 	for _, c := range []struct {
 		venue, symbol, bookFeed, tradeFeed, price, bid string
 		levels                                         int
 	}{
-		{"bitget", "SOXLUSDT", "bitget-soxl-soxs", "bitget-soxl-soxs", "1.005", "1.00", 1},
-		{"bitget", "SOXSUSDT", "bitget-soxl-soxs", "", "", bids12[0][0], 12},
+		{"bitget", "SOXLUSDT", "bitget-soxl-soxs-books", "bitget-soxl-soxs", "1.005", "1.00", 1},
+		{"bitget", "SOXSUSDT", "bitget-soxl-soxs-books", "", "", bids12[0][0], 12},
 		{"binance", "SOXLUSDT", "binance-public", "binance-market", "2.005", "2.000", 5},
 	} {
 		var rows, prices, bids, books, sized int
@@ -856,7 +1056,7 @@ func TestShutdownLogsDroppedRows(t *testing.T) {
 		t.Fatal(err)
 	}
 	log, logs := testLogger()
-	m := newManager([]*feed{bitgetFeed("SOXL-SOXS", []string{"SOXLUSDT"}, map[string]int{"SOXLUSDT": 5}, wsURL(srv))}, pool, t.TempDir(), log)
+	m := newManager([]*feed{oneFeed("SOXL-SOXS", []string{"SOXLUSDT"}, map[string]int{"SOXLUSDT": 5}, wsURL(srv))}, pool, t.TempDir(), log)
 	ctx, cancel := context.WithTimeout(context.Background(), 2500*time.Millisecond)
 	defer cancel()
 	if err := m.Run(ctx); err != nil {
@@ -1008,6 +1208,16 @@ func (l *logBuffer) String() string {
 func testLogger() (*slog.Logger, *logBuffer) {
 	logs := &logBuffer{}
 	return slog.New(slog.NewTextHandler(logs, nil)), logs
+}
+
+// oneFeed is a Bitget feed of one connection carrying every topic of the
+// contracts, the book topics by their depth: the recorder's single feed of a
+// combo before 2026-11-26, which the tests of the per-stream rules use.
+func oneFeed(comboID string, symbols []string, levels map[string]int, endpoint string) *feed {
+	topics := func(symbol string) []string {
+		return append(append(bitgetBooks(levels[symbol]), "books1"), bitgetTopics...)
+	}
+	return bitgetFeed("bitget-"+strings.ToLower(comboID), symbols, topics, endpoint, 1)
 }
 
 // testFeed binds one feed to a temporary output and a writer without a database.
@@ -1167,6 +1377,7 @@ type testEvent struct {
 	Request    json.RawMessage `json:"request"`
 	Error      string          `json:"error"`
 	Frames     int             `json:"frames"`
+	Conn       int             `json:"conn"`
 	Payload    json.RawMessage `json:"payload"`
 	Text       string          `json:"text"`
 }
