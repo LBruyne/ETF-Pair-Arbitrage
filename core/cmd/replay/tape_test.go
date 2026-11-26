@@ -4,6 +4,7 @@ import (
 	"compress/gzip"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"etf-pair-arbitrage/core/cex"
@@ -29,8 +30,10 @@ func writeFile(t *testing.T, dir, name string, lines ...[]byte) {
 // The bear leg's depth is books50 cut to five levels before its books5
 // recording starts and books5 from then on; the inputs of all topics come
 // in arrival order, a depth frame before a books1 frame of the same
-// millisecond and sequence number, and the recorder's disconnects of the
-// pair's connection drop both legs.
+// millisecond and sequence number, and a leg is lost only when the
+// recorder's feed carrying its books1 disconnects (the feed's last
+// connection ends): not when one of its connections ends, nor when the
+// trades' feed or another pair's feed does.
 func TestTapeReadsTheDepthOfItsTimeInArrivalOrder(t *testing.T) {
 	dir := t.TempDir()
 	ten := side(d("60"), "0.001", 10, true)
@@ -40,7 +43,22 @@ func TestTapeReadsTheDepthOfItsTimeInArrivalOrder(t *testing.T) {
 	writeFile(t, dir, "SOXSUSDT.books1.1000.jsonl.gz", tapeLine(1000, "SOXSUSDT", "books1", 1, ten[:1], asks[:1]))
 	writeFile(t, dir, "SOXLUSDT.books5.1000.jsonl.gz", tapeLine(1500, "SOXLUSDT", "books5", 2, side(d("40"), "0.01", 5, true), side(d("40.01"), "0.01", 5, false)))
 	writeFile(t, dir, "SOXLUSDT.books1.1000.jsonl.gz", tapeLine(1500, "SOXLUSDT", "books1", 2, side(d("40"), "0.01", 1, true), side(d("40.01"), "0.01", 1, false)))
-	os.WriteFile(filepath.Join(dir, "bitget", "20261125", "events.jsonl"), []byte(`{"received_ms":2500,"feed":"bitget-soxl-soxs","event":"disconnected"}`+"\n"+`{"received_ms":2600,"feed":"bitget-tqqq-sqqq","event":"disconnected"}`+"\n"), 0o644)
+	subscribe := func(feed string, args ...string) string {
+		var parts []string
+		for _, a := range args {
+			symbol, topic, _ := strings.Cut(a, ".")
+			parts = append(parts, `{"instType":"usdt-futures","topic":"`+topic+`","symbol":"`+symbol+`"}`)
+		}
+		return `{"received_ms":900,"feed":"` + feed + `","event":"connected","url":"wss://x","request":{"op":"subscribe","args":[` + strings.Join(parts, ",") + `]}}`
+	}
+	os.WriteFile(filepath.Join(dir, "bitget", "20261125", "events.jsonl"), []byte(strings.Join([]string{
+		subscribe("bitget-soxl-soxs-books", "SOXLUSDT.books5", "SOXLUSDT.books1", "SOXSUSDT.books50", "SOXSUSDT.books5", "SOXSUSDT.books1"),
+		subscribe("bitget-soxl-soxs", "SOXLUSDT.publicTrade", "SOXSUSDT.publicTrade"),
+		subscribe("bitget-tqqq-sqqq-books", "TQQQUSDT.books5", "TQQQUSDT.books1"),
+		`{"received_ms":2200,"feed":"bitget-soxl-soxs-books","event":"link_disconnected","conn":1}`, // one connection of three: the books stay
+		`{"received_ms":2300,"feed":"bitget-soxl-soxs","event":"disconnected"}`,                     // the trades' connection: not a book loss
+		`{"received_ms":2500,"feed":"bitget-soxl-soxs-books","event":"disconnected"}`,
+		`{"received_ms":2600,"feed":"bitget-tqqq-sqqq-books","event":"disconnected"}`}, "\n")+"\n"), 0o644)
 
 	streams, downs, err := openTape(tapeSpec{dir: dir, from: 1000, to: 5000, bull: "SOXLUSDT", bear: "SOXSUSDT", bearBooks5From: 2000})
 	if err != nil {

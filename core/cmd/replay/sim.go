@@ -143,7 +143,7 @@ func (v *replayVenue) PlaceOrder(context.Context, cex.OrderRequest) (cex.OrderAc
 func (v *replayVenue) deliver(symbol cex.Symbol, in *input) {
 	if in.down {
 		if f := v.onDown[symbol]; f != nil {
-			f(errors.New("replay: the recorder's connection was lost"))
+			f(errors.New("replay: the recorder's book feed was lost"))
 		}
 		return
 	}
@@ -331,7 +331,7 @@ type sim struct {
 // loop restored and started.
 func newSim(sc simConfig) (*sim, error) {
 	cfg := *sc.cfg
-	cfg.Cex.BookConnections = 1 // the recorder's one connection
+	cfg.Cex.BookConnections = 1 // the recording is one stream per topic: since 2026-11-26 the recorder keeps the first of its connections' copies
 	s := &sim{sc: sc, clock: &vclock{now: sc.start}, sink: newMemSink(sc.keepSamples), cur: sc.start}
 	pair := cfg.Cex.Pair
 	s.venue = &replayVenue{rules: bitgetRules(pair.Bull.Symbol, pair.Bear.Symbol), onEvent: map[cex.Symbol]func(cex.BookEvent){}, onDown: map[cex.Symbol]func(error){}}

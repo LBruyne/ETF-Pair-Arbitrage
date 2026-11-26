@@ -24,14 +24,16 @@ import (
 // <tape>/bitget/<YYYYMMDD in UTC+8>/<SYMBOL>.<topic>.<first received ms>.jsonl.gz,
 // one line per frame {"received_ms":..., "payload":<the frame as received>};
 // a file never crosses an hour. events.jsonl in the same directory notes
-// each connection's connects and disconnects.
+// each feed's connects and disconnects. Since 2026-11-26 a pair's books
+// come from a feed of three connections that keeps the copy of each
+// sequence number that arrives first, as the trading program does.
 
 // input is one thing the replay delivers at its local arrival: a book frame
-// of a leg, or the loss of the connection that carries both legs.
+// of a leg, or the loss of the recorder's feed that carries the leg's books.
 type input struct {
 	at   int64 // received_ms
 	leg  cex.Leg
-	down bool // the recorder's connection was lost; ev is unset
+	down bool // the recorder's feed of the leg's books was lost; ev is unset
 	ev   cex.BookEvent
 }
 
@@ -141,13 +143,19 @@ func tapeFiles(dir string, symbol cex.Symbol, topic string, from, to int64) ([]s
 	return out, nil
 }
 
-// tapeDisconnects reads the recorder's disconnects of the connection that
-// carries the two legs within the window: each is a loss of both legs.
+// tapeDisconnects reads the recorder's book losses of the two legs within
+// the window: a leg is lost when the feed whose connected event subscribes
+// its books1 disconnects. That event marks the feed's last connection
+// ending; a feed of several connections notes each one's ends as
+// link_disconnected, which loses nothing while another is up. Feeds without
+// the legs' books (the trades', another pair's) lose nothing.
 func tapeDisconnects(spec tapeSpec) ([]input, error) {
 	paths, err := filepath.Glob(filepath.Join(spec.dir, "bitget", "*", "events.jsonl"))
 	if err != nil {
 		return nil, err
 	}
+	sort.Strings(paths)               // day directories: oldest first, so that a feed's connected event comes before its disconnects
+	carries := map[string][]cex.Leg{} // feed: the legs whose books1 its newest connected event subscribes
 	var out []input
 	for _, p := range paths {
 		f, err := os.Open(p)
@@ -163,17 +171,35 @@ func tapeDisconnects(spec tapeSpec) ([]input, error) {
 				Event      string `json:"event"`
 				Request    struct {
 					Args []struct {
+						Topic  string `json:"topic"`
 						Symbol string `json:"symbol"`
 					} `json:"args"`
 				} `json:"request"`
 			}
-			if json.Unmarshal(sc.Bytes(), &e) != nil || e.Event != "disconnected" || e.ReceivedMs < spec.from || e.ReceivedMs >= spec.to {
+			if json.Unmarshal(sc.Bytes(), &e) != nil {
 				continue
 			}
-			if !strings.Contains(e.Feed, "soxl") {
-				continue // another pair's connection
+			switch e.Event {
+			case "connected":
+				var legs []cex.Leg
+				for _, a := range e.Request.Args {
+					switch {
+					case a.Topic != cex.TopicBooks1:
+					case cex.Symbol(a.Symbol) == spec.bull:
+						legs = append(legs, cex.Bull)
+					case cex.Symbol(a.Symbol) == spec.bear:
+						legs = append(legs, cex.Bear)
+					}
+				}
+				carries[e.Feed] = legs
+			case "disconnected":
+				if e.ReceivedMs < spec.from || e.ReceivedMs >= spec.to {
+					continue
+				}
+				for _, leg := range carries[e.Feed] {
+					out = append(out, input{at: e.ReceivedMs, leg: leg, down: true})
+				}
 			}
-			out = append(out, input{at: e.ReceivedMs, leg: cex.Bull, down: true}, input{at: e.ReceivedMs, leg: cex.Bear, down: true})
 		}
 		f.Close()
 		if err := sc.Err(); err != nil {
