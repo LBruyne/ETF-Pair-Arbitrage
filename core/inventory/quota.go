@@ -13,7 +13,10 @@ import (
 // everything still held on both legs, batches not built yet included, plus
 // the recorded dust of each leg at its average price, plus what the entry
 // and completion orders without a final state may still fill at their quota
-// price. left is total - used and may be negative.
+// price. With a thin leg first (WithThinLeg), used leaves out the unpaired
+// thin leg of each batch still building (SPEC 12.4 "额度"): only what is
+// paired, and what pending orders reserve, takes quota. left is total - used
+// and may be negative.
 func (m *InventoryManager) Quota() (total, used, left decimal.Decimal) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -24,7 +27,67 @@ func (m *InventoryManager) Quota() (total, used, left decimal.Decimal) {
 func (m *InventoryManager) quota() (total, used, left decimal.Decimal) {
 	total = m.cfg.Leverage.Mul(m.capital.Add(decimal.Min(decimal.Zero, m.realised())))
 	used = m.reserved.Add(m.held())
+	if m.cycle != nil {
+		for _, lot := range m.cycle.Lots {
+			used = used.Sub(m.unpaired(lot).Cost)
+		}
+	}
 	return total, used, total.Sub(used)
+}
+
+// Unpaired returns the unpaired thin leg of a batch of the open cycle while
+// it is building (SPEC 12.2 S_open): zero without a thin leg first, for a
+// batch that has ended and for one the cycle does not hold. Its Cost is
+// what the quota leaves out and what the top-up quota counts it at.
+func (m *InventoryManager) Unpaired(id LotID) Unpaired {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.cycle != nil {
+		for _, lot := range m.cycle.Lots {
+			if lot.ID == id {
+				return m.unpaired(lot)
+			}
+		}
+	}
+	return Unpaired{Qty: decimal.Zero, Cost: decimal.Zero}
+}
+
+// unpaired is Unpaired of one lot: the thin leg's open quantity less what
+// the other leg pairs, its open quantity and the unfilled quantity of its
+// pending entry and completion orders on this lot, at the cycle's pairing
+// anchors (q_thin x A_thin = q_thick x A_thick). A pending order of the
+// other leg reserves its own notional, and the thin quantity it would pair
+// takes quota from then on. The caller holds mu.
+func (m *InventoryManager) unpaired(lot *Lot) Unpaired {
+	none := Unpaired{Qty: decimal.Zero, Cost: decimal.Zero}
+	if m.thin == nil || lot.Status != LotBuilding {
+		return none
+	}
+	thin, thick := *m.thin, cex.Bull
+	if thin == cex.Bull {
+		thick = cex.Bear
+	}
+	pairing := m.cycle.PairAnchors
+	aThin, aThick := pairing.Bear, pairing.Bull
+	if thin == cex.Bull {
+		aThin, aThick = pairing.Bull, pairing.Bear
+	}
+	t := lot.Legs[thin]
+	if !t.EntryQty.IsPositive() || !aThin.IsPositive() {
+		return none
+	}
+	other := lot.Legs[thick].Open()
+	for _, o := range m.orders {
+		if o.Request.Leg == thick && !o.Status.Terminal() && m.assigned[o.Request.ClientOrderID] == lot.ID &&
+			(o.Request.Purpose == cex.PurposeEntry || o.Request.Purpose == cex.PurposeComplete) {
+			other = other.Add(o.Request.Qty.Sub(o.CumExecQty))
+		}
+	}
+	qty := t.Open().Sub(other.Mul(aThick).Div(aThin))
+	if !qty.IsPositive() {
+		return none
+	}
+	return Unpaired{Qty: qty, Cost: portion(t.EntryValue, qty, t.EntryQty)}
 }
 
 // HeldNotional is the entry value of what the ledger holds now: every lot's

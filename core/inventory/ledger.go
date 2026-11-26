@@ -261,42 +261,53 @@ func rebuild(lots []*Lot, orders []cex.OrderRecord, assigned map[cex.ClientOrder
 		byID[lot.ID] = lot
 	}
 	for _, o := range orders {
-		if !o.CumExecQty.IsPositive() {
-			continue
-		}
-		rest := share{qty: o.CumExecQty, value: o.CumExecValue, fee: o.Fee}
-		leg, lot := o.Request.Leg, byID[assigned[o.Request.ClientOrderID]]
-		switch o.Request.Purpose {
-		case cex.PurposeEntry, cex.PurposeComplete:
-			if lot != nil {
-				lot.Legs[leg].addEntry(rest.take(rest.qty))
+		if beyond := book(lots, byID[assigned[o.Request.ClientOrderID]], o); beyond.IsPositive() {
+			if dropped == nil {
+				dropped = map[cex.ClientOrderID]decimal.Decimal{}
 			}
-		case cex.PurposeTrim:
-			// Booked on the batch it trims (PRD 7.4), up to what that
-			// batch's leg still holds. The gap a trim closes is the whole
-			// cycle's, so it can be larger than the batch: the rest closes
-			// the older lots like an exit.
-			if lot != nil {
-				if q := decimal.Min(rest.qty, lot.Legs[leg].Open()); q.IsPositive() {
-					lot.Legs[leg].addExit(rest.take(q))
-				}
-			}
-			fallthrough
-		default: // exit and forced: first in, first out; one order across two lots is split by quantity
-			for _, lot := range lots {
-				if q := decimal.Min(rest.qty, lot.Legs[leg].Open()); q.IsPositive() {
-					lot.Legs[leg].addExit(rest.take(q))
-				}
-			}
-			if rest.qty.IsPositive() {
-				if dropped == nil {
-					dropped = map[cex.ClientOrderID]decimal.Decimal{}
-				}
-				dropped[o.Request.ClientOrderID] = rest.qty
-			}
+			dropped[o.Request.ClientOrderID] = beyond
 		}
 	}
 	return dropped
+}
+
+// book adds one order's fill to the lots, by its purpose: an entry or a
+// completion to lot, the lot assigned to it (nil: not booked); a trim first
+// to lot and the rest like an exit; an exit or a forced exit first in, first
+// out. It returns the closing quantity beyond what the lots hold, which is
+// not booked. rebuild books every order through it, and CloseNet a
+// hypothetical one, so the two allocate alike.
+func book(lots []*Lot, lot *Lot, o cex.OrderRecord) (beyond decimal.Decimal) {
+	if !o.CumExecQty.IsPositive() {
+		return decimal.Zero
+	}
+	rest := share{qty: o.CumExecQty, value: o.CumExecValue, fee: o.Fee}
+	leg := o.Request.Leg
+	switch o.Request.Purpose {
+	case cex.PurposeEntry, cex.PurposeComplete:
+		if lot != nil {
+			lot.Legs[leg].addEntry(rest.take(rest.qty))
+		}
+		return decimal.Zero
+	case cex.PurposeTrim:
+		// Booked on the batch it trims (PRD 7.4), up to what that batch's
+		// leg still holds. The gap a trim closes is the whole cycle's, so it
+		// can be larger than the batch: the rest closes the older lots like
+		// an exit.
+		if lot != nil {
+			if q := decimal.Min(rest.qty, lot.Legs[leg].Open()); q.IsPositive() {
+				lot.Legs[leg].addExit(rest.take(q))
+			}
+		}
+	}
+	// exit and forced, and what a trim leaves: first in, first out; one
+	// order across two lots is split by quantity
+	for _, lot := range lots {
+		if q := decimal.Min(rest.qty, lot.Legs[leg].Open()); q.IsPositive() {
+			lot.Legs[leg].addExit(rest.take(q))
+		}
+	}
+	return rest.qty
 }
 
 func (l *LotLeg) addEntry(part share) {
@@ -305,6 +316,68 @@ func (l *LotLeg) addEntry(part share) {
 
 func (l *LotLeg) addExit(part share) {
 	l.ExitQty, l.ExitValue, l.ExitFee = l.ExitQty.Add(part.qty), l.ExitValue.Add(part.value), l.ExitFee.Add(part.fee)
+}
+
+// --- valuation ---
+
+// CloseNet values a close of the open cycle that is not sent yet: close[leg]
+// of each leg at its price, a fee of feeRate (a fraction of the traded
+// value, the taker fee) on each, booked as the ledger would book such fills
+// now (SPEC 12.2, 12.9). It is the one valuation of a close; it reads the
+// ledger and changes nothing. What is booked already counts once.
+//
+// purpose sets the allocation, as for a real order:
+//   - cex.PurposeExit (or cex.PurposeForced): first in, first out over the
+//     cycle's lots. The result is the round's expected net: what the cycle
+//     has realised, funding included, plus this close.
+//   - cex.PurposeTrim: first back into lot, the rest first in, first out (an
+//     unwind and a profit close of a thin leg are trims of their batch). The
+//     result is the increment of this close alone: an older lot's profit
+//     cannot make it pass (SPEC 12.5 example 11).
+//
+// It refuses another purpose, a trim without a lot of the cycle, and a close
+// of more than the cycle holds on a leg.
+func (m *InventoryManager) CloseNet(purpose cex.OrderPurpose, lot LotID, close [2]CloseLeg, feeRate decimal.Decimal) (decimal.Decimal, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.cycle == nil {
+		return decimal.Zero, errNoCycle
+	}
+	c := m.cycle.clone() // booked on a copy: the ledger is not touched
+	var into *Lot
+	switch purpose {
+	case cex.PurposeExit, cex.PurposeForced:
+	case cex.PurposeTrim:
+		for _, l := range c.Lots {
+			if l.ID == lot {
+				into = l
+			}
+		}
+		if into == nil {
+			return decimal.Zero, fmt.Errorf("inventory: CloseNet: a trim needs a lot of cycle %s, got %q", c.ID, lot)
+		}
+	default:
+		return decimal.Zero, fmt.Errorf("inventory: CloseNet values a close, got purpose %s", purpose)
+	}
+
+	c.realise(true, time.Time{})
+	before := c.Gross.Sub(c.Fees)
+	for _, leg := range cex.Legs {
+		q := close[leg]
+		if !q.Qty.IsPositive() {
+			continue
+		}
+		value := q.Qty.Mul(q.Price)
+		o := cex.OrderRecord{Request: cex.OrderRequest{Leg: leg, Purpose: purpose}, CumExecQty: q.Qty, CumExecValue: value, Fee: value.Mul(feeRate)}
+		if beyond := book(c.Lots, into, o); beyond.IsPositive() {
+			return decimal.Zero, fmt.Errorf("inventory: CloseNet: closing %s %s is %s more than cycle %s holds", q.Qty, leg, beyond, c.ID)
+		}
+	}
+	c.realise(true, time.Time{})
+	if purpose == cex.PurposeTrim {
+		return c.Gross.Sub(c.Fees).Sub(before), nil
+	}
+	return c.Gross.Sub(c.Fees).Add(c.Funding), nil
 }
 
 // --- results and statuses ---
@@ -434,6 +507,9 @@ func logLot(l *Lot, from LotStatus) {
 	if l.Status == LotVoid {
 		attrs = append(attrs, "void_reason", l.VoidReason)
 	}
+	if l.End != "" {
+		attrs = append(attrs, "end", l.End)
+	}
 	logger.GlobalLogger.Info(message, attrs...)
 }
 
@@ -467,6 +543,37 @@ func (m *InventoryManager) SettleLot(id LotID, built bool, now time.Time) {
 		return
 	}
 	logger.GlobalLogger.Warn("inventory: no building lot to settle", "lot", id, "built", built)
+}
+
+// SettlePairedLot ends the building of a thin-leg-first entry batch in the
+// end state exec found (SPEC 12.4): LotEndBuilt and LotEndBuiltPartial make
+// it a position, like SettleLot's built; the three others make it void, the
+// end state its void reason. From then on its thin leg takes quota in full.
+func (m *InventoryManager) SettlePairedLot(id LotID, end LotEnd, now time.Time) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.cycle == nil {
+		return
+	}
+	for _, lot := range m.cycle.Lots {
+		if lot.ID != id || lot.Status != LotBuilding {
+			continue
+		}
+		switch end {
+		case LotEndBuilt, LotEndBuiltPartial:
+			lot.Status = LotOpen
+		case LotEndEntryFailed, LotEndUnwoundProfit, LotEndUnwoundStop:
+			lot.Status, lot.VoidReason, lot.ClosedAt = LotVoid, string(end), now
+		default:
+			logger.GlobalLogger.Warn("inventory: unknown end state; the lot stays building", "lot", id, "end", end)
+			return
+		}
+		lot.End = end
+		logLot(lot, LotBuilding)
+		m.refresh(now)
+		return
+	}
+	logger.GlobalLogger.Warn("inventory: no building lot to settle", "lot", id, "end", end)
 }
 
 // CloseCycle ends the open cycle for the given reason (an End constant). It

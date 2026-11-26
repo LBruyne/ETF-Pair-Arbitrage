@@ -66,11 +66,26 @@ const (
 	LotVoid     LotStatus = "void"     // the batch was not built; what it lost is booked all the same
 )
 
-// Why a lot is void, as stored in lot.void_reason.
+// Why a lot is void, as stored in lot.void_reason. A thin-leg-first batch
+// that ends void carries its end state instead (LotEndEntryFailed,
+// LotEndUnwoundProfit, LotEndUnwoundStop).
 const (
 	VoidNoFill     = "no_fill"     // neither leg filled
 	VoidOneLeg     = "one_leg"     // one leg filled and was trimmed back
 	VoidStoreError = "store_error" // its row could not be confirmed written, so its orders were never sent
+)
+
+// LotEnd is how the building of a thin-leg-first entry batch ended (SPEC
+// 12.4): every such batch ends in one of these. Built ends are positions,
+// the others void lots.
+type LotEnd string
+
+const (
+	LotEndBuilt         LotEnd = "built"          // the unpaired thin leg was paired, or only dust of it is left
+	LotEndBuiltPartial  LotEnd = "built_partial"  // part was paired; the rest of the thin leg was unwound or closed at a profit
+	LotEndEntryFailed   LotEnd = "entry_failed"   // the thin leg filled nothing or was refused
+	LotEndUnwoundProfit LotEnd = "unwound_profit" // nothing was paired; the thin leg was closed at a profit (12.4 step 7)
+	LotEndUnwoundStop   LotEnd = "unwound_stop"   // nothing was paired; the thin leg was unwound at the stop, the window or as too small
 )
 
 // Why a cycle ended, as stored in cycle.end_reason. exec passes one of them
@@ -106,7 +121,8 @@ type Lot struct {
 	CycleID    CycleID
 	Seq        int // its number within the cycle, from 1
 	Status     LotStatus
-	VoidReason string // VoidNoFill, VoidOneLeg or VoidStoreError; empty unless void
+	VoidReason string // VoidNoFill, VoidOneLeg or VoidStoreError, or a void LotEnd; empty unless void
+	End        LotEnd // a thin-leg-first batch: how its building ended; empty while building and for a batch whose legs went together
 	Direction  strategy.Direction
 	Legs       [2]LotLeg // by cex.Leg
 
@@ -199,6 +215,21 @@ func (d Dust) add(qty, price decimal.Decimal) Dust {
 		return Dust{Qty: net, AvgPrice: d.AvgPrice}
 	}
 	return Dust{Qty: net, AvgPrice: price}
+}
+
+// --- valuation ---
+
+// CloseLeg is one leg of a close CloseNet values: Qty at Price, in USDT a
+// share. A zero Qty sends nothing on that leg.
+type CloseLeg struct {
+	Qty, Price decimal.Decimal
+}
+
+// Unpaired is the part of a thin-leg-first batch's thin leg that the other
+// leg does not pair yet (S_open, SPEC 12.2) while the batch is in pairing.
+type Unpaired struct {
+	Qty  decimal.Decimal // the thin leg's open quantity less what the other leg's filled and pending quantity pairs at the pairing anchors; never negative
+	Cost decimal.Decimal // Qty at the thin leg's entry average price, in USDT: its actual cost, which the top-up quota counts (SPEC 12.4 step 6)
 }
 
 // --- funding ---

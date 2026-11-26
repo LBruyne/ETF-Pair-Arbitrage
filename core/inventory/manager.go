@@ -32,6 +32,7 @@ type InventoryManager struct {
 	symbols [2]cex.Symbol // by leg
 	cex     cexSource     // positions, funding records and settled funding rates are read from here
 	timing  timings
+	thin    *cex.Leg // the leg a batch takes first (exec.thin_leg); nil: both legs go together
 
 	// bound by UseStore, before Restore and Run
 	store store.Sink // nil records nothing
@@ -71,12 +72,18 @@ type InventoryManager struct {
 	nextSample, nextStatus time.Time
 }
 
-// Option changes how a manager runs. The process passes none.
+// Option changes how a manager runs: the replay passes WithClock, a process
+// with exec.thin_leg set WithThinLeg.
 type Option func(*InventoryManager)
 
 // WithClock makes the manager read the time from c instead of the wall
 // clock: a replay's virtual clock (cmd/replay).
 func WithClock(c cex.Clock) Option { return func(m *InventoryManager) { m.timing.clock = c.Now } }
+
+// WithThinLeg tells the manager that every entry batch takes leg first
+// (exec.thin_leg, SPEC 12.4): while a batch is building, the part of that
+// leg the other leg does not pair yet takes no quota.
+func WithThinLeg(leg cex.Leg) Option { return func(m *InventoryManager) { m.thin = &leg } }
 
 // NewManager validates cfg and builds the manager for the two legs of pair
 // on the exchange facts of c.
