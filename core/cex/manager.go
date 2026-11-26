@@ -85,7 +85,27 @@ type CexManager struct {
 	// the last result SettingsOK logged, so that a state is logged once
 	settingsLogMu sync.Mutex
 	settingsLog   string
+
+	// a replay's manager (Synchronous): no loop runs, and the venue's
+	// inputs and the order sends happen on the caller's goroutine
+	sync    bool
+	syncCtx context.Context // StartSynchronous's; the context a resubscription runs under
 }
+
+// Option changes how a manager runs. The process passes none.
+type Option func(*CexManager)
+
+// WithClock makes the manager read the time from c instead of the wall
+// clock: a replay's virtual clock.
+func WithClock(c Clock) Option { return func(m *CexManager) { m.timing.clock = c.Now } }
+
+// Synchronous builds the manager for a replay that drives everything from
+// one goroutine (cmd/replay): every frame and loss the venue reports is
+// applied at once, on the goroutine that reports it, instead of through
+// Run's inbox, and PlaceOrders hands each order to the venue within its own
+// call instead of on a goroutine. Such a manager is started with
+// StartSynchronous and never with Run.
+func Synchronous() Option { return func(m *CexManager) { m.sync = true } }
 
 // bookStream is one of a leg's connections: a subscription of the leg's
 // depth topic and books1. A leg has several, all feeding the one leg book:
@@ -121,13 +141,12 @@ type booksView struct {
 
 // referenceView is the published reference data.
 type referenceView struct {
-	fx        FX
-	fxMinutes map[int64]decimal.Decimal // unix ms of a minute's start -> the last valid F read in it
-	anchors   Anchors
-	rules     map[Symbol]MarketRule        // nil until loaded
-	settings  *AccountSettings             // nil until read
-	funding   [2]map[int64]decimal.Decimal // by leg: unix ms of a settlement -> its funding rate
-	changed   chan struct{}                // closed when the next view is published
+	fx       FX
+	anchors  Anchors
+	rules    map[Symbol]MarketRule        // nil until loaded
+	settings *AccountSettings             // nil until read
+	funding  [2]map[int64]decimal.Decimal // by leg: unix ms of a settlement -> its funding rate
+	changed  chan struct{}                // closed when the next view is published
 }
 
 // accountView is the published account data of the two legs.
@@ -140,7 +159,7 @@ type accountView struct {
 
 // NewManager validates cfg and builds the manager on the venue and the three
 // read-only sources. Nothing is connected until Run.
-func NewManager(cfg Config, venue Venue, index IndexSource, fx FXSource, issuer IssuerSource) (*CexManager, error) {
+func NewManager(cfg Config, venue Venue, index IndexSource, fx FXSource, issuer IssuerSource, opts ...Option) (*CexManager, error) {
 	if err := cfg.Validate(); err != nil {
 		return nil, err
 	}
@@ -150,6 +169,9 @@ func NewManager(cfg Config, venue Venue, index IndexSource, fx FXSource, issuer 
 	}
 	m := &CexManager{cfg: cfg, venue: venue, index: index, fxSource: fx, issuer: issuer, calendar: calendar, timing: defaultTimings,
 		symbols: [2]Symbol{cfg.Pair.Bull.Symbol, cfg.Pair.Bear.Symbol}, tickers: [2]string{cfg.Pair.Bull.Ticker, cfg.Pair.Bear.Ticker}, orders: newOrderStore()}
+	for _, opt := range opts {
+		opt(m)
+	}
 	m.bookInputs = make(chan bookInput, m.timing.bookInbox)
 	for _, leg := range Legs {
 		m.streams[leg] = make([]bookStream, cfg.BookConnections)
@@ -177,6 +199,39 @@ func (m *CexManager) Run(ctx context.Context) {
 	m.runBooks(ctx)
 	loops.Wait()
 	log.Info("cex: stopped")
+}
+
+// StartSynchronous starts a manager built Synchronous, in place of Run: on
+// the caller's goroutine it subscribes every leg's books and the private
+// stream and reads the market rules, the account settings and the
+// positions once. No loop is started: F, the anchors, the funding records
+// and the order table's timeouts and queries are not followed, and the
+// caller drives the rest - the venue's deliveries, the venue's timers and
+// the reads - on its own goroutine.
+func (m *CexManager) StartSynchronous(ctx context.Context) error {
+	if !m.sync {
+		return fmt.Errorf("cex: StartSynchronous needs a manager built Synchronous")
+	}
+	m.syncCtx = ctx
+	for _, leg := range Legs {
+		for conn := range m.streams[leg] {
+			m.openBookStream(ctx, leg, conn)
+		}
+	}
+	if err := m.venue.SubscribePrivate(ctx, m.symbols[:], m.onPrivateEvent, func(error) {}); err != nil {
+		return fmt.Errorf("cex: private stream: %w", err)
+	}
+	now := m.timing.clock()
+	if err := m.readRules(ctx, now); err != nil {
+		return fmt.Errorf("cex: market rules: %w", err)
+	}
+	if err := m.readSettings(ctx, now); err != nil {
+		return fmt.Errorf("cex: account settings: %w", err)
+	}
+	if _, err := m.ReadPositions(ctx); err != nil {
+		return fmt.Errorf("cex: positions: %w", err)
+	}
+	return nil
 }
 
 // --- the book loop ---
@@ -230,8 +285,12 @@ func (m *CexManager) openBookStream(ctx context.Context, leg Leg, conn int) {
 // venue's read goroutine. A full inbox drops it: a dropped snapshot is
 // replaced by the next one, a dropped update breaks the chain and the
 // connection is subscribed again, a dropped loss leaves the depth to age
-// out.
+// out. A Synchronous manager applies the input at once instead.
 func (m *CexManager) enqueueBookInput(in bookInput) {
+	if m.sync {
+		m.handleBookInput(m.syncCtx, in)
+		return
+	}
 	select {
 	case m.bookInputs <- in:
 	default:
@@ -266,7 +325,7 @@ func (m *CexManager) handleBookInput(ctx context.Context, in bookInput) {
 		log.Info("cex: book down", "symbol", symbol, "topic", m.legConfig(in.leg).BookTopic)
 	case in.ev.Topic == TopicBooks1:
 		held := book.best
-		st.count(in.ev, held == nil || in.ev.Seq > held.seq)
+		st.count(in.ev, held == nil || in.ev.Seq > held.seq, !m.sync)
 		book.applyBest(in.ev)
 		log.Debug("cex: books1 frame", "symbol", symbol, "connection", in.conn, "seq", in.ev.Seq)
 		if book.best == held && wasUp {
@@ -277,7 +336,7 @@ func (m *CexManager) handleBookInput(ctx context.Context, in bookInput) {
 		if held != nil {
 			heldSeq = held.seq
 		}
-		st.count(in.ev, held == nil || in.ev.Seq > heldSeq)
+		st.count(in.ev, held == nil || in.ev.Seq > heldSeq, !m.sync)
 		log.Debug("cex: depth frame", "symbol", symbol, "connection", in.conn, "topic", in.ev.Topic, "action", in.ev.Action, "seq", in.ev.Seq, "prev_seq", in.ev.PrevSeq)
 		switch {
 		case book.applyDepth(in.ev):
@@ -297,14 +356,15 @@ func (m *CexManager) handleBookInput(ctx context.Context, in bookInput) {
 
 // count notes one frame of the connection: that it is up, whether the frame
 // was the first to bring its sequence number, and how old the book state was
-// on arrival.
-func (st *bookStream) count(ev BookEvent, first bool) {
+// on arrival. The delays are kept for Run's status line, which reads and
+// resets them; keep is false where no status line runs (Synchronous).
+func (st *bookStream) count(ev BookEvent, first, keep bool) {
 	st.connected = true
 	st.frames++
 	if first {
 		st.first++
 	}
-	if !ev.ExchangeTime.IsZero() {
+	if keep && !ev.ExchangeTime.IsZero() {
 		st.delays = append(st.delays, ev.ReceivedAt.Sub(ev.ExchangeTime))
 	}
 }

@@ -70,46 +70,6 @@ func TestFXFreshnessAndInvalidQuotes(t *testing.T) {
 	}
 }
 
-// The last valid F of each minute is kept for the bell anchor, for fxKeep.
-func TestFXKeepsTheLastValueOfEachMinute(t *testing.T) {
-	minute := time.Date(2026, 11, 23, 20, 59, 0, 0, time.UTC) // 15:59 New York
-	r := newRig(t, testConfig(), minute)
-	ctx := context.Background()
-	for _, read := range []struct {
-		at       time.Duration
-		bid, ask string
-	}{{5 * time.Second, "0.9990", "0.9990"}, {55 * time.Second, "0.9992", "0.9992"}, {65 * time.Second, "0.9994", "0.9994"}} {
-		r.clock.Set(minute.Add(read.at))
-		r.fx.set(read.bid, read.ask, nil)
-		r.m.pollFX(ctx)
-	}
-	// An invalid quote late in the second minute does not become its value.
-	r.clock.Set(minute.Add(115 * time.Second))
-	r.fx.set("1.1", "1.0", nil)
-	r.m.pollFX(ctx)
-
-	if got, ok := r.m.fxAtMinute(minute); !ok || !got.Equal(dec("0.9992")) {
-		t.Errorf("F of the first minute = %s (%t), want its last read 0.9992", got, ok)
-	}
-	if got, ok := r.m.fxAtMinute(minute.Add(time.Minute)); !ok || !got.Equal(dec("0.9994")) {
-		t.Errorf("F of the second minute = %s (%t), want 0.9994", got, ok)
-	}
-	if _, ok := r.m.fxAtMinute(minute.Add(-time.Minute)); ok {
-		t.Error("a minute without a read has a value")
-	}
-
-	// Eleven minutes on the first minute is gone, a recent one is kept.
-	r.clock.Set(minute.Add(11 * time.Minute))
-	r.fx.set("0.9995", "0.9995", nil)
-	r.m.pollFX(ctx)
-	if _, ok := r.m.fxAtMinute(minute); ok {
-		t.Error("a minute older than fxKeep is still kept")
-	}
-	if _, ok := r.m.fxAtMinute(minute.Add(time.Minute)); !ok {
-		t.Error("a minute inside fxKeep was dropped")
-	}
-}
-
 // FXMinuteCloses hands a range to the source.
 func TestFXMinuteCloses(t *testing.T) {
 	r := newRig(t, testConfig(), t0)

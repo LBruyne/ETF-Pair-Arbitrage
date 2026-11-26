@@ -117,7 +117,7 @@ func TestAnchorBellRetryLogsSayWhatIsMissing(t *testing.T) {
 			t.Errorf("logged %q, want %q", got, line)
 		}
 	}
-	// No own F of the minute and no candle.
+	// No candle of the minute.
 	want(step(), "INFO cex: bell F of the minute missing; retrying")
 	// The candle's source fails.
 	r.fx.candleErr = errors.New("coinbase: http 503")
@@ -133,106 +133,46 @@ func TestAnchorBellRetryLogsSayWhatIsMissing(t *testing.T) {
 	want(step(), "WARN cex: bell anchor read failed; retrying")
 }
 
-// The bell anchor is F x the index close, with F the last value the process
-// itself read in the closing minute; the source's candle only stands in when
-// the process read none.
-func TestAnchorBellUsesTheOwnFOfTheMinute(t *testing.T) {
-	r := anchorRig(t, testConfig(), bellMin.Add(10*time.Second))
+// The bell anchor is F x the index close, with F the close of the source's
+// 1-minute candle of the closing minute (owner item 69): the F the process
+// itself read in that minute is not used.
+func TestAnchorBellUsesTheCandleCloseOfTheMinute(t *testing.T) {
+	r := anchorRig(t, testConfig(), bellMin.Add(10*time.Second)) // candle 0.9990
 	ctx := context.Background()
-	r.fx.set("0.9980", "0.9984", nil) // mid 0.9982
-	r.m.pollFX(ctx)
 	r.clock.Set(bellMin.Add(50 * time.Second))
-	r.fx.set("0.9984", "0.9988", nil) // mid 0.9986: the minute's last
-	r.m.pollFX(ctx)
-	r.clock.Set(monClose.Add(10 * time.Second))
-	r.fx.set("0.9970", "0.9970", nil) // after the close: not the minute's
+	r.fx.set("0.9984", "0.9988", nil) // mid 0.9986: the process's own last F of the minute
 	r.m.pollFX(ctx)
 
 	changed := r.m.ReferenceChanged()
 	a := r.stepAt(monClose.Add(time.Minute))
-	wantAnchors(t, a, AnchorBell, "39.944", "49.93") // 0.9986 x 40, 0.9986 x 50
+	wantAnchors(t, a, AnchorBell, "39.96", "49.95") // 0.9990 x 40, 0.9990 x 50
 	select {
 	case <-changed:
 	default:
 		t.Error("ReferenceChanged was not closed by the anchor")
 	}
-	if r.fx.candleCalls != 0 {
-		t.Error("the candle was read although the process had its own F of the minute")
+	if r.fx.candleCalls != 1 {
+		t.Errorf("%d candle reads, want 1", r.fx.candleCalls)
 	}
 	// The fixed F of each leg, then the bell anchor of each leg.
 	facts := r.facts()
-	if len(facts) != 4 || facts[0].Kind != FactBellF || facts[0].Leg != "bull" || !facts[0].Value.Equal(dec("0.9986")) || facts[0].Source != "own" || facts[1].Kind != FactBellF || facts[1].Leg != "bear" {
+	if len(facts) != 4 || facts[0].Kind != FactBellF || facts[0].Leg != "bull" || !facts[0].Value.Equal(dec("0.999")) || facts[0].Source != "candle" || facts[1].Kind != FactBellF || facts[1].Leg != "bear" {
 		t.Fatalf("anchor facts = %+v, want the fixed F of both legs first", facts)
 	}
 	facts = facts[2:]
-	if facts[0].Kind != FactBell || facts[0].Leg != "bull" || !facts[0].Value.Equal(dec("39.944")) || !facts[0].F.Equal(dec("0.9986")) ||
-		facts[0].SessionID != "2026-12-21" || facts[0].KnownMs != monClose.Add(time.Minute).UnixMilli() || facts[1].Leg != "bear" || !facts[1].Value.Equal(dec("49.93")) {
+	if facts[0].Kind != FactBell || facts[0].Leg != "bull" || !facts[0].Value.Equal(dec("39.96")) || !facts[0].F.Equal(dec("0.999")) ||
+		facts[0].SessionID != "2026-12-21" || facts[0].KnownMs != monClose.Add(time.Minute).UnixMilli() || facts[1].Leg != "bear" || !facts[1].Value.Equal(dec("49.95")) {
 		t.Errorf("bell facts = %+v", facts)
-	}
-
-	// Without an own value the candle of the minute is used.
-	r2 := anchorRig(t, testConfig(), monClose)
-	wantAnchors(t, r2.stepAt(monClose.Add(time.Minute)), AnchorBell, "39.96", "49.95") // 0.9990 x 40, x 50
-	if r2.fx.candleCalls != 1 {
-		t.Errorf("%d candle reads, want 1", r2.fx.candleCalls)
-	}
-}
-
-// lateIndexRig is a rig whose process read F = 1.000 in the closing minute,
-// while the source's candle of that minute closed at 0.999, and whose index
-// klines are not there yet.
-func lateIndexRig(t *testing.T) *testRig {
-	t.Helper()
-	r := newRig(t, testConfig(), bellMin.Add(30*time.Second))
-	r.issuer.err = ErrIssuerKey // the issuer is not part of this
-	r.fx.candles[bellMin.UnixMilli()] = dec("0.999")
-	r.fx.set("1.000", "1.000", nil)
-	r.m.pollFX(context.Background())
-	return r
-}
-
-// The F of the closing minute is fixed for the Session the first time it is
-// there. An index that only arrives in the eleventh minute, when the
-// process's own minute values no longer hold the closing minute, is still
-// multiplied by the F the process recorded, not by the candle (PRD 3.3).
-func TestAnchorBellKeepsItsFWhenTheIndexIsLate(t *testing.T) {
-	r := lateIndexRig(t)
-	ctx := context.Background()
-	if a := r.stepAt(monClose.Add(time.Minute)); a.Kind != AnchorNone {
-		t.Fatalf("an anchor without the index: %+v", a)
-	}
-	if a := r.stepAt(monClose.Add(6 * time.Minute)); a.Kind != AnchorNone {
-		t.Fatalf("an anchor without the index: %+v", a)
-	}
-	// Eleven minutes after the close F is still being read and the closing
-	// minute has left the process's own minute values.
-	late := monClose.Add(11 * time.Minute)
-	r.clock.Set(late)
-	r.fx.set("0.998", "0.998", nil)
-	r.m.pollFX(ctx)
-	if _, kept := r.m.fxAtMinute(bellMin); kept {
-		t.Fatal("the closing minute is still among the process's minute values: the scenario needs it gone")
-	}
-	r.index.setClose("SOXLUSDT", bellMin, "40")
-	r.index.setClose("SOXSUSDT", bellMin, "50")
-	a := r.stepAt(late)
-	wantAnchors(t, a, AnchorBell, "40", "50")
-	if !a.KnownAt.Equal(late) || r.fx.candleCalls != 0 {
-		t.Errorf("known at %s after %d candle reads, want the eleventh minute and no candle read", showTime(a.KnownAt), r.fx.candleCalls)
-	}
-	// The fixed F was stored when it was fixed, a minute after the close.
-	facts := r.facts()
-	if len(facts) != 4 || facts[0].Kind != FactBellF || facts[0].Source != "own" || !facts[0].Value.Equal(dec("1")) || facts[0].KnownMs != monClose.Add(time.Minute).UnixMilli() ||
-		facts[2].Kind != FactBell || !facts[2].F.Equal(dec("1")) || !facts[2].Value.Equal(dec("40")) || facts[2].KnownMs != late.UnixMilli() {
-		t.Errorf("anchor facts = %+v", facts)
 	}
 }
 
 // A restart while the index is still awaited takes the fixed F over from
-// the stored fact: the new process has no value of the closing minute of its
-// own and would otherwise use the candle.
+// the stored fact: the candle is not read again, even when the source has
+// revised it meanwhile.
 func TestAnchorBellKeepsItsFAcrossARestart(t *testing.T) {
-	r := lateIndexRig(t)
+	r := newRig(t, testConfig(), monClose)
+	r.issuer.err = ErrIssuerKey // the issuer is not part of this
+	r.fx.candles[bellMin.UnixMilli()] = dec("0.999")
 	r.stepAt(monClose.Add(time.Minute)) // F fixed, the index missing
 	facts := AnchorFactsFromRows(r.facts())
 	if len(facts) != 2 || facts[0].Kind != FactBellF {
@@ -242,7 +182,7 @@ func TestAnchorBellKeepsItsFAcrossARestart(t *testing.T) {
 	restart := monClose.Add(6 * time.Minute)
 	r2 := newRig(t, testConfig(), restart)
 	r2.issuer.err = ErrIssuerKey
-	r2.fx.candles[bellMin.UnixMilli()] = dec("0.999")
+	r2.fx.candles[bellMin.UnixMilli()] = dec("0.998") // revised by the source
 	r2.m.Restore(facts, nil)
 	if a := r2.stepAt(restart); a.Kind != AnchorNone {
 		t.Fatalf("an anchor without the index: %+v", a)
@@ -250,20 +190,19 @@ func TestAnchorBellKeepsItsFAcrossARestart(t *testing.T) {
 	r2.index.setClose("SOXLUSDT", bellMin, "40")
 	r2.index.setClose("SOXSUSDT", bellMin, "50")
 	a := r2.stepAt(monClose.Add(11 * time.Minute))
-	wantAnchors(t, a, AnchorBell, "40", "50")
+	wantAnchors(t, a, AnchorBell, "39.96", "49.95")
 	if r2.fx.candleCalls != 0 {
 		t.Errorf("%d candle reads after the restart, want none: F was restored", r2.fx.candleCalls)
 	}
 	// The restarted process stores the bell anchor and not the F again.
-	if facts := r2.facts(); len(facts) != 2 || facts[0].Kind != FactBell || !facts[0].F.Equal(dec("1")) || string(facts[0].Detail) != `{"f_source":"own","index_usdt":"40","minute_ms":`+itoa(bellMin.UnixMilli())+`}` {
+	if facts := r2.facts(); len(facts) != 2 || facts[0].Kind != FactBell || !facts[0].F.Equal(dec("0.999")) || string(facts[0].Detail) != `{"f_source":"candle","index_usdt":"40","minute_ms":`+itoa(bellMin.UnixMilli())+`}` {
 		t.Errorf("facts after the restart = %+v detail %s", facts, facts[0].Detail)
 	}
 }
 
-// A process that was not running in the closing minute has no F of its own:
-// the candle's close is its F, fixed likewise at the first read, whatever
-// the source answers later.
-func TestAnchorBellFixesTheCandleFWhenNotRunningAtTheClose(t *testing.T) {
+// The candle's close is fixed at the first read, whatever the source answers
+// later: an index that only arrives eleven minutes on is multiplied by it.
+func TestAnchorBellFixesTheCandleFWhenTheIndexIsLate(t *testing.T) {
 	start := monClose.Add(3 * time.Hour)
 	r := newRig(t, testConfig(), start)
 	r.issuer.err = ErrIssuerKey
@@ -729,4 +668,30 @@ func TestAnchorFactsFromRows(t *testing.T) {
 	if len(got) != 1 || got[0].Leg != Bear || got[0].Kind != FactBell || !got[0].Value.Equal(dec("49.95")) || !got[0].F.Equal(dec("0.999")) || got[0].KnownAt.UnixMilli() != 1798000000000 {
 		t.Errorf("facts = %+v", got)
 	}
+}
+
+// A bell F the source does not have yet, or a read of it that failed, is
+// read again after referenceRetry, not after anchorPoll: one failed read does
+// not hold the bell anchor up for five minutes. Without the candle there is
+// still no bell anchor.
+func TestAnchorBellFIsReadAgainSoon(t *testing.T) {
+	r := newRig(t, testConfig(), monClose)
+	r.issuer.err = ErrIssuerKey
+	r.index.setClose("SOXLUSDT", bellMin, "40")
+	r.index.setClose("SOXSUSDT", bellMin, "50")
+	r.fx.candleErr = errors.New("coinbase: timeout")
+	if a := r.stepAt(monClose.Add(time.Minute)); a.Kind != AnchorNone {
+		t.Fatalf("an anchor without F: %+v", a)
+	}
+	r.fx.candleErr = nil
+	if a := r.stepAt(monClose.Add(time.Minute + 3*time.Second)); a.Kind != AnchorNone || r.fx.candleCalls != 1 {
+		t.Fatalf("read again before referenceRetry: %+v, %d candle reads", a, r.fx.candleCalls)
+	}
+	// The candle is still missing at the retry: no bell anchor yet.
+	if a := r.stepAt(monClose.Add(time.Minute + 5*time.Second)); a.Kind != AnchorNone || r.fx.candleCalls != 2 {
+		t.Fatalf("at the retry without a candle: %+v, %d candle reads", a, r.fx.candleCalls)
+	}
+	r.fx.candles[bellMin.UnixMilli()] = dec("0.999")
+	a := r.stepAt(monClose.Add(time.Minute + 10*time.Second))
+	wantAnchors(t, a, AnchorBell, "39.96", "49.95")
 }

@@ -104,7 +104,8 @@ func ClientOrderSeq(id ClientOrderID) (seq int, ok bool) {
 // --- placing ---
 
 // PlaceOrders registers the orders as pending, commits their cex_order rows,
-// and then sends each on a goroutine of its own. When the rows cannot be
+// and then sends each on a goroutine of its own (within this call for a
+// Synchronous manager). When the rows cannot be
 // confirmed written, a group that holds an order that is not reduce-only is
 // not sent: its orders end as not_sent and the error is returned. A group of
 // reduce-only orders is sent all the same, because reducing a position must
@@ -148,6 +149,10 @@ func (m *CexManager) PlaceOrders(reqs ...OrderRequest) error {
 		}
 	}
 	for _, req := range reqs {
+		if m.sync {
+			m.sendOrder(req) // a replay: in the caller's call, in order
+			continue
+		}
 		go m.sendOrder(req)
 	}
 	return nil

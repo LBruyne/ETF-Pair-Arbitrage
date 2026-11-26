@@ -20,7 +20,7 @@ type anchorState struct {
 
 	// the bell anchor: F x the index close of the minute before the close
 	bellF       decimal.Decimal    // F of that minute, fixed for the Session the first time it is available
-	bellFSource string             // fSourceOwn or fSourceCandle
+	bellFSource string             // where it came from, as stored (fSourceCandle; a fact restored from an older run may say "own")
 	bellFAt     time.Time          // when F was fixed; zero until then
 	bell        [2]decimal.Decimal // by leg; zero until read
 	bellAt      time.Time          // when both were read; zero until then
@@ -41,12 +41,10 @@ type anchorState struct {
 // restart while the index is still awaited uses the same F.
 const FactBellF = "bell_f"
 
-// Where the F of a bell anchor comes from, as stored in a bell_f fact's
-// source.
-const (
-	fSourceOwn    = "own"    // the last valid F the process itself read in the closing minute
-	fSourceCandle = "candle" // the source's candle of that minute: the process read no F in it
-)
+// fSourceCandle is the source of a bell anchor's F as a bell_f fact stores
+// it: the close of the source's 1-minute candle of the closing minute
+// (owner item 69).
+const fSourceCandle = "candle"
 
 // payoutDay is one configured dividend with the times that follow from its
 // ex-date.
@@ -221,13 +219,14 @@ func (a *anchorState) restore(facts []AnchorFact) {
 
 // readBell reads the bell anchor once it is due: for each leg the close of
 // the index kline of the minute before the Session's opening close, times F
-// of that minute. F is the last valid value the process itself read in that
-// minute, or the source's candle of the minute when the process read none.
-// It is fixed for the Session the first time it is available and stored, so
-// an index that arrives late, after the process's own minute values have
-// been dropped, or after a restart, is still multiplied by the same F. Until
-// F and both index closes are there the Session has no bell anchor and the
-// read of what is missing is repeated every anchorPoll. What is missing is
+// of that minute. F is the close of the source's 1-minute candle of that
+// minute (owner item 69), whether or not the process was running then. It
+// is fixed for the Session the first time it is read and stored, so an
+// index that arrives late, or a restart, is still multiplied by the same F
+// even if the source revises its candle meanwhile. Until
+// F and both index closes are there the Session has no bell anchor; a
+// missing or failed F is read again after referenceRetry, a missing index
+// every anchorPoll. What is missing is
 // logged as it is: an input the source does not have yet is expected and an
 // Info line, a read that failed is a Warn with its reason.
 func (m *CexManager) readBell(ctx context.Context, now time.Time) {
@@ -237,36 +236,34 @@ func (m *CexManager) readBell(ctx context.Context, now time.Time) {
 	}
 	log := logger.GlobalLogger
 	minute := a.session.Start.Add(-time.Minute)
-	// retry puts the read off by anchorPoll and says why: message for an
-	// input that is not there yet, err for a read that failed.
-	retry := func(message, input string, err error) {
-		a.nextBell = now.Add(m.timing.anchorPoll)
+	// retry puts the read off by wait and says why: message for an input
+	// that is not there yet, err for a read that failed.
+	retry := func(message, input string, err error, wait time.Duration) {
+		a.nextBell = now.Add(wait)
 		if err != nil {
-			log.Warn("cex: bell anchor read failed; retrying", "session", a.session.ID, "read", input, "minute", showTime(minute), "err", err, "retry_in", m.timing.anchorPoll)
+			log.Warn("cex: bell anchor read failed; retrying", "session", a.session.ID, "read", input, "minute", showTime(minute), "err", err, "retry_in", wait)
 			return
 		}
-		log.Info(message, "session", a.session.ID, "missing", input, "minute", showTime(minute), "retry_in", m.timing.anchorPoll)
+		log.Info(message, "session", a.session.ID, "missing", input, "minute", showTime(minute), "retry_in", wait)
 	}
 
 	// F of the minute, unless it is fixed already.
 	if a.bellFAt.IsZero() {
-		f, own := m.fxAtMinute(minute)
-		source := fSourceOwn
-		if !own {
-			callCtx, cancel := context.WithTimeout(ctx, m.timing.sourceCall)
-			price, ok, err := m.fxSource.MinuteClose(callCtx, minute)
-			cancel()
-			if err != nil || !ok {
-				retry("cex: bell F of the minute missing; retrying", "F candle of the minute", err)
-				return
-			}
-			f, source = price, fSourceCandle
+		callCtx, cancel := context.WithTimeout(ctx, m.timing.sourceCall)
+		f, ok, err := m.fxSource.MinuteClose(callCtx, minute)
+		cancel()
+		if err != nil || !ok {
+			// The candle is read again soon: without it there is no bell
+			// anchor, and one failed read must not hold it up for an
+			// anchorPoll.
+			retry("cex: bell F of the minute missing; retrying", "F candle of the minute", err, m.timing.referenceRetry)
+			return
 		}
-		a.bellF, a.bellFSource, a.bellFAt = f, source, m.timing.clock()
+		a.bellF, a.bellFSource, a.bellFAt = f, fSourceCandle, m.timing.clock()
 		for _, leg := range Legs {
-			m.recordFact(AnchorFact{SessionID: a.session.ID, Kind: FactBellF, Leg: leg, Value: f, F: f, Source: source, KnownAt: a.bellFAt}, map[string]any{"minute_ms": minute.UnixMilli()})
+			m.recordFact(AnchorFact{SessionID: a.session.ID, Kind: FactBellF, Leg: leg, Value: f, F: f, Source: fSourceCandle, KnownAt: a.bellFAt}, map[string]any{"minute_ms": minute.UnixMilli()})
 		}
-		log.Info("cex: bell F fixed", "session", a.session.ID, "f", f, "f_source", source, "minute", showTime(minute))
+		log.Info("cex: bell F fixed", "session", a.session.ID, "f", f, "f_source", fSourceCandle, "minute", showTime(minute))
 	}
 
 	// The index close of each leg.
@@ -276,7 +273,7 @@ func (m *CexManager) readBell(ctx context.Context, now time.Time) {
 		price, ok, err := m.index.IndexClose(callCtx, m.symbols[leg], minute)
 		cancel()
 		if err != nil || !ok {
-			retry("cex: bell index not ready; retrying", "index kline of "+string(m.symbols[leg]), err)
+			retry("cex: bell index not ready; retrying", "index kline of "+string(m.symbols[leg]), err, m.timing.anchorPoll)
 			return
 		}
 		index[leg] = price

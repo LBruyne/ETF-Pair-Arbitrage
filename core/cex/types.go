@@ -623,6 +623,15 @@ func (e *VenueError) Error() string {
 
 // --- interfaces ---
 
+// Clock is the time and the one-shot timer a component runs on. The
+// process passes none and runs on the wall clock and real timers; a replay
+// (cmd/replay) passes a virtual clock that it advances itself and whose
+// timers it fires on its own goroutine.
+type Clock interface {
+	Now() time.Time
+	AfterFunc(d time.Duration, f func()) // runs f once, d from now
+}
+
 // Venue is one exchange as cex uses it: reference reads, the market-data and
 // private streams, and the one order command. An implementation converts the
 // exchange's wire shapes to these types and does nothing else. It has no
@@ -757,7 +766,6 @@ type timings struct {
 	statusLog time.Duration // one status line this often
 
 	fxPoll time.Duration // F is read this often
-	fxKeep time.Duration // the last F of each minute is kept this long, for the bell anchor
 
 	anchorTick       time.Duration // the anchor state is advanced this often
 	bellDelay        time.Duration // the index kline of the closing minute is read this long after the close
@@ -786,7 +794,7 @@ type timings struct {
 
 // defaultTimings are the values used against the real sources.
 var defaultTimings = timings{clock: time.Now, bookInbox: 4096, statusLog: 30 * time.Second,
-	fxPoll: 5 * time.Second, fxKeep: 10 * time.Minute,
+	fxPoll:     5 * time.Second,
 	anchorTick: time.Second, bellDelay: time.Minute, anchorPoll: 5 * time.Minute, distributionPoll: 24 * time.Hour,
 	referenceTick: time.Second, referenceRetry: 5 * time.Second, rulesPoll: time.Hour, settingsPoll: time.Minute,
 	recordsPoll: time.Minute, recordsLookback: 7 * 24 * time.Hour, fundingPoll: 5 * time.Minute, fundingRates: 100, assetsPoll: 10 * time.Second,

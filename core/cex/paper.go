@@ -19,6 +19,7 @@ type PaperConfig struct {
 	TakerFeeBps float64          // the fee of a fill, in basis points of its value
 	Leverage    int              // the leverage the account settings are reported with
 	DepthMaxAge time.Duration    // cex.depth_max_age: a depth whose best price arrived later than this after it is stale at an order's arrival
+	Clock       Clock            // nil: the wall clock and real timers; a replay's virtual clock otherwise
 }
 
 // paperTimings are the paper venue's clock and timer; tests replace them.
@@ -26,6 +27,13 @@ type paperTimings struct {
 	clock func() time.Time
 	after func(d time.Duration, f func()) // runs f once, d from now, on a goroutine of its own
 }
+
+// paperFeeDecimals is the scale a paper fill's fee is cut to, toward zero:
+// the exchange reports fills' and orders' fees cut to 8 decimals (the
+// adapter's feeDecimals). An order's fee is the sum of its fills' fees;
+// whether the exchange cuts per fill or the order's total once is to be
+// confirmed on a real order with several fills.
+const paperFeeDecimals = 8
 
 // fundingInterval is the grid of the contracts' funding settlements: every
 // eight hours from midnight UTC.
@@ -90,6 +98,9 @@ func NewPaperVenue(real Venue, cfg PaperConfig) *PaperVenue {
 	p := &PaperVenue{real: real, cfg: cfg, fee: decimal.NewFromFloat(cfg.TakerFeeBps).Div(decimal.NewFromInt(10000)),
 		symbols: [2]Symbol{cfg.Pair.Bull.Symbol, cfg.Pair.Bear.Symbol}, orders: map[ClientOrderID]*paperOrder{},
 		timing: paperTimings{clock: time.Now, after: func(d time.Duration, f func()) { time.AfterFunc(d, f) }}}
+	if cfg.Clock != nil {
+		p.timing = paperTimings{clock: cfg.Clock.Now, after: cfg.Clock.AfterFunc}
+	}
 	for _, leg := range Legs {
 		p.positions[leg].Symbol = p.symbols[leg]
 	}
@@ -317,7 +328,7 @@ func (p *PaperVenue) match(id ClientOrderID) {
 	for _, level := range takes {
 		value := level.Qty.Mul(level.Price)
 		fill := Fill{ExecID: fmt.Sprintf("%s-%d", r.OrderID, len(events)+1), OrderID: r.OrderID, ClientOrderID: id, Symbol: req.Symbol, Side: req.Side,
-			Price: level.Price, Qty: level.Qty, Value: value, Fee: value.Mul(p.fee), ExecTime: now, ReceivedAt: now}
+			Price: level.Price, Qty: level.Qty, Value: value, Fee: value.Mul(p.fee).Truncate(paperFeeDecimals), ExecTime: now, ReceivedAt: now}
 		p.fills = append(p.fills, fill)
 		events = append(events, PrivateEvent{Fill: &fill, ReceivedAt: now})
 		r.CumExecQty, r.CumExecValue, r.Fee = r.CumExecQty.Add(level.Qty), r.CumExecValue.Add(value), r.Fee.Add(fill.Fee)

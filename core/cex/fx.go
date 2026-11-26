@@ -24,10 +24,10 @@ func (m *CexManager) runFX(ctx context.Context) {
 }
 
 // pollFX reads the source's best bid and ask once. A valid quote is
-// published as F = (bid + ask) / 2 with the arrival time of the answer, and
-// kept as its minute's last value for the bell anchor. A failed read or an
-// invalid quote (a side not positive, or the bid above the ask) publishes
-// nothing, so it does not extend the life of the F read before it.
+// published as F = (bid + ask) / 2 with the arrival time of the answer. A
+// failed read or an invalid quote (a side not positive, or the bid above
+// the ask) publishes nothing, so it does not extend the life of the F read
+// before it.
 func (m *CexManager) pollFX(ctx context.Context) {
 	log := logger.GlobalLogger
 	// A read is given one interval at most: an answer that does not come is
@@ -52,19 +52,7 @@ func (m *CexManager) pollFX(ctx context.Context) {
 
 	if valid {
 		fx := FX{Price: bid.Add(ask).Div(decimal.NewFromInt(2)), Bid: bid, Ask: ask, ReceivedAt: now}
-		m.editReference(func(v *referenceView) {
-			// A new map: the published one is immutable. Minutes older than
-			// fxKeep are left behind.
-			minutes := make(map[int64]decimal.Decimal, len(v.fxMinutes)+1)
-			oldest := now.Add(-m.timing.fxKeep).UnixMilli()
-			for minute, price := range v.fxMinutes {
-				if minute >= oldest {
-					minutes[minute] = price
-				}
-			}
-			minutes[now.Truncate(time.Minute).UnixMilli()] = fx.Price
-			v.fx, v.fxMinutes = fx, minutes
-		})
+		m.editReference(func(v *referenceView) { v.fx = fx })
 		log.Debug("cex: fx", "price", fx.Price, "bid", bid, "ask", ask)
 	}
 
@@ -90,13 +78,6 @@ func (m *CexManager) FX(now time.Time) (fx FX, fresh bool) {
 // first, for minutes the process did not record itself.
 func (m *CexManager) FXMinuteCloses(ctx context.Context, from, to time.Time) ([]FXMinute, error) {
 	return m.fxSource.MinuteCloses(ctx, from, to)
-}
-
-// fxAtMinute is the last valid F the process read in the minute that starts
-// at minute, if it read one and still keeps it.
-func (m *CexManager) fxAtMinute(minute time.Time) (decimal.Decimal, bool) {
-	price, ok := m.reference.Load().fxMinutes[minute.UnixMilli()]
-	return price, ok
 }
 
 // fxAge writes the age of F for a log line.
