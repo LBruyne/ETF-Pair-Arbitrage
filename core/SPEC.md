@@ -1822,7 +1822,7 @@ func (s *Store) LoadState(ctx context.Context, sessionID string) (State, error) 
 
 **输入**
 
-- 盘口：录制服务的原始帧（`experiments/book_tape/bitget/<日>/<合约>.<频道>.<首条接收毫秒>.jsonl.gz`），每条腿深度 + `books1`，按本机接收时刻合并成一条时间线；同一毫秒里不同频道的先后录制没有记下，按 `seq`、深度先于 `books1`、bull 先于 bear 排。SOXS 的深度：录到 `books5`（2026-11-25 18:00:07.412 UTC+8 起）就用 `books5`，之前用 `books50` 截到前 5 档代替（结果里标明 `bear_depth`）。录制服务那条连接的断线（`events.jsonl` 的 `disconnected`）作为两条腿的断线送入。录制只有一条连接，`book_connections` 在回放里固定为 1。正在写的最后一个文件末尾不完整时读到那里为止。
+- 盘口：录制服务的原始帧（`experiments/book_tape/bitget/<日>/<合约>.<频道>.<首条接收毫秒>.jsonl.gz`），每条腿深度 + `books1`，按本机接收时刻合并成一条时间线；同一毫秒里不同频道的先后录制没有记下，按 `seq`、深度先于 `books1`、bull 先于 bear 排。SOXS 的深度：录到 `books5`（2026-11-25 18:00:07.412 UTC+8 起）就用 `books5`，之前用 `books50` 截到前 5 档代替（结果里标明 `bear_depth`）。一条腿的断线是录制服务里订阅这条腿 `books1` 的那个 feed 的 `disconnected`（`events.jsonl`；以 feed 的 `connected` 帧里的订阅为准）：2026-11-26 之前每个组合一条连接带全部频道，一次断线丢两条腿；之后盘口在 `bitget-<组合>-books` 上，3 条连接、同一 `seq` 只存先到的那份（与本程序 `book_connections` 的取法相同，用户第 72 条），最后一条连接断开才写 `disconnected`，单条连接的断开（`link_disconnected`）不丢腿，成交那个 feed 的断线也不丢。录下的已是每个频道一条按先到合并的流，所以 `book_connections` 在回放里固定为 1。正在写的最后一个文件末尾不完整时读到那里为止。
 - F 和锚点：一般回测读看板库（只读角色，密码取自 `dashboard/.env` 的 `ETFPAIR_DB_READER_PASSWORD`，程序内拼 DSN，不打印）：F 是 `fx_minute` 每分钟那次采样（按采样时刻生效，60 秒失效规则照旧），铃锚点是 `etf_bell`、NAV 是 `etf_nav` 每只基金第一次确认的值，两腿都知道时（较晚那条腿的得知时刻）生效；每个 Session 在它的收盘时刻先发布“无锚点”。看板库里 11-26 之前的铃锚点 F 是看板当时的 ticker 读数（旧规则），不是 K 线收盘，两者差约 1e-5，只影响换锚那一刻的价差水平。
 - 复现一次纸面运行（`-paper-run <run_id>`）：读 trade schema（只读 DSN 在 `core/.env.reader`）里那次运行的配置（`process_run.config`）、开始时刻、它每秒用的 F（`signal_sample.f`，作为那一秒的读数）、它的 `anchor_fact`（铃锚点、NAV 按得知时刻），以及它启动时读回的东西：同一 Session 开始前的 `minute_bar`、开始时已知的锚点事实、开始前最后一个仓位（开仓间隔）、R（账本起点之后、开始之前已结束各轮的净额）。
 - 日历是程序自己的（`cex.NewCalendar` 加所用配置的人工改动；复现纸面运行时用那次运行自己的配置）。
