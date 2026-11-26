@@ -1008,3 +1008,38 @@ func TestExitBeyondTheHoldingIsWarned(t *testing.T) {
 		t.Errorf("SOXL held %s, want 0", hold[cex.Bull])
 	}
 }
+
+// HeldNotional is the entry value of what the ledger holds, first in, first
+// out, without the reservations of orders still pending: two lots bought at
+// 40 and 50, one share sold, leave 50 held (a moving average would say 45);
+// a third lot at 60 makes it 110 while a pending entry order reserves more
+// quota but adds nothing held.
+func TestHeldNotionalFirstInFirstOut(t *testing.T) {
+	r := newRig(t, "1000", "10")
+	c := r.openCycle(t, strategy.Long)
+	lot1 := r.openLot(t)
+	orders := []cex.OrderRecord{fill(ord(c.ID, 1, cex.Bull, cex.PurposeEntry, cex.SideBuy, lot1.ID, "40", "1"), "1", "40", "0")}
+	r.m.Sync(orders)
+	r.m.SettleLot(lot1.ID, true, r.clock.Now())
+	r.clock.Add(time.Minute)
+	lot2 := r.openLot(t)
+	orders = append(orders, fill(ord(c.ID, 2, cex.Bull, cex.PurposeEntry, cex.SideBuy, lot2.ID, "50", "1"), "1", "50", "0"))
+	r.m.Sync(orders)
+	r.m.SettleLot(lot2.ID, true, r.clock.Now())
+	wantDec(t, "held after two lots", r.m.HeldNotional(), "90")
+
+	r.clock.Add(time.Minute)
+	orders = append(orders, fill(ord(c.ID, 3, cex.Bull, cex.PurposeExit, cex.SideSell, "", "45", "1"), "1", "45", "0"))
+	r.m.Sync(orders)
+	wantDec(t, "held after selling one of two", r.m.HeldNotional(), "50")
+
+	r.clock.Add(time.Minute)
+	lot3 := r.openLot(t)
+	orders = append(orders, fill(ord(c.ID, 4, cex.Bull, cex.PurposeEntry, cex.SideBuy, lot3.ID, "60", "1"), "1", "60", "0"),
+		ord(c.ID, 5, cex.Bull, cex.PurposeEntry, cex.SideBuy, lot3.ID, "60", "2"))
+	r.m.Sync(orders)
+	wantDec(t, "held with a pending entry order", r.m.HeldNotional(), "110")
+	if _, used, _ := r.m.Quota(); !used.Equal(dec("230")) {
+		t.Errorf("quota used = %s, want 230: what is held and the pending order's 2 x 60", used)
+	}
+}

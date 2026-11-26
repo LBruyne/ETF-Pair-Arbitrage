@@ -23,17 +23,33 @@ func (m *InventoryManager) Quota() (total, used, left decimal.Decimal) {
 // quota is Quota; the caller holds mu.
 func (m *InventoryManager) quota() (total, used, left decimal.Decimal) {
 	total = m.cfg.Leverage.Mul(m.capital.Add(decimal.Min(decimal.Zero, m.realised())))
-	used = m.reserved
+	used = m.reserved.Add(m.held())
+	return total, used, total.Sub(used)
+}
+
+// HeldNotional is the entry value of what the ledger holds now: every lot's
+// open quantity at its entry price (first in, first out) plus the recorded
+// dust at its average price. It is the quota's used without what the
+// pending orders reserve; the step 8 replay takes its peak notional from it.
+func (m *InventoryManager) HeldNotional() decimal.Decimal {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.held()
+}
+
+// held is HeldNotional; the caller holds mu.
+func (m *InventoryManager) held() decimal.Decimal {
+	held := decimal.Zero
 	if m.cycle != nil {
-		used = used.Add(m.cycle.entryNotional())
+		held = m.cycle.entryNotional()
 	}
 	// The dust is still held on the venue. A remainder is in its lot until
 	// the cycle closes and in the dust from then on, at the same price: it
 	// counts once throughout.
 	for _, d := range m.dust {
-		used = used.Add(d.Qty.Abs().Mul(d.AvgPrice))
+		held = held.Add(d.Qty.Abs().Mul(d.AvgPrice))
 	}
-	return total, used, total.Sub(used)
+	return held
 }
 
 // realised is R, the realised total the quota follows (PRD 6.3): the net of
