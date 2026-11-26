@@ -12,7 +12,8 @@ it those tests are skipped. They run every query over several ranges, every Run 
 and the Round Trips table with a recomputation from the fills (PRD V19), the Settings with process_run.config and the last
 second's figures with the Run's newest signal_sample."""
 import json, math, os, re, subprocess, sys, time, unittest, urllib.parse
-from datetime import datetime, timezone
+from datetime import datetime, time as clock_time, timedelta, timezone
+from zoneinfo import ZoneInfo
 from decimal import Decimal
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -142,22 +143,25 @@ class Shape(unittest.TestCase):
             if p["type"] != "row":
                 self.assertTrue(p["description"], p["title"])
         titles = [p["title"] for p in self.b["panels"] if p["type"] == "row"]
-        self.assertEqual([t.split(" · ")[0] for t in titles], ["Status", "Execution Summary", "Position and Market", "Live Execution", "Round Trips",
+        self.assertEqual([t.split(" · ")[0] for t in titles], ["Status", "Execution Summary", "Position and Entry", "Live Execution", "Round Trips",
                                                                "Round Trip Detail", "Inventory", "Settings", "Execution Statistics", "System"])
         self.assertEqual(titles[0], "Status · Running Session · ${runtext}")
         self.assertEqual([p.get("collapsed") for p in self.b["panels"] if p["type"] == "row"], [False] * 8 + [True, True])
 
     def test_status_first(self):
-        """Owner items 74-75: the board starts with Status · Running Session holding Execution, Margin and Alerts, in the top
-        fourteen grid units (no scrolling at 1680 px); Execution and Margin are word tiles coloured by STATUS_WORDS."""
+        """Owner items 74-76: the board starts with Status · Running Session holding Execution, Account, Market (two strips, as
+        Combo Spread's) and Alerts, in the top twenty grid units; Execution and Account are word tiles coloured by STATUS_WORDS."""
         top, rows = [], 0
         for p in self.b["panels"]:
             rows += p["type"] == "row"
             if rows > 1:
                 break
             top.append(p)
-        self.assertEqual([p["title"] for p in top], ["Status · Running Session · ${runtext}", "Execution", "Margin", "Alerts"])
-        self.assertLessEqual(max(p["gridPos"]["y"] + p["gridPos"]["h"] for p in top), 14)
+        self.assertEqual([p["title"] for p in top], ["Status · Running Session · ${runtext}", "Execution", "Account", "Market · Prices",
+                                                     "Market · Spread and Signal", "Alerts"])
+        self.assertLessEqual(max(p["gridPos"]["y"] + p["gridPos"]["h"] for p in top), 20)
+        self.assertNotIn('AS "Close"', board.Q_STATUS_EXEC)   # owner item 76: no Close
+        self.assertNotIn('AS "Anchor"', board.Q_STATUS_EXEC)   # the Anchor is in Market
         for p in top[1:3]:
             self.assertEqual(p["options"]["colorMode"], "background")
             self.assertEqual([m["options"]["pattern"] for m in p["fieldConfig"]["defaults"]["mappings"]], [w for w, _ in board.STATUS_WORDS])
@@ -178,16 +182,26 @@ class Shape(unittest.TestCase):
         self.assertEqual(colour("order sent"), board.WELL)
         nb = board.NBSP
         for word, c in [("LIVE", "#8a1f1f"), ("PAPER", "#5a5953"), ("up 2h" + nb + "05m", board.WELL), ("stale · 25s", board.BAD), ("lost", board.BAD),
-                        ("starting", board.WARN), ("stopped", board.GREY), ("11‑26" + nb + "12:57", "transparent"), ("off hours", board.WELL),
-                        ("us regular", board.GREY), ("close window", board.WARN), ("in 1d" + nb + "12h", "transparent"), ("passed", board.GREY),
-                        ("nav", board.WELL), ("bell", board.WELL), ("missing", board.WARN), ("ok", board.WELL), ("SOXS conflict", board.WARN),
+                        ("starting", board.WARN), ("stopped", board.GREY), ("11‑26" + nb + "12:57", "transparent"),
+                        ("Pre‑Mkt", "#b88a0a"), ("Regular", board.GREY), ("After‑Hrs", "#d55181"), ("Overnight", "#4f8fe6"), ("Closed", board.GREY),
+                        ("residual · SOXL +0.01", board.WARN), ("residual · SOXL −0.01 SOXS +0.02", board.WARN), ("13.01 U", "transparent"),
+                        ("ok", board.WELL), ("SOXS conflict", board.WARN),
                         ("SOXL unusable · SOXS conflict", board.WARN), ("none open", board.WELL), ("2 working", board.WELL), ("1 unknown", board.BAD),
                         ("2 left open", board.BAD), ("flat", board.GREY), ("short · 55m", board.WELL), ("long left open", board.BAD),
                         ("match", board.WELL), ("mismatch", board.BAD), ("not read", board.WARN), ("5,586.40 U", "transparent"), ("paper", board.GREY),
                         ("ok · 0.23 %", board.WELL), ("warn · 35.00 %", board.WARN), ("high · 70.00 %", board.BAD), ("ok · SOXL 1,386 %", board.WELL),
-                        ("warn · SOXS 20 %", board.WARN), ("near · SOXL 8 %", board.BAD), ("76 % used", "transparent"), ("+0.22 U", "transparent"),
+                        ("warn · SOXS 20 %", board.WARN), ("near · SOXL 8 %", board.BAD), ("+0.22 U", "transparent"),
                         ("−1.05 U", "transparent"), ("2 awaited", board.WARN), ("no data", board.GREY), ("no run", board.GREY)]:
             self.assertEqual(colour(word), c, word)
+
+    def test_phase_as_combo_spread(self):
+        """Owner item 76: the Phase tile in Combo Spread's words and colours (combo_spread_board.PHASE and PHASE_TEXT)."""
+        import combo_spread_board as combo
+        words = {name: o.get("text", name) for name, o in combo.PHASE["options"].items()}
+        self.assertEqual(board.PHASE_WORDS, words)
+        self.assertEqual(board.PHASE_COLORS, dict(combo.PHASE_TEXT, Closed=combo.PHASE["options"]["Closed"]["color"]))
+        for name, word in board.PHASE_WORDS.items():
+            self.assertIn(("^%s$" % word, board.PHASE_COLORS[name]), board.STATUS_WORDS)
 
     def test_execution_charts(self):
         """One frame for both charts; the Spread chart shows the Deviation chart's result; every tooltip row is a tooltip-only
@@ -251,19 +265,23 @@ class Queries(unittest.TestCase):
                             psql_json(fill(q, v))
 
     def test_run_picker(self):
-        """The Run options: Newest Live Run, Newest Paper Run, then every Run newest first, numbered by start from 01 across both
-        modes, with its mode, start, end and state; Newest resolves to the newest Run of that mode; a wrong Combo or an unknown
-        Run shows nothing (No Run)."""
+        """The Run options: Newest Live Run, Newest Paper Run, then every Run newest first, named start–end · Bitget · pair · mode
+        without a number (owner item 76); Newest resolves to the newest Run of that mode; a wrong Combo or an unknown Run shows
+        nothing (No Run)."""
         runs = psql_json("SELECT run_id, live, started_ms, stopped_ms FROM trade.process_run ORDER BY started_ms, run_id")
         opts = psql_json(fill(board.Q_RUN_OPTIONS, self.values(1)))
         heads = [o["__value"] for o in opts[:2]]
         self.assertEqual(heads, [x for x, live in (("__live", True), ("__paper", False)) if any(r["live"] == live for r in runs)])
         rest = opts[len(heads):]
         self.assertEqual([o["__value"] for o in rest], [r["run_id"] for r in reversed(runs)])
-        for n, r in enumerate(runs, 1):
+        md = lambda ms: utc8(ms).strftime("%m-%d %H:%M").replace("-", board.NBHY).replace(" ", board.NBSP)
+        for r in runs:
             text = next(o["__text"] for o in rest if o["__value"] == r["run_id"])
-            self.assertTrue(text.startswith("Run %02d · %s · " % (n, "Live" if r["live"] else "Paper")), text)
-            self.assertTrue(text.endswith(" · stopped") if r["stopped_ms"] else text.endswith((" · running", " · lost")), text)
+            end = "now" if not r["stopped_ms"] else md(r["stopped_ms"])[6:] if md(r["stopped_ms"])[:5] == md(r["started_ms"])[:5] else md(r["stopped_ms"])
+            want = "%s–%s · Bitget · SOXL/SOXS · %s" % (md(r["started_ms"]), end, "Live" if r["live"] else "Paper")
+            self.assertIn(text, (want, want + " · lost", want + " · starting"))
+            self.assertNotRegex(text, r"Run \d")
+        self.assertTrue(opts[0]["__text"].startswith("Newest Live Run · ") and opts[0]["__text"].endswith(" · Live"))
         for newest, live in (("__live", True), ("__paper", False)):
             want = [r["run_id"] for r in runs if r["live"] == live][-1:]
             got = psql_json(fill("WITH %s SELECT run_id FROM sel" % board.SEL, self.values(1, newest)))
@@ -325,33 +343,36 @@ class Queries(unittest.TestCase):
             self.assertAlmostEqual(got, want, delta=5 if running else 0)   # a running Run adds seconds between the two reads
             mine = {r["cycle_id"] for r in psql_json("SELECT cycle_id FROM trade.cycle WHERE run_id = '%s' UNION SELECT cycle_id FROM "
                                                      "trade.decision WHERE run_id = '%s' AND cycle_id IS NOT NULL" % (run, run))}
-            self.assertLessEqual({r["cycle_id"] for r in psql_json(fill(board.Q_BLOTTER, v))}, mine, run)
+            self.assertLessEqual({r["cycle_id"] for r in psql_json(fill(board.Q_BLOTTER, v)) if r["cycle_id"]}, mine, run)
 
-    def test_last_second_is_the_newest_sample(self):
-        """Health / Position / Spread / Entry and the Legs table show the picked Run's newest signal_sample (its last second)."""
-        for run in ("__live", "__paper", self.runs()[0]):
+    def test_market_is_the_newest_sample(self):
+        """Market and Position show the picked Run's newest signal_sample (its last second): both legs' mid and anchor, the
+        anchor's kind, Spread, Mean, σ, F, and the Signal in Combo Spread's words on the executable deviations (No Book on a
+        conflicting or unusable book, owner item 70)."""
+        for run in ["__live", "__paper"] + self.runs():
             v = self.values(1, run)
-            rid = psql_json(fill("WITH %s SELECT run_id, end_ms FROM sel" % board.SEL, v))[0]
+            rid = psql_json(fill("WITH %s SELECT run_id, end_ms, config FROM sel" % board.SEL, v))[0]
+            newest = "SELECT * FROM trade.signal_sample WHERE run_id = '%s' AND ts_ms <= %d ORDER BY ts_ms DESC LIMIT 1" % (rid["run_id"], rid["end_ms"])
+            s = psql_json(newest)[0]
+            m = psql_json(fill(board.Q_MARKET, v))[0]
             now = psql_json(fill(board.Q_NOW, v))[0]
-            legs = psql_json(fill(board.Q_LEGS, v))
-            s = psql_json("SELECT * FROM trade.signal_sample WHERE run_id = '%s' AND ts_ms <= %d ORDER BY ts_ms DESC LIMIT 1" % (rid["run_id"], rid["end_ms"]))[0]
-            if now["As Of"] is None or utc8(s["ts_ms"]).strftime("%H:%M:%S") != now["As Of"]:
-                continue   # a new second came in between the two reads; the next run checks it
-            self.assertEqual(now["Spread"], Decimal(str(math.floor(float(s["mid_d"]) * 10 + 0.5) / 10)))
-            self.assertEqual(now["Mean"], Decimal(str(math.floor(float(s["mu_d"]) * 10 + 0.5) / 10)) if s["mu_d"] is not None else None)
-            self.assertEqual(float(now["F"]), float(s["f"]))
-            self.assertEqual([l["Leg"] for l in legs], ["SOXL", "SOXS"])
-            self.assertEqual(legs[0]["USD"], s["anchor_bull"])
-            self.assertEqual(legs[1]["USD"], s["anchor_bear"])
-            if s["mid_bull"] is None:
-                self.assertIsNone(legs[0]["Mid"])
-            else:
-                self.assertAlmostEqual(float(legs[0]["Mid"]), float(s["mid_bull"]), delta=0.0005)   # to 0.001
-            self.assertAlmostEqual(float(legs[1]["USDT"]), float(s["anchor_bear"]) / float(s["f"]), places=9)
-            book = "Conflict" if s["conflict_bear"] else "Unusable" if not s["depth_ok_bear"] else "OK"
-            self.assertEqual(legs[1]["Book"], book)
-            side = "Flat" if s["direction"] is None else s["direction"].title()
-            self.assertEqual(now["Side"], side)
+            if psql_json(newest)[0]["ts_ms"] != s["ts_ms"]:
+                continue   # a new second came in between the reads
+            one = lambda x: Decimal(str(math.floor(float(x) * 10 + 0.5) / 10)) if x is not None else None
+            self.assertEqual((m["Spread"], m["Mean"]), (one(s["mid_d"]), one(s["mu_d"])))
+            self.assertEqual(float(m["F"]), float(s["f"]))
+            self.assertEqual((m["Bull Anchor"], m["Bear Anchor"]), (s["anchor_bull"], s["anchor_bear"]))
+            if s["mid_bull"] is not None:
+                self.assertAlmostEqual(float(m["Bull Price"]), float(s["mid_bull"]), delta=0.0005)
+            self.assertEqual(m["Anchor"], {"nav": "NAV", "bell": "Bell"}.get(s["anchor_kind"], "Missing"))
+            cfg = rid["config"] if isinstance(rid["config"], dict) else json.loads(rid["config"])
+            d_in, sig = float(cfg["strategy"]["d_in"]), float(s["sigma_d"] or 0)
+            ok = s["depth_ok_bull"] and s["depth_ok_bear"] and not (s["conflict_bull"] or s["conflict_bear"])
+            want = ("No Anchor" if s["anchor_kind"] is None else "No Mean" if not s["stats_ready"] or not sig else "No Book" if not ok
+                    else "Long" if s["x_long_d"] is not None and float(s["x_long_d"]) / sig <= -d_in
+                    else "Short" if s["x_short_d"] is not None and float(s["x_short_d"]) / sig >= d_in else "None")
+            self.assertEqual(m["Signal"], want, run)
+            self.assertEqual(now["Side"], "Flat" if s["direction"] is None else s["direction"].title())
 
     # ------------------------------------------------------------------------------------- Status · Running Session
     def raw_run(self, run):
@@ -378,8 +399,7 @@ class Queries(unittest.TestCase):
                  for l in ("bull", "bear")] if s else []
         working = [o for o in orders if o["unknown"] or o["status"] in ("pending", "acked")]
         ex = {"Mode": "LIVE" if r["live"] else "PAPER", "Start / End": hm(r["stopped_ms"] or r["started_ms"]),
-              "Phase": "stopped" if stopped else {"off_hours": "off hours", "regular": "us regular", "close_window": "close window"}[s["phase"]],
-              "Anchor": "stopped" if stopped else s["anchor_kind"] or "missing",
+              "Phase": "stopped" if stopped else board.PHASE_WORDS[self.us_phase(s)],
               "Books": "stopped" if stopped else " · ".join(b for b in books if b) or "ok",
               "Orders": "none open" if not working else "%d left open" % len(working) if stopped else
                         "%d unknown" % sum(o["unknown"] for o in working) if any(o["unknown"] for o in working) else "%d working" % len(working),
@@ -388,48 +408,102 @@ class Queries(unittest.TestCase):
         pct = lambda x, q: str(Decimal(x).quantize(Decimal(q), rounding="ROUND_HALF_UP"))
         awaited = sum(len(c["funding_awaited"]) for c in cycles if isinstance(c["funding_awaited"], list))
         booked = sum((c["funding"] for c in cycles if c["funding_known"]), Decimal(0))
-        mg = {"Cycle": "flat" if not held else ("%s left open" % held[0]["direction"]) if stopped else held[0]["direction"],
-              "Positions": "mismatch" if i["mismatch"] else "not read" if i["pos_bull"] is None or i["pos_bear"] is None else "match",
+        signed = lambda q: ("+" if q > 0 else "−" if q < 0 else "") + format(abs(q).normalize(), "f")
+        residual = " ".join("%s %s" % (tick[l], signed(i["pos_" + l])) for l in ("bull", "bear") if i["pos_" + l])
+        mg = {"Position": ("%s left open" % held[0]["direction"]) if held and stopped else held[0]["direction"] if held
+                          else "flat" if not residual else "residual · " + residual,
+              "Ledger": "mismatch" if i["mismatch"] else "not read" if i["pos_bull"] is None or i["pos_bear"] is None else "match",
               "Equity": "paper" if not r["live"] else "stopped" if stopped else "{:,.2f} U".format(i["equity"]),
+              "Maint. Margin": "paper" if not r["live"] else "stopped" if stopped else "{:,.2f} U".format(
+                  (i["margin_ratio"] * i["equity"]).quantize(Decimal("0.01"), rounding="ROUND_HALF_UP")),
               "Margin Ratio": "paper" if not r["live"] else "stopped" if stopped else "%s · %s %%" % (
                   "ok" if i["margin_ratio"] < Decimal("0.3") else "warn" if i["margin_ratio"] < Decimal("0.6") else "high", pct(100 * i["margin_ratio"], "0.01")),
-              "Quota": "stopped" if stopped else "%s %% used" % pct(100 * i["quota_used"] / i["quota_total"], "1"),
               "Funding": "%d awaited" % awaited if awaited else "%s%s U" % ("−" if booked < 0 else "+", "{:,.2f}".format(abs(booked)))}
         if r["live"] and not stopped:
             legs = [(l, (i["liq_" + l] - i["mark_" + l]) / i["mark_" + l] if i["pos_" + l] < 0 else (i["mark_" + l] - i["liq_" + l]) / i["mark_" + l])
                     for l in ("bull", "bear") if i["pos_" + l] and i["liq_" + l] is not None]
             if not i["pos_bull"] and not i["pos_bear"]:
-                mg["Liq Distance"] = "flat"
+                mg["Liquidation"] = "flat"
             elif legs:
                 l, d = min(legs, key=lambda x: x[1])
-                mg["Liq Distance"] = "%s · %s %s %%" % ("near" if d < Decimal("0.1") else "warn" if d < Decimal("0.25") else "ok", tick[l], "{:,.0f}".format(100 * d))
+                mg["Liquidation"] = "%s · %s %s %%" % ("near" if d < Decimal("0.1") else "warn" if d < Decimal("0.25") else "ok", tick[l], "{:,.0f}".format(100 * d))
         else:
-            mg["Liq Distance"] = "paper" if not r["live"] else "stopped"
+            mg["Liquidation"] = "paper" if not r["live"] else "stopped"
         return r, s, i, ex, mg
 
+    def us_phase(self, s):
+        """The US market phase of a sample by dashboard/SPEC.md section 3's rule (Combo Spread's etf_phase), in Python."""
+        if s["phase"] in ("regular", "close_window"):
+            return "Regular"
+        ny = ZoneInfo("America/New_York")
+        bell = psql_json("SELECT min((detail ->> 'minute_ms')::bigint) AS m FROM trade.anchor_fact WHERE live = %s AND session_id = '%s' AND kind = 'bell'"
+                         % (s["live"], s["session_id"]))[0]["m"]
+        start_close = (bell + 60000) if bell else int(datetime.combine(datetime.fromisoformat(s["session_id"]).date(), clock_time(16), ny).timestamp() * 1000)
+        t = datetime.fromtimestamp(s["ts_ms"] / 1000, ny).replace(tzinfo=None)
+        d = datetime.fromtimestamp(s["session_end_ms"] / 1000, ny).date()
+        at = lambda day, h, m: datetime.combine(day, clock_time(h, m))
+        if start_close <= s["ts_ms"] < start_close + 4 * 3600000:
+            return "After-Hours"
+        if at(d - timedelta(days=1), 20, 0) <= t < at(d, 4, 0):
+            return "Overnight"
+        if at(d, 4, 0) <= t < at(d, 9, 30):
+            return "Pre-Market"
+        return "Closed"
+
+    def test_phase_rule(self):
+        """The Phase SQL against the Python rule on hand-made seconds of 2026-11-25/27/30 (New York): Thanksgiving closed, the
+        overnight before the early close of 11-27, its pre-market, a Friday evening and Sunday's overnight before Monday."""
+        ny = ZoneInfo("America/New_York")
+        ms = lambda y, mo, d, h, mi: int(datetime(y, mo, d, h, mi, tzinfo=ny).timestamp() * 1000)
+        cases = [  # (sample time, program phase, session_id, session end, want)
+            (ms(2026, 11, 25, 17, 0), "off_hours", "2026-11-24", ms(2026, 11, 25, 16, 0), None),   # placeholder replaced below
+            (ms(2026, 11, 26, 0, 30), "off_hours", "2026-11-25", ms(2026, 11, 27, 13, 0), "Closed"),
+            (ms(2026, 11, 26, 21, 0), "off_hours", "2026-11-25", ms(2026, 11, 27, 13, 0), "Overnight"),
+            (ms(2026, 11, 27, 5, 0), "off_hours", "2026-11-25", ms(2026, 11, 27, 13, 0), "Pre-Market"),
+            (ms(2026, 11, 27, 10, 0), "regular", "2026-11-25", ms(2026, 11, 27, 13, 0), "Regular"),
+            (ms(2026, 11, 28, 21, 0), "off_hours", "2026-11-27", ms(2026, 11, 30, 16, 0), "Closed"),
+            (ms(2026, 11, 29, 21, 0), "off_hours", "2026-11-27", ms(2026, 11, 30, 16, 0), "Overnight"),
+            (ms(2026, 11, 30, 9, 0), "off_hours", "2026-11-27", ms(2026, 11, 30, 16, 0), "Pre-Market")][1:]
+        for ts, phase, sid, end, want in cases:
+            s = {"ts_ms": ts, "phase": phase, "session_id": sid, "session_end_ms": end, "live": True}
+            got = psql_json("SELECT %s AS p FROM (SELECT %d::bigint AS ts_ms, '%s'::text AS phase, '%s'::text AS session_id, %d::bigint AS session_end_ms, "
+                            "true AS live) x" % (board.us_phase("x"), ts, phase, sid, end))[0]["p"]
+            self.assertEqual((got, self.us_phase(s)), (want, want), datetime.fromtimestamp(ts / 1000, ny))
+
+    def test_phase_of_every_runs_seconds(self):
+        """The Phase SQL against the Python rule on a sample of every Run's own seconds (one every 10 minutes)."""
+        for run in self.runs():
+            rows = psql_json("SELECT x.*, %s AS p FROM (SELECT * FROM trade.signal_sample WHERE run_id = '%s' AND ts_ms %% 600000 < 1000) x"
+                             % (board.us_phase("x"), run))
+            for s in rows:
+                self.assertEqual(s["p"], self.us_phase(s), (run, s["ts_ms"]))
+
     def test_status_words_from_the_schema(self):
-        """Every Execution and Margin word of every Run against its own records read straight from the tables (process_run, its
+        """Every Execution and Account word of every Run against its own records read straight from the tables (process_run, its
         newest signal_sample and inventory_sample, its orders not final, its open round trip, its funding): Mode, Start / End,
-        Phase, Anchor, Books, Orders, Entry; Cycle, Positions, Equity, Margin Ratio, Liq Distance, Quota, Funding; Run as
-        stopped or up / stale / lost. A running Run is read again until no new sample came in between."""
+        Phase, Books, Orders, Entry; Position, Ledger, Equity, Maint. Margin, Margin Ratio, Liquidation, Funding; Run as stopped
+        or up / stale / lost. A running Run is read again until no new sample came in between."""
         for run in self.runs():
             for _ in range(5):
                 r, s, i, ex, mg = self.expected_status(run)
                 v = self.values(1, run)
-                got = psql_json(fill(board.Q_STATUS_EXEC, v))[0], psql_json(fill(board.Q_STATUS_MARGIN, v))[0]
+                got = psql_json(fill(board.Q_STATUS_EXEC, v))[0], psql_json(fill(board.Q_STATUS_ACCOUNT, v))[0]
                 if self.expected_status(run)[1:3] == (s, i):
                     break
             with self.subTest(run=run):
                 for k, want in ex.items():
                     self.assertEqual(got[0][k], want, k)
                 for k, want in mg.items():
-                    self.assertEqual(got[1][k], want, k)
+                    if k == "Position" and want in ("long", "short"):
+                        self.assertTrue(got[1][k].startswith(want + " · "), got[1][k])
+                    else:
+                        self.assertEqual(got[1][k], want, k)
                 if r["stopped_ms"]:
                     self.assertEqual(got[0]["Run"], "stopped")
-                    self.assertEqual((got[0]["Close"], got[1]["Open P&L"]), ("stopped", "stopped"))
                 else:
                     self.assertRegex(got[0]["Run"], r"^(up |stale · |lost$|starting$)")
-                    self.assertRegex(got[0]["Close"], r"^(in |passed$)")
+                if not mg["Position"].startswith(("flat", "residual", "left")) and not r["stopped_ms"]:
+                    self.assertRegex(got[1]["Position"], r"^(long|short) · ")
 
     def expected_alerts(self, run):
         """The Alerts of a Run recomputed in Python from its records (SPEC 7, Alerts)."""
@@ -542,6 +616,16 @@ class Queries(unittest.TestCase):
                     self.assertEqual(g["Liq Distance"], want)
                     self.assertEqual(g["Age"] is None, r["stopped_ms"] is not None)
 
+    def test_empty_tables_say_so(self):
+        """Owner item 78: a table with nothing to show has one row that says so (Round Trips, Orders, End Reasons, At the Line,
+        Latency), not an empty panel; a Run with round trips has no such row."""
+        v = self.values(1, "__none")
+        for q, col, text in ((board.Q_BLOTTER, "End Reason", "No round trip in the Range"), (board.Q_ORDERS, "Status", "No order: no round trip in the Range"),
+                             (board.Q_END_REASONS, "End Reason", "No round trip closed in the Range"), (board.Q_BLOCKED, "Reason", "None in the Range"),
+                             (board.Q_LATENCY, "Stage", "No order in the Range")):
+            self.assertEqual([r[col] for r in psql_json(fill(q, v))], [text])
+        self.assertNotIn("No round trip in the Range", [r["End Reason"] for r in psql_json(fill(board.Q_BLOTTER, self.values(1, self.PAPER_RUN)))])
+
     def test_plain_words(self):
         """End and idle reasons in words; a code the board does not list (a new end reason such as dust_only, before the board
         knows it) reads as its own words."""
@@ -608,11 +692,11 @@ class Queries(unittest.TestCase):
         v = self.values(24 * 30, run)
         fills = {r["cycle_id"]: r for r in psql_json(
             "SELECT o.cycle_id, sum(CASE f.side WHEN 'sell' THEN f.value ELSE -f.value END) AS gross, sum(f.fee) AS fees, "
-            "sum(f.value) FILTER (WHERE o.purpose IN ('entry', 'complete')) AS entry_value, count(*) AS fills "
+            "sum(f.value) FILTER (WHERE o.purpose IN ('entry', 'complete')) AS entry_value, count(*) AS fills, sum(f.value) AS traded "
             "FROM trade.cex_fill f JOIN trade.cex_order o ON o.live = f.live AND o.client_order_id = f.client_order_id WHERE f.run_id = '%s' "
             "GROUP BY o.cycle_id" % run)}
         cycles = {r["cycle_id"]: r for r in psql_json("SELECT * FROM trade.cycle WHERE run_id = '%s'" % run)}
-        rows = psql_json(fill(board.Q_BLOTTER, v))
+        rows = [r for r in psql_json(fill(board.Q_BLOTTER, v)) if r["cycle_id"]]   # a Run without one has the row that says so
         self.assertTrue(all(cycles[r["cycle_id"]]["end_reason"] != "no_fill" for r in rows))
         checked = 0
         for row in rows:
@@ -630,13 +714,22 @@ class Queries(unittest.TestCase):
                 checked += 1
         known = [c for c in cycles.values() if c["status"] != "open" and c["funding_known"] and c["end_reason"] != "no_fill" and c["cycle_id"] in fills]
         p = psql_json(fill(board.Q_PNL, v))[0]
-        net = psql_json(fill(board.Q_CUM_NET, v))
+        net = psql_json(fill(board.Q_CUM, v))
         want = sum(fills[c["cycle_id"]]["gross"] - fills[c["cycle_id"]]["fees"] + c["funding"] for c in known)
         tol = sum(Decimal("0.0002") * fills[c["cycle_id"]]["fills"] for c in known if c["live"])
-        self.assertAlmostEqual(-(p["Fees"] or 0), sum(fills[c["cycle_id"]]["fees"] for c in known), delta=tol)
-        self.assertAlmostEqual(p["Net"], want, delta=tol)
-        self.assertEqual(net[-1]["Net"], p["Net"])
-        self.assertEqual(p["Trips"], len([c for c in cycles.values() if c["status"] != "open" and c["end_reason"] != "no_fill"]))
+        self.assertAlmostEqual(-(p["Fee"] or 0), sum(fills[c["cycle_id"]]["fees"] for c in known), delta=tol)
+        self.assertAlmostEqual(p["PnL"], want, delta=tol)
+        self.assertAlmostEqual(p["Gross"], sum(fills[c["cycle_id"]]["gross"] for c in known), delta=tol)
+        self.assertEqual((net[-1]["PnL"], net[-1]["Gross"]), (p["PnL"], p["Gross"]))   # owner item 77: the chart ends on the Summary
+        steps = [r for r in net[1:-1]]
+        self.assertEqual(len(steps), 2 * len(known))   # two points at each close: before and after
+        closed = [c for c in cycles.values() if c["status"] != "open" and c["end_reason"] != "no_fill"]
+        self.assertAlmostEqual(p["Notional"], sum((fills[c["cycle_id"]]["traded"] for c in closed if c["cycle_id"] in fills), Decimal(0)), delta=tol)
+        peak = psql_json(fill("WITH %s SELECT max(quota_used) AS m FROM trade.inventory_sample i WHERE i.run_id = '%s' AND i.ts_ms >= (SELECT rg.from_ms FROM rg) "
+                              "AND i.ts_ms < (SELECT rg.to_ms FROM rg)" % (board.SEL, run), v))[0]["m"]
+        self.assertEqual(p["Peak Used"], peak)
+        if peak:
+            self.assertAlmostEqual(float(p["Return"]), float(10000 * p["PnL"] / peak), places=6)
         points = psql_json(fill(board.Q_TRIP_GAIN, v)) + psql_json(fill(board.Q_TRIP_LOSS, v))
         self.assertEqual(sorted(r["cycle_id"] for r in points), sorted(c["cycle_id"] for c in known))
 

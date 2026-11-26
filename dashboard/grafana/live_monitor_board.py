@@ -2,6 +2,12 @@
 database (core/store/schema.sql, core/SPEC.md 5.6), read by the read-only role etfpair_trade_reader through the data source
 etfpair-trade (dashboard/SPEC.md section 7).
 
+Version 4.1 (owner items 76-78): a Run is named start–end · Bitget · pair · mode, without a number; Status holds Execution
+(no Close; the Phase in Combo Spread's words and colours), Account (4.0's Margin: position or residual, ledger, equity,
+maintenance margin, margin ratio, liquidation, funding) and Market (two strips after Combo Spread's latest second, with the
+Anchor); the Summary reads PnL, Gross, Fee, Funding, Open PnL, Notional, Peak Used, Win Rate, Return, with cumulative Gross
+and PnL under it; an empty table says why in one row.
+
 Version 4 (owner items 73-75) takes the sibling dex-cex Live Monitor's design: its grouping into rows named "Section ·
 scope", in its order (Status · Running Session with Execution, Margin and Alerts first; Execution Summary; the position and
 market at the last second; the charts; Round Trips and their detail; Inventory; Settings; Execution Statistics and System
@@ -147,19 +153,26 @@ def coded(value, decimals, why):
 
 
 # ------------------------------------------------------------------------------------------------- the Run and the Range
-# The Run (owner item 71, numbered and named like the sibling dex-cex board's Runs): one start of the program, one row of
-# process_run with its mode (live), its effective settings (config) and its pair. Picked as Newest Live Run (__live, the
-# default: the live run started last, whatever runs beside it), Newest Paper Run (__paper) or one Run by its run_id; both
-# newest are worked out by every query, so a new start is followed without reloading the page. Run nn: the Runs of both modes
-# numbered by start, from 01.
+# The Run (owner item 71): one start of the program, one row of process_run with its mode (live), its effective settings
+# (config) and its pair. Picked as Newest Live Run (__live, the default: the live run started last, whatever runs beside it),
+# Newest Paper Run (__paper) or one Run by its run_id; both newest are worked out by every query, so a new start is followed
+# without reloading the page. Owner item 76: a Run is named by its start–end, venue and pair, without a number:
+# 11‑26 12:57–now · Bitget · SOXL/SOXS · Live (the end's date only when it is another day; now while it runs; the mode last,
+# so paper and live stay told apart). The program trades Bitget's perpetuals only (its config names no venue).
+VENUE = "Bitget"
 RUN_ID = ("(SELECT CASE '$run' WHEN '__live' THEN (SELECT x.run_id FROM trade.process_run x WHERE x.live ORDER BY x.started_ms DESC LIMIT 1) "
           "WHEN '__paper' THEN (SELECT x.run_id FROM trade.process_run x WHERE NOT x.live ORDER BY x.started_ms DESC LIMIT 1) ELSE '$run' END)")
-RUN_NO = "(SELECT count(*) FROM trade.process_run n WHERE (n.started_ms, n.run_id) <= ({r}.started_ms, {r}.run_id))"
-RUN_NUMBER = "'Run ' || lpad(%s::text, 2, '0')" % RUN_NO
-RUN_NAME = RUN_NUMBER + " || ' · ' || CASE WHEN {r}.live THEN 'Live' ELSE 'Paper' END"
 # The Combo of a Run: its pair's tickers (cex.pair), Bitget's perpetuals; a Run trades one. The pick reaches SEL: a Combo the
 # Run does not trade leaves the page empty.
 PAIR = ("coalesce({r}.config #>> '{{cex,pair,bull,ticker}}', 'SOXL') || ' / ' || coalesce({r}.config #>> '{{cex,pair,bear,ticker}}', 'SOXS')")
+
+
+def run_label(r):
+    """SQL: a Run's name, start–end · venue · pair · mode (owner item 76), UTC+8."""
+    return ("{start} || '–' || CASE WHEN {r}.stopped_ms IS NULL THEN 'now' WHEN {day} = {stop_day} THEN {stop_hm} ELSE {stop} END "
+            "|| ' · {venue} · ' || replace({pair}, ' / ', '/') || ' · ' || CASE WHEN {r}.live THEN 'Live' ELSE 'Paper' END").format(
+        r=r, start=clock("%s.started_ms" % r, "MM-DD HH24:MI"), day=clock("%s.started_ms" % r, "MM-DD"), stop_day=clock("%s.stopped_ms" % r, "MM-DD"),
+        stop_hm=clock("%s.stopped_ms" % r, "HH24:MI"), stop=clock("%s.stopped_ms" % r, "MM-DD HH24:MI"), venue=VENUE, pair=PAIR.format(r=r))
 # Since and Until (with their hours, owner item 71 as the sibling board's): Since is Run start (0) or a UTC+8 date the Run ran
 # on (its midnight in ms) at an hour 00-23; Until is Run end (NO_END_MS) or a date at an hour 01-24, that moment excluded.
 # Parsed from quoted text (a typed value that is not a number counts as Run start / Run end).
@@ -200,30 +213,33 @@ def in_range(ms):
     return "%s >= %s AND %s < %s" % (ms, FROM_MS, ms, TO_MS)
 
 
+def or_say(q, names, column, message):
+    """q, or when it returns no row one row that says so in its column (owner item 78: no empty panel that only shows –; a
+    table's no-value text would also fill its empty cells, so the row carries it)."""
+    cells = ", ".join(("'%s'" % message if n == column else "NULL") + ' AS "%s"' % n for n in names)
+    return "SELECT * FROM (%s) z\nUNION ALL SELECT %s WHERE NOT EXISTS (%s)" % (q, cells, q)
+
+
 # The charts: drawn on the time picker's axis (so a drag zooms them), with the Run's seconds inside the Range only.
 CHART_FROM, CHART_TO = "greatest($__from, %s)" % FROM_MS, "least($__to, %s - 1)" % TO_MS
 
 
-# The Run picker: Newest Live Run, Newest Paper Run (each when one exists), then every Run, newest first, as
-# Run nn · Mode · MM-DD HH:MI – HH:MI (the date again when it ends on another day; now while it runs) · running / stopped /
-# starting (its first minute) / lost (no stop recorded and no sample in the last minute: crashed or killed); the two Newest
-# name the Run they stand for now.
+# The Run picker: Newest Live Run, Newest Paper Run (each when one exists), then every Run, newest first, by its name
+# (run_label), and · starting (its first minute) or · lost (no stop recorded and no sample in the last minute: crashed or
+# killed) when it is neither running nor stopped; the two Newest name the Run they stand for now.
 RUN_STATE = ("CASE WHEN r.stopped_ms IS NOT NULL THEN 'stopped' WHEN EXISTS (SELECT 1 FROM trade.signal_sample s WHERE s.ts_ms > %s - 60000 "
              "AND s.run_id = r.run_id AND s.live = r.live) THEN 'running' WHEN %s - r.started_ms < 60000 THEN 'starting' ELSE 'lost' END" % (NOW_MS, NOW_MS))
 Q_RUN_OPTIONS = sql("""
 SELECT x.__text, x.__value FROM (
-  SELECT 'Newest Live Run · ' || @NUMBER@ AS __text, '__live' AS __value, 2 AS g, 0::bigint AS o
+  SELECT 'Newest Live Run · ' || @NAME@ AS __text, '__live' AS __value, 2 AS g, 0::bigint AS o
   FROM (SELECT * FROM trade.process_run x WHERE x.live ORDER BY x.started_ms DESC LIMIT 1) r
   UNION ALL
-  SELECT 'Newest Paper Run · ' || @NUMBER@, '__paper', 1, 0 FROM (SELECT * FROM trade.process_run x WHERE NOT x.live ORDER BY x.started_ms DESC LIMIT 1) r
+  SELECT 'Newest Paper Run · ' || @NAME@, '__paper', 1, 0 FROM (SELECT * FROM trade.process_run x WHERE NOT x.live ORDER BY x.started_ms DESC LIMIT 1) r
   UNION ALL
-  SELECT @NAME@ || ' · ' || @START@ || ' – ' || CASE WHEN q.state <> 'stopped' THEN 'now'
-              WHEN @DAY@ = @STOP_DAY@ THEN @STOP_HM@ ELSE @STOP@ END || ' · ' || q.state, r.run_id, 0, r.started_ms
+  SELECT @NAME@ || CASE WHEN q.state IN ('starting', 'lost') THEN ' · ' || q.state ELSE '' END, r.run_id, 0, r.started_ms
   FROM trade.process_run r CROSS JOIN LATERAL (SELECT @STATE@ AS state) q
   UNION ALL SELECT 'No Run Yet', '__none', 0, 0 WHERE NOT EXISTS (SELECT 1 FROM trade.process_run x)) x
-ORDER BY x.g DESC, x.o DESC""", NAME=RUN_NAME.format(r="r"), NUMBER=RUN_NUMBER.format(r="r"), START=clock("r.started_ms", "MM-DD HH24:MI"), STATE=RUN_STATE,
-                    DAY=clock("r.started_ms", "MM-DD"), STOP_DAY=clock("r.stopped_ms", "MM-DD"), STOP_HM=clock("r.stopped_ms", "HH24:MI"),
-                    STOP=clock("r.stopped_ms", "MM-DD HH24:MI"))
+ORDER BY x.g DESC, x.o DESC""", NAME=run_label("r"), STATE=RUN_STATE)
 # The UTC+8 dates the picked Run ran on (start to end, today while it runs), newest first, after Run start / Run end.
 RUN_DAYS = sql("""
 SELECT g::bigint AS day_ms FROM trade.process_run r,
@@ -246,10 +262,10 @@ Q_COMBO = sql("""
 SELECT @PAIR@ AS __text, @PAIR@ AS __value FROM trade.process_run r WHERE r.run_id = @RUN_ID@
 UNION ALL SELECT 'No Combo', '__none' WHERE NOT EXISTS (SELECT 1 FROM trade.process_run r WHERE r.run_id = @RUN_ID@)""",
               PAIR=PAIR.format(r="r"), RUN_ID=RUN_ID)
-# For titles: the Run (Run 07 · Live), the Range in words (MM-DD HH:MI – MM-DD HH:MI, now while it reaches the present; an
+# For titles: the Run (its name), the Range in words (MM-DD HH:MI – MM-DD HH:MI, now while it reaches the present; an
 # empty one says why), and the legs' tickers.
 Q_RUN_TEXT = sql("""WITH @SEL@
-SELECT coalesce((SELECT @NAME@ FROM sel), 'No Run') AS __text""", SEL=SEL, NAME=RUN_NAME.format(r="sel"))
+SELECT coalesce((SELECT @NAME@ FROM sel), 'No Run') AS __text""", SEL=SEL, NAME=run_label("sel"))
 Q_SPAN = sql("""WITH @SEL@
 SELECT CASE WHEN NOT EXISTS (SELECT 1 FROM sel) THEN 'no Run' WHEN rg.from_ms >= rg.to_ms THEN 'empty: Until not after Since'
             ELSE @FROM@ || ' – ' || CASE WHEN rg.to_ms > @NOW@ THEN 'now' ELSE @TO@ END END AS __text
@@ -338,32 +354,19 @@ SELECT CASE WHEN s.ts_ms IS NULL THEN NULL WHEN s.direction IS NULL THEN 'Flat' 
        CASE WHEN s.direction IS NOT NULL THEN CASE s.direction WHEN 'short' THEN -s.hold_bull ELSE s.hold_bull END END AS "Bull",
        CASE WHEN s.direction IS NOT NULL THEN CASE s.direction WHEN 'short' THEN -s.hold_bear ELSE s.hold_bear END END AS "Bear",
        h.v_bull + h.v_bear AS "Cost", @HELD_FOR@ AS "Held", @TO_EXIT@ AS "To Exit",
-       @SPREAD@ AS "Spread", @MEAN@ AS "Mean", @SIGMA_D@ AS "σ", @DEVIATION@ AS "Deviation", s.f AS "F", @AS_OF@ AS "As Of",
        CASE WHEN s.ts_ms IS NOT NULL THEN @STATE@ END AS "Entry", CASE WHEN s.ts_ms IS NOT NULL THEN @WHY@ END AS "Why",
        CASE WHEN s.stats_ready THEN @BUY@ END AS "Buy Both", CASE WHEN s.stats_ready THEN @SELL@ END AS "Sell Both",
        @TO_LONG@ AS "To Long Entry", @TO_SHORT@ AS "To Short Entry"
 FROM (SELECT 1) one LEFT JOIN r ON true LEFT JOIN s ON true LEFT JOIN h ON true LEFT JOIN sr ON true""",
             LATEST=LATEST, HELD=HELD, HELD_FOR=span("%s - h.opened_ms" % NOW_MS),
             TO_EXIT="CASE WHEN s.stats_ready AND s.depth_ok_bull AND s.depth_ok_bear THEN %s END" % shown(TO_EXIT, 2),
-            SPREAD=shown("s.mid_d", 1), MEAN=shown("s.mu_d", 1), SIGMA_D=shown("s.sigma_d", 1),
-            DEVIATION="CASE WHEN s.stats_ready THEN %s END" % shown("(s.mid_d - s.mu_d) / %s" % SIGMA, 2), AS_OF=clock("s.ts_ms", "HH24:MI:SS"),
             STATE=idle_state("s.idle_reason"), WHY=why("s.idle_reason"), BUY=shown("s.x_long_d / %s" % SIGMA, 2),
             SELL=shown("s.x_short_d / %s" % SIGMA, 2), TO_LONG=distance(TO_LONG), TO_SHORT=distance(TO_SHORT))
-# The legs at the Run's newest second, one row each: the mid (USDT, to 0.001: SOXL's half tick, SOXS's tick), the anchor in USD (per share, the issuer's
-# NAV or the bell's) and in USDT (USD ÷ F), and the book as the executor judges it (Conflict: the snapshot and the ticks
-# disagree; Unusable: too old or too thin). The program records no bid / ask or pricing-level price per second.
-Q_LEGS = sql("""
-WITH @LATEST@
-SELECT l.leg AS "Leg", l.mid AS "Mid", l.anchor AS "USD", l.anchor / nullif(s.f, 0) AS "USDT", l.book AS "Book"
-FROM s CROSS JOIN LATERAL (VALUES
-  (1, '$bull', @MID_BULL@, s.anchor_bull, CASE WHEN s.conflict_bull THEN 'Conflict' WHEN NOT s.depth_ok_bull THEN 'Unusable' ELSE 'OK' END),
-  (2, '$bear', @MID_BEAR@, s.anchor_bear, CASE WHEN s.conflict_bear THEN 'Conflict' WHEN NOT s.depth_ok_bear THEN 'Unusable' ELSE 'OK' END)) l(o, leg, mid, anchor, book)
-ORDER BY l.o""", LATEST=LATEST, MID_BULL=shown("s.mid_bull", 3), MID_BEAR=shown("s.mid_bear", 3))
 
 # ------------------------------------------------------------------------------------------- Status · Running Session
-# Owner items 73-75: the board starts, as the sibling dex-cex board does, with Status · Running Session: Execution and
-# Margin as one word per part (green well, amber needs a look, red at risk, grey nothing to judge; an amount or a time
-# plain), then Alerts. The picked Run (Newest Live Run by default), whatever the Range.
+# Owner items 73-76: the board starts, as the sibling dex-cex board does, with Status · Running Session: Execution and
+# Account as one word per part (green well, amber needs a look, red at risk, grey nothing to judge; an amount or a time
+# plain), Market, then Alerts. The picked Run (Newest Live Run by default), whatever the Range.
 # The Entry word: what the program answered in its last second, short enough for a tile; the words of the strategy's
 # ordinary answers (Blocked) are listed, so their colour (grey) is matched by name.
 ENTRY_WORDS = {"no_signal": "ready", "regular_hours": "regular hours", "spacing": "spacing", "holding_other_side": "other side held",
@@ -389,6 +392,32 @@ def money_word(x):
 
 
 LIVE_RUN = "(SELECT sel.stopped_ms IS NULL FROM sel)"
+# The US market phase as Combo Spread words and colours it (owner item 76; dashboard/SPEC.md section 3, "交易时段", and Combo
+# Spread's Phase figure): Pre‑Mkt, Regular, After‑Hrs, Overnight, Closed, each in its band's colour. Combo Spread reads them
+# from etfpair.etf_phase, which this board's reader cannot see; the same rule is worked out here from the program's own
+# second: Regular while the program is in US regular hours (its phase regular or close_window: holidays and early closes as
+# the program's calendar has them); otherwise, New York time, After-Hours for 4 h from the close that started the session
+# (that close: the bell's minute, the minute before the close, plus one; 16:00 before a bell is read), Overnight from 20:00
+# the evening before the day whose close ends the session (session_end_ms) to 04:00 that day, Pre-Market 04:00 to 09:30
+# that day, Closed otherwise (weekends, holidays, the evening after an early close).
+PHASE_COLORS = {"Pre-Market": "#b88a0a", "Regular": GREY, "After-Hours": "#d55181", "Overnight": "#4f8fe6", "Closed": GREY}
+PHASE_WORDS = {"Pre-Market": "Pre‑Mkt", "Regular": "Regular", "After-Hours": "After‑Hrs", "Overnight": "Overnight", "Closed": "Closed"}
+NY = "'America/New_York'"
+
+
+def us_phase(x):
+    """SQL: the US market phase (a PHASE_COLORS key) of the program's sample x (signal_sample's columns, live among them)."""
+    return sql("""CASE WHEN @X@.phase IN ('regular', 'close_window') THEN 'Regular' WHEN @X@.session_end_ms IS NULL THEN NULL ELSE (
+  SELECT CASE WHEN @X@.ts_ms >= q.sc AND @X@.ts_ms < q.sc + 14400000 THEN 'After-Hours'
+              WHEN q.t >= q.d - 1 + time '20:00' AND q.t < q.d + time '04:00' THEN 'Overnight'
+              WHEN q.t >= q.d + time '04:00' AND q.t < q.d + time '09:30' THEN 'Pre-Market' ELSE 'Closed' END
+  FROM (SELECT coalesce((SELECT min((a.detail ->> 'minute_ms')::bigint) + 60000 FROM trade.anchor_fact a
+                         WHERE a.live = @X@.live AND a.session_id = @X@.session_id AND a.kind = 'bell'),
+                        (extract(epoch FROM (@X@.session_id::date + time '16:00') AT TIME ZONE @NY@) * 1000)::bigint) AS sc,
+               (to_timestamp(@X@.session_end_ms / 1000.0) AT TIME ZONE @NY@)::date AS d,
+               to_timestamp(@X@.ts_ms / 1000.0) AT TIME ZONE @NY@ AS t) q) END""", X=x, NY=NY)
+
+
 Q_STATUS_EXEC = sql("""
 WITH @LATEST@
 SELECT CASE WHEN r.run_id IS NULL THEN 'no run' WHEN r.live THEN 'LIVE' ELSE 'PAPER' END AS "Mode",
@@ -398,11 +427,8 @@ SELECT CASE WHEN r.run_id IS NULL THEN 'no run' WHEN r.live THEN 'LIVE' ELSE 'PA
             WHEN @NOW@ - s.ts_ms > @STALE_MS@ THEN 'stale · ' || @AGE@
             ELSE 'up ' || @UP@ END AS "Run",
        CASE WHEN r.stopped_ms IS NOT NULL THEN @STOPPED@ ELSE @STARTED@ END AS "Start / End",
-       CASE WHEN r.stopped_ms IS NOT NULL THEN 'stopped' WHEN s.ts_ms IS NULL THEN 'no data' WHEN s.phase = 'off_hours' THEN 'off hours' WHEN s.phase = 'regular' THEN 'us regular'
-            WHEN s.phase = 'close_window' THEN 'close window' ELSE replace(s.phase, '_', ' ') END AS "Phase",
-       CASE WHEN r.stopped_ms IS NOT NULL THEN 'stopped' WHEN s.session_end_ms > @NOW@ THEN 'in ' || @CLOSE_IN@ WHEN s.session_end_ms IS NOT NULL THEN 'passed'
-            ELSE 'no data' END AS "Close",
-       CASE WHEN r.stopped_ms IS NOT NULL THEN 'stopped' WHEN s.ts_ms IS NULL THEN 'no data' WHEN s.anchor_kind IS NULL THEN 'missing' ELSE s.anchor_kind END AS "Anchor",
+       CASE WHEN r.stopped_ms IS NOT NULL THEN 'stopped' WHEN s.ts_ms IS NULL THEN 'no data'
+            ELSE CASE @PHASE@ @PHASE_WORDS@ ELSE 'no data' END END AS "Phase",
        CASE WHEN r.stopped_ms IS NOT NULL THEN 'stopped' WHEN s.ts_ms IS NULL THEN 'no data' ELSE coalesce(nullif(concat_ws(' · ',
             CASE WHEN s.conflict_bull THEN '$bull conflict' WHEN NOT s.depth_ok_bull THEN '$bull unusable' END,
             CASE WHEN s.conflict_bear THEN '$bear conflict' WHEN NOT s.depth_ok_bear THEN '$bear unusable' END), ''), 'ok') END AS "Books",
@@ -414,13 +440,15 @@ SELECT CASE WHEN r.run_id IS NULL THEN 'no run' WHEN r.live THEN 'LIVE' ELSE 'PA
 FROM (SELECT 1) one LEFT JOIN r ON true LEFT JOIN s ON true""",
                     LATEST=LATEST, NOW=NOW_MS, STALE_MS=str(SAMPLE_AGE_S * 1000), AGE=span("%s - s.ts_ms" % NOW_MS),
                     UP=span("%s - r.started_ms" % NOW_MS, seconds=False), STOPPED=clock("r.stopped_ms", "MM-DD HH24:MI"),
-                    STARTED=clock("r.started_ms", "MM-DD HH24:MI"),
-                    CLOSE_IN=span("s.session_end_ms - %s" % NOW_MS, seconds=False), LIVE_RUN=LIVE_RUN, RUN_O=of_run("o"),
+                    STARTED=clock("r.started_ms", "MM-DD HH24:MI"), PHASE=us_phase("s"),
+                    PHASE_WORDS=" ".join("WHEN '%s' THEN '%s'" % kv for kv in PHASE_WORDS.items()), LIVE_RUN=LIVE_RUN, RUN_O=of_run("o"),
                     ENTRY=entry_word("s.idle_reason"))
-# Margin: the venue's side of the Run, from its newest inventory sample (every 10 s). The whole account's equity and margin
-# ratio (Bitget usdtEquity and mgnRatio; live only, the account also holds the sibling repository's positions); the nearer
-# leg's distance to its liquidation price (live only: the paper venue reports none); the quota used; the open round trip
-# valued at the mids; the funding booked to the Run's round trips, or the settlements they still wait for. The board's own
+# Account (owner item 76; 4.0's Margin): the venue's side of the Run, from its newest inventory sample (every 10 s). Position:
+# the open round trip's side and age, flat (the venue holds nothing on either leg), or the residual the venue still holds
+# per leg with no round trip open (dust); Ledger: the venue's positions against the program's ledger; the whole account's
+# equity, maintenance margin (mgnRatio × equity) and margin ratio (Bitget usdtEquity and mgnRatio; live only, the account
+# also holds the sibling repository's positions); the nearer leg's distance to its liquidation price (live only: the paper
+# venue reports none); the funding booked to the Run's round trips, or the settlements they still wait for. The board's own
 # lines (the program takes no decision from these, PRD 6.6): margin ratio ok below 30 %, warn below 60 %, high from there;
 # liquidation ok beyond 25 % of the mark, warn beyond 10 %, near within.
 MARGIN_WARN, MARGIN_HIGH, LIQ_WARN, LIQ_NEAR = 0.30, 0.60, 0.25, 0.10
@@ -428,15 +456,20 @@ LIQ_LEGS = sql("""lq AS (SELECT x.leg, x.d FROM i CROSS JOIN LATERAL (VALUES
   ('$bull', CASE WHEN i.pos_bull < 0 THEN (i.liq_bull - i.mark_bull) / nullif(i.mark_bull, 0) WHEN i.pos_bull > 0 THEN (i.mark_bull - i.liq_bull) / nullif(i.mark_bull, 0) END),
   ('$bear', CASE WHEN i.pos_bear < 0 THEN (i.liq_bear - i.mark_bear) / nullif(i.mark_bear, 0) WHEN i.pos_bear > 0 THEN (i.mark_bear - i.liq_bear) / nullif(i.mark_bear, 0) END)) x(leg, d)
   WHERE x.d IS NOT NULL ORDER BY x.d LIMIT 1)""")
-Q_STATUS_MARGIN = sql("""
+SIGNED_CT = "CASE WHEN {x} > 0 THEN '+' WHEN {x} < 0 THEN '−' ELSE '' END || trim_scale(abs({x}))::text"
+Q_STATUS_ACCOUNT = sql("""
 WITH @LATEST@, @HELD@, @LIQ@
-SELECT CASE WHEN r.run_id IS NULL THEN 'no data' WHEN h.dir IS NULL THEN 'flat' WHEN r.stopped_ms IS NOT NULL THEN h.dir || ' left open'
-            ELSE h.dir || ' · ' || @HELD_FOR@ END AS "Cycle",
+SELECT CASE WHEN r.run_id IS NULL THEN 'no data' WHEN h.dir IS NOT NULL AND r.stopped_ms IS NOT NULL THEN h.dir || ' left open'
+            WHEN h.dir IS NOT NULL THEN h.dir || ' · ' || @HELD_FOR@
+            WHEN i.ts_ms IS NULL OR i.pos_bull IS NULL OR i.pos_bear IS NULL THEN 'no data'
+            WHEN i.pos_bull = 0 AND i.pos_bear = 0 THEN 'flat'
+            ELSE 'residual · ' || concat_ws(' ', CASE WHEN i.pos_bull <> 0 THEN '$bull ' || @RB@ END, CASE WHEN i.pos_bear <> 0 THEN '$bear ' || @RE@ END) END AS "Position",
        CASE WHEN i.ts_ms IS NULL THEN 'no data' WHEN i.mismatch THEN 'mismatch' WHEN i.pos_bull IS NULL OR i.pos_bear IS NULL THEN 'not read'
-            ELSE 'match' END AS "Positions",
+            ELSE 'match' END AS "Ledger",
        CASE WHEN r.run_id IS NULL OR i.ts_ms IS NULL THEN 'no data' WHEN NOT r.live THEN 'paper' WHEN r.stopped_ms IS NOT NULL THEN 'stopped'
-            WHEN i.equity IS NULL THEN 'no data'
-            ELSE to_char(i.equity, 'FM999,999,990.00') || ' U' END AS "Equity",
+            WHEN i.equity IS NULL THEN 'no data' ELSE to_char(i.equity, 'FM999,999,990.00') || ' U' END AS "Equity",
+       CASE WHEN r.run_id IS NULL OR i.ts_ms IS NULL THEN 'no data' WHEN NOT r.live THEN 'paper' WHEN r.stopped_ms IS NOT NULL THEN 'stopped'
+            WHEN i.equity IS NULL OR i.margin_ratio IS NULL THEN 'no data' ELSE to_char(i.margin_ratio * i.equity, 'FM999,999,990.00') || ' U' END AS "Maint. Margin",
        CASE WHEN r.run_id IS NULL OR i.ts_ms IS NULL THEN 'no data' WHEN NOT r.live THEN 'paper' WHEN r.stopped_ms IS NOT NULL THEN 'stopped'
             WHEN i.margin_ratio IS NULL THEN 'no data'
             ELSE CASE WHEN i.margin_ratio < @M_WARN@ THEN 'ok' WHEN i.margin_ratio < @M_HIGH@ THEN 'warn' ELSE 'high' END
@@ -444,27 +477,46 @@ SELECT CASE WHEN r.run_id IS NULL THEN 'no data' WHEN h.dir IS NULL THEN 'flat' 
        CASE WHEN r.run_id IS NULL OR i.ts_ms IS NULL THEN 'no data' WHEN NOT r.live THEN 'paper' WHEN r.stopped_ms IS NOT NULL THEN 'stopped'
             WHEN coalesce(i.pos_bull, 0) = 0 AND coalesce(i.pos_bear, 0) = 0 THEN 'flat' WHEN lq.d IS NULL THEN 'no data'
             ELSE CASE WHEN lq.d < @L_NEAR@ THEN 'near' WHEN lq.d < @L_WARN@ THEN 'warn' ELSE 'ok' END
-                 || ' · ' || lq.leg || ' ' || to_char(100 * lq.d, 'FM999,990') || ' %' END AS "Liq Distance",
-       CASE WHEN r.stopped_ms IS NOT NULL THEN 'stopped' WHEN i.quota_total > 0 THEN to_char(100 * i.quota_used / i.quota_total, 'FM990') || ' % used' ELSE 'no data' END AS "Quota",
-       CASE WHEN r.stopped_ms IS NOT NULL THEN 'stopped' WHEN s.ts_ms IS NULL THEN 'no data' WHEN h.dir IS NULL THEN 'flat' ELSE coalesce(@OPEN_PNL@, 'no data') END AS "Open P&L",
+                 || ' · ' || lq.leg || ' ' || to_char(100 * lq.d, 'FM999,990') || ' %' END AS "Liquidation",
        (SELECT CASE WHEN count(*) FILTER (WHERE jsonb_typeof(c.funding_awaited) = 'array' AND jsonb_array_length(c.funding_awaited) > 0) > 0
                     THEN sum(CASE WHEN jsonb_typeof(c.funding_awaited) = 'array' THEN jsonb_array_length(c.funding_awaited) ELSE 0 END) || ' awaited'
                     ELSE @FUNDING@ END
         FROM trade.cycle c WHERE @RUN_C@) AS "Funding"
 FROM (SELECT 1) one LEFT JOIN r ON true LEFT JOIN s ON true LEFT JOIN i ON true LEFT JOIN h ON true LEFT JOIN lq ON true""",
-                      LATEST=LATEST, HELD=HELD, LIQ=LIQ_LEGS, M_WARN=str(MARGIN_WARN), M_HIGH=str(MARGIN_HIGH), L_NEAR=str(LIQ_NEAR),
-                      L_WARN=str(LIQ_WARN), OPEN_PNL=money_word(UNREALISED), RUN_C=cycle_of_run("c"),
-                      HELD_FOR=span("least(%s, r.end_ms) - h.opened_ms" % NOW_MS, seconds=False),
-                      FUNDING=money_word("coalesce(sum(c.funding) FILTER (WHERE c.funding_known), 0)"))
+                       LATEST=LATEST, HELD=HELD, LIQ=LIQ_LEGS, M_WARN=str(MARGIN_WARN), M_HIGH=str(MARGIN_HIGH), L_NEAR=str(LIQ_NEAR),
+                       L_WARN=str(LIQ_WARN), RUN_C=cycle_of_run("c"), RB=SIGNED_CT.format(x="i.pos_bull"), RE=SIGNED_CT.format(x="i.pos_bear"),
+                       HELD_FOR=span("least(%s, r.end_ms) - h.opened_ms" % NOW_MS, seconds=False),
+                       FUNDING=money_word("coalesce(sum(c.funding) FILTER (WHERE c.funding_known), 0)"))
+# Market (owner item 76): the Run's newest second as Combo Spread's latest-second strips show a pair: both legs' price (the mid
+# on the program's book) and anchor (USD), the anchor's kind (Combo Spread's Anchor Status: NAV, Bell, Missing), the spread,
+# its mean and σ (D), the deviation (σ), F, and the Signal in Combo Spread's words: Long when the executable Buy Both is at or
+# past −d_in σ, Short when Sell Both is at or past +d_in σ, None inside; No Anchor, No Mean (σ not ready) and No Book (a leg's
+# book conflicts or its depth is unusable: the executor enters on none, owner item 70) instead.
+SIGNAL_COLORS = {"Long": BLUE, "Short": ORANGE, "None": TEXT, "No Anchor": GREY, "No Mean": GREY, "No Book": GREY}
+ANCHOR_COLORS = {"NAV": TEXT, "Bell": GREY, "Missing": WARN}
+Q_MARKET = sql("""
+WITH @LATEST@
+SELECT @MID_BULL@ AS "Bull Price", s.anchor_bull AS "Bull Anchor", @MID_BEAR@ AS "Bear Price", s.anchor_bear AS "Bear Anchor",
+       CASE WHEN s.ts_ms IS NULL THEN NULL WHEN s.anchor_kind = 'nav' THEN 'NAV' WHEN s.anchor_kind = 'bell' THEN 'Bell' ELSE 'Missing' END AS "Anchor",
+       @SPREAD@ AS "Spread", @MEAN@ AS "Mean", @SIGMA_D@ AS "σ", @DEVIATION@ AS "Deviation",
+       CASE WHEN s.ts_ms IS NULL THEN NULL WHEN s.anchor_kind IS NULL THEN 'No Anchor' WHEN NOT s.stats_ready OR @SIGMA@ IS NULL THEN 'No Mean'
+            WHEN NOT @EXECUTABLE@ THEN 'No Book' WHEN s.x_long_d / @SIGMA@ <= -@D_IN@ THEN 'Long' WHEN s.x_short_d / @SIGMA@ >= @D_IN@ THEN 'Short'
+            ELSE 'None' END AS "Signal",
+       s.f AS "F"
+FROM (SELECT 1) one LEFT JOIN r ON true LEFT JOIN s ON true LEFT JOIN sr ON true""",
+               LATEST=LATEST, MID_BULL=shown("s.mid_bull", 3), MID_BEAR=shown("s.mid_bear", 3), SPREAD=shown("s.mid_d", 1),
+               MEAN=shown("s.mu_d", 1), SIGMA_D=shown("s.sigma_d", 1), SIGMA=SIGMA, EXECUTABLE=EXECUTABLE.format(s="s"),
+               DEVIATION="CASE WHEN s.stats_ready THEN %s END" % shown("(s.mid_d - s.mu_d) / %s" % SIGMA, 2),
+               D_IN="(sr.config -> 'strategy' ->> 'd_in')::float8")
 # The colours of the words (Grafana takes the first mapping that matches): the mode first, then red, amber, green, grey;
 # an amount, a time or a share plain.
 STATUS_WORDS = [
-    ("^LIVE$", "#8a1f1f"), ("^PAPER$", "#5a5953"),
+    ("^LIVE$", "#8a1f1f"), ("^PAPER$", "#5a5953")] + [("^%s$" % word, PHASE_COLORS[name]) for name, word in PHASE_WORDS.items()] + [
     ("^(lost|stale · .*|mismatch|\\d+ unknown|.* left open|near · .*|high · .*|stop · .*)$", BAD),
-    ("^(starting|close window|missing|.* conflict.*|.* unusable.*|not read|held · .*|stopping|stop pending|warn · .*|\\d+ awaited)$", WARN),
-    ("^(up .*|ok|ok · .*|nav|bell|match|none open|\\d+ working|ready|order sent|off hours|(long|short)( · .*)?)$", WELL),
-    ("^(no data|no run|stopped|flat|paper|us regular|passed|%s)$" % "|".join(re.escape(w) for w in BLOCKED_WORDS), GREY),
-    ("^([+−].* U|[0-9,.]+ U|\\d\\d‑\\d\\d\u00a0\\d\\d:\\d\\d|in .*|\\d+ % used)$", "transparent")]
+    ("^(starting|.* conflict.*|.* unusable.*|not read|held · .*|stopping|stop pending|warn · .*|residual · .*|\\d+ awaited)$", WARN),
+    ("^(up .*|ok|ok · .*|match|none open|\\d+ working|ready|order sent|(long|short)( · .*)?)$", WELL),
+    ("^(no data|no run|stopped|flat|paper|%s)$" % "|".join(re.escape(w) for w in BLOCKED_WORDS), GREY),
+    ("^([+−].* U|[0-9,.]+ U|\\d\\d‑\\d\\d\u00a0\\d\\d:\\d\\d)$", "transparent")]
 
 # Alerts: what stopped or held trading in the picked Run and what became of it, the unfinished first, each group newest
 # first, at most 200 (the sibling board's Alerts, mapped onto what schema trade records; the program writes no alert of
@@ -581,37 +633,45 @@ SELECT NULL, NULL, NULL, NULL, NULL, 'No alert in this Run: nothing stopped or h
 # The round trips of the Run closed in the Range. A cycle whose funding is not known yet (funding_known false) is left out of
 # every money figure (Net, Fees, Funding, Win Rate) until it is known; Trips counts it.
 CLOSED = "trade.cycle c WHERE %s AND c.status <> 'open' AND %s" % (cycle_of_run("c"), in_range("c.closed_ms"))
-# The Execution Summary of the Range: the round trips closed in it (no-fill ones left out; one whose funding is not known yet
-# counted in Trips and Notional only), each figure a column.
+# The Execution Summary of the Range (owner item 76, in this order): the round trips closed in it (no-fill ones left out;
+# one whose funding is not known yet counted in Notional only): PnL (net), Gross, Fee, Funding, the open round trip's P&L, the
+# Notional traded (both legs, every fill of those round trips), the Peak Used (the largest quota use, of N = M × L, the Run's
+# inventory samples in the Range show: held at entry prices, open orders, dust), the Win Rate and the Return: PnL over Peak
+# Used (owner item 69: a return on the largest notional actually used), bps.
 Q_PNL = sql("""
 WITH @LATEST@, c AS MATERIALIZED (
-  SELECT c.*, (SELECT sum(x.entry_value_bull + x.entry_value_bear) FROM trade.lot x WHERE x.live = c.live AND x.cycle_id = c.cycle_id) AS notional
+  SELECT c.*, (SELECT sum(x.entry_value_bull + x.entry_value_bear + x.exit_value_bull + x.exit_value_bear) FROM trade.lot x
+               WHERE x.live = c.live AND x.cycle_id = c.cycle_id) AS traded
   FROM @CLOSED@ AND c.end_reason IS DISTINCT FROM 'no_fill'),
-k AS (SELECT * FROM c WHERE c.funding_known), @HELD@
-SELECT (SELECT coalesce(sum(k.net), 0) FROM k) AS "Net", (SELECT coalesce(sum(k.gross), 0) FROM k) AS "Gross",
-       (SELECT -coalesce(sum(k.fees), 0) FROM k) AS "Fees", (SELECT coalesce(sum(k.funding), 0) FROM k) AS "Funding",
-       (SELECT @UNREALISED@ FROM (SELECT 1) one LEFT JOIN s ON true LEFT JOIN h ON true) AS "Open P&L",
-       (SELECT 10000 * sum(k.net) / nullif(sum(k.notional), 0) FROM k) AS "Return",
+k AS (SELECT * FROM c WHERE c.funding_known), @HELD@,
+pk AS (SELECT max(p.quota_used) AS used FROM trade.inventory_sample p WHERE @RUN_P@ AND @RANGE_P@)
+SELECT (SELECT coalesce(sum(k.net), 0) FROM k) AS "PnL", (SELECT coalesce(sum(k.gross), 0) FROM k) AS "Gross",
+       (SELECT -coalesce(sum(k.fees), 0) FROM k) AS "Fee", (SELECT coalesce(sum(k.funding), 0) FROM k) AS "Funding",
+       (SELECT @UNREALISED@ FROM (SELECT 1) one LEFT JOIN s ON true LEFT JOIN h ON true) AS "Open PnL",
+       (SELECT coalesce(sum(c.traded), 0) FROM c) AS "Notional", (SELECT pk.used FROM pk) AS "Peak Used",
        (SELECT 100.0 * count(*) FILTER (WHERE k.net > 0) / nullif(count(*), 0) FROM k) AS "Win Rate",
-       (SELECT count(*) FROM c) AS "Trips", (SELECT coalesce(sum(c.notional), 0) FROM c) AS "Notional" """,
-            CLOSED=CLOSED, LATEST=LATEST, HELD=HELD, UNREALISED=shown(UNREALISED, 2))
+       (SELECT 10000 * coalesce(sum(k.net), 0) / nullif((SELECT pk.used FROM pk), 0) FROM k) AS "Return" """,
+            CLOSED=CLOSED, LATEST=LATEST, HELD=HELD, UNREALISED=shown(UNREALISED, 2), RUN_P=of_run("p"), RANGE_P=in_range("p.ts_ms"))
 # The Execution Summary's charts, as the sibling board's, on the Range's own axis (an xy chart: Time in ms; Q_PERIOD gives the
 # axis its two ends however few points there are): the running Net as steps from 0 at the Range's start to its end (now
 # while it reaches the present), and each round trip's Net at its close, gains and losses apart (an xy chart draws a
 # missing value as zero), its cycle_id for the link to its orders.
 Q_PERIOD = sql("""WITH @SEL@, e AS (SELECT rg.from_ms AS t0, least(rg.to_ms - 1, @NOW@) AS t1 FROM rg)
 SELECT e.t0 AS "Time", 0 AS "Period", e.t0 AS "From", e.t1 AS "To" FROM e UNION ALL SELECT e.t1, 0, e.t0, e.t1 FROM e""", SEL=SEL, NOW=NOW_MS)
-KNOWN = sql("""k AS MATERIALIZED (SELECT c.cycle_id, c.closed_ms, c.net FROM @CLOSED@ AND c.funding_known AND c.end_reason IS DISTINCT FROM 'no_fill')""",
+KNOWN = sql("""k AS MATERIALIZED (SELECT c.cycle_id, c.closed_ms, c.gross, c.net FROM @CLOSED@ AND c.funding_known AND c.end_reason IS DISTINCT FROM 'no_fill')""",
             CLOSED=CLOSED)
-Q_CUM_NET = sql("""
+# Owner item 77: under the Summary, cumulative Gross and PnL over the Range, as the Summary counts them, a step at each close,
+# from 0 at the Range's start to its end (now while it reaches the present).
+Q_CUM = sql("""
 WITH @SEL@, @KNOWN@,
-cum AS (SELECT k.closed_ms AS t, k.net AS v, sum(k.net) OVER (ORDER BY k.closed_ms, k.cycle_id ROWS UNBOUNDED PRECEDING) AS c,
-               row_number() OVER (ORDER BY k.closed_ms, k.cycle_id) AS n FROM k)
-SELECT x.t AS "Time", x.v AS "Net" FROM (
-  SELECT rg.from_ms AS t, 0::numeric AS v, 0 AS n, 0 AS o FROM rg
-  UNION ALL SELECT cum.t, cum.c - cum.v, cum.n, 1 FROM cum
-  UNION ALL SELECT cum.t, cum.c, cum.n, 2 FROM cum
-  UNION ALL SELECT least(rg.to_ms - 1, @NOW@), coalesce((SELECT cum.c FROM cum ORDER BY cum.n DESC LIMIT 1), 0), 1e9, 3 FROM rg) x
+cum AS (SELECT k.closed_ms AS t, k.gross AS dg, k.net AS dn, row_number() OVER w AS n,
+               sum(k.gross) OVER w AS g, sum(k.net) OVER w AS p FROM k WINDOW w AS (ORDER BY k.closed_ms, k.cycle_id ROWS UNBOUNDED PRECEDING))
+SELECT x.t AS "Time", x.g AS "Gross", x.p AS "PnL" FROM (
+  SELECT rg.from_ms AS t, 0::numeric AS g, 0::numeric AS p, 0 AS n, 0 AS o FROM rg
+  UNION ALL SELECT cum.t, cum.g - cum.dg, cum.p - cum.dn, cum.n, 1 FROM cum
+  UNION ALL SELECT cum.t, cum.g, cum.p, cum.n, 2 FROM cum
+  UNION ALL SELECT least(rg.to_ms - 1, @NOW@), coalesce((SELECT cum.g FROM cum ORDER BY cum.n DESC LIMIT 1), 0),
+                   coalesce((SELECT cum.p FROM cum ORDER BY cum.n DESC LIMIT 1), 0), 1e9, 3 FROM rg) x
 ORDER BY x.t, x.n, x.o""", SEL=SEL, KNOWN=KNOWN, NOW=NOW_MS)
 
 
@@ -917,7 +977,7 @@ WHERE v.value IS NOT NULL ORDER BY v.o""",
 IN_RANGE = "%s AND c.opened_ms < %s AND coalesce(c.closed_ms, %s) >= %s" % (cycle_of_run("c"), TO_MS, NOW_MS, FROM_MS)
 TRADED = "%s AND c.end_reason IS DISTINCT FROM 'no_fill'" % IN_RANGE
 NET_CODED = "CASE WHEN c.status = 'open' THEN %d WHEN NOT c.funding_known THEN %d ELSE c.net END" % (OPEN, PENDING)
-Q_BLOTTER = sql("""
+Q_BLOTTER = or_say(sql("""
 WITH @SEL@
 SELECT c.cycle_id, to_timestamp(c.opened_ms / 1000.0) AS "Opened", to_timestamp(c.closed_ms / 1000.0) AS "Closed", @HELD@ AS "Held",
        initcap(c.direction) AS "Side", l.notional AS "Notional", @ENTRY@ AS "In σ", @EXIT@ AS "Out σ", @NET@ AS "Net",
@@ -932,7 +992,7 @@ LEFT JOIN LATERAL (SELECT (d.detail ->> 'x_d')::float8 / nullif((d.detail ->> 's
                    WHERE d.live = c.live AND d.cycle_id = c.cycle_id AND d.kind = 'exit' ORDER BY d.ts_ms DESC LIMIT 1) e ON true
 WHERE @TRADED@
 ORDER BY c.opened_ms DESC LIMIT 500""", SEL=SEL, TRADED=TRADED, HELD=span("coalesce(c.closed_ms, %s) - c.opened_ms" % NOW_MS),
-                ENTRY=shown("l.entry", 2), EXIT=shown("e.x", 2), NET=NET_CODED, REASON=end_reason("c.end_reason"))
+                ENTRY=shown("l.entry", 2), EXIT=shown("e.x", 2), NET=NET_CODED, REASON=end_reason("c.end_reason")), ['cycle_id', 'Opened', 'Closed', 'Held', 'Side', 'Notional', 'In σ', 'Out σ', 'Net', 'Net bps', 'End Reason'], 'End Reason', 'No round trip in the Range')
 # The round trips of the Range for the (hidden) Round Trip setting, newest first (the default); no-fill ones too, so that
 # one can be looked at by its address; one option that says so when there is none.
 Q_CYCLE_OPTIONS = sql("""
@@ -953,7 +1013,7 @@ def leg_price(x):
         x, "0" * TICK_DECIMALS["bull"], x, "0" * TICK_DECIMALS["bear"])
 
 
-Q_ORDERS = sql("""
+Q_ORDERS = or_say(sql("""
 WITH @SEL@
 SELECT to_timestamp(o.submitted_ms / 1000.0) AS "Time", initcap(o.purpose) AS "Purpose", CASE o.leg WHEN 'bull' THEN '$bull' ELSE '$bear' END AS "Leg",
        initcap(o.side) || CASE WHEN o.reduce_only THEN ' · RO' ELSE '' END AS "Side", o.qty AS "Qty", o.cum_exec_qty AS "Filled",
@@ -963,7 +1023,7 @@ SELECT to_timestamp(o.submitted_ms / 1000.0) AS "Time", initcap(o.purpose) AS "P
             WHEN o.status = 'cancelled' THEN 'No Fill' WHEN o.status IN ('pending', 'acked') THEN 'Working'
             ELSE initcap(replace(o.status, '_', ' ')) END || coalesce(' · ' || nullif(concat_ws(' ', o.error_code, o.error_message), ''), '') AS "Status"
 FROM trade.cex_order o WHERE @RUN_O@ AND o.cycle_id = @CYCLE@ ORDER BY o.submitted_ms, o.client_order_id""",
-               SEL=SEL, RUN_O=of_mode("o"), CYCLE=CYCLE, FEE_PENDING=str(FEE_PENDING), LIMIT=leg_price("o.price"), AVG=leg_price("o.avg_price"))
+               SEL=SEL, RUN_O=of_mode("o"), CYCLE=CYCLE, FEE_PENDING=str(FEE_PENDING), LIMIT=leg_price("o.price"), AVG=leg_price("o.avg_price")), ['Time', 'Purpose', 'Leg', 'Side', 'Qty', 'Filled', 'Limit', 'Avg', 'Fee', 'Latency', 'Status'], 'Status', 'No order: no round trip in the Range')
 
 # -------------------------------------------------------------------------------------------------------------- Inventory
 # Each leg at the Run's newest inventory sample (every 10 s), as the sibling board's Positions Now: the venue's position and
@@ -984,27 +1044,27 @@ FROM i JOIN r ON true LEFT JOIN s ON true LEFT JOIN n ON true CROSS JOIN LATERAL
 ORDER BY l.o""", LATEST=LATEST, RATES=RATES, NOW=NOW_MS, EXPOSURE=shown("l.pos * l.mid", 2))
 
 # ---------------------------------------------------------------------------------------------- Diagnostics · Execution
-Q_END_REASONS = sql("""
+Q_END_REASONS = or_say(sql("""
 WITH @SEL@
 SELECT @REASON@ AS "End Reason", count(*) AS "Cycles", sum(c.net) FILTER (WHERE c.funding_known) AS "Net",
        count(*) FILTER (WHERE NOT c.funding_known) AS "Pending"
 FROM trade.cycle c WHERE @IN_RANGE@ AND c.status <> 'open' GROUP BY c.end_reason ORDER BY count(*) DESC, 1""",
-                    SEL=SEL, IN_RANGE=IN_RANGE, REASON=end_reason("c.end_reason"))
+                    SEL=SEL, IN_RANGE=IN_RANGE, REASON=end_reason("c.end_reason")), ['End Reason', 'Cycles', 'Net', 'Pending'], 'End Reason', 'No round trip closed in the Range')
 Q_IDLE = sql("""
 WITH @SEL@
 SELECT @STATE@ || ' · ' || @WHY@ AS "Answer", count(*) AS "Seconds", 100.0 * count(*) / sum(count(*)) OVER () AS "Share"
 FROM trade.signal_sample s WHERE @RANGE_S@ AND @RUN_S@
 GROUP BY s.idle_reason ORDER BY count(*) DESC""", SEL=SEL, RANGE_S=in_range("s.ts_ms"), RUN_S=of_run("s"),
              STATE=idle_state("s.idle_reason"), WHY=idle_why("s.idle_reason"))
-Q_BLOCKED = sql("""
+Q_BLOCKED = or_say(sql("""
 WITH @SEL@
 SELECT @WHY@ AS "Reason", initcap(d.direction) AS "Side", count(*) AS "Seconds", to_timestamp(max(d.ts_ms) / 1000.0) AS "Last"
 FROM trade.decision d WHERE @RUN_D@ AND d.kind = 'at_line_blocked' AND @RANGE_D@
-GROUP BY d.reason, d.direction ORDER BY count(*) DESC""", SEL=SEL, RUN_D=of_run("d"), RANGE_D=in_range("d.ts_ms"), WHY=idle_why("d.reason"))
+GROUP BY d.reason, d.direction ORDER BY count(*) DESC""", SEL=SEL, RUN_D=of_run("d"), RANGE_D=in_range("d.ts_ms"), WHY=idle_why("d.reason")), ['Reason', 'Side', 'Seconds', 'Last'], 'Reason', 'None in the Range')
 LATENCY_STAGES = [("Submit → Sent", "local", "o.sent_ms - o.submitted_ms"), ("Sent → Ack", "local", "o.acked_ms - o.sent_ms"),
                   ("Sent → Final", "local", "o.final_ms - o.sent_ms"), ("Accepted → Created", "venue", "o.exchange_created_ms - o.accepted_ms"),
                   ("Created → Last Update", "venue", "o.exchange_updated_ms - o.exchange_created_ms")]
-Q_LATENCY = sql("""
+Q_LATENCY = or_say(sql("""
 WITH @SEL@
 SELECT k.stage AS "Stage", k.clock AS "Clock", count(k.ms) AS "Orders", percentile_cont(0.5) WITHIN GROUP (ORDER BY k.ms) AS "Median",
        percentile_cont(0.9) WITHIN GROUP (ORDER BY k.ms) AS "P90", max(k.ms) AS "Max"
@@ -1012,7 +1072,7 @@ FROM trade.cex_order o
 CROSS JOIN LATERAL (VALUES @STAGES@) k(i, stage, clock, ms)
 WHERE @RUN_O@ AND @RANGE_O@ AND k.ms IS NOT NULL
 GROUP BY k.i, k.stage, k.clock ORDER BY k.i""", SEL=SEL, RUN_O=of_run("o"), RANGE_O=in_range("o.submitted_ms"),
-                STAGES=", ".join("(%d, '%s', '%s', %s)" % (i, s, c, q) for i, (s, c, q) in enumerate(LATENCY_STAGES)))
+                STAGES=", ".join("(%d, '%s', '%s', %s)" % (i, s, c, q) for i, (s, c, q) in enumerate(LATENCY_STAGES))), ['Stage', 'Clock', 'Orders', 'Median', 'P90', 'Max'], 'Stage', 'No order in the Range')
 
 # ------------------------------------------------------------------------------------------------- Diagnostics · System
 # The Run's events of every module in the Range (trade.event: today the program writes only its errors there), newest first;
@@ -1037,7 +1097,7 @@ SELECT @NAME@ || CASE WHEN r.run_id = @RID@ THEN ' · shown' ELSE '' END AS "Run
        (r.config #>> '{inventory,capital}')::numeric * (r.config #>> '{inventory,leverage}')::numeric AS "N",
        r.host AS "Host", r.run_id AS "Run ID", r.started_ms::text AS from_ms, coalesce(r.stopped_ms::text, 'now') AS to_ms
 FROM trade.process_run r
-ORDER BY r.started_ms DESC LIMIT 100""", SEL=SEL, NAME=RUN_NAME.format(r="r"), RID=RID, STATE=RUN_STATE,
+ORDER BY r.started_ms DESC LIMIT 100""", SEL=SEL, NAME=run_label("r"), RID=RID, STATE=RUN_STATE,
              RAN=span("coalesce(r.stopped_ms, %s) - r.started_ms" % NOW_MS))
 Q_ANCHORS = sql("""
 WITH @SEL@
@@ -1185,33 +1245,59 @@ def build():
     panels.append(row("Status · Running Session · ${runtext}", y)); y += 1
     panels.append(status_words("Execution", Q_STATUS_EXEC, 0, y, 24, bullets(
         "The picked Run (Newest Live Run by default), at its newest second, whatever the Range. Green well, amber needs a look, red trading "
-        "at risk, grey nothing to judge; an amount or a time plain.",
+        "at risk, grey nothing to judge; a time plain.",
         [("Mode", "LIVE (real orders on Bitget) or PAPER (the program trades against its own copy of the books; nothing is sent): a Run is one "
                   "mode, and every panel shows the picked Run only, so paper and live are never merged."),
          ("Run", "up for how long; starting (no sample yet); stale (no sample for more than %d s and no stop recorded); lost (none for a minute: "
                  "crashed or killed); stopped (in order)." % SAMPLE_AGE_S),
          ("Start / End", "when the Run started; for a stopped one, when it stopped; UTC+8."),
-         ("Phase", "off hours (entries allowed), us regular (exits only), close window (flattening before the close)."),
-         ("Close", "the time left to the regular close that ends the session: everything is flat by then."),
-         ("Anchor", "nav (both legs on the issuer's NAV), bell (F × Binance's index at the close, until the NAV is confirmed) or missing (no entries)."),
+         ("Phase", "the US market phase, worded and coloured as on Combo Spread: Pre‑Mkt, Regular, After‑Hrs, Overnight, Closed (weekend or "
+                   "holiday); the program enters outside Regular only."),
          ("Books", "ok, or a leg whose book conflicts (snapshot and ticks disagree) or is unusable (too old or thin): no entry goes out on it."),
          ("Orders", "the Run's orders not final: n working, n unknown (being queried), or n left open by a stopped Run."),
          ("Entry", "the program's answer this second: ready (no signal yet) or order sent; the strategy's ordinary answers in grey (regular "
                    "hours, spacing, quota used up, ...); held (waits on a book, F, the venue or a stop); stop (a person is needed).")])))
     y += 3
-    panels.append(status_words("Margin", Q_STATUS_MARGIN, 0, y, 24, bullets(
+    panels.append(status_words("Account", Q_STATUS_ACCOUNT, 0, y, 24, bullets(
         "The venue's side of the Run at its newest inventory sample (every 10 s). The program takes no decision from these (PRD 6.6); "
         "the board's own lines colour them.",
-        [("Cycle", "flat, or the open round trip's side and how long it has been open (left open: a stopped Run's, in red)."),
-         ("Positions", "match (the venue's positions equal the ledger's), mismatch (no orders until a person checks) or not read."),
+        [("Position", "the open round trip's side and how long it has been open; flat (the venue holds nothing on either leg); residual "
+                      "(amber): what the venue still holds per leg with no round trip open (dust); left open (red): a stopped Run's."),
+         ("Ledger", "match (the venue's positions equal the program's ledger), mismatch (no orders until a person checks) or not read."),
          ("Equity", "Bitget usdtEquity of the WHOLE account, USDT (it also holds the sibling repository's positions); paper: none."),
+         ("Maint. Margin", "the account's maintenance margin, USDT: margin ratio × equity."),
          ("Margin Ratio", "Bitget mgnRatio of the whole account (maintenance margin ÷ equity): ok below %d %%, warn below %d %%, high from there."
           % (MARGIN_WARN * 100, MARGIN_HIGH * 100)),
-         ("Liq Distance", "the nearer leg's liquidation price from its mark, in %% of the mark: ok beyond %d %%, warn beyond %d %%, near within; "
-                          "flat without a position." % (LIQ_WARN * 100, LIQ_NEAR * 100)),
-         ("Quota", "held at entry prices plus open orders and dust, of the quota L × (M + min(0, R))."),
-         ("Open P&L", "the open round trip at the newest second's mids against its entry cost, after its entry fees, before exit fees."),
+         ("Liquidation", "the nearer leg's liquidation price from its mark, in %% of the mark: ok beyond %d %%, warn beyond %d %%, near within; "
+                         "flat without a position; prices in Inventory." % (LIQ_WARN * 100, LIQ_NEAR * 100)),
          ("Funding", "booked to the Run's round trips, USDT (+ received), or the settlements still without a record (n awaited).")])))
+    y += 3
+    price = {"unit": "none", "decimals": 3, "mappings": [NO_FIGURE]}
+    usd = {"unit": "currencyUSD", "decimals": 2, "mappings": [NO_FIGURE]}   # as Combo Spread's anchors: $32.03
+    d1 = {"unit": "suffix: D", "decimals": 1, "mappings": [NO_FIGURE]}
+    value_map = lambda colors: {"mappings": [NO_FIGURE, {"type": "value", "options": {k: {"color": c, "index": i} for i, (k, c) in enumerate(colors.items())}}]}
+    market = stat_strip("Market · Prices", Q_MARKET, [
+        ("Bull Price", "Each leg's mid on the program's book, USDT.", dict(price, displayName="${bull} Price")),
+        ("Bull Anchor", "Each leg's anchor, USD per share: the bell (F × Binance's index at the close), then the issuer's NAV once confirmed.",
+         dict(usd, displayName="${bull} Anchor")),
+        ("Bear Price", "", dict(price, displayName="${bear} Price")),
+        ("Bear Anchor", "", dict(usd, displayName="${bear} Anchor")),
+        ("Anchor", "As Combo Spread's Anchor Status: NAV, Bell (provisional, grey) or Missing (amber: no entries).", value_map(ANCHOR_COLORS)),
+        ("F", "USD per USDT the program converts the anchors with (Combo Spread's USD/USDT).", {"unit": "none", "decimals": 5, "mappings": [NO_FIGURE]}),
+    ], 0, y, 24, 3, intro="The Run's newest second (its age: the Run tile above), as Combo Spread's Prices · Latest Second; whatever the Range.",
+        columns=["Bull Price", "Bull Anchor", "Bear Price", "Bear Anchor", "Anchor", "F"], title_size=12, value_size=18)
+    panels.append(market)
+    y += 3
+    panels.append(stat_strip("Market · Spread and Signal", None, [
+        ("Spread", "D, on both legs' mids: 10⁴ × (F × (P_bull ÷ A_bull + P_bear ÷ A_bear) − 2); 1 D = 0.5 bps of the two legs' notional.", d1),
+        ("Mean", "D: the program's mean of the spread.", d1),
+        ("σ", "D: its standard deviation.", d1),
+        ("Deviation", "(Spread − Mean) ÷ σ, on the mids.", {"unit": "suffix:σ", "decimals": 2, "mappings": [NO_FIGURE]}),
+        ("Signal", "In Combo Spread's words, on the program's executable deviations: Long (Buy Both at or past −d_in σ), Short (Sell Both at "
+                   "or past +d_in σ), None inside; No Anchor, No Mean (σ not ready), No Book (a leg's book conflicts or its depth is "
+                   "unusable: the program enters on none).", value_map(SIGNAL_COLORS)),
+    ], 0, y, 24, 3, intro="The same second, as Combo Spread's Spread and Signal · Latest Second.", source=market,
+        columns=["Spread", "Mean", "σ", "Deviation", "Signal"], title_size=12, value_size=18))
     y += 3
     panels.append(table("Alerts", Q_ALERTS, 0, y, 24, 7, description=bullets(
         "What stopped or held trading in the picked Run and what became of it: the unfinished first, each group newest first, at most 200.",
@@ -1233,36 +1319,45 @@ def build():
         col("cycle_id", custom_hidden=True)]))
     y += 7
 
-    # ------------------------------------------------------------------ Execution Summary
+    # ------------------------------------------------------------------ Execution Summary (owner items 76, 77)
     panels.append(row("Execution Summary · ${span}", y)); y += 1
     money = dict(MONEY, unit="suffix: U")
     panels.append(stat_strip("Summary", Q_PNL, [
-        ("Net", "Gross + Fees + Funding of the round trips closed in the Range, USDT: what the strategy earned (one whose funding is not known "
+        ("PnL", "Gross + Fee + Funding of the round trips closed in the Range, USDT: what the strategy earned (one whose funding is not known "
                 "yet left out until it is).", money),
         ("Gross", "Both legs' fills, sells less buys, before costs.", money),
-        ("Fees", "Trading fees, as a cost (negative).", money),
+        ("Fee", "Trading fees, as a cost (negative).", money),
         ("Funding", "Funding booked to them; + received.", money),
-        ("Open P&L", "The open round trip at the newest second's mids after its entry fees, before exit fees and the half spread an exit "
-                     "pays; not in Net.", dict(money, displayName="Open" + NBSP + "P&L")),
-        ("Return", "Net over their entry notional, bps (of the notional, not D).", dict(MONEY, unit="suffix: bps", decimals=1)),
-        ("Win Rate", "Closed round trips with a positive Net.", {"unit": "percent", "decimals": 0, "mappings": [NO_FIGURE]}),
-        ("Trips", "Round trips closed in the Range (no-fill ones left out).", {"unit": "locale", "decimals": 0}),
-        ("Notional", "Both legs' entry value of those round trips, USDT.", {"unit": "suffix: U", "decimals": 0, "mappings": [NO_FIGURE]}),
-    ], 0, y, 24, 4, intro="The Run's round trips closed in the Range (row title).", title_size=12, value_size=20))
+        ("Open PnL", "The open round trip at the newest second's mids after its entry fees, before exit fees and the half spread an exit "
+                     "pays; green above zero, red below; not in PnL.", money),
+        ("Notional", "Traded: both legs' fills (entries, completions, trims, exits) of those round trips, USDT.",
+         {"unit": "locale", "decimals": 0, "mappings": [NO_FIGURE]}),
+        ("Peak Used", "The most of N = M × L in use in the Range (held at entry prices, open orders, dust), USDT, from the Run's inventory "
+                      "samples.", {"unit": "locale", "decimals": 0, "mappings": [NO_FIGURE]}),
+        ("Win Rate", "Closed round trips with a positive PnL.", {"unit": "percent", "decimals": 0, "mappings": [NO_FIGURE]}),
+        ("Return", "PnL over Peak Used, bps (owner item 69: a return on the largest notional actually used).", dict(MONEY, unit="suffix: bps", decimals=1)),
+    ], 0, y, 24, 4, intro="The Run's round trips closed in the Range (row title), in the owner's order (item 76); money in USDT (U), "
+                         "Notional and Peak Used in USDT.", title_size=12, value_size=18))
     y += 4
-    panels.append(xy("Cumulative Net · USDT", [("A", Q_CUM_NET), ("Period", Q_PERIOD)], 0, y, 12, 8,
-                     "The running Net over the Range, stepping at each round trip's close (its funding known), from 0 at the Range's start to its end.",
-                     "lines", [by_regex("^Net$", {"color": {"mode": "fixed", "fixedColor": PURPLE}, "custom.axisLabel": " ", "decimals": 2,
+    panels.append(xy("Cumulative Gross and PnL · USDT", [("A", Q_CUM), ("Period", Q_PERIOD)], 0, y, 12, 8, bullets(
+        "Owner item 77: the running Gross and PnL over the Range, as the Summary counts them, stepping at each round trip's close (its funding "
+        "known), from 0 at the Range's start to its end.",
+        [("Gross", "both legs' fills, sells less buys (teal)."), ("PnL", "Gross + Fee + Funding (purple); the gap between the lines is what "
+                                                                          "fees and funding took.")]),
+                     "lines", [by_regex("^Gross$", {"color": {"mode": "fixed", "fixedColor": "#4fc3d9"}, "custom.axisLabel": " ", "decimals": 2,
+                                                    "custom.axisSoftMin": -0.1, "custom.axisSoftMax": 0.1}),
+                               by_regex("^PnL$", {"color": {"mode": "fixed", "fixedColor": PURPLE}, "custom.axisLabel": " ", "decimals": 2,
                                                   "custom.axisSoftMin": -0.1, "custom.axisSoftMax": 0.1})]))
-    panels.append(xy("Net per Round Trip · USDT", [("Gain", Q_TRIP_GAIN), ("Loss", Q_TRIP_LOSS), ("Period", Q_PERIOD)], 12, y, 12, 8,
-                     "Each round trip's Net at its close (its funding known); click a point, then Show this round trip's orders, for its orders.",
+    panels.append(xy("PnL per Round Trip · USDT", [("Gain", Q_TRIP_GAIN), ("Loss", Q_TRIP_LOSS), ("Period", Q_PERIOD)], 12, y, 12, 8,
+                     "Each round trip's PnL at its close (its funding known); click a point, then Show this round trip's orders, for its orders.",
                      "points", [by_regex("^Gain$", {"color": {"mode": "fixed", "fixedColor": GOOD}, "custom.axisLabel": " ", "decimals": 4}),
                                 by_regex("^Loss$", {"color": {"mode": "fixed", "fixedColor": BAD}, "custom.axisLabel": " ", "decimals": 4})], link=link))
     y += 8
 
-    # ------------------------------------------------------------------ Position and Market · Last Second (owner item 71)
-    panels.append(row("Position and Market · Last Second · ${combo}", y)); y += 1
+    # ------------------------------------------------------------------ Position and Entry · Last Second (owner item 71)
+    panels.append(row("Position and Entry · Last Second · ${combo}", y)); y += 1
     side = {"mappings": [NO_FIGURE] + SIDE_COLORS + regex_colors([("Flat", GREY)])}
+    sig = {"unit": "suffix:σ", "decimals": 2, "mappings": [NO_FIGURE]}
     position = stat_strip("Position · ct and USDT", Q_NOW, [
         ("Side", "Flat, or the open round trip's side: Long (both legs bought, blue), Short (both sold, orange).", side),
         ("Bull", "Contracts held on the leg as the program counts them, signed (+ long, − short); – when flat.",
@@ -1273,34 +1368,9 @@ def build():
         ("To Exit", "σ still to go to the exit line (a Long: Sell Both up to −d_out σ; a Short: Buy Both down to +d_out σ); 0 or less: at the "
                     "line, the exit is being sent · –: a leg's depth is unusable (the program sends no exit then; a book conflict does not stop "
                     "an exit).", {"unit": "suffix:σ", "decimals": 2, "mappings": [NO_FIGURE], "displayName": "To" + NBSP + "Exit"}),
-    ], 0, y, 11, 3, intro="The Run's newest second (a stopped Run's last), whatever the Range.",
+    ], 0, y, 24, 3, intro="The Run's newest second (a stopped Run's last), whatever the Range.",
         columns=["Side", "Bull", "Bear", "Cost", "Held", "To Exit"], value_size=16, title_size=12)
-    panels.append(position)
-    book = regex_colors([("Conflict", WARN), ("Unusable", WARN), ("OK", GREY)])
-    legs = table("Legs · USDT and USD", Q_LEGS, 0, y + 3, 9, 5, description=bullets(
-        "Each leg at the Run's newest second; the program records no bid / ask, pricing-level price or depth per second (only the mids and the "
-        "executable deviations), so the board has none.",
-        [("Mid", "USDT, on the program's book, to 0.001."), ("USD", "the anchor the spread is measured against, per share: the issuer's NAV or the "
-                                                            "bell's F × Binance's index."),
-         ("USDT", "the anchor in USDT (USD ÷ F)."),
-         ("Book", "OK, Conflict (amber: the book snapshot and the tick stream disagree) or Unusable (amber: too old or too thin): no entry goes "
-                  "out while either leg's is not OK.")]), overrides=[
-        col("Leg", 52), col("Mid", None, custom_align="right", unit="none", decimals=3),
-        col("USD", None, custom_align="right", unit="none", decimals=3), col("USDT", None, custom_align="right", unit="none", decimals=3),
-        col("Book", 76, custom_cellOptions={"type": "color-text"}, mappings=book)])
-    legs["fieldConfig"]["defaults"]["custom"]["wrapHeaderText"] = False
-    panels.append(legs)
-    sig = {"unit": "suffix:σ", "decimals": 2, "mappings": [NO_FIGURE]}
-    panels.append(stat_strip("Spread · D and σ", None, [
-        ("Spread", "D, on both legs' mids: 10⁴ × (F × (P_bull ÷ A_bull + P_bear ÷ A_bear) − 2); 1 D = 0.5 bps of the two legs' notional.",
-         {"unit": "suffix: D", "decimals": 1, "mappings": [NO_FIGURE]}),
-        ("Mean", "D: the program's mean of the spread (the Run's mean model).", {"unit": "suffix: D", "decimals": 1, "mappings": [NO_FIGURE]}),
-        ("σ", "D: its standard deviation (the Run's σ window).", {"unit": "suffix: D", "decimals": 1, "mappings": [NO_FIGURE]}),
-        ("Deviation", "(Spread − Mean) ÷ σ, on the mids; the executable sides are in Entry below.", sig),
-        ("F", "USD per USDT the program converts the anchors with.", {"unit": "none", "decimals": 5, "mappings": [NO_FIGURE]}),
-        ("As Of", "The second these figures are of (UTC+8).", None),
-    ], 11, y, 13, 3, intro="The Run's newest second.", source=position, columns=["Spread", "Mean", "σ", "Deviation", "F", "As Of"],
-        value_size=16, title_size=12)); y += 3
+    panels.append(position); y += 3
     entry_state = {"mappings": [NO_FIGURE] + regex_colors(list(STATE_COLORS.items()))}
     panels.append(stat_strip("Entry · σ and D", None, [
         ("Entry", "Can it open now: Ready (green, no signal yet) · Order Sent (green) · Blocked: the strategy's ordinary answer · Held Back "
@@ -1313,8 +1383,8 @@ def build():
         ("To Long Entry", "How far Buy Both still has to fall to the Long entry line (−d_in σ), in σ and in D; At the Line once there · —: "
          "a leg's book conflicts or its depth is unusable, so the program enters on none (Why names the leg).", None),
         ("To Short Entry", "How far Sell Both still has to rise to the Short entry line (+d_in σ) · — as for To Long Entry.", None),
-    ], 9, y, 15, 5, intro="The Run's newest second.", source=position, columns=["Entry", "Why", "Buy Both", "Sell Both", "To Long Entry",
-                                                                                "To Short Entry"], value_size=15, title_size=12)); y += 5
+    ], 0, y, 24, 3, intro="The Run's newest second.", source=position, columns=["Entry", "Why", "Buy Both", "Sell Both", "To Long Entry",
+                                                                                "To Short Entry"], value_size=16, title_size=12)); y += 3
 
     # ------------------------------------------------------------------ Live Execution
     panels.append(row("Live Execution · ${lines}", y)); y += 1
@@ -1412,7 +1482,7 @@ def build():
     panels.append(row("Round Trips · ${combo} · ${span}", y)); y += 1
     money_col = dict(custom_align="right", unit="none", decimals=4, mappings=[NO_FIGURE, PENDING_TEXT], **SIGN_BAND)
     sigma_col = dict(custom_align="right", unit="none", decimals=2, mappings=[NO_FIGURE])
-    panels.append(table("Round Trips · Newest First", Q_BLOTTER, 0, y, 24, 9, description=bullets(
+    panels.append(table("Round Trips · Newest First", Q_BLOTTER, 0, y, 24, 7, description=bullets(
         "Every round trip of the Run open at any time in the Range, newest first, at most 500; no-fill ones (nothing traded) left out.",
         [("Opened", "its first entry, UTC+8; click for its orders below."), ("Closed, Held", "its close, and open to close (to now while open)."),
          ("Side", "Long: both legs bought; Short: both sold."),
@@ -1426,14 +1496,14 @@ def build():
         col("Side", 64, custom_cellOptions={"type": "color-text"}, mappings=SIDE_COLORS),
         col("Notional", 94, custom_align="right", unit="none", decimals=2), col("In σ", 64, **sigma_col), col("Out σ", 64, **sigma_col),
         col("Net", 80, **money_col), col("Net bps", 72, displayName="Net Bps", **dict(money_col, decimals=1)), col("End Reason", custom_minWidth=140)]))
-    y += 9
+    y += 7
 
     # ------------------------------------------------------------------ Round Trip Detail
     panels.append(row("Round Trip Detail · ${cycle:text}", y)); y += 1
 
     def num(d):
         return dict(custom_align="right", unit="none", decimals=d, mappings=[NO_FIGURE])
-    panels.append(table("Orders · ct, USDT and ms", Q_ORDERS, 0, y, 24, 9, description=bullets(
+    panels.append(table("Orders · ct, USDT and ms", Q_ORDERS, 0, y, 24, 7, description=bullets(
         "Every order of the picked round trip (the Range's newest by default), in the order the program sent them, its fills folded in.",
         [("Purpose", "Entry, Complete (the leg that filled less), Trim (the leg that filled more), Exit, Forced."),
          ("Side", "Buy or Sell; RO: a reduce-only order."), ("Qty, Filled", "contracts ordered and filled."),
@@ -1446,11 +1516,11 @@ def build():
         col("Filled", 64, **num(2)), col("Limit", 80, custom_align="right"), col("Avg", 80, custom_align="right"),
         col("Fee", 84, custom_align="right", unit="none", decimals=5, mappings=[NO_FIGURE, PENDING_TEXT], **SIGN_BAND), col("Latency", 72, **dict(num(0), unit="suffix: ms")),
         col("Status", custom_minWidth=130, custom_cellOptions={"type": "color-text"},
-            mappings=regex_colors([("Rejected", BAD), ("Unknown", WARN), ("Partial", WARN), ("No Fill", GREY)]))])); y += 9
+            mappings=regex_colors([("Rejected", BAD), ("Unknown", WARN), ("Partial", WARN), ("No Fill", GREY)]))])); y += 7
 
     # ------------------------------------------------------------------ Inventory
     panels.append(row("Inventory · ${runtext}", y)); y += 1
-    panels.append(table("Positions Now · ct, USDT and Bps", Q_POSITIONS, 0, y, 24, 5, description=bullets(
+    positions = table("Positions Now · ct, USDT and Bps", Q_POSITIONS, 0, y, 24, 4, description=bullets(
         "Each leg at the Run's newest inventory sample (every 10 s), whatever the Range; the venue's figures live only (the paper venue reports "
         "positions alone).",
         [("Venue, Ledger", "the venue's position and the program's ledger (dust included), contracts, signed (+ long, − short); they must match."),
@@ -1468,7 +1538,9 @@ def build():
         col("Exposure", **num(2)), col("Funding", **num(2)),
         col("Age", custom_align="right", unit="suffix: s", decimals=0, custom_cellOptions={"type": "color-text"},
             color={"mode": "thresholds"}, thresholds={"mode": "absolute", "steps": [{"color": "text", "value": None}, {"color": WARN, "value": 60}]},
-            mappings=[NO_FIGURE])])); y += 5
+            mappings=[NO_FIGURE])])
+    positions["fieldConfig"]["defaults"]["custom"]["wrapHeaderText"] = False   # one header line: both legs fit 4 units
+    panels.append(positions); y += 4
 
     # ------------------------------------------------------------------ Settings
     panels.append(row("Settings · ${runtext}", y)); y += 1
@@ -1534,7 +1606,7 @@ def build():
             [("Run", "click to show that Run, its whole life on the charts."),
              ("State", "Running (a sample in the last minute), Stopped (in order), Lost (neither: crashed or killed)."),
              ("Ran", "start to stop, or to now."), ("N", "the notional M × L it may hold, USDT."), ("Run ID", "process_run.run_id.")]), overrides=[
-            col("Run", 190, links=[{"title": "Show this Run, its whole life on the charts", "targetBlank": False, "url": URL + (
+            col("Run", 330, links=[{"title": "Show this Run, its whole life on the charts", "targetBlank": False, "url": URL + (
                 "?orgId=1&from=${__data.fields.from_ms}&to=${__data.fields.to_ms}&refresh=10s&var-run=${__data.fields[\"Run ID\"]}"
                 "&var-since=0&var-since_hour=00&var-until=%s&var-until_hour=24" % NO_END_MS)}]),
             col("from_ms", custom_hidden=True), col("to_ms", custom_hidden=True), col("Started", 116, unit="time:MM-DD HH:mm:ss"),
