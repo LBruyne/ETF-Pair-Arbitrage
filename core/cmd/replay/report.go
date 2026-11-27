@@ -60,6 +60,8 @@ type summary struct {
 	WindowNet          decimal.Decimal `json:"window_net"`
 	WindowReturnOnN    decimal.Decimal `json:"window_return_on_n"`
 	WindowReturnOnUsed decimal.Decimal `json:"window_return_on_used"`
+
+	Seq seqStats `json:"seq"` // the comparison of SPEC 12.10
 }
 
 // How a summary's window result was valued.
@@ -260,6 +262,11 @@ func summarize(s *memSink, session string, notional, peak decimal.Decimal, end *
 	if out.UsedNotional.IsPositive() {
 		out.ReturnOnUsed, out.WindowReturnOnUsed = out.RoundTripNet.Div(out.UsedNotional), out.WindowNet.Div(out.UsedNotional)
 	}
+	var endMs int64
+	if end != nil {
+		endMs = end.at.UnixMilli()
+	}
+	out.Seq = seqReport(s, inSession, endMs)
 	return out
 }
 

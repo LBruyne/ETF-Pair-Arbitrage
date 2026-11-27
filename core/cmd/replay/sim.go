@@ -152,6 +152,32 @@ func (v *replayVenue) deliver(symbol cex.Symbol, in *input) {
 	}
 }
 
+// refusingPaper is the paper venue as Bitget answers a reducing order: a
+// reduce-only order larger than what the leg's position holds against its
+// side is refused when sent (Bitget's 40804 by WebSocket, 25231 by REST;
+// live 2026-11-27, SOXL 7.80 against a net long of 7.79), where the paper
+// venue alone would fill what the position holds. So a replay meets the
+// refusal and the loop's answer to it (SPEC 12.12, item 100 point 1) as the
+// live process does. The position is the paper one when the order is sent.
+type refusingPaper struct{ *cex.PaperVenue }
+
+func (v refusingPaper) PlaceOrder(ctx context.Context, req cex.OrderRequest) (cex.OrderAck, error) {
+	if req.ReduceOnly {
+		set, err := v.Positions(ctx, nil)
+		if err != nil {
+			return cex.OrderAck{}, err
+		}
+		held := set.BySymbol[req.Symbol].Qty // signed: a short is negative
+		if req.Side == cex.SideBuy {
+			held = held.Neg()
+		}
+		if req.Qty.GreaterThan(decimal.Max(held, decimal.Zero)) {
+			return cex.OrderAck{}, &cex.VenueError{Code: "40804", Message: "replay: the reduce-only quantity is larger than the position", Kind: cex.ErrorReduceQty}
+		}
+	}
+	return v.PaperVenue.PlaceOrder(ctx, req)
+}
+
 // noSources stand for Binance, Coinbase and Direxion: a synchronous manager
 // reads none of them; F and the anchors come from the history (replayCex).
 type noSources struct{}
@@ -237,6 +263,8 @@ type memSink struct {
 	matches     []store.DecisionRow
 	samples     []store.SignalSampleRow
 	minutes     []store.MinuteBarRow
+	stages      []store.ExitStageRow // every half-target row, in the order written
+	held        []heldPoint          // the ledger's held value at every change (the simulation writes it)
 	sampled     int
 	idle        map[string]int
 }
@@ -285,6 +313,8 @@ func (s *memSink) Record(rows ...store.Row) {
 			}
 		case store.MinuteBarRow:
 			s.minutes = append(s.minutes, r)
+		case store.ExitStageRow:
+			s.stages = append(s.stages, r)
 		}
 	}
 }
@@ -347,7 +377,7 @@ func newSim(sc simConfig) (*sim, error) {
 		TakerFeeBps: cfg.Strategy.TakerFeeBps, Leverage: int(cfg.Inventory.Leverage.IntPart()), DepthMaxAge: cfg.Cex.DepthMaxAge, Clock: s.clock})
 	s.paper.UseStore(s.sink)
 	var err error
-	if s.cmgr, err = cex.NewManager(cfg.Cex, s.paper, noSources{}, noSources{}, noSources{}, cex.WithClock(s.clock), cex.Synchronous()); err != nil {
+	if s.cmgr, err = cex.NewManager(cfg.Cex, refusingPaper{s.paper}, noSources{}, noSources{}, noSources{}, cex.WithClock(s.clock), cex.Synchronous()); err != nil {
 		return nil, err
 	}
 	s.cmgr.UseStore(s.sink)
@@ -464,6 +494,7 @@ func (s *sim) advance(t time.Time) {
 	s.loop.Advance(t)
 	if h := s.inv.HeldNotional(); !h.Equal(s.held) {
 		s.held = h
+		s.sink.held = append(s.sink.held, heldPoint{ms: t.UnixMilli(), value: h})
 		if c := s.inv.Cycle(); c != nil {
 			s.session = c.SessionID
 		}

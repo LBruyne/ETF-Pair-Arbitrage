@@ -62,7 +62,7 @@ func run(args []string) error {
 	fs.StringVar(&o.from, "from", "", "the start of one window instead of -sessions, UTC+8 2006-01-02T15:04:05 (a Session ends at its own close)")
 	fs.StringVar(&o.to, "to", "", "the end of the window (UTC+8 2006-01-02T15:04:05); with -sessions it cuts a Session short")
 	fs.StringVar(&o.paperRun, "paper-run", "", "reproduce this paper run from its start: its configuration, the F it used, its anchor facts and what it restored")
-	fs.StringVar(&o.grid, "grid", "", "parameter grid, e.g. 'model=ema,sma;x=30;y=30;din=2;dout=-0.5;lat=15/15,5/5;n=1000,10000,100000' (lat: bull/bear ms; n: N = M x L in USDT)")
+	fs.StringVar(&o.grid, "grid", "", "parameter grid, e.g. 'model=ema,sma;x=30;y=30;din=2;dout=-0.5;thin=none,bear;exit2=none,-1;lat=15/15,5/5;n=1000,10000,100000' (thin: the leg taken first, none for both together; exit2: none for one exit line; lat: bull/bear ms; n: N = M x L in USDT)")
 	fs.BoolVar(&o.keep, "keep", false, "also write each second's sample, every decision and every paper match")
 	fs.IntVar(&o.repeat, "repeat", 1, "run every simulation this many times and require identical results (determinism)")
 	fs.StringVar(&o.logPath, "log", "", "write the components' log lines (info) to this file; default: none")
@@ -265,10 +265,12 @@ type gridPoint struct {
 // parseGrid expands the grid over the base configuration; an empty grid is
 // the base alone. Keys: model (ema, sma), x and y (minutes), din and dout
 // (sigmas: strategy.entry_in and strategy.entry_out; the grid keeps the short
-// names), lat (bull/bear in ms) and n (N in USDT: M = N / L).
+// names), thin (bear, bull or none: exec.thin_leg, none being both legs
+// together), exit2 (sigmas, or none for one exit line: strategy.exit2; SPEC
+// 12.9), lat (bull/bear in ms) and n (N in USDT: M = N / L).
 func parseGrid(spec string, base *config.Config) ([]gridPoint, error) {
 	values := map[string][]string{}
-	order := []string{"model", "x", "y", "din", "dout", "lat", "n"}
+	order := []string{"model", "x", "y", "din", "dout", "thin", "exit2", "lat", "n"}
 	for _, part := range strings.Split(spec, ";") {
 		if strings.TrimSpace(part) == "" {
 			continue
@@ -283,7 +285,7 @@ func parseGrid(spec string, base *config.Config) ([]gridPoint, error) {
 	s, e := base.Strategy, base.Exec.SimOrderLatency
 	n := base.Inventory.Capital.Mul(base.Inventory.Leverage)
 	defaults := map[string][]string{"model": {string(s.MeanModel)}, "x": {strconv.Itoa(s.MeanMinutes)}, "y": {strconv.Itoa(s.SigmaMinutes)},
-		"din": {fmtFloat(s.EntryIn)}, "dout": {fmtFloat(s.EntryOut)}, "lat": {fmt.Sprintf("%d/%d", e.Bull.Milliseconds(), e.Bear.Milliseconds())}, "n": {n.String()}}
+		"din": {fmtFloat(s.EntryIn)}, "dout": {fmtFloat(s.EntryOut)}, "thin": {thinName(base.Exec.ThinLeg)}, "exit2": {s.Exit2Text()}, "lat": {fmt.Sprintf("%d/%d", e.Bull.Milliseconds(), e.Bear.Milliseconds())}, "n": {n.String()}}
 	for k, v := range defaults {
 		if _, set := values[k]; !set {
 			values[k] = v
@@ -322,10 +324,25 @@ func parseGrid(spec string, base *config.Config) ([]gridPoint, error) {
 		if st.EntryOut, err = strconv.ParseFloat(p["dout"], 64); err != nil {
 			return nil, fmt.Errorf("-grid dout: %w", err)
 		}
+		st.Exit2 = nil
+		if p["exit2"] != "none" {
+			x, err := strconv.ParseFloat(p["exit2"], 64)
+			if err != nil {
+				return nil, fmt.Errorf("-grid exit2: %w", err)
+			}
+			st.Exit2 = &x
+		}
 		if err := st.Validate(); err != nil {
 			return nil, fmt.Errorf("-grid %v: %w", p, err)
 		}
 		cfg.Strategy = st
+		cfg.Exec.ThinLeg = p["thin"]
+		if cfg.Exec.ThinLeg == "none" {
+			cfg.Exec.ThinLeg = ""
+		}
+		if err := cfg.Exec.Validate(); err != nil {
+			return nil, fmt.Errorf("-grid %v: %w", p, err)
+		}
 		bull, bear, ok := strings.Cut(p["lat"], "/")
 		lb, err1 := strconv.Atoi(bull)
 		lr, err2 := strconv.Atoi(bear)
@@ -338,10 +355,19 @@ func parseGrid(spec string, base *config.Config) ([]gridPoint, error) {
 			return nil, fmt.Errorf("-grid n %q: want a positive USDT amount", p["n"])
 		}
 		cfg.Inventory.Capital = notional.Div(cfg.Inventory.Leverage)
-		name := fmt.Sprintf("%s%s-%s_din%s_dout%s_lat%s_N%s", p["model"], p["x"], p["y"], p["din"], p["dout"], strings.ReplaceAll(p["lat"], "/", "-"), p["n"])
+		name := fmt.Sprintf("%s%s-%s_din%s_dout%s_thin%s_exit2%s_lat%s_N%s", p["model"], p["x"], p["y"], p["din"], p["dout"], p["thin"], p["exit2"], strings.ReplaceAll(p["lat"], "/", "-"), p["n"])
 		out = append(out, gridPoint{name: name, cfg: &cfg})
 	}
 	return out, nil
+}
+
+// thinName is exec.thin_leg as the grid writes it: none for both legs
+// together.
+func thinName(leg string) string {
+	if leg == "" {
+		return "none"
+	}
+	return leg
 }
 
 func contains(list []string, s string) bool {
@@ -443,7 +469,7 @@ func writeSim(dir string, s *sim, w window, print string) ([]summary, error) {
 	sums = append(sums, total)
 	meta := map[string]any{"name": s.sc.name, "funding": "excluded: the replay books no funding", "window": w.label, "from": showMs(w.tape.from), "to": showMs(w.tape.to), "fingerprint": print,
 		"bear_depth": bearDepth(w.tape), "advance_calls": s.steps, "samples": s.sink.sampled, "idle_reasons": s.sink.idle,
-		"strategy": s.sc.cfg.Strategy, "latency_ms": [2]int64{s.sc.cfg.Exec.SimOrderLatency.Bull.Milliseconds(), s.sc.cfg.Exec.SimOrderLatency.Bear.Milliseconds()},
+		"strategy": s.sc.cfg.Strategy, "thin_leg": thinName(s.sc.cfg.Exec.ThinLeg), "exit2": s.sc.cfg.Strategy.Exit2Text(), "latency_ms": [2]int64{s.sc.cfg.Exec.SimOrderLatency.Bull.Milliseconds(), s.sc.cfg.Exec.SimOrderLatency.Bear.Milliseconds()},
 		"capital": s.sc.cfg.Inventory.Capital, "leverage": s.sc.cfg.Inventory.Leverage, "summaries": sums}
 	if err := writeJSON(filepath.Join(dir, "summary.json"), meta); err != nil {
 		return nil, err
@@ -551,10 +577,19 @@ func writeSamples(path string, rows []store.SignalSampleRow) error {
 	return f.Close()
 }
 
-var gridHeader = []string{"window", "sim", "session", "bear_depth", "model", "x", "y", "d_in", "d_out", "lat_bull_ms", "lat_bear_ms", "n_usdt",
+var gridHeader = []string{"window", "sim", "session", "bear_depth", "model", "x", "y", "d_in", "d_out", "thin_leg", "exit2", "lat_bull_ms", "lat_bear_ms", "n_usdt",
 	"round_trip_net", "cash_net", "fees", "orders", "fills", "entry_batches", "both_legs", "one_leg", "no_fill", "one_leg_rate", "entry_fill_rate",
 	"completions", "trims", "cycles", "end_reasons", "peak_notional", "used_notional", "return_on_n", "return_on_used", "open_bull", "open_bear",
-	"window_value", "window_net", "window_return_on_n", "window_return_on_used", "fingerprint"}
+	"window_value", "window_net", "window_return_on_n", "window_return_on_used",
+	// SPEC 12.10 (seqStats)
+	"signals", "planned_notional", "built_notional", "built_per_signal", "built_ratio",
+	"es_entry_failed", "es_built", "es_built_partial", "es_unwound_profit", "es_unwound_stop", "es_building",
+	"exposed_batches", "exposure_median_s", "exposure_max_s", "complete_slip", "unwind_net", "profit_close_net",
+	"d1_batches", "d1_net", "d2_batches", "d2_net", "d2_expected",
+	"closed_exit", "closed_exit1", "closed_exit2", "closed_forced", "net_exit", "net_exit1", "net_exit2", "net_forced", "stages_set", "stages_done",
+	"line_to_flat_cycles", "line_to_flat_median_s", "line_to_flat_max_s", "line_to_flat_usdt_h", "realised_check",
+	"exit_batches", "exit_batch_max_s", "refused", "refused_reduce_qty", "residual_cycles", "residual_bull", "residual_bear",
+	"fingerprint"}
 
 // gridRow is one summary as a row of grid.csv.
 func gridRow(w window, name string, s *sim, sum summary, print string) []string {
@@ -564,13 +599,38 @@ func gridRow(w window, name string, s *sim, sum summary, print string) []string 
 		reasons = append(reasons, fmt.Sprintf("%s:%d", k, v))
 	}
 	sort.Strings(reasons)
-	return []string{w.label, name, sum.Session, bearDepth(w.tape), string(st.MeanModel), strconv.Itoa(st.MeanMinutes), strconv.Itoa(st.SigmaMinutes), fmtFloat(st.EntryIn), fmtFloat(st.EntryOut),
+	q := sum.Seq
+	perSignal, ratio := decimal.Zero, decimal.Zero
+	if q.Signals > 0 {
+		perSignal = q.BuiltNotional.Div(decimal.NewFromInt(int64(q.Signals)))
+	}
+	if q.PlannedNotional.IsPositive() {
+		ratio = q.BuiltNotional.Div(q.PlannedNotional)
+	}
+	seq := []string{strconv.Itoa(q.Signals), q.PlannedNotional.String(), q.BuiltNotional.StringFixed(8), perSignal.StringFixed(8), ratio.StringFixed(6)}
+	for _, state := range []string{"entry_failed", "built", "built_partial", "unwound_profit", "unwound_stop", "building"} {
+		seq = append(seq, strconv.Itoa(q.EndStates[state]))
+	}
+	seq = append(seq, strconv.Itoa(q.ExposedBatches), fmtFloat(q.ExposureMedianS), fmtFloat(q.ExposureMaxS), q.CompleteSlip.String(), q.UnwindNet.String(), q.ProfitCloseNet.String(),
+		strconv.Itoa(q.D1Batches), q.D1Net.String(), strconv.Itoa(q.D2Batches), q.D2Net.String(), q.D2Expected.String())
+	for _, m := range []map[string]decimal.Decimal{q.ClosedByLine, q.NetByLine} {
+		for _, line := range []string{lineOne, "exit1", "exit2", lineForced} {
+			seq = append(seq, m[line].String())
+		}
+	}
+	seq = append(seq, strconv.Itoa(q.StagesSet), strconv.Itoa(q.StagesDone),
+		strconv.Itoa(q.LineToFlatCycles), fmtFloat(q.LineToFlatMedianS), fmtFloat(q.LineToFlatMaxS), strconv.FormatFloat(q.LineToFlatUSDTh, 'f', 4, 64), q.RealisedCheck.String(),
+		strconv.Itoa(q.ExitBatches), fmtFloat(q.ExitBatchMaxS), strconv.Itoa(q.Refused), strconv.Itoa(q.RefusedReduceQty),
+		strconv.Itoa(q.ResidualCycles), q.ResidualQty[0].String(), q.ResidualQty[1].String())
+	row := []string{w.label, name, sum.Session, bearDepth(w.tape), string(st.MeanModel), strconv.Itoa(st.MeanMinutes), strconv.Itoa(st.SigmaMinutes), fmtFloat(st.EntryIn), fmtFloat(st.EntryOut),
+		thinName(s.sc.cfg.Exec.ThinLeg), st.Exit2Text(),
 		strconv.FormatInt(lat.Bull.Milliseconds(), 10), strconv.FormatInt(lat.Bear.Milliseconds(), 10), sum.Notional.String(),
 		sum.RoundTripNet.String(), sum.CashNet.String(), sum.Fees.String(), strconv.Itoa(sum.Orders), strconv.Itoa(sum.Fills),
 		strconv.Itoa(sum.EntryBatches), strconv.Itoa(sum.BothLegs), strconv.Itoa(sum.OneLeg), strconv.Itoa(sum.NoFill), fmtFloat(sum.OneLegRate), fmtFloat(sum.EntryFillRate),
 		strconv.Itoa(sum.Completions), strconv.Itoa(sum.Trims), strconv.Itoa(sum.Cycles), strings.Join(reasons, " "),
 		sum.PeakNotional.String(), sum.UsedNotional.String(), sum.ReturnOnN.StringFixed(8), sum.ReturnOnUsed.StringFixed(8), sum.OpenQty[0].String(), sum.OpenQty[1].String(),
-		sum.WindowValue, windowNumber(sum, sum.WindowNet.String()), windowNumber(sum, sum.WindowReturnOnN.StringFixed(8)), windowNumber(sum, sum.WindowReturnOnUsed.StringFixed(8)), print}
+		sum.WindowValue, windowNumber(sum, sum.WindowNet.String()), windowNumber(sum, sum.WindowReturnOnN.StringFixed(8)), windowNumber(sum, sum.WindowReturnOnUsed.StringFixed(8))}
+	return append(append(row, seq...), print)
 }
 
 // windowNumber is a window result as written in grid.csv: empty when the
