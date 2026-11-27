@@ -94,7 +94,7 @@ func (m *ExecManager) workExitPair(r *round, e *exitState) (ended bool) {
 	}
 	m.countExitStage(r, e)
 
-	in := strategy.ExitPairInput{Batch: e.batch, Pairing: m.pairing, Hold: r.cycle.Hold(), Books: r.books.ByLeg, Rules: r.rules, F: r.fx.Price.InexactFloat64(),
+	in := strategy.ExitPairInput{Batch: e.batch, Pairing: m.pairing, Hold: m.reducibleHold(r.cycle), Books: r.books.ByLeg, Rules: r.rules, F: r.fx.Price.InexactFloat64(),
 		Anchors: m.anchors, PairAnchors: r.cycle.PairAnchors, Value: m.closeValuer(""), Stopping: m.stop.stopping, Forced: m.forced != "", Now: r.now}
 	for _, leg := range cex.Legs {
 		in.DepthOK[leg] = r.books.DepthOK(leg, r.now)

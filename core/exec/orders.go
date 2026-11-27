@@ -250,7 +250,7 @@ func (m *ExecManager) forcedExit(r *round, byPositions bool) (done bool) {
 	if !r.rulesOK {
 		return m.idle(strategy.ReasonNotReady)
 	}
-	hold := c.Hold()
+	hold := m.reducibleHold(c)
 	if byPositions {
 		pos := m.venuePositions(r)
 		if !pos.Loaded {
@@ -480,7 +480,7 @@ func (m *ExecManager) positionHold(r *round, dir strategy.Direction, pos cex.Pos
 		}
 		hold[leg] = decimal.Max(q, decimal.Zero)
 	}
-	return hold
+	return reducible(hold, dir, dust)
 }
 
 // --- closing the cycle ---
@@ -625,4 +625,27 @@ func ids(reqs []cex.OrderRequest) []cex.ClientOrderID {
 		out[i] = req.ClientOrderID
 	}
 	return out
+}
+
+// reducible caps a cycle's holding per leg at what a reduce-only order may
+// close on the venue: the net position there, which also carries the dust
+// of earlier cycles. Dust of the other sign (a long cycle's 7.80 next to
+// dust of -0.01) leaves 7.79 to reduce; dust of the same sign changes
+// nothing. A reducing order above the venue's net is refused (Bitget
+// 40804), so every reducing order is sized within this.
+func reducible(hold [2]decimal.Decimal, dir strategy.Direction, dust [2]decimal.Decimal) (out [2]decimal.Decimal) {
+	for _, leg := range cex.Legs {
+		d := dust[leg]
+		if dir == strategy.Short {
+			d = d.Neg()
+		}
+		out[leg] = decimal.Max(decimal.Zero, decimal.Min(hold[leg], hold[leg].Add(d)))
+	}
+	return out
+}
+
+// reducibleHold is the open cycle's holding within what reducing orders
+// may close (reducible).
+func (m *ExecManager) reducibleHold(c *inventory.Cycle) [2]decimal.Decimal {
+	return reducible(c.Hold(), c.Direction, m.inv.Dust())
 }

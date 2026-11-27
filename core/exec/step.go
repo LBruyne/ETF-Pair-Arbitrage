@@ -432,7 +432,7 @@ func (m *ExecManager) exitInput(r *round) strategy.ExitInput {
 	if !stats.Ready {
 		stats = m.lastReady
 	}
-	in := strategy.ExitInput{Direction: c.Direction, Hold: c.Hold(), Books: r.books.ByLeg, Rules: r.rules, F: r.fx.Price.InexactFloat64(),
+	in := strategy.ExitInput{Direction: c.Direction, Hold: m.reducibleHold(c), Books: r.books.ByLeg, Rules: r.rules, F: r.fx.Price.InexactFloat64(),
 		Anchors: m.anchors, PairAnchors: c.PairAnchors, Stats: stats,
 		Pairing: m.pairing, Stage: m.stageOf(c), BuiltLots: builtLots(c), Value: m.closeValuer("")}
 	for _, leg := range cex.Legs {
