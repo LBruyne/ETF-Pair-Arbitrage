@@ -132,21 +132,21 @@ func (s *Strategy) AtEntryLine(dir Direction, x, sigma float64) bool {
 
 // spacingOK reports whether an entry in direction dir at deviation x may
 // follow the last built entry. The first entry, an entry in the other
-// direction and one after entry_spacing do not wait. A sooner one in the
-// same direction must be entry_step_d further from the mean than the last.
+// direction and one after entry_time_spacing do not wait. A sooner one in the
+// same direction must be entry_step_spacing further from the mean than the last.
 // When the anchors changed since the last entry, the two deviations are not
 // comparable and the entry waits the whole spacing.
 func (s *Strategy) spacingOK(in EntryInput, dir Direction, x float64) bool {
-	if in.Last == nil || in.Last.Direction != dir || in.Now.Sub(in.Last.At) >= s.cfg.EntrySpacing {
+	if in.Last == nil || in.Last.Direction != dir || in.Now.Sub(in.Last.At) >= s.cfg.EntryTimeSpacing {
 		return true
 	}
 	if in.AnchorChangedAt.After(in.Last.At) {
 		return false
 	}
 	if dir == Long {
-		return x <= in.Last.E-s.cfg.EntryStepD
+		return x <= in.Last.E-s.cfg.EntryStepSpacing
 	}
-	return x >= in.Last.E+s.cfg.EntryStepD
+	return x >= in.Last.E+s.cfg.EntryStepSpacing
 }
 
 // entrySize sizes one batch. Each leg offers take_ratio of the quantity its

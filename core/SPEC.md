@@ -85,7 +85,7 @@ core/
 | 时间 | `time.Time`；库里 `*_ms` 为 Unix 毫秒 `BIGINT`；日志和看板显示 UTC+8；交易所时间与本机收到的时间分列存 |
 | 标识 | 命名类型：`cex.Symbol`（`SOXLUSDT`）、`cex.Leg`（`Bull` / `Bear`）、`cex.Side`（`buy` / `sell`）、`cex.ClientOrderID`、`cex.OrderID`、`strategy.Direction`（`long` = 两条腿都买，`short` = 都卖）、`inventory.CycleID`、`inventory.LotID` |
 
-价差的单位（PRD 第 2 节）：D 的 1 个单位 = 两腿合计名义 V 的 0.5 bps。例：V = 10,000 USDT 时价差走 1 个单位是 0.5 USDT；往返手续费 1.3 bps × V = 1.3 USDT，折成价差约 2.6 个单位。配置和日志里凡是价差单位的键以 `_d` 结尾（`entry_step_d`），按名义算的以 `_bps` 结尾。
+价差的单位（PRD 第 2 节）：D 的 1 个单位 = 两腿合计名义 V 的 0.5 bps。例：V = 10,000 USDT 时价差走 1 个单位是 0.5 USDT；往返手续费 1.3 bps × V = 1.3 USDT，折成价差约 2.6 个单位。配置和日志里凡是价差单位的键以 `_d` 结尾（`entry_step_spacing`），按名义算的以 `_bps` 结尾。
 
 ## 4. 数据流
 
@@ -1621,8 +1621,8 @@ strategy:
   pricing_level: { bull: 2, bear: 5 }   # per leg, the raw level of the taker side an entry or a line exit is priced on (owner item 57)
   take_ratio: "0.5"           # the share of the quantity up to the pricing level one batch takes (owner item 59: keep ½)
   min_batch_notional: "100"  # USDT, both legs together at their limit prices: a smaller entry batch is not sent (owner item 59)
-  entry_spacing: 60s          # a same-side entry sooner than this needs entry_step_d more
-  entry_step_d: 1             # in spread units
+  entry_time_spacing: 60s          # a same-side entry sooner than this needs entry_step_spacing more
+  entry_step_spacing: 1             # in spread units
   completion_window: 5s       # after an entry batch is sent, its short leg may still be completed this long
   forced_slip_bps: 10         # forced exits and trims give up this much past the best price, of each leg's price
   forced_exit_before_close: 1m
@@ -2176,9 +2176,9 @@ func (s *Store) LoadState(ctx context.Context, sessionID string) (State, error) 
 
 1. **信号**：两腿取价档价算出的 x 越过入场线。做多 x ≤ −entry_in·σ，做空 x ≥ entry_in·σ。
 2. **成本**：(entry_in − entry_out)·σ ≥ C + m。
-3. **间距**（PRD 5，`entry_spacing` 60 s / `entry_step_d` 1 单位）：
+3. **间距**（PRD 5，`entry_time_spacing` 60 s / `entry_step_spacing` 1 单位）：
    - “上一批”是上一次发出薄腿单的那一批，不论它怎样结束（第 93 条第 5 点）。
-   - 同方向的下一批要满足其一：离上一批的决策时刻已过 `entry_spacing`；或者 x 比上一批的 x_dec 再深 `entry_step_d`。
+   - 同方向的下一批要满足其一：离上一批的决策时刻已过 `entry_time_spacing`；或者 x 比上一批的 x_dec 再深 `entry_step_spacing`。
    - 一批之内的补单不改“上一批”。
 4. **一次只有一批在配平**：有一批在 `thin` 或 `pair` 状态时，不开新批，到线出场也等它结束。停止和强平接管整轮（12.4 第 2 条）。
 

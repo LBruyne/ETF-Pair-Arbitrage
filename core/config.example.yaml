@@ -50,8 +50,8 @@ strategy:
   pricing_level: { bull: 2, bear: 5 }   # per leg, 1 to 5: the N-th level of the book as received (1 = the best) on the side an entry or a line exit takes. Its price is the order's limit and the leg's price in the spread; levels 1 to N are the quantity counted. A side with fewer than N levels gives no such order
   take_ratio: "0.5"           # the share of the quantity down to that level one batch takes
   min_batch_notional: "100"  # USDT, both legs together at their limit prices: a smaller entry batch is not sent
-  entry_spacing: 60s          # a same-side entry sooner than this needs entry_step_d more
-  entry_step_d: 1             # in spread units
+  entry_time_spacing: 60s     # a same-side entry sooner than this needs entry_step_spacing more (owner item 105: was entry_spacing)
+  entry_step_spacing: 1       # in spread units (was entry_step_d)
   completion_window: 5s       # this long after a batch is sent, its short leg may still be completed; later it is trimmed back. Used only while exec.thin_leg is ""
   forced_slip_bps: 10         # forced exits and trims give up this much past the best price, of each leg's price
   forced_exit_before_close: 1m   # positions are closed this long before the regular close

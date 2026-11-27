@@ -40,9 +40,9 @@ type Config struct {
 	// MinBatchNotional is the least an entry batch may be worth, both legs together at their limit prices, in USDT.
 	MinBatchNotional decimal.Decimal `yaml:"min_batch_notional"`
 
-	EntrySpacing     time.Duration `yaml:"entry_spacing"`     // a same-side entry sooner than this after the last one needs EntryStepD more
-	EntryStepD       float64       `yaml:"entry_step_d"`      // that extra deviation, in spread units
-	CompletionWindow time.Duration `yaml:"completion_window"` // how long after a batch is sent its short leg may still be completed
+	EntryTimeSpacing time.Duration `yaml:"entry_time_spacing"` // a same-side entry sooner than this after the last one needs EntryStepSpacing more
+	EntryStepSpacing float64       `yaml:"entry_step_spacing"` // that extra deviation, in spread units
+	CompletionWindow time.Duration `yaml:"completion_window"`  // how long after a batch is sent its short leg may still be completed
 
 	ForcedSlipBps         float64       `yaml:"forced_slip_bps"`          // forced exits and trims price this far past the best price, of each leg's price
 	ForcedExitBeforeClose time.Duration `yaml:"forced_exit_before_close"` // positions are closed this long before the regular close
@@ -64,8 +64,8 @@ var DefaultConfig = Config{
 	PricingLevel:          LegLevels{Bull: 2, Bear: 5},
 	TakeRatio:             decimal.RequireFromString("0.5"),
 	MinBatchNotional:      decimal.RequireFromString("100"),
-	EntrySpacing:          60 * time.Second,
-	EntryStepD:            1,
+	EntryTimeSpacing:      60 * time.Second,
+	EntryStepSpacing:      1,
 	CompletionWindow:      5 * time.Second,
 	ForcedSlipBps:         10,
 	ForcedExitBeforeClose: time.Minute,
@@ -162,11 +162,11 @@ func (c Config) Validate() error {
 	if !c.TakeRatio.IsPositive() || c.TakeRatio.GreaterThan(decimal.NewFromInt(1)) {
 		errs = append(errs, fmt.Errorf("strategy.take_ratio must be above 0 and at most 1, got %s", c.TakeRatio))
 	}
-	if c.EntrySpacing < 0 {
-		errs = append(errs, fmt.Errorf("strategy.entry_spacing must not be negative, got %s", c.EntrySpacing))
+	if c.EntryTimeSpacing < 0 {
+		errs = append(errs, fmt.Errorf("strategy.entry_time_spacing must not be negative, got %s", c.EntryTimeSpacing))
 	}
-	if !(c.EntryStepD >= 0) {
-		errs = append(errs, fmt.Errorf("strategy.entry_step_d must not be negative, got %v", c.EntryStepD))
+	if !(c.EntryStepSpacing >= 0) {
+		errs = append(errs, fmt.Errorf("strategy.entry_step_spacing must not be negative, got %v", c.EntryStepSpacing))
 	}
 	if c.CompletionWindow <= 0 {
 		errs = append(errs, fmt.Errorf("strategy.completion_window must be positive, got %s", c.CompletionWindow))

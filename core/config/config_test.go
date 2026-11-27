@@ -171,6 +171,12 @@ func TestLoad(t *testing.T) {
 		{name: "the old d_out is refused", edits: []edit{{"  entry_out: -0.5 ", "  d_out: -0.5 "}}, env: envFull,
 			wantErr: []string{"field d_out not found"}},
 
+		// Owner item 105: entry_spacing and entry_step_d were renamed; the old keys are refused, not read.
+		{name: "the old entry_spacing is refused", edits: []edit{{"  entry_time_spacing: 60s ", "  entry_spacing: 60s "}}, env: envFull,
+			wantErr: []string{"field entry_spacing not found"}},
+		{name: "the old entry_step_d is refused", edits: []edit{{"  entry_step_spacing: 1 ", "  entry_step_d: 1 "}}, env: envFull,
+			wantErr: []string{"field entry_step_d not found"}},
+
 		// Owner items 96-97: nav_settle_delay gave way to nav_watch; the old key is refused, not read.
 		{name: "the old nav_settle_delay is refused", edits: []edit{{"  nav_watch: 1h ", "  nav_settle_delay: 1h "}}, env: envFull,
 			wantErr: []string{"field nav_settle_delay not found"}},
