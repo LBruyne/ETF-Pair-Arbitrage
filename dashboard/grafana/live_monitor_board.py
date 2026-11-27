@@ -235,7 +235,8 @@ def or_say(q, names, column, message):
     """q, or when it returns no row one row that says so in its column (owner item 78: no empty panel that only shows –; a
     table's no-value text would also fill its empty cells, so the row carries it)."""
     cells = ", ".join(("'%s'" % message if n == column else "NULL") + ' AS "%s"' % n for n in names)
-    return "SELECT * FROM (%s) z\nUNION ALL SELECT %s WHERE NOT EXISTS (%s)" % (q, cells, q)
+    # q runs once (owner item 99): its rows are kept and the message row asks only whether there were any (4.4 ran q twice).
+    return "WITH z AS MATERIALIZED (%s)\nSELECT * FROM z\nUNION ALL SELECT %s WHERE NOT EXISTS (SELECT 1 FROM z)" % (q, cells)
 
 
 # The charts: drawn on the time picker's axis (so a drag zooms them), with the Run's seconds inside the Range only.
@@ -837,8 +838,14 @@ def word_codes(words, colors=None):
     return code_texts({i + 1: w for i, w in enumerate(words.values())}, colors)
 
 
+# Speed (owner item 99, 2026-11-27): the decisions every marker looks up (the next exit, the pair steps of its lot, the
+# exit_pair steps after an exit, the trims and completions sent for it) and the orders of the entries' lots are read once,
+# each into a small materialised set (dk, nx, pfd, xp, tc, lo), and each marker reads its orders by their key: on a round
+# trip of 21,465 exit_pair steps and 21,802 orders (11-27 02:48–11:43) every marker had scanned both tables (decision has
+# no index on cycle_id or lot_id): 2.4 s for that Run's markers, now about 0.1 s. The figures are those of the per-marker
+# lookups before (the same rows, the same aggregates).
 MARKERS = sql("""
-m0 AS (
+m00 AS MATERIALIZED (
   SELECT d.ts_ms, d.run_id, (d.detail ->> 'x_d')::float8 AS x, (d.detail ->> 'mu_d')::float8 AS mu,
          CASE WHEN d.kind = 'entry' AND l.status = 'void' AND l.es IN @UNWOUND@ THEN CASE d.direction WHEN 'short' THEN 13 ELSE 12 END
               WHEN d.kind = 'entry' AND l.status = 'void' THEN CASE d.direction WHEN 'short' THEN 7 ELSE 6 END
@@ -848,13 +855,27 @@ m0 AS (
          CASE WHEN c.status = 'open' THEN @OPEN@ WHEN NOT c.funding_known THEN @PENDING@ ELSE c.net END AS cycle_net, c.opened_ms AS exec_ms,
          coalesce(d.detail -> 'client_order_ids', jsonb_build_array(d.detail ->> 'client_order_id')) AS ids,
          d.live, d.cycle_id, d.lot_id, d.kind, d.detail,
-         CASE WHEN d.kind = 'entry' THEN coalesce(l.es, CASE WHEN d.detail ? 'thin_leg' AND l.status = 'building' THEN 'pairing' END) END AS batch_end,
-         (SELECT min(n.ts_ms) FROM trade.decision n WHERE n.live = d.live AND n.cycle_id = d.cycle_id AND n.kind IN ('exit', 'forced') AND n.ts_ms > d.ts_ms) AS next_ms
+         CASE WHEN d.kind = 'entry' THEN coalesce(l.es, CASE WHEN d.detail ? 'thin_leg' AND l.status = 'building' THEN 'pairing' END) END AS batch_end
   FROM trade.decision d
   LEFT JOIN LATERAL (SELECT x.status, coalesce(to_jsonb(x) ->> 'end_state', CASE WHEN x.status = 'void' THEN x.void_reason END) AS es
                      FROM trade.lot x WHERE x.live = d.live AND x.lot_id = d.lot_id) l ON true
   LEFT JOIN trade.cycle c ON c.live = d.live AND c.cycle_id = d.cycle_id
   WHERE @RUN_D@ AND d.kind IN @KINDS@ AND d.ts_ms >= @CHART_FROM@ AND d.ts_ms <= @CHART_TO@),
+dk AS MATERIALIZED (
+  SELECT f.ts_ms, f.cycle_id, f.kind, f.reason, f.detail FROM (SELECT DISTINCT m00.live, m00.cycle_id FROM m00) x
+  JOIN trade.decision f ON f.live = x.live AND f.cycle_id = x.cycle_id WHERE f.kind IN ('exit', 'forced', 'exit_pair', 'trim', 'complete')),
+nx AS MATERIALIZED (SELECT dk.cycle_id, dk.ts_ms FROM dk WHERE dk.kind IN ('exit', 'forced')),
+pfd AS MATERIALIZED (
+  SELECT f.lot_id, f.ts_ms, f.reason, f.detail FROM (SELECT DISTINCT m00.live, m00.lot_id FROM m00 WHERE m00.kind = 'entry') y
+  JOIN trade.decision f ON f.live = y.live AND f.lot_id = y.lot_id WHERE f.kind = 'pair'),
+tc AS MATERIALIZED (SELECT dk.cycle_id, (dk.detail ->> 'batch_sent_ms')::bigint AS sent_ms, dk.detail ->> 'client_order_id' AS id
+                    FROM dk WHERE dk.kind IN ('trim', 'complete')),
+xp AS MATERIALIZED (SELECT dk.cycle_id, dk.ts_ms, dk.reason, dk.detail, dk.detail ->> 'client_order_id' AS id FROM dk
+                    WHERE dk.kind = 'exit_pair' AND dk.cycle_id IN (SELECT m00.cycle_id FROM m00 WHERE m00.kind = 'exit')),
+lo AS MATERIALIZED (SELECT o.lot_id, o.client_order_id FROM trade.cex_order o
+                    WHERE @RUN_O@ AND o.lot_id IN (SELECT m00.lot_id FROM m00 WHERE m00.kind = 'entry')),
+m0 AS (
+  SELECT m00.*, (SELECT min(nx.ts_ms) FROM nx WHERE nx.cycle_id = m00.cycle_id AND nx.ts_ms > m00.ts_ms) AS next_ms FROM m00),
 m AS (
   SELECT m0.ts_ms, m0.run_id, m0.action, m0.cycle_net, m0.exec_ms, coalesce(m0.mu + m0.x, n.mid) AS ys, coalesce(m0.x, n.dev) AS yd, o.*,
          @BATCH_END@ AS batch_end, @BATCH_WHY@ AS batch_why, pf.d_ideal, pf.cap, pf.paired_ms,
@@ -872,12 +893,12 @@ m AS (
               FILTER (WHERE f.detail ->> 'action' IN ('risk_exit', 'done') AND f.detail ? 'd_ideal'))[1] AS d_ideal,
            (array_agg((f.detail ->> 'vwap_cap')::numeric ORDER BY f.ts_ms DESC) FILTER (WHERE (f.detail ->> 'vwap_cap')::numeric > 0))[1] AS cap,
            max(f.ts_ms) FILTER (WHERE f.detail ->> 'action' = 'done') - min((f.detail ->> 'first_fill_ms')::bigint) AS paired_ms
-    FROM trade.decision f WHERE f.live = m0.live AND f.lot_id = m0.lot_id AND f.kind = 'pair') pf ON m0.kind = 'entry'
+    FROM pfd f WHERE m0.kind = 'entry' AND f.lot_id = m0.lot_id) pf ON m0.kind = 'entry'
   LEFT JOIN LATERAL (
     SELECT (array_agg(f.detail ->> 'action' ORDER BY f.ts_ms DESC) FILTER (WHERE f.detail ->> 'action' IN ('done', 'no_fill', 'hand_over')))[1] AS end_action,
            (array_agg(nullif(f.reason, '') ORDER BY f.ts_ms DESC) FILTER (WHERE f.detail ->> 'action' IN ('done', 'no_fill', 'hand_over')))[1] AS hard,
            (array_agg((f.detail ->> 'actual_net')::numeric ORDER BY f.ts_ms DESC) FILTER (WHERE f.detail ? 'actual_net'))[1] AS actual
-    FROM trade.decision f WHERE f.live = m0.live AND f.cycle_id = m0.cycle_id AND f.kind = 'exit_pair' AND f.ts_ms >= m0.ts_ms
+    FROM xp f WHERE m0.kind = 'exit' AND f.cycle_id = m0.cycle_id AND f.ts_ms >= m0.ts_ms
       AND f.ts_ms < coalesce(m0.next_ms, @NO_END@)) ef ON m0.kind = 'exit'
   CROSS JOIN LATERAL (
     SELECT sum(o.cum_exec_qty) FILTER (WHERE o.leg = 'bull' AND NOT o.undo) AS q_bull, sum(o.cum_exec_value) FILTER (WHERE o.leg = 'bull' AND NOT o.undo) AS v_bull,
@@ -885,13 +906,13 @@ m AS (
            count(*) FILTER (WHERE o.leg = 'bull' AND NOT o.undo) AS n_bull, count(*) FILTER (WHERE o.leg = 'bear' AND NOT o.undo) AS n_bear,
            sum(o.cum_exec_qty) FILTER (WHERE o.leg = 'bull' AND o.undo) AS t_bull, sum(o.cum_exec_qty) FILTER (WHERE o.leg = 'bear' AND o.undo) AS t_bear,
            sum(o.fee) AS fee, bool_or(o.cum_exec_qty > 0 AND NOT o.fee_known) AS fee_pending
-    FROM (SELECT o.*, o.purpose = 'trim' AS undo FROM trade.cex_order o WHERE @RUN_O@ AND (o.client_order_id IN (SELECT jsonb_array_elements_text(m0.ids))
-      OR m0.kind = 'entry' AND o.lot_id = m0.lot_id
-      OR o.client_order_id IN (
-        SELECT f.detail ->> 'client_order_id' FROM trade.decision f
-        WHERE f.live = m0.live AND f.cycle_id = m0.cycle_id AND (f.kind IN ('trim', 'complete') AND (f.detail ->> 'batch_sent_ms')::bigint = m0.ts_ms
-          OR m0.kind = 'exit' AND f.kind = 'exit_pair' AND f.ts_ms >= m0.ts_ms AND f.ts_ms < coalesce(m0.next_ms, @NO_END@))))) o) o)""",
-              RUN_D=of_run("d"), RUN_S=of_run("s"), RUN_O=of_mode("o"), CHART_FROM=CHART_FROM, CHART_TO=CHART_TO, KINDS="(%s)" % ", ".join("'%s'" % k for k in DECISION_KINDS),
+    FROM (SELECT jsonb_array_elements_text(m0.ids) AS id
+          UNION SELECT lo.client_order_id FROM lo WHERE m0.kind = 'entry' AND lo.lot_id = m0.lot_id
+          UNION SELECT tc.id FROM tc WHERE tc.cycle_id = m0.cycle_id AND tc.sent_ms = m0.ts_ms
+          UNION SELECT xp.id FROM xp WHERE m0.kind = 'exit' AND xp.cycle_id = m0.cycle_id AND xp.ts_ms >= m0.ts_ms
+                                       AND xp.ts_ms < coalesce(m0.next_ms, @NO_END@)) i
+    CROSS JOIN LATERAL (SELECT o.*, o.purpose = 'trim' AS undo FROM trade.cex_order o WHERE @RUN_O@ AND o.client_order_id = i.id) o) o)""",
+              RUN_D=of_run("d"), RUN_S=of_run("s"), RUN_O=of_mode("o"), RLIVE=RLIVE, CHART_FROM=CHART_FROM, CHART_TO=CHART_TO, KINDS="(%s)" % ", ".join("'%s'" % k for k in DECISION_KINDS),
               OPEN=str(OPEN), PENDING=str(PENDING), UNWOUND="(%s)" % ", ".join("'%s'" % k for k in UNWOUND_ENDS), NO_END=NO_END_MS,
               BATCH_END=coded_word("m0.batch_end", BATCH_ENDS), BATCH_WHY=coded_word("pf.why", BATCH_WHY), STAGE=coded_word("m0.detail ->> 'line'", EXIT_STAGES),
               NO_FILL_CLOSE=str(list(THICK_CLOSES).index("no_fill") + 1),
@@ -1313,8 +1334,24 @@ ORDER_STEP = sql("""coalesce('Batch ' || l.seq || ' · ', '') || CASE
   WHEN k.kind = 'exit' THEN @LINE@ || CASE WHEN k.thin THEN ' · Thin' ELSE '' END
   WHEN k.kind = 'exit_pair' THEN @LINE@ || CASE k.action WHEN 'hard_close' THEN ' · Hard Close' ELSE ' · Thick' END
   ELSE initcap(replace(coalesce(k.kind, o.purpose), '_', ' ')) END""", LINE=LINE_WORD)
+# Each order's first decision (the one that names it: detail.client_order_id, or an element or key of client_order_ids, as
+# jsonb ? matches) among the round trip's decisions of the Run's mode, earliest first: read once for the round trip and
+# joined by the order's id (owner item 99: one lookup per order over the round trip's decisions took more than the 15 s
+# timeout on the 21,802 orders of 11-27 02:48).
+ORDER_DECISION = """ko AS (
+  SELECT DISTINCT ON (x.id) x.id, k.kind, k.detail ->> 'action' AS action, k.detail ->> 'line' AS line, k.detail ? 'thin_leg' AS thin
+  FROM (SELECT DISTINCT o.live, o.cycle_id FROM trade.cex_order o WHERE %s AND o.cycle_id = {cycle}) oc
+  JOIN trade.decision k ON k.live = oc.live AND k.cycle_id = oc.cycle_id
+  CROSS JOIN LATERAL (
+    SELECT k.detail ->> 'client_order_id' AS id
+    UNION ALL SELECT e #>> '{{}}' FROM jsonb_array_elements(CASE WHEN jsonb_typeof(k.detail -> 'client_order_ids') = 'array' THEN k.detail -> 'client_order_ids' END) e
+              WHERE jsonb_typeof(e) = 'string'
+    UNION ALL SELECT jsonb_object_keys(CASE WHEN jsonb_typeof(k.detail -> 'client_order_ids') = 'object' THEN k.detail -> 'client_order_ids' END)
+    UNION ALL SELECT k.detail ->> 'client_order_ids' WHERE jsonb_typeof(k.detail -> 'client_order_ids') = 'string') x
+  WHERE x.id IS NOT NULL
+  ORDER BY x.id, k.ts_ms)""" % of_mode("o")
 Q_ORDERS = or_say(sql("""
-WITH @SEL@
+WITH @SEL@, @KO@
 SELECT to_timestamp(o.submitted_ms / 1000.0) AS "Time", initcap(o.purpose) AS "Purpose", @STEP@ AS "Step", CASE o.leg WHEN 'bull' THEN '$bull' ELSE '$bear' END AS "Leg",
        initcap(o.side) || CASE WHEN o.reduce_only THEN ' · RO' ELSE '' END AS "Side", o.qty AS "Qty", o.cum_exec_qty AS "Filled",
        @LIMIT@ AS "Limit", @AVG@ AS "Avg", CASE WHEN o.cum_exec_qty = 0 THEN NULL WHEN NOT o.fee_known THEN @FEE_PENDING@ ELSE o.fee END AS "Fee",
@@ -1323,13 +1360,11 @@ SELECT to_timestamp(o.submitted_ms / 1000.0) AS "Time", initcap(o.purpose) AS "P
             WHEN o.status = 'cancelled' THEN 'No Fill' WHEN o.status IN ('pending', 'acked') THEN 'Working'
             ELSE initcap(replace(o.status, '_', ' ')) END || coalesce(' · ' || nullif(concat_ws(' ', o.error_code, o.error_message), ''), '') AS "Status"
 FROM trade.cex_order o
-LEFT JOIN LATERAL (SELECT k.kind, k.detail ->> 'action' AS action, k.detail ->> 'line' AS line, k.detail ? 'thin_leg' AS thin FROM trade.decision k
-                   WHERE k.live = o.live AND k.cycle_id = o.cycle_id
-                     AND (k.detail ->> 'client_order_id' = o.client_order_id OR k.detail -> 'client_order_ids' ? o.client_order_id)
-                   ORDER BY k.ts_ms LIMIT 1) k ON true
+LEFT JOIN ko k ON k.id = o.client_order_id
 LEFT JOIN trade.lot l ON l.live = o.live AND l.lot_id = o.lot_id
 WHERE @RUN_O@ AND o.cycle_id = @CYCLE@ ORDER BY o.submitted_ms, o.client_order_id""",
-               SEL=SEL, RUN_O=of_mode("o"), CYCLE=CYCLE, FEE_PENDING=str(FEE_PENDING), LIMIT=leg_price("o.price"), AVG=leg_price("o.avg_price"), STEP=ORDER_STEP),
+               SEL=SEL, RUN_O=of_mode("o"), CYCLE=CYCLE, FEE_PENDING=str(FEE_PENDING), LIMIT=leg_price("o.price"), AVG=leg_price("o.avg_price"), STEP=ORDER_STEP,
+               KO=ORDER_DECISION.format(cycle=CYCLE)),
                   ['Time', 'Purpose', 'Step', 'Leg', 'Side', 'Qty', 'Filled', 'Limit', 'Avg', 'Fee', 'Latency', 'Status'], 'Status', 'No order: no round trip in the Range')
 
 # -------------------------------------------------------------------------------------------------------------- Inventory
