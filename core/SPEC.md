@@ -2665,7 +2665,7 @@ func (m *Manager) onPairTick(now time.Time) {
 
 **10.6 / 10.7 实现时的取舍**（提交 `2e27f77`、`43be9b2`；lead 认可）：
 1. **重启后的 x_ref**：补单当时的 x 不在订单记录里。重启前有补单成交过的批，重启后不再补，按停新仓处理，配平照常。
-2. **出场批中重启**：决策时价差、D1 和保护价不在订单记录里。所以重启后价差止损不生效；厚腿按保本界限等，最长等到 30 s 时窗再硬平。恢复的批不知道属于哪条线，之后厚腿的成交不计入 H。
+2. **出场批中重启**：决策时价差、D1 和保护价不在订单记录里。（已由下面“第 100 条”第 3 点取代：从这一批的 `kind='exit'` 决策读回；只有读不到时才照这里的做法：价差止损不生效，厚腿按保本界限等，最长等到 30 s 时窗再硬平，之后厚腿的成交不计入 H。）
 3. **重启后的 FirstFill** 取薄腿订单的 `final_ms`。实盘中它和执行循环用的是同一个本机时钟。
 4. **回吐的第一张单**要等薄腿上一张单满 200 ms（同一条腿的间隔），不在薄腿成交的那一拍发出。
 5. **配平期间均值重新预热**时，用最近一次就绪的统计（与 PRD 9.7 相同）。
@@ -2682,10 +2682,33 @@ func (m *Manager) onPairTick(now time.Time) {
 10. **一点没配上、只剩零头的批**：记 `unwound_stop`，原因为 too_small，零头照第 47 条记下。这一条推翻了 10.4 的 `built`。
 
 **首次实盘之后的修复**（2026-11-27，`befe3cb`、`402cd43`；PRD 5.22；证据 `experiments/live_thin_first_20261127/timeline.txt`）：
-1. `strategy.Reducible`：只减仓单以交易所净持仓（持有量加上反号零头）为上限。用于 ExitInput 和 ExitPairInput 的 Hold、强平（`positionHold` 和 `forcedExit`）、回吐（`GapInput.Dust`），以及配平中的 unwind 和盈利平（`PairInput.Dust`）。
+1. `strategy.Reducible`：只减仓单以**账本推算的净额**（持有量加上反号零头，零头是账本记下的）为上限。用于 ExitInput 和 ExitPairInput 的 Hold、强平（`positionHold` 和 `forcedExit`）、回吐（`GapInput.Dust`），以及配平中的 unwind 和盈利平（`PairInput.Dust`）。它是推算，不是交易所读回的持仓；两者只在数量拒单之后才合用（下面“第 100 条”第 1 点）。
 2. `strategy.ExitThickTarget`：出场厚腿目标按整轮累计取整；薄腿平完时平掉厚腿剩下的全部。`ExitPairInput.Before` 由 exec 的 `closedBefore` 给出。
 3. `watchRejects` / `rejectAlarm`：同一条腿连续 3 次拒单报警，之后每 `stop_alarm_after` 重复一次；事件 kind 为 `orders_rejected`。
 4. 11-27 11:43:02–23 重启后发出的 7.8 份单，来自回吐（`gapInput` 用的是 `c.Hold()`），不是 restoreExit。
+
+**审计意见（第 100 条，`experiments/live_thin_first_20261127/AUDIT_live1.md`）之后的修复**（工作树，未提交；PRD 5.22）：
+1. **数量拒单改变下一步**（审计一.3）：
+   - `cex.ErrorReduceQty`：Bitget 的 40804（WS）和 25231（REST）归为这一类（`bitget.reduceQtyCodes`）；其他拒单不变。这一类只在内存里，`cex_order` 没有它的列，重启前的拒单不算。
+   - `lastQtyRefusal`：一条腿最近一张只减仓单是这一类拒单。之后这条腿有了别的结果（成交、撤单、其他拒单）就失效。
+   - `readAfterRefusal`（`step` 里，`noteBatchDone` 之后）：拒单之后还没有收到过持仓（`Positions().ReceivedAt` 早于拒单的 `FinalAt`）时，调 `readPositions` 读一次，这一拍以 `positions_read` 结束；距上次读不到 `positionsRead`（1 s）时不读，这一拍照常往下走。
+   - `venueReducible`：拒单之后到达的持仓里，这条腿在这一轮方向上的净持仓（另一方向记 0）。这是交易所读回的证据。
+   - `reducibleHold(r)` = min(`ledgerReducible`, `venueReducible`)，用于出场（ExitInput、ExitPairInput 的 Hold）和强平；`ledgerReducible` 就是原来的 `strategy.Reducible`，`restoreExit` 用它。
+   - `reduceQty`：每一张只减仓单发出前（回吐、按持仓回吐、强平、出场两腿、出场薄腿、出场厚腿、配平中的盈利平和 unwind）取 min(策略数量, 交易所可减量)；结果等于被拒的数量，或交易所不收（`Sendable`），这张单不发，等待原因 `qty_refused`（新增，`strategy.ReasonQtyRefused`），报警照常（`watchRejects` 的连续拒单没有被别的结果打断）。另一条腿照常发。出场薄腿被挡时这一批不发（厚腿不先于薄腿）；两腿一起出场时被挡的那条腿不发、另一条照发。
+   - `maySend` 仍只挡价格类拒单（同一价格不重发）和 200 ms 间隔；数量类在 `reduceQty` 里挡。
+   - 测试：`exec/refusal_test.go`（7.80 被拒 → 读到 7.79 → 下一张 7.79；交易所仍显示 7.80 时不再发 7.80，例行核对读到 7.79 后发 7.79；强平中 SOXL 被挡、SOXS 照发）。
+2. **报警到达值班端**（审计一.3 末尾）：`orders_rejected` 是 `trade.event` 里 level `error` 的一行（module `exec`），带 run_id 和 live，Live Monitor 的 Alerts 面板（`dashboard/grafana/live_monitor_board.py` 的 `Q_ALERTS`，最后一个 UNION 分支：这一 Run 的 error / warn 事件）把它列为 critical、Open、来源 `Program · exec`、What `Orders Rejected`；同时写一条 Error 日志。`TestRefusalAlarmReachesTheAlerts` 在开发库上按面板的条件查这一行。看板没有改；它的 IDLE 表里还没有 `qty_refused`，这个原因暂时按原码显示为 Blocked，不进 Alerts 的 held entries（报警由上面的事件给出）。
+3. **出场批重启保留出场规则**（审计一.4）：
+   - `store.State.ExitDecision`：未结束这一轮最后一行 `kind='exit'` 的决策；`main` 交给 `RestoreExitDecision`。
+   - `restoreExitRules`：决策的 `client_order_ids` 含接回的批的薄腿单时，还原 line、d1、protect、d_dec、expected_net，以及 `anchor_kind`、`anchor_bull`、`anchor_bear`、`f`（`ExitBatch.DecisionAnchors/DecisionF`），`batchState.line` 同步。
+   - exit1 的批：`sendThinExit` 在决策里记 `stage_closed_bull` / `stage_closed_bear`（这一批开始时 H 已平的量）；重启后以它为基数，H 的进度 = 基数 + 这一批的实际成交，重启前已计入的只算一次。旧决策没有这两项时，基数取存下的已平量减去这一批已有的成交。
+   - 读不到决策时照 10.6 / 10.7 第 2 点。
+   - 测试：`exec/restore_exit_test.go`（D1 的批 10 s 后重启，SOXL 仍以保护价 40.38 为界发出，不等保本价；exit1 的批重启后 SOXL 52.65 计入 H，SOXS 35.10 不重复计，H 为 35.10 / 52.65）；`store` 的 LoadState 测试读回最后一行出场决策。
+4. **热路径**（审计四）：每一拍的成本在 2 万张单的一轮里从 1.38 s 降到 12 ms（`BenchmarkRound`，20 张单时 48 µs → 33 µs；每拍的内存分配次数与订单数无关）。
+   - `orderIn` 在按 id 排好序的快照上二分查找。原来逐个比较并复制整条记录，每拍对批里每张单各做一次，是平方级。
+   - `cex` 按这一轮维护按 id 排序的订单列表（`orderStore.byCycle`）；`CycleOrders` 只复制这一轮的记录，不扫别的轮、不排序。
+   - `watchRejects` 从游标处二分开始；`closedBefore` 到批的薄腿单为止；`refreshExit` 和 `inventory.heldAt` 跳过零成交的单。
+   - 账本语义不变；剩下的成本（复制这一轮的快照、几次线性扫描）与订单数成正比，约 0.6 µs 一张。
 
 **上线前独立审查之后的修复**（`experiments/seq_taker_design_20261126/REVIEW_10_10.md`，提交 `e8bf4f6`；PRD 5.9、5.21）：
 1. D_ideal（入场与出场）按这一批**决定时的锚点和 F** 计算：`PairBatch.DecisionAnchors/DecisionF`、`ExitBatch.DecisionAnchors/DecisionF`、`decisionBasis`。P\*、x 和界限照旧用当前的锚点。重启时从 `State.EntryDecision`（还在 building 的 lot 最近一行 `kind='entry'` 决策的 detail：`anchor_bull`、`anchor_bear`、`f`）读回；读不到就用当前值，并记一条警告。
