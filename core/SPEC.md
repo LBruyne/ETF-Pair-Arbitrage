@@ -2681,6 +2681,12 @@ func (m *Manager) onPairTick(now time.Time) {
    - `trade.lot.end_state` 记五种结束状态。
 10. **一点没配上、只剩零头的批**：记 `unwound_stop`，原因为 too_small，零头照第 47 条记下。这一条推翻了 10.4 的 `built`。
 
+**首次实盘之后的修复**（2026-11-27，`befe3cb`、`402cd43`；PRD 5.22；证据 `experiments/live_thin_first_20261127/timeline.txt`）：
+1. `strategy.Reducible`：只减仓单以交易所净持仓（持有量加上反号零头）为上限。用于 ExitInput 和 ExitPairInput 的 Hold、强平（`positionHold` 和 `forcedExit`）、回吐（`GapInput.Dust`），以及配平中的 unwind 和盈利平（`PairInput.Dust`）。
+2. `strategy.ExitThickTarget`：出场厚腿目标按整轮累计取整；薄腿平完时平掉厚腿剩下的全部。`ExitPairInput.Before` 由 exec 的 `closedBefore` 给出。
+3. `watchRejects` / `rejectAlarm`：同一条腿连续 3 次拒单报警，之后每 `stop_alarm_after` 重复一次；事件 kind 为 `orders_rejected`。
+4. 11-27 11:43:02–23 重启后发出的 7.8 份单，来自回吐（`gapInput` 用的是 `c.Hold()`），不是 restoreExit。
+
 **上线前独立审查之后的修复**（`experiments/seq_taker_design_20261126/REVIEW_10_10.md`，提交 `e8bf4f6`；PRD 5.9、5.21）：
 1. D_ideal（入场与出场）按这一批**决定时的锚点和 F** 计算：`PairBatch.DecisionAnchors/DecisionF`、`ExitBatch.DecisionAnchors/DecisionF`、`decisionBasis`。P\*、x 和界限照旧用当前的锚点。重启时从 `State.EntryDecision`（还在 building 的 lot 最近一行 `kind='entry'` 决策的 detail：`anchor_bull`、`anchor_bear`、`f`）读回；读不到就用当前值，并记一条警告。
 2. `PairInput.TopUpBlocked`：有 PRD 5.10 的任一种不开仓情形或正在预热时，这一拍不补单。不算“本批已不能再补”。
