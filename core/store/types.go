@@ -437,6 +437,13 @@ type State struct {
 	// holds the anchors and F the decision's spread was taken under. nil when
 	// no lot is building or its decision was not written.
 	EntryDecision *DecisionRow
+	// ExitDecision is the unfinished cycle's last exit decision (kind
+	// exit): an exit batch taken up from its orders after a restart reads
+	// its rules from it - the line, D1 and the protection, the decision's
+	// spread with its anchors and F, and the half target's closed
+	// quantities at the batch's start - when its client_order_ids hold the
+	// batch's thin order. nil when the cycle has none.
+	ExitDecision *DecisionRow
 
 	// What the ledger needs beyond the unfinished cycle.
 	Funding        []FundingRow // every funding record booked, oldest first: a record is booked once, by its record_id

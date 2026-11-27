@@ -301,6 +301,24 @@ DO $$ BEGIN
     IF to_regclass('trade.cex_order_cycle_idx') IS NULL THEN
         CREATE INDEX cex_order_cycle_idx ON trade.cex_order (live, cycle_id);
     END IF;
+    -- For the Live Monitor's per-round lookups (dashboard/SPEC.md 7, 4.4.1);
+    -- the tables are small (26k decisions on 2026-11-27), so building them at
+    -- the start takes well under a second.
+    IF to_regclass('trade.cex_order_lot_idx') IS NULL THEN
+        CREATE INDEX cex_order_lot_idx ON trade.cex_order (live, lot_id);
+    END IF;
+    IF to_regclass('trade.decision_cycle_idx') IS NULL THEN
+        CREATE INDEX decision_cycle_idx ON trade.decision (live, cycle_id);
+    END IF;
+    IF to_regclass('trade.decision_lot_idx') IS NULL THEN
+        CREATE INDEX decision_lot_idx ON trade.decision (live, lot_id);
+    END IF;
+    IF to_regclass('trade.decision_ts_idx') IS NULL THEN
+        CREATE INDEX decision_ts_idx ON trade.decision (live, ts_ms);
+    END IF;
+    IF to_regclass('trade.event_ts_idx') IS NULL THEN
+        CREATE INDEX event_ts_idx ON trade.event (live, ts_ms);
+    END IF;
 END $$;
 
 -- cex_order: the rest of an order's timestamps, for measuring where its time

@@ -592,7 +592,8 @@ func tablesOf(rows []statement) string {
 // session) with its lots and orders, the inventory state, the minute bars
 // and anchor facts of sessionID, the last lot that was built (or, with the
 // thin leg first, that sent its thin order), the unfinished cycle's half
-// target of exit1 and the entry decision of its lot still building, and
+// target of exit1, its last exit decision and the entry decision of its
+// lot still building, and
 // what the ledger needs beside the cycle: the funding
 // records booked and the finished cycles whose funding is not known yet.
 // main calls it before any manager runs.
@@ -623,6 +624,13 @@ func (s *Store) LoadState(ctx context.Context, sessionID string) (State, error) 
 		}
 		if len(stages) == 1 {
 			st.ExitStage = &stages[0]
+		}
+		exits, err := load[DecisionRow](ctx, s.pool, "live = $1 AND kind = 'exit' AND cycle_id = $2 ORDER BY ts_ms DESC LIMIT 1", live, st.Cycle.CycleID)
+		if err != nil {
+			return st, err
+		}
+		if len(exits) == 1 {
+			st.ExitDecision = &exits[0]
 		}
 		for _, lot := range st.Lots {
 			if lot.Status != "building" {

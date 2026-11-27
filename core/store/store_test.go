@@ -1043,6 +1043,29 @@ func TestLoadStateThinLegFirst(t *testing.T) {
 	if e := st.EntryDecision; e == nil || e.LotID != "c-thin-4" || e.Kind != "entry" || e.TsMs != 8000 || !strings.Contains(string(e.Detail), `"f": "0.998685"`) {
 		t.Errorf("entry decision %+v, want c-thin-4's entry with its detail", st.EntryDecision)
 	}
+	if st.ExitDecision != nil {
+		t.Errorf("exit decision %+v, want none: the cycle has no exit decision", st.ExitDecision)
+	}
+
+	// The cycle's last exit decision is read back (the restore of an exit
+	// batch matches it to the batch's thin order); another cycle's and the
+	// other mode's are not.
+	if err := s.WriteSync(
+		DecisionRow{TsMs: 9100, CycleID: "c-thin", Kind: "exit", Reason: "", Detail: []byte(`{"line":"exit1","client_order_ids":["a"]}`)},
+		DecisionRow{TsMs: 9200, CycleID: "c-thin", Kind: "exit", Reason: "d1_loss", Detail: []byte(`{"line":"exit","d1":true,"protect":"40.38","client_order_ids":["b"]}`)},
+		DecisionRow{TsMs: 9300, CycleID: "c-other", Kind: "exit", Detail: []byte(`{"client_order_ids":["c"]}`)},
+	); err != nil {
+		t.Fatal(err)
+	}
+	if err := live.WriteSync(DecisionRow{TsMs: 9400, CycleID: "c-thin", Kind: "exit", Detail: []byte(`{"client_order_ids":["d"]}`)}); err != nil {
+		t.Fatal(err)
+	}
+	if st, err = s.LoadState(ctx, "2026-11-25"); err != nil {
+		t.Fatal(err)
+	}
+	if e := st.ExitDecision; e == nil || e.TsMs != 9200 || e.Reason != "d1_loss" || !strings.Contains(string(e.Detail), `"protect": "40.38"`) {
+		t.Errorf("exit decision %+v, want c-thin's last exit with its detail", st.ExitDecision)
+	}
 }
 
 // What the ledger needs from LoadState beside the unfinished cycle: every
