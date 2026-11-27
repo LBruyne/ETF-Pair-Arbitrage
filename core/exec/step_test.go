@@ -54,8 +54,8 @@ func TestEntryReasonOrder(t *testing.T) {
 	// results came half a second before t0, after every depth held.
 	r.m.stop.noEntries = true
 	r.src.set(true, true)
-	regularOpen := r.m.session.RegularOpen
-	r.m.session.RegularOpen = t0.Add(-time.Hour)
+	sessionEnd := r.m.session.End
+	r.m.session.End = t0.Add(time.Hour) // inside entry_stop_before_close, before the forced exit
 	bell := r.src.Anchors()
 	r.src.setAnchors(cex.Anchors{SessionID: bell.SessionID})
 	r.m.batch = &batchState{kind: cex.PurposeEntry, settled: true, doneAt: t0.Add(-500 * time.Millisecond), rejected: true}
@@ -76,7 +76,7 @@ func TestEntryReasonOrder(t *testing.T) {
 			cancel()
 			<-done
 		}},
-		{strategy.ReasonRegularHours, func() { r.m.session.RegularOpen = regularOpen }},
+		{strategy.ReasonCloseNear, func() { r.m.session.End = sessionEnd }},
 		{strategy.ReasonNoAnchor, func() { a := bell; a.EntryBan = true; r.src.setAnchors(a) }},
 		{strategy.ReasonActionWindow, func() { r.src.setAnchors(bell) }},
 		{strategy.ReasonDepthBull, func() { // a SOXL depth older than the batch's results
@@ -125,10 +125,10 @@ func TestCapitalPendingStopsEntries(t *testing.T) {
 	r.idleAt(t0, strategy.ReasonStoreError)
 	r.sink.Fail(nil)
 	r.idleAt(t0, strategy.ReasonCapitalPending)
-	regularOpen := r.m.session.RegularOpen
-	r.m.session.RegularOpen = t0.Add(-time.Hour)
+	sessionEnd := r.m.session.End
+	r.m.session.End = t0.Add(time.Hour)
 	r.idleAt(t0, strategy.ReasonCapitalPending)
-	r.m.session.RegularOpen = regularOpen
+	r.m.session.End = sessionEnd
 }
 
 // heldState is a ledger as a restart reads it back: capital M and one open
@@ -486,8 +486,8 @@ func TestSessionTimes(t *testing.T) {
 		r.trade(utc8Time(11, 26, 5, 3, 5))
 
 		r.at(utc8Time(11, 28, 1, 58, 59))
-		r.books(calibration(1)) // B: no exit, no entry (regular hours)
-		r.idleAt(utc8Time(11, 28, 1, 58, 59), strategy.ReasonRegularHours)
+		r.books(calibration(1)) // B: no exit, no entry (near the close: entries stopped at 00:00)
+		r.idleAt(utc8Time(11, 28, 1, 58, 59), strategy.ReasonCloseNear)
 		if r.m.forced != "" {
 			t.Fatalf("forced exit %q before 01:59", r.m.forced)
 		}
@@ -551,4 +551,22 @@ func TestSessionTimes(t *testing.T) {
 			t.Errorf("last decision %s, want an exit in the regular hours", d.Kind)
 		}
 	})
+}
+
+// Owner item 108: the strategy runs in the regular session too. At 22:33:05
+// on 11-25, after the regular open (22:30) and long before the close of
+// 11-26 05:00, the short signal of the entry book opens a lot.
+func TestEntryDuringRegularHours(t *testing.T) {
+	r := newRig(t, utc8Time(11, 25, 22, 31, 0), rigOptions{})
+	r.warmUp()
+	t0 := utc8Time(11, 25, 22, 33, 5)
+	if !t0.After(r.m.session.RegularOpen) {
+		t.Fatalf("regular open %s is not before %s", showTime(r.m.session.RegularOpen), showTime(t0))
+	}
+	r.at(t0)
+	r.books(entryBook())
+	r.trade(t0)
+	if r.inv.Cycle() == nil {
+		t.Fatalf("no cycle after the entry in the regular session; idle reason %q", r.m.idleReason)
+	}
 }

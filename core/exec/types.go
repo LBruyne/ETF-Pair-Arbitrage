@@ -167,8 +167,8 @@ type view struct {
 
 // The phases of a Session as signal_sample stores them.
 const (
-	phaseOffHours    = "off_hours"    // from the close to the regular open: entries are allowed
-	phaseRegular     = "regular"      // the regular session: exits only
+	phaseOffHours    = "off_hours"    // from the close to the regular open
+	phaseRegular     = "regular"      // the regular session: entries too until entry_stop_before_close before the close (owner item 108)
 	phaseCloseWindow = "close_window" // forced_exit_before_close before the close: everything is closed
 )
 

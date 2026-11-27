@@ -466,7 +466,7 @@ func (m *ExecManager) gapInput(r *round) strategy.GapInput {
 	in := strategy.GapInput{Direction: c.Direction, Hold: c.Hold(), Dust: m.inv.Dust(), PairAnchors: c.PairAnchors, Books: r.books.ByLeg, Rules: r.rules, Now: r.now}
 	_, _, in.QuotaLeft = m.inv.Quota()
 	settingsOK, _ := m.cex.SettingsOK(m.leverage)
-	mayAdd := r.now.Before(m.session.RegularOpen) && !m.stop.stopping && !m.stop.noEntries && settingsOK // PRD 8.5
+	mayAdd := r.now.Before(m.entryCutoff()) && !m.stop.stopping && !m.stop.noEntries && settingsOK // PRD 8.5
 	for _, leg := range cex.Legs {
 		in.HasPrice[leg] = r.books.HasPrice(leg, r.now)
 		in.DepthOK[leg] = r.books.DepthOK(leg, r.now)
@@ -598,8 +598,8 @@ func (m *ExecManager) entryBlocked(r *round) strategy.Reason {
 
 	// Step 2: the trading hours and the anchors.
 	switch {
-	case !now.Before(m.session.RegularOpen):
-		return strategy.ReasonRegularHours
+	case !now.Before(m.entryCutoff()):
+		return strategy.ReasonCloseNear
 	case m.anchors.Kind == cex.AnchorNone:
 		return strategy.ReasonNoAnchor
 	case m.anchors.EntryBan:
@@ -647,6 +647,13 @@ func (m *ExecManager) noteAtLine(r *round, reason strategy.Reason) {
 	m.recordDecision(r.now, "at_line_blocked", r.cycle, "", dir, reason, map[string]any{
 		"x_long_d": finite(v.xLong), "x_short_d": finite(v.xShort), "mu_d": finite(v.mu), "sigma_d": finite(v.sigma),
 		"anchor_kind": m.anchors.Kind, "f": r.fx.Price, "depth_seq_bull": r.books.ByLeg[cex.Bull].DepthSeq, "depth_seq_bear": r.books.ByLeg[cex.Bear].DepthSeq})
+}
+
+// entryCutoff is when entries and top-ups stop: entry_stop_before_close
+// before the Session's close (owner item 108). The regular session trades
+// like the off-hours until then.
+func (m *ExecManager) entryCutoff() time.Time {
+	return m.session.End.Add(-m.scfg.EntryStopBeforeClose)
 }
 
 // phase is the part of the Session now is in.

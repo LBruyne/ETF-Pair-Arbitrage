@@ -211,15 +211,15 @@ func TestScriptedSession(t *testing.T) {
 	r.quotaLeft("18773.76875")
 	r.endMinute() // 05:03 ends on book A: neutral, the cycle is kept
 
-	// 22:30:05, the regular open has passed: the entry book gives the short
-	// signal again, but entries stop (regular_hours); the exit line is not
-	// reached (x at the asks under the last ready mean is +27.5), and there
-	// is no forced exit at the open.
-	r.at(utc8Time(11, 25, 22, 30, 5))
+	// 03:00:05 next day, two hours before the close (owner item 108): the
+	// entry book gives the short signal again, but entries stop (close_near);
+	// the exit line is not reached (x at the asks under the last ready mean
+	// is +27.5), and the forced exit has not begun.
+	r.at(utc8Time(11, 26, 3, 0, 5))
 	r.books(entryBook())
-	r.idleAt(utc8Time(11, 25, 22, 30, 5), strategy.ReasonRegularHours)
+	r.idleAt(utc8Time(11, 26, 3, 0, 5), strategy.ReasonCloseNear)
 	if r.m.forced != "" {
-		t.Errorf("forced exit %q at the regular open", r.m.forced)
+		t.Errorf("forced exit %q two hours before the close", r.m.forced)
 	}
 
 	// 04:59:00 next day, close - 1 minute: the forced exit begins. The books
@@ -241,9 +241,9 @@ func TestScriptedSession(t *testing.T) {
 	})
 	r.trade(utc8Time(11, 26, 4, 59, 1))
 	// The round of the results closes the cycle on its read of the positions
-	// and sends nothing; the round that read wakes finds the regular hours.
-	if r.inv.Cycle() != nil || r.m.idleReason != strategy.ReasonRegularHours {
-		t.Errorf("cycle open %t, idle reason %q after the results; want closed, regular_hours", r.inv.Cycle() != nil, r.m.idleReason)
+	// and sends nothing; the round that read wakes finds the close near.
+	if r.inv.Cycle() != nil || r.m.idleReason != strategy.ReasonCloseNear {
+		t.Errorf("cycle open %t, idle reason %q after the results; want closed, close_near", r.inv.Cycle() != nil, r.m.idleReason)
 	}
 	forced := r.decisions()[4]
 	if detail := decodeDetail(t, forced.Detail); forced.Kind != "forced" || detail["price_bull"] != "40.35" || detail["price_bear"] != "59.36" ||
@@ -315,7 +315,7 @@ func TestScriptedSession(t *testing.T) {
 	// 10 s, as in production) falls on the rounds of 05:01:30 and of the
 	// warm-up: those seconds' samples say positions_read; their own reasons,
 	// depth_bull and warmup, are checked round by round above.
-	for _, want := range []string{"positions_read", "spacing", "regular_hours", "no_price", "await_depth"} {
+	for _, want := range []string{"positions_read", "spacing", "close_near", "no_price", "await_depth"} {
 		if !reasons[want] {
 			t.Errorf("no signal_sample with idle_reason %s; got %v", want, reasons)
 		}

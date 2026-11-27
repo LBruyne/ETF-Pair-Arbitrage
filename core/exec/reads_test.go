@@ -28,7 +28,7 @@ func TestNoEntryOnFactsOlderThanAPositionRead(t *testing.T) {
 	tick := utc8Time(11, 25, 5, 3, 2)
 	r.at(tick)
 	r.books(entryBook())
-	r.m.session.RegularOpen = tick.Add(80 * time.Millisecond)
+	r.m.session.End = tick.Add(80*time.Millisecond + 2*time.Hour) // entries stop 80 ms after tick
 	r.m.nextReconcile = tick
 	r.gate.duringRead(func() { r.at(tick.Add(120 * time.Millisecond)); r.books(calibration(1)) })
 	r.stepOnce()
@@ -39,19 +39,19 @@ func TestNoEntryOnFactsOlderThanAPositionRead(t *testing.T) {
 	if r.m.idleReason != strategy.ReasonPositionsRead {
 		t.Errorf("idle reason %q, want positions_read", r.m.idleReason)
 	}
-	r.idleAt(r.clock(), strategy.ReasonRegularHours)
+	r.idleAt(r.clock(), strategy.ReasonCloseNear)
 }
 
-// The same across the real cutoff, the regular open of 11-25 at 22:30:00
-// (09:30 New York): the comparison is due at 22:29:59.950 with the short
-// signal in place; the read returns at 22:30:00.070 with the signal
+// The same across the real cutoff, two hours before the close of 11-26
+// 05:00 (owner item 108): the comparison is due at 02:59:59.950 with the
+// short signal in place; the read returns at 03:00:00.070 with the signal
 // withdrawn. No entry.
-func TestNoEntryAcrossTheRegularOpenDuringARead(t *testing.T) {
-	r := newRig(t, utc8Time(11, 25, 22, 27, 0), rigOptions{})
+func TestNoEntryAcrossTheEntryCutoffDuringARead(t *testing.T) {
+	r := newRig(t, utc8Time(11, 26, 2, 57, 0), rigOptions{})
 	r.warmUp()
-	tick := utc8Time(11, 25, 22, 29, 59).Add(950 * time.Millisecond)
-	if !r.m.session.RegularOpen.Equal(utc8Time(11, 25, 22, 30, 0)) {
-		t.Fatalf("regular open %s, want 22:30", showTime(r.m.session.RegularOpen))
+	tick := utc8Time(11, 26, 2, 59, 59).Add(950 * time.Millisecond)
+	if cut := r.m.session.End.Add(-r.m.scfg.EntryStopBeforeClose); !cut.Equal(utc8Time(11, 26, 3, 0, 0)) {
+		t.Fatalf("entries stop at %s, want 03:00", showTime(cut))
 	}
 	r.at(tick)
 	r.books(entryBook())
@@ -61,10 +61,10 @@ func TestNoEntryAcrossTheRegularOpenDuringARead(t *testing.T) {
 	r.results()
 	r.stepOnce()
 	if n := len(r.orders()); n != 0 {
-		t.Fatalf("%d entry orders across 22:30, want none; idle reason %q", n, r.m.idleReason)
+		t.Fatalf("%d entry orders across 03:00, want none; idle reason %q", n, r.m.idleReason)
 	}
-	if r.m.idleReason != strategy.ReasonRegularHours {
-		t.Errorf("idle reason %q, want regular_hours", r.m.idleReason)
+	if r.m.idleReason != strategy.ReasonCloseNear {
+		t.Errorf("idle reason %q, want close_near", r.m.idleReason)
 	}
 }
 

@@ -46,6 +46,7 @@ type Config struct {
 
 	ForcedSlipBps         float64       `yaml:"forced_slip_bps"`          // forced exits and trims price this far past the best price, of each leg's price
 	ForcedExitBeforeClose time.Duration `yaml:"forced_exit_before_close"` // positions are closed this long before the regular close
+	EntryStopBeforeClose  time.Duration `yaml:"entry_stop_before_close"`  // from this long before the regular close no entry or top-up is made, exits only (owner item 108)
 	// RewarmOnAnchorChange true: when the NAV replaces the bell anchor (as
 	// soon as both legs' NAV are read, PRD 11.3) entries wait for a new
 	// warm-up. A later NAV-to-NAV change within cex.nav_watch is a hot switch
@@ -69,6 +70,7 @@ var DefaultConfig = Config{
 	CompletionWindow:      5 * time.Second,
 	ForcedSlipBps:         10,
 	ForcedExitBeforeClose: time.Minute,
+	EntryStopBeforeClose:  2 * time.Hour,
 }
 
 // Exit2Text is the second exit line for a log line: the number as written,
@@ -177,6 +179,12 @@ func (c Config) Validate() error {
 	if c.ForcedExitBeforeClose <= 0 {
 		errs = append(errs, fmt.Errorf("strategy.forced_exit_before_close must be positive, got %s", c.ForcedExitBeforeClose))
 	}
+	switch {
+	case c.EntryStopBeforeClose <= 0:
+		errs = append(errs, fmt.Errorf("strategy.entry_stop_before_close must be positive, got %s", c.EntryStopBeforeClose))
+	case c.EntryStopBeforeClose < c.ForcedExitBeforeClose:
+		errs = append(errs, fmt.Errorf("strategy.entry_stop_before_close must not be shorter than forced_exit_before_close, got %s < %s", c.EntryStopBeforeClose, c.ForcedExitBeforeClose))
+	}
 	return errors.Join(errs...)
 }
 
@@ -225,7 +233,7 @@ const (
 	ReasonPositionMismatch Reason = "position_mismatch" // the venue's positions differ from the ledger
 
 	// Step 2: the trading hours and the anchors.
-	ReasonRegularHours Reason = "regular_hours" // entries are made off-hours only
+	ReasonCloseNear    Reason = "close_near"    // entry_stop_before_close before the regular close: exits only (owner item 108; until then entries go in the regular session too)
 	ReasonNoAnchor     Reason = "no_anchor"     // the Session has no anchor yet
 	ReasonActionWindow Reason = "action_window" // inside a dividend or split window
 

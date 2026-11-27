@@ -138,7 +138,7 @@ func TestThinFirstTopUpBlocked(t *testing.T) {
 	}{
 		{"F stale", func(r *rig) { r.fxFixed = true; r.src.setFX("1", t1.Add(-61*time.Second)) }},
 		{"action window", func(r *rig) { a := r.src.Anchors(); a.EntryBan = true; r.src.setAnchors(a) }},
-		{"regular hours", func(r *rig) { r.m.session.RegularOpen = t1 }},
+		{"near the close", func(r *rig) { r.m.session.End = t1.Add(2 * time.Hour) }},
 		{"account settings", func(r *rig) { r.src.set(false, true) }},
 		{"warming up", func(r *rig) { r.m.stats = strategy.Stats{} }},
 	} {

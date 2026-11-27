@@ -186,6 +186,12 @@ func TestLoad(t *testing.T) {
 			wantErr: []string{"cex.nav_hot_switch_d must be a finite number of spread units, 0 or more"}},
 		{name: "nav_hot_switch_d zero: every NAV change warms up again", edits: []edit{{"  nav_hot_switch_d: 1 ", "  nav_hot_switch_d: 0 "}}, env: envFull},
 
+		// Owner item 108: entries stop entry_stop_before_close before the close, the forced exit comes later.
+		{name: "entry_stop_before_close zero", edits: []edit{{"  entry_stop_before_close: 2h ", "  entry_stop_before_close: 0s "}}, env: envFull,
+			wantErr: []string{"strategy.entry_stop_before_close must be positive"}},
+		{name: "entry_stop_before_close shorter than the forced exit", edits: []edit{{"  entry_stop_before_close: 2h ", "  entry_stop_before_close: 30s "}}, env: envFull,
+			wantErr: []string{"strategy.entry_stop_before_close must not be shorter than forced_exit_before_close"}},
+
 		// exit2: optional; -entry_in <= exit2 <= entry_out (SPEC 12.6).
 		{name: "exit2 written", edits: []edit{{"  # exit2: -1 ", "  exit2: -1 "}}, env: envFull},
 		{name: "exit2 equal to entry_out is allowed", edits: []edit{{"  # exit2: -1 ", "  exit2: -0.5 "}}, env: envFull},

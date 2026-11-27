@@ -465,16 +465,17 @@ func TestExitAtTheLineLeavingDustEndsExitLine(t *testing.T) {
 	}
 }
 
-// V9, PRD 8.5: from the regular open a gap is only trimmed, completion
-// would be an entry. Example 3's books, where completing is cheaper, with
-// the results after 22:30.
-func TestRegularHoursOnlyTrim(t *testing.T) {
-	r := newRig(t, utc8Time(11, 25, 22, 26, 0), rigOptions{latency: 250 * time.Millisecond})
+// V9, PRD 8.5: from entry_stop_before_close before the close (owner item
+// 108: two hours) a gap is only trimmed, completion would be an entry.
+// Example 3's books, where completing is cheaper, with the results after
+// 03:00 of 11-26 (the close 05:00).
+func TestNearTheCloseOnlyTrim(t *testing.T) {
+	r := newRig(t, utc8Time(11, 26, 2, 56, 0), rigOptions{latency: 250 * time.Millisecond})
 	r.warmUp()
-	r.endMinute() // 22:28 ends on book A: the mean of 22:27 and 22:28 is mu = 3.3333, sigma = 4
-	t0 := utc8Time(11, 25, 22, 29, 59)
+	r.endMinute() // 02:58 ends on book A: the mean of 02:57 and 02:58 is mu = 3.3333, sigma = 4
+	t0 := utc8Time(11, 26, 2, 59, 59)
 	r.enterMatchedOn(t0, entryBook(), thinBear())
-	t1 := utc8Time(11, 25, 22, 30, 0).Add(500 * time.Millisecond)
+	t1 := utc8Time(11, 26, 3, 0, 0).Add(500 * time.Millisecond)
 	r.at(t1)
 	r.books(gapBook(side{lv("40.47", "300"), lv("40.48", "300")}, appendix3Bids("59.418")))
 	r.trade(t1)
