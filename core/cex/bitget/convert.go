@@ -246,10 +246,15 @@ func fill(row fillRow, receivedAt time.Time) (cex.Fill, error) {
 	return out, nil
 }
 
-// feeOf sums the fee details of an order or a fill: positive is paid.
+// feeOf sums the fee details of an order or a fill: positive is paid. An
+// empty fee is zero: Bitget's order history gives {"feeCoin":"","fee":""}
+// for an order that filled nothing (live 2026-11-27, a cancelled IOC).
 func feeOf(details []feeDetailRow) (decimal.Decimal, error) {
 	total := decimal.Zero
 	for _, d := range details {
+		if d.Fee == "" {
+			continue
+		}
 		fee, err := decimal.NewFromString(d.Fee)
 		if err != nil {
 			return total, fmt.Errorf("fee %q", d.Fee)
