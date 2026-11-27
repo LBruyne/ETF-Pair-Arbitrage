@@ -149,9 +149,12 @@ class Shape(unittest.TestCase):
                 self.assertTrue(p["description"], p["title"])
         titles = [p["title"] for p in self.b["panels"] if p["type"] == "row"]
         self.assertEqual([t.split(" · ")[0] for t in titles], ["Status", "Execution Summary", "Position", "Live Execution", "Round Trips",
-                                                               "Round Trip Detail", "Inventory", "Settings", "Execution Statistics", "System"])
+                                                               "Round Trip Detail", "Every Order", "Inventory", "Settings", "Execution Statistics", "System"])
         self.assertEqual(titles[0], "Status · Running Session · ${runtext}")
-        self.assertEqual([p.get("collapsed") for p in self.b["panels"] if p["type"] == "row"], [False] * 8 + [True, True])
+        self.assertEqual([p.get("collapsed") for p in self.b["panels"] if p["type"] == "row"], [False] * 6 + [True] + [False] * 2 + [True, True])
+        # 4.5: every order of a round trip only in the folded row (queried while it is open), the visible Orders folds the runs
+        every = next(p for p in self.b["panels"] if p["type"] == "row" and p["title"].startswith("Every Order"))
+        self.assertEqual([q["targets"][0]["rawSql"] for q in every["panels"]], [board.Q_ORDERS_EVERY])
 
     def test_status_first(self):
         """Owner items 74-76: the board starts with Status · Running Session holding Execution, Account, Market (two strips, as
@@ -580,6 +583,46 @@ class Queries(unittest.TestCase):
                 if not mg["Position"].startswith(("flat", "residual", "left")) and not r["stopped_ms"]:
                     self.assertRegex(got[1]["Position"], r"^(long|short) · ")
 
+    @staticmethod
+    def refusal_words(e, alarms):
+        """The Detail of an orders_rejected alarm (core/exec rejectAlarm's detail) as Python writes it."""
+        d = e["detail"] if isinstance(e["detail"], dict) else json.loads(e["detail"] or "{}")
+        tick = {"bull": "SOXL", "bear": "SOXS"}
+
+        def counts(x, word):
+            items = sorted(((k, int(v)) for k, v in (x or {}).items() if re.fullmatch(r"[0-9]+", str(v))), key=lambda kv: (-kv[1], kv[0]))
+            return ", ".join("%s × %s" % (word(k), format(v, ",")) for k, v in items) or None
+
+        def span(ms):
+            ms = int(round(ms))
+            if ms < 60000:
+                return "%ds" % (ms // 1000)
+            if ms < 3600000:
+                return "%dm\u00a0%02ds" % (ms // 60000, ms // 1000 % 60)
+            if ms < 86400000:
+                return "%dh\u00a0%02dm" % (ms // 3600000, ms // 60000 % 60)
+            return "%dd\u00a0%02dh" % (ms // 86400000, ms // 3600000 % 24)
+        parts = []
+        if d.get("count") is not None:
+            lasted = float(d["lasted_s"]) if d.get("lasted_s") is not None else None
+            parts.append(format(int(d["count"]), ",") + " orders refused in a row" + (" over " + span(lasted * 1000) if lasted is not None and lasted >= 1 else "")
+                         + (" since " + utc8(int(d["since_ms"])).strftime("%m-%d %H:%M:%S").replace("-", board.NBHY).replace(" ", board.NBSP)
+                            if d.get("since_ms") is not None else ""))
+        p_ = counts(d.get("purposes"), lambda k: k.title())
+        c_ = counts(d.get("codes"), lambda k: k or "(none)")
+        inner = "; ".join(x for x in (p_, c_ and "codes " + c_) if x)
+        if parts and inner:
+            parts[0] += " (" + inner + ")"
+        if d.get("purpose") is not None:
+            parts.append("last " + " ".join(x for x in (d["purpose"].title(), d.get("side"), d.get("qty") and d["qty"] + " ct",
+                                                       d.get("price") and "@ " + d["price"] + " USDT") if x))
+        if all(d.get(k) is not None for k in ("venue", "ledger", "hold")):
+            parts.append("venue %s / ledger %s / round trip %s ct" % (d["venue"], d["ledger"], d["hold"]))
+        if alarms > 1:
+            parts.append("alarm raised %d times" % alarms)
+        parts.append(re.sub(r"^[^:]*:\s*", "", e["message"]))
+        return "; ".join(parts)
+
     def expected_alerts(self, run):
         """The Alerts of a Run recomputed in Python from its records (SPEC 7, Alerts)."""
         r, s, i, cycles, open_lots, orders = self.raw_run(run)
@@ -632,9 +675,15 @@ class Queries(unittest.TestCase):
             if isinstance(c["funding_awaited"], list) and c["funding_awaited"]:
                 out.append((c["closed_ms"], "warning", "In Progress" if running else "Open", "Execution " + md(c["opened_ms"]), "Funding Awaited", None))
         by_id = {c["cycle_id"]: c for c in psql_json("SELECT * FROM trade.cycle WHERE live = %s" % r["live"])}
+        # 4.5: a round trip's forced-exit decisions with the same cause and slip are one row, at the newest
+        forced = {}
         for d in psql_json("SELECT * FROM trade.decision WHERE run_id = '%s' AND live = %s AND kind = 'forced'" % (run, r["live"])):
-            c = by_id.get(d["cycle_id"])
-            out.append((d["ts_ms"], "serious", "In Progress" if c and c["status"] == "open" and running else "Recovered",
+            det = d["detail"] if isinstance(d["detail"], dict) else json.loads(d["detail"] or "{}")
+            k = (d["cycle_id"], det.get("cause"), None if det.get("slip_bps") is None else str(det.get("slip_bps")))
+            forced[k] = max(forced.get(k, 0), d["ts_ms"])
+        for (cid, _, _), ts in forced.items():
+            c = by_id.get(cid)
+            out.append((ts, "serious", "In Progress" if c and c["status"] == "open" and running else "Recovered",
                         "Execution " + (md(c["opened_ms"]) if c else "–"), "Forced Exit", None))
         # 4.4: a batch's unwind of its unpaired thin leg and an exit's hard close of its thick leg (risk exits), an exit below
         # break-even (its pre-check failed, D1)
@@ -644,15 +693,39 @@ class Queries(unittest.TestCase):
             w = {"pair": "Thin Leg Unwound", "exit_pair": "Exit Hard Close", "exit": "Exit Below Break-Even"}[d["kind"]]
             out.append((d["ts_ms"], "warning", "In Progress" if c and c["status"] == "open" and running else "Recovered",
                         "Execution " + (md(c["opened_ms"]) if c else "–"), w, None))
-        for o in orders:
+        # 4.5: a run of consecutive orders (the Run's, in their order) rejected without a fill on the same round trip, leg, purpose,
+        # side, quantity and error code is one row at its last order's time
+        runs_, prev = [], None
+        for o in sorted(orders, key=lambda o: (o["submitted_ms"], o["client_order_id"])):
+            fold = ((o["cycle_id"], o["leg"], o["purpose"], o["side"], Decimal(str(o["qty"])), o["error_code"] or "")
+                    if o["status"] == "rejected" and Decimal(str(o["cum_exec_qty"])) == 0 and not o["unknown"] and not o["not_found"] else None)
+            if fold is not None and fold == prev:
+                runs_[-1].append(o)
+            else:
+                runs_.append([o])
+            prev = fold
+        for run_ in runs_:
+            o = run_[0]
             if o["unknown"] or o["not_found"] or o["status"] in ("rejected", "not_sent", "never_arrived"):
-                w = ("Order Outcome Unknown" if o["unknown"] else "Order Not Found" if o["not_found"] else "Order Rejected" if o["status"] == "rejected"
-                     else "Order Not Sent" if o["status"] == "not_sent" else "Order Never Arrived")
-                out.append((o["submitted_ms"], "warning" if o["status"] == "not_sent" else "serious",
-                            ("In Progress" if running else "Open") if o["unknown"] else "Recovered", "Order · " + tick[o["leg"]], w, None))
+                w = ("Order Outcome Unknown" if o["unknown"] else "Order Not Found" if o["not_found"] else "Orders Rejected" if len(run_) > 1
+                     else "Order Rejected" if o["status"] == "rejected" else "Order Not Sent" if o["status"] == "not_sent" else "Order Never Arrived")
+                out.append((run_[-1]["submitted_ms"], "warning" if o["status"] == "not_sent" else "serious",
+                            ("In Progress" if running else "Open") if o["unknown"] else "Recovered", "Order · " + tick[o["leg"]], w,
+                            None if len(run_) == 1 else ("contains", " · %s in a row, " % format(len(run_), ","))))
+        # 4.5: the program's alarm on a leg's orders refused in a row (orders_rejected) in words, the alarms of one run one row
+        alarms = {}
         for e in psql_json("SELECT * FROM trade.event WHERE run_id = '%s' AND live = %s AND level IN ('error', 'warn')" % (run, r["live"])):
-            out.append((e["ts_ms"], "critical" if e["level"] == "error" else "warning", "Open", "Program · " + e["module"],
-                        e["kind"].replace("_", " ").title(), e["message"]))
+            if e["kind"] != "orders_rejected":
+                out.append((e["ts_ms"], "critical" if e["level"] == "error" else "warning", "Open", "Program · " + e["module"],
+                            e["kind"].replace("_", " ").title(), e["message"]))
+                continue
+            det = e["detail"] if isinstance(e["detail"], dict) else json.loads(e["detail"] or "{}")
+            k = (det.get("leg") or "", str(det.get("since_ms")) if det.get("since_ms") is not None else str(e["seq"]))
+            alarms.setdefault(k, []).append(e)
+        for (leg, _), es in alarms.items():
+            e = max(es, key=lambda e: (e["ts_ms"], e["seq"]))
+            out.append((e["ts_ms"], "critical" if e["level"] == "error" else "warning", "Open",
+                        "Order · " + tick[leg] if leg in tick else "Program · " + e["module"], "Refused in a Row", self.refusal_words(e, len(es))))
         if running and s is None or running and int(time.time() * 1000) - s["ts_ms"] > board.SAMPLE_AGE_S * 1000:
             out.append((None, "critical", "Open", "Run", None, None))
         return r, out
@@ -686,7 +759,9 @@ class Queries(unittest.TestCase):
                     for w in want:
                         match = [g for g in got_rows if g[1:5] == w[1:5] and g[0] == w[0]]
                         self.assertTrue(match, w)
-                        if w[5] is not None:
+                        if isinstance(w[5], tuple):
+                            self.assertIn(w[5][1], match[0][5], w[4])
+                        elif w[5] is not None:
                             self.assertEqual(match[0][5], w[5], w[4])
 
     def test_positions_now_are_the_newest_inventory_sample(self):
@@ -716,10 +791,54 @@ class Queries(unittest.TestCase):
         Latency), not an empty panel; a Run with round trips has no such row."""
         v = self.values(1, "__none")
         for q, col, text in ((board.Q_BLOTTER, "End Reason", "No round trip in the Range"), (board.Q_ORDERS, "Status", "No order: no round trip in the Range"),
+                             (board.Q_ORDERS_EVERY, "Status", "No order: no round trip in the Range"),
                              (board.Q_END_REASONS, "End Reason", "None in the Range"), (board.Q_BLOCKED, "Reason", "None in the Range"),
                              (board.Q_LATENCY, "Stage", "No order in the Range")):
             self.assertEqual([r[col] for r in psql_json(fill(q, v))], [text])
         self.assertNotIn("No round trip in the Range", [r["End Reason"] for r in psql_json(fill(board.Q_BLOTTER, self.values(1, self.PAPER_RUN)))])
+
+    def test_orders_fold_runs_of_refusals(self):
+        """4.5 (the auditor's review of the first thin-first live run): Orders shows the same orders as Every Order (4.4.1's
+        Orders), each run of consecutive orders without a fill that were refused or cancelled, on the same leg, purpose, step,
+        side, quantity and status (code), as one row: its first order's figures, Until its last one's time, Orders how many,
+        Limit the range of their limits, no latency. Every order with a fill keeps its own row; no two rows that could fold
+        sit next to each other."""
+        same = ["Purpose", "Step", "Leg", "Side", "Qty", "Filled", "Avg", "Fee", "Status"]
+        seen = set()
+        for run in self.runs():
+            r = psql_json("SELECT live FROM trade.process_run WHERE run_id = '%s'" % run)
+            live = r[0]["live"] if r else None
+            for c in psql_json("SELECT DISTINCT o.cycle_id FROM trade.cex_order o WHERE o.run_id = '%s'" % run):
+                if (live, c["cycle_id"]) in seen:
+                    continue
+                seen.add((live, c["cycle_id"]))
+                v = dict(self.values(1, run), cycle=c["cycle_id"])
+                every, folded = psql_json(fill(board.Q_ORDERS_EVERY, v)), psql_json(fill(board.Q_ORDERS, v))
+                with self.subTest(run=run, cycle=c["cycle_id"]):
+                    self.assertEqual(sum(f["Orders"] for f in folded), len(every))
+                    i, prev = 0, None
+                    for f in folded:
+                        part = every[i:i + f["Orders"]]
+                        first = part[0]
+                        self.assertEqual([f[k] for k in same], [first[k] for k in same])
+                        self.assertEqual(f["Time"], first["Time"])
+                        foldable = lambda o: o["Filled"] == 0 and o["Status"].startswith(("Rejected", "No Fill"))
+                        key = lambda o: tuple(o[k] for k in ("Leg", "Purpose", "Step", "Side", "Qty", "Status"))
+                        if f["Orders"] == 1:
+                            self.assertEqual((f["Until"], f["Limit"], f["Latency"]), (None, first["Limit"], first["Latency"]))
+                        else:
+                            self.assertTrue(all(foldable(o) and key(o) == key(first) for o in part), f)
+                            self.assertEqual(f["Until"], part[-1]["Time"])
+                            self.assertIsNone(f["Latency"])
+                            limits = sorted({Decimal(o["Limit"]) for o in part})
+                            self.assertEqual(f["Limit"], first["Limit"] if len(limits) == 1 else "%s–%s" % (
+                                min(part, key=lambda o: Decimal(o["Limit"]))["Limit"], max(part, key=lambda o: Decimal(o["Limit"]))["Limit"]))
+                        if prev is not None and foldable(prev) and foldable(first):
+                            self.assertNotEqual(key(prev), key(first), "two rows that fold side by side")
+                        prev, i = part[-1], i + f["Orders"]
+                    if c["cycle_id"] == "c1795718904692":   # 11-27 02:48: 21,802 orders, 21,796 refused, in a handful of rows
+                        self.assertEqual(len(every), 21802)
+                        self.assertLessEqual(len(folded), 12)
 
     def test_plain_words(self):
         """End and idle reasons in words; a code the board does not list (a new end reason such as dust_only, before the board
@@ -925,7 +1044,7 @@ class Queries(unittest.TestCase):
             # Orders: every order's step; the thick leg's pairing orders Pair, the thin leg's closes Unwind / Profit Close, an exit's
             # thick leg Thick or Hard Close
             for c in psql_json("SELECT cycle_id FROM trade.cycle WHERE run_id = '%s'" % run):
-                for o in psql_json(fill(board.Q_ORDERS, dict(v, cycle=c["cycle_id"]))):
+                for o in psql_json(fill(board.Q_ORDERS_EVERY, dict(v, cycle=c["cycle_id"]))):
                     step = o["Step"]
                     self.assertTrue(step, o)
                     if o["Purpose"] == "Complete":

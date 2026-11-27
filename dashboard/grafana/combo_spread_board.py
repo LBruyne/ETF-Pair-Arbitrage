@@ -642,6 +642,21 @@ REFRESH = "1s"
 REFRESH_INTERVALS = ["1s", "5s", "10s", "30s", "1m", "5m"]
 
 
+# 3.6.1 (the auditor's review of the first thin-first live run, owner item 100): this board's Real spreads and Signal are a
+# research reading, the sweep average of N through each leg's levels 1..L, not the trading program's price (it takes the
+# same number of levels but prices each leg at the L-th level's price and sizes by half of what is there, PRD 3.2, 4.1).
+SWEEP = "Sweep Average"
+NOT_PROGRAM = ("Sweep average, not the trading program's price: Real Long / Short Spread and the Signal here are the spread on the "
+               "average prices of N swept through each leg's levels 1–${bull_levels} (${bull}) and 1–${bear_levels} (${bear}). The "
+               "program reads as many levels but prices each leg at the last of them (the limit of its order) and sizes by half of "
+               "what they hold, so its entries need not match this board second by second; why the program sent an order: the Live "
+               "Monitor (the link at the top).")
+LIVE_MONITOR = {"title": "Live Monitor · Why an Order Was Sent", "type": "link", "icon": "info", "url": "/d/arb-etf-pair-live-monitor/live-monitor",
+                "tooltip": "This board's Real spreads and Signal are the sweep average of N through levels 1–L (a research reading); the "
+                           "trading program prices each leg at its L-th level. Its decisions and orders are on the Live Monitor.",
+                "targetBlank": False, "keepTime": False, "includeVars": False}
+
+
 def build():
     reset_ids()
     templating = [
@@ -662,7 +677,7 @@ def build():
         textbox_var("d_bps", "Entry (bps)", "", "A number typed here is the Entry in bps (10, 7.5, 10bps) and Entry's sigma is not "
                     "used; empty it (and press Enter) to go back to Entry's sigma · anything else: No Entry, no Entry lines."),
         custom_var("notional", "Notional (USDT)", NOTIONAL_OPTIONS, "10000",
-                   "N, both legs together: the Real spreads and the Signal fill N through both legs' pricing levels (2 at a 0.01 tick, 5 "
+                   "N, both legs together: the Real spreads and the Signal sweep N through both legs' pricing levels (2 at a 0.01 tick, 5 "
                    "at 0.001), on their totals where they hold less (Partial) · pick one or type any amount and press Enter: 2000, "
                    "20,000, 20k, 2万, 20000U · the options are written 1k to 100k, so a typed number of four digits or more never "
                    "picks one; only 1 to 99 (contained in 100 or 500) need a U (50U) · the titles show the N in use.",
@@ -715,7 +730,7 @@ def build():
     ], 0, y, 24, 3, intro="The newest second at which both legs have a basis price: their books' mids, else their last trades (ten minutes "
                           "back at most).", source=prices)); y += 3
     usdt = {"unit": "locale", "decimals": 0}
-    panels.append(stat_strip("Signal · Latest Second · Notional ${n_text} USDT", None, [
+    panels.append(stat_strip("Signal · Latest Second · Notional ${n_text} USDT · " + SWEEP, None, [
         ("Real Long Deviation", "|Real Long Spread − Mean| while Real Long Spread is below the Mean, the side a Long fills on · Other "
          "Side (grey): Real Long Spread at or above the Mean, where a Long cannot come (the tooltips still give |Real Long Spread − "
          "Mean| there) · Real Long Spread: the Spread on the average prices of buying both legs for N through their pricing levels' asks "
@@ -733,9 +748,9 @@ def build():
          "(the title shows ? or 0), amber · No Entry: Entry is not a positive number, amber · No Sigma: Entry is a multiple of sigma and "
          "sigma is not ready (or Sigma Scale is not valid) · Past T: a leg's dividend took effect "
          "without its amount, amber, no signal until the amount is known.", {"mappings": [SIGNAL]}),
-    ], 0, y, 24, 3, intro="The same second, at the notional N (USDT, both legs together); the deviations are absolute, each shown on "
-                          "the side of the Mean its real spread can fill on, as the bright lines of Entry Points · Bps (Other Side on the "
-                          "other), and the Signal gives the side.",
+    ], 0, y, 24, 3, intro=NOT_PROGRAM + "\n\nThe same second, at the notional N (USDT, both legs together); the deviations are absolute, "
+                          "each shown on the side of the Mean its real spread can fill on, as the bright lines of Entry Points · Bps (Other "
+                          "Side on the other), and the Signal gives the side.",
         source=prices)); y += 3
     # The book of each leg in the same second, a row a leg (Q_LAST's two rows): its price tick on this CEX, its pricing levels
     # and their depth on each side, in contracts and USDT (owner item 61, point 4).
@@ -746,9 +761,10 @@ def build():
                         transformations=[keep_fields(book_fields), rows_with("Leg")], description=(
         "Depth = the total of a leg's pricing levels on a side: ct (contracts, shares of the ETF) and USDT (Σ price × size)\n\n"
         "The same second as the strips above · Tick: the leg's price tick on this CEX · Levels: its pricing levels, the first levels "
-        "from the best price on the side a taker takes, as the trading program prices (PRD 3.2): 2 at a 0.01 tick (SOXL), 5 at 0.001 "
+        "from the best price on the side a taker takes, as many as the trading program reads (PRD 3.2): 2 at a 0.01 tick (SOXL), 5 at 0.001 "
         "(Bitget SOXS), the levels as recorded, never merged into 0.01 ones · the Real spreads, the fills and the Signal take N "
-        "through these levels only · the total, not the program's takeable half · No Book: no usable book of the leg in that second "
+        "through these levels only, as a sweep average (the program prices at the last level instead) · the total, not the program's "
+        "takeable half · No Book: no usable book of the leg in that second "
         "· Few Levels: that side holds fewer levels than its pricing levels (no pricing level)."), overrides=[
         col("Leg", 80), col("Tick", 80, custom_align="right"), col("Levels", 80, custom_align="right"),
         col("Bid · ct", **depth_ct), col("Bid · USDT", **depth_usdt), col("Ask · ct", **depth_ct), col("Ask · USDT", **depth_usdt)])); y += 5
@@ -781,7 +797,7 @@ def build():
         col("Result", 104, custom_cellOptions={"type": "color-text"}, mappings=[CALENDAR]),
         col("Detail", custom_minWidth=120, custom_wrapText=True)])); y += 6
 
-    panels.append(row("Spread · ${ma:text} ${ma_text} min · σ ${sigma_text} min · Entry ${d_text} · Notional ${n_text} USDT (Both Legs)", y)); y += 1
+    panels.append(row("Spread · ${ma:text} ${ma_text} min · σ ${sigma_text} min · Entry ${d_text} · Notional ${n_text} USDT (Both Legs) · " + SWEEP, y)); y += 1
     # The tooltips show only twins, each point's value or the reason it has none (tooltip_only), as Grafana would show a nearby
     # point's value in place of a NULL: the drawn lines and the legend's figures are kept out of them.
     no_value = code_texts(NO_VALUE)
@@ -804,7 +820,7 @@ def build():
         twin(name, ORANGE if name.startswith("Bid") else BLUE, display,
              {"unit": "locale", "decimals": 2 if name.endswith("ct") else 0}) for name, display, _, _ in DEPTHS]
     spread = timeseries("Spread · Bps", Q_SPREAD, 0, y, 24, 13, band, transformations=[keep_fields(SPREAD_ORDER), organize(SPREAD_ORDER)], description=(
-        "Spread = 10⁴ × (F·P_bull ÷ A_bull + F·P_bear ÷ A_bear − 2) · P: both legs' mid prices, else both last trades · Real Long, Real "
+        NOT_PROGRAM + "\n\nSpread = 10⁴ × (F·P_bull ÷ A_bull + F·P_bear ÷ A_bear − 2) · P: both legs' mid prices, else both last trades · Real Long, Real "
         "Short Spread: the same on the average prices of buying, selling both legs for the notional N through their pricing levels' "
         "asks, bids · σ: the population standard deviation of the minute bars' spread over the Sigma Scale · Long: Real Long Spread ≤ "
         "Mean − Entry · Short: Real Short Spread ≥ Mean + Entry · Entry: the bps typed in Entry (bps), else k × σ (Entry's 0.5σ … 3σ) at each point\n\n"
@@ -817,7 +833,8 @@ def build():
         "ask) ÷ 2 of both legs' recorded books in that second, else both legs' last trades before it (before the recorder: trades "
         "only, No Book) · Real Long Spread, Real Short Spread: what opening or closing a basket of N USDT (both legs together) as a "
         "taker gives in that second, the quantities making q·A equal on both legs, through each leg's pricing levels only (${bull} 1–"
-        "${bull_levels}, ${bear} 1–${bear_levels}: 2 at a 0.01 tick, 5 at 0.001, the trading program's, PRD 3.2); where those levels "
+        "${bull_levels}, ${bear} 1–${bear_levels}: 2 at a 0.01 tick, 5 at 0.001, as many as the trading program reads, PRD 3.2, averaged "
+        "here where the program takes the last level's price); where those levels "
         "hold less than N, on their totals, and the Signal reads Partial · Deviation, Real Long Deviation, Real Short Deviation: |Spread "
         "− Mean|, |Real Long Spread − Mean|, |Real Short Spread − Mean|, absolute (with their signs on Deviation · Bps) · Signal: as in "
         "Signal · Latest Second · depth: as in Book · Latest Second · A: session anchor, less a dividend or over a split's ratio from "
@@ -852,7 +869,7 @@ def build():
     deviation = timeseries("Deviation · Bps", None, 0, y, 24, 13, signed, zero_line=True, source=spread,
                            transformations=[keep_fields(DEVIATION_FIELDS + [name for name, _ in DEVIATION_SIGMAS])] + DEVIATION_BAND +
                            [organize(DEVIATION_ORDER, rename=DEVIATION_NAMES)], description=(
-        "Deviation = Spread − Mean · Real Long / Short Deviation = Real Long / Short Spread − Mean · Long: Real Long Deviation ≤ −Entry "
+        NOT_PROGRAM + "\n\nDeviation = Spread − Mean · Real Long / Short Deviation = Real Long / Short Spread − Mean · Long: Real Long Deviation ≤ −Entry "
         "· Short: Real Short Deviation ≥ +Entry · ±k σ: k times sigma, k = 0.5, 1, 1.5, 2, 2.5, 3\n\n"
         "The Spread chart with its Mean at zero, with signs · purple: Deviation on the mids (trades where there is no book; the only line "
         "before the recorder) · blue: Real Long Deviation, buying both legs for N through their pricing levels' asks, never below purple "
@@ -893,7 +910,7 @@ def build():
                              transformations=[keep_fields(ENTRY_FIELDS + [name for name, _ in ENTRY_SIGMAS])] +
                              [organize(ENTRY_ORDER, rename={"Deviation · Line": "Deviation"}, exclude=["Sigma"])],
                              description=(
-        "Deviation = |Spread − Mean| · Real Long Deviation = |Real Long Spread − Mean| · Real Short Deviation = |Real Short Spread − Mean| · "
+        NOT_PROGRAM + "\n\nDeviation = |Spread − Mean| · Real Long Deviation = |Real Long Spread − Mean| · Real Short Deviation = |Real Short Spread − Mean| · "
         "Long: Real Long Spread ≤ Mean − Entry · Short: Real Short Spread ≥ Mean + Entry\n\n"
         "All three are absolute (with their signs: Deviation · Bps); each real line is bright on the side of the Mean its real spread can fill on and faded on the other: "
         "Real Long Deviation (blue) bright while Real Long Spread is below the Mean, Real Short Deviation (orange) bright while Real "
@@ -1015,6 +1032,6 @@ def build():
                                     [marks("Corporate Actions", Q_MARKS, PURPLE, [spread["id"]]),
                                      marks("Anchor Changes", Q_ANCHOR_CHANGES, PURPLE, [p["id"] for p in panels if p["type"] == "timeseries"])]},
             "links": [reset_link("combo-spread", templating, "now-6h", REFRESH, keep=("combo", "venue"),
-                                 tooltip="Settings, time range and refresh back to defaults; Combo and CEX stay.")],
+                                 tooltip="Settings, time range and refresh back to defaults; Combo and CEX stay."), LIVE_MONITOR],
             "time": {"from": "now-6h", "to": "now"}, "refresh": REFRESH, "timepicker": {"refresh_intervals": REFRESH_INTERVALS}, "tags": [],
             "description": "Basket spread of a bull and a bear ETF perp on one exchange, against its moving mean and the entry band, session by session."}

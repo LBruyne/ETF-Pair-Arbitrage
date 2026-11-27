@@ -981,7 +981,7 @@
    "id": 6,
    "type": "table",
    "title": "Alerts",
-   "description": "What stopped or held trading in the picked Run and what became of it: the unfinished first, each group newest first, at most 200.\n\n- **Severity**: critical: position mismatch, a lost or stale Run, an entry held for a person (settings, records, mismatch), a program error; serious: a sample gap, one leg only, a forced exit, an order rejected, unknown, never arrived or not found; warning: an entry held back (a book, F, no anchor, backing off, a stop pending), a stop or session end while holding, dust, funding awaited, an order not sent.\n- **Status**: Open: a person is needed; In Progress: the program is still on it (only while the Run runs, else Open); Recovered: it ended by itself; Recorded: dust, recorded and not processed (owner item 47).\n- **Time**: when it happened, UTC+8; for an entry held back, the start of its newest episode.\n- **Source**: the part it belongs to: the Run, the positions, the entry, an order or a round trip (click a round trip's Source for its orders below).\n- **What, Detail**: what happened, and its figures: for an entry held back, how often, how long in all and at most, and the seconds an executable deviation was past an entry line meanwhile (the entries it cost).",
+   "description": "What stopped or held trading in the picked Run and what became of it: the unfinished first, each group newest first, at most 200.\n\n- **Severity**: critical: position mismatch, a lost or stale Run, an entry held for a person (settings, records, mismatch), a program error (Refused in a Row among them); serious: a sample gap, one leg only, a forced exit, an order rejected, unknown, never arrived or not found; warning: an entry held back (a book, F, no anchor, backing off, a stop pending), a stop or session end while holding, dust, funding awaited, an order not sent.\n- **Status**: Open: a person is needed; In Progress: the program is still on it (only while the Run runs, else Open); Recovered: it ended by itself; Recorded: dust, recorded and not processed (owner item 47).\n- **Time**: when it happened, UTC+8; for an entry held back, the start of its newest episode.\n- **Source**: the part it belongs to: the Run, the positions, the entry, an order or a round trip (click a round trip's Source for its orders below).\n- **What, Detail**: what happened, and its figures: for an entry held back, how often, how long in all and at most, and the seconds an executable deviation was past an entry line meanwhile (the entries it cost); a run of orders rejected in a row (same round trip, leg, purpose, side, quantity and code) is one row, Orders Rejected, with how many and from when to when, and a round trip's repeated forced-exit decisions one Forced Exit row (4.5).\n- **Refused in a Row**: the program's alarm (critical, Open; again every stop_alarm_after while the refusals go on, one row with how often it was raised): Source names the leg; Detail how many orders in a row and for how long, by purpose and by error code, the last order and the venue's, the ledger's and the round trip's position (check the quantity against the venue's position).",
    "gridPos": {
     "x": 0,
     "y": 13,
@@ -1002,7 +1002,7 @@
      "format": "table",
      "rawQuery": true,
      "editorMode": "code",
-     "rawSql": "WITH sel AS MATERIALIZED (SELECT r.run_id, r.live, r.started_ms, r.stopped_ms, r.host, r.config, coalesce(r.stopped_ms, (extract(epoch FROM now()) * 1000)::bigint) AS end_ms\n                         FROM trade.process_run r WHERE r.run_id = (SELECT CASE '$run' WHEN '__live' THEN (SELECT x.run_id FROM trade.process_run x WHERE x.live ORDER BY x.started_ms DESC LIMIT 1) WHEN '__paper' THEN (SELECT x.run_id FROM trade.process_run x WHERE NOT x.live ORDER BY x.started_ms DESC LIMIT 1) ELSE '$run' END) AND coalesce(r.config #>> '{cex,pair,bull,ticker}', 'SOXL') || ' / ' || coalesce(r.config #>> '{cex,pair,bear,ticker}', 'SOXS') = '$combo'),\nrg AS MATERIALIZED (SELECT greatest(sel.started_ms, (CASE WHEN '${since}' ~ '^[0-9]{1,14}$' AND '${since}' <> '0' THEN '${since}'::bigint + CASE WHEN '${since_hour}' ~ '^[0-9]{1,2}$' THEN '${since_hour}'::int ELSE 0 END * 3600000 ELSE 0 END)) AS from_ms, least(sel.end_ms + 1, (CASE WHEN '${until}' ~ '^[0-9]{1,14}$' AND '${until}'::bigint < 99999999999999 THEN '${until}'::bigint + CASE WHEN '${until_hour}' ~ '^[0-9]{1,2}$' THEN '${until_hour}'::int ELSE 24 END * 3600000 ELSE 99999999999999 END)) AS to_ms FROM sel),\n     r AS (SELECT * FROM sel), sr AS (SELECT * FROM sel),\n     s AS (SELECT * FROM trade.signal_sample s WHERE s.run_id = (SELECT sel.run_id FROM sel) AND s.live = (SELECT sel.live FROM sel) AND s.ts_ms <= (SELECT sel.end_ms FROM sel)\n           AND s.ts_ms > (SELECT sel.end_ms FROM sel) - 172800000 ORDER BY s.ts_ms DESC LIMIT 1),\n     i AS (SELECT * FROM trade.inventory_sample i WHERE i.run_id = (SELECT sel.run_id FROM sel) AND i.live = (SELECT sel.live FROM sel) AND i.ts_ms <= (SELECT sel.end_ms FROM sel)\n           AND i.ts_ms > (SELECT sel.end_ms FROM sel) - 172800000 ORDER BY i.ts_ms DESC LIMIT 1),\nx AS MATERIALIZED (\n  SELECT q.ts_ms, q.idle_reason, q.ts_ms - lag(q.ts_ms) OVER w AS gap,\n         q.stats_ready AND (q.x_long_d / nullif(q.sigma_d, 0) <= -coalesce(sr.config #>> '{strategy,entry_in}', sr.config #>> '{strategy,d_in}')::float8 OR q.x_short_d / nullif(q.sigma_d, 0) >= coalesce(sr.config #>> '{strategy,entry_in}', sr.config #>> '{strategy,d_in}')::float8) AS at_line,\n         CASE WHEN q.idle_reason IS DISTINCT FROM lag(q.idle_reason) OVER w OR q.ts_ms - lag(q.ts_ms) OVER w > 3000 THEN 1 ELSE 0 END AS new_ep\n  FROM trade.signal_sample q CROSS JOIN sr WHERE q.run_id = (SELECT sel.run_id FROM sel) AND q.live = (SELECT sel.live FROM sel) WINDOW w AS (ORDER BY q.ts_ms)),\nep AS (SELECT x.idle_reason AS code, min(x.ts_ms) AS t0, count(*) AS n, count(*) FILTER (WHERE x.at_line) AS at_line\n       FROM (SELECT x.*, sum(x.new_ep) OVER (ORDER BY x.ts_ms) AS k FROM x WHERE x.idle_reason IN ('no_levels', 'depth_bull', 'depth_bear', 'conflict_bull', 'conflict_bear', 'fx_stale', 'rejected_backoff', 'no_anchor', 'depth', 'no_price', 'order_unknown', 'stopping', 'no_new_entries', 'settings', 'store_error', 'position_mismatch', 'valuation')) x GROUP BY x.idle_reason, x.k),\nheld AS (SELECT ep.code, min(ep.t0) AS first_ms, max(ep.t0) AS last_ms, count(*) AS times, sum(ep.n) AS seconds, max(ep.n) AS longest,\n                sum(ep.at_line) AS at_line FROM ep GROUP BY ep.code),\nmi AS (SELECT y.*, sum(y.st) OVER (ORDER BY y.ts_ms) AS k FROM (\n         SELECT m.ts_ms, m.mismatch, m.pos_bull, m.pos_bear, m.ledger_bull, m.ledger_bear,\n                CASE WHEN m.mismatch AND NOT coalesce(lag(m.mismatch) OVER (ORDER BY m.ts_ms), false) THEN 1 ELSE 0 END AS st\n         FROM trade.inventory_sample m WHERE m.run_id = (SELECT sel.run_id FROM sel) AND m.live = (SELECT sel.live FROM sel)) y),\nmis AS (SELECT min(mi.ts_ms) AS t0, max(mi.ts_ms) AS t1, (array_agg(mi.pos_bull ORDER BY mi.ts_ms))[1] AS pb, (array_agg(mi.ledger_bull ORDER BY mi.ts_ms))[1] AS lb,\n               (array_agg(mi.pos_bear ORDER BY mi.ts_ms))[1] AS pe, (array_agg(mi.ledger_bear ORDER BY mi.ts_ms))[1] AS le\n        FROM mi WHERE mi.mismatch GROUP BY mi.k),\nal AS (\n  SELECT h.last_ms AS ts_ms, CASE WHEN h.code IN ('settings', 'store_error', 'position_mismatch') THEN 'critical' ELSE 'warning' END AS sev,\n         CASE WHEN (SELECT sel.stopped_ms IS NULL FROM sel) AND h.code = (SELECT s.idle_reason FROM s) THEN CASE WHEN h.code IN ('settings', 'store_error', 'position_mismatch') THEN 'Open' ELSE 'In Progress' END\n              ELSE 'Recovered' END AS status,\n         'Entry' AS source, CASE WHEN h.code IS NULL THEN 'This Second' ELSE CASE h.code WHEN 'no_signal' THEN 'No Signal Yet' WHEN 'regular_hours' THEN 'Regular Hours' WHEN 'spacing' THEN 'Spacing After Entry' WHEN 'holding_other_side' THEN 'Holding Other Side' WHEN 'cost_not_covered' THEN 'Fees Not Covered' WHEN 'quota_exhausted' THEN 'Quota Used Up' WHEN 'too_small' THEN 'Below Minimum Size' WHEN 'warmup' THEN 'Mean/σ Warming Up' WHEN 'zero_sigma' THEN 'σ Is Zero' WHEN 'positions_read' THEN 'Reading Positions' WHEN 'await_orders' THEN 'Orders in Flight' WHEN 'await_depth' THEN 'Awaiting Book' WHEN 'await_close' THEN 'Awaiting Flat Confirm' WHEN 'action_window' THEN 'Dividend/Split Window' WHEN 'capital_pending' THEN 'Capital Change Pending' WHEN 'no_levels' THEN 'Book Too Thin' WHEN 'depth_bull' THEN '$bull Book Unusable' WHEN 'depth_bear' THEN '$bear Book Unusable' WHEN 'conflict_bull' THEN '$bull Book Conflict' WHEN 'conflict_bear' THEN '$bear Book Conflict' WHEN 'fx_stale' THEN 'USD/USDT Stale' WHEN 'rejected_backoff' THEN 'Rejected, Backing Off' WHEN 'no_anchor' THEN 'No Anchor Yet' WHEN 'depth' THEN 'Exit Book Unusable' WHEN 'no_price' THEN 'No Price to Reduce' WHEN 'order_unknown' THEN 'Order Outcome Unknown' WHEN 'not_ready' THEN 'Starting Up' WHEN 'stopping' THEN 'Stopping' WHEN 'no_new_entries' THEN 'Stop Pending' WHEN 'settings' THEN 'Account Settings' WHEN 'store_error' THEN 'Records Not Written' WHEN 'position_mismatch' THEN 'Position Mismatch' WHEN 'pair_bound' THEN 'Thick Leg Beyond Its Bound' WHEN 'window' THEN 'Pair Window Over' WHEN 'stop_d' THEN 'Ideal Spread Stop' WHEN 'profit' THEN 'Thin Leg Profit Close' WHEN 'exit_bound' THEN 'Exit: Thick Leg Beyond Break-Even' WHEN 'd1_loss' THEN 'Exit Below Break-Even' WHEN 'exit_window' THEN 'Exit: Thick Leg Hard Close' WHEN 'exit_stop_d' THEN 'Exit: Thick Leg Hard Close' WHEN 'valuation' THEN 'Close Not Valued' WHEN 'forced' THEN 'Forced Exit' WHEN 'no_profit' THEN 'Exit 1: Round Not in Profit' WHEN 'precheck' THEN 'Exit 1: Batch Short of Break-Even' WHEN 'half_done' THEN 'Half Closed, Rest at Exit 2' ELSE initcap(replace(h.code, '_', ' ')) END END AS what,\n         h.times || CASE WHEN h.times = 1 THEN ' time' ELSE ' times' END || ' since ' || to_char(to_timestamp((h.first_ms) / 1000.0) AT TIME ZONE 'Etc/GMT-8', 'HH24:MI:SS') || ', ' || h.seconds || ' s in all, longest ' || h.longest || ' s'\n           || CASE WHEN h.at_line > 0 THEN '; ' || h.at_line || ' s of them past an entry line' ELSE '' END AS detail, NULL::text AS cycle_id\n  FROM held h\n  UNION ALL\n  SELECT x.ts_ms - x.gap, 'serious', 'Recovered', 'Run', 'Sample Gap', 'no sample for ' || CASE WHEN (x.gap)::bigint IS NULL THEN NULL WHEN (x.gap)::bigint < 60000 THEN ((x.gap)::bigint / 1000) || 's' WHEN (x.gap)::bigint < 3600000 THEN ((x.gap)::bigint / 60000) || 'm ' || lpad((((x.gap)::bigint / 1000) % 60)::text, 2, '0') || 's' WHEN (x.gap)::bigint < 86400000 THEN ((x.gap)::bigint / 3600000) || 'h ' || lpad((((x.gap)::bigint / 60000) % 60)::text, 2, '0') || 'm' ELSE ((x.gap)::bigint / 86400000) || 'd ' || lpad((((x.gap)::bigint / 3600000) % 24)::text, 2, '0') || 'h' END || ': the loop stalled or the process was down', NULL\n  FROM x WHERE x.gap > 5000\n  UNION ALL\n  SELECT coalesce(s.ts_ms, r.started_ms), 'critical', 'Open', 'Run', CASE WHEN s.ts_ms IS NULL OR (extract(epoch FROM now()) * 1000)::bigint - s.ts_ms > 60000 THEN 'Run Lost' ELSE 'Samples Stale' END,\n         'no stop recorded and ' || CASE WHEN s.ts_ms IS NULL THEN 'no sample yet' ELSE 'the newest sample ' || CASE WHEN ((extract(epoch FROM now()) * 1000)::bigint - s.ts_ms)::bigint IS NULL THEN NULL WHEN ((extract(epoch FROM now()) * 1000)::bigint - s.ts_ms)::bigint < 60000 THEN (((extract(epoch FROM now()) * 1000)::bigint - s.ts_ms)::bigint / 1000) || 's' WHEN ((extract(epoch FROM now()) * 1000)::bigint - s.ts_ms)::bigint < 3600000 THEN (((extract(epoch FROM now()) * 1000)::bigint - s.ts_ms)::bigint / 60000) || 'm ' || lpad(((((extract(epoch FROM now()) * 1000)::bigint - s.ts_ms)::bigint / 1000) % 60)::text, 2, '0') || 's' WHEN ((extract(epoch FROM now()) * 1000)::bigint - s.ts_ms)::bigint < 86400000 THEN (((extract(epoch FROM now()) * 1000)::bigint - s.ts_ms)::bigint / 3600000) || 'h ' || lpad(((((extract(epoch FROM now()) * 1000)::bigint - s.ts_ms)::bigint / 60000) % 60)::text, 2, '0') || 'm' ELSE (((extract(epoch FROM now()) * 1000)::bigint - s.ts_ms)::bigint / 86400000) || 'd ' || lpad(((((extract(epoch FROM now()) * 1000)::bigint - s.ts_ms)::bigint / 3600000) % 24)::text, 2, '0') || 'h' END || ' old' END\n         || ': the process crashed, hung or cannot write', NULL\n  FROM r LEFT JOIN s ON true WHERE r.stopped_ms IS NULL AND (extract(epoch FROM now()) * 1000)::bigint - r.started_ms >= 60000 AND (s.ts_ms IS NULL OR (extract(epoch FROM now()) * 1000)::bigint - s.ts_ms > 10000)\n  UNION ALL\n  SELECT mis.t0, 'critical', CASE WHEN mis.t1 = (SELECT i.ts_ms FROM i) AND (SELECT sel.stopped_ms IS NULL FROM sel) THEN 'Open' ELSE 'Recovered' END, 'Positions', 'Position Mismatch',\n         'venue / ledger: $bull ' || coalesce(trim_scale((mis.pb)::numeric)::text, '–') || ' / ' || trim_scale((mis.lb)::numeric)::text || ', $bear ' || coalesce(trim_scale((mis.pe)::numeric)::text, '–') || ' / ' || trim_scale((mis.le)::numeric)::text || ' ct; no orders until a person checks', NULL\n  FROM mis\n  UNION ALL\n  SELECT coalesce(c.closed_ms, c.opened_ms), CASE WHEN c.end_reason = 'one_leg' AND NOT EXISTS (SELECT 1 FROM trade.lot x WHERE x.live = c.live AND x.cycle_id = c.cycle_id AND to_jsonb(x) ->> 'end_state' IS NOT NULL) THEN 'serious' ELSE 'warning' END,\n         CASE WHEN c.end_reason = 'dust_only' OR c.dust_bull <> 0 OR c.dust_bear <> 0 THEN 'Recorded' ELSE 'Recovered' END,\n         'Execution ' || to_char(to_timestamp((c.opened_ms) / 1000.0) AT TIME ZONE 'Etc/GMT-8', 'MM‑DD HH24:MI:SS'),\n         CASE WHEN c.end_reason = 'one_leg' AND EXISTS (SELECT 1 FROM trade.lot x WHERE x.live = c.live AND x.cycle_id = c.cycle_id AND to_jsonb(x) ->> 'end_state' IS NOT NULL) THEN 'Nothing Paired' ELSE CASE c.end_reason WHEN 'one_leg' THEN 'One Leg Only' WHEN 'stop' THEN 'Stopped While Holding' WHEN 'session_changed' THEN 'Session Ended While Holding'\n              WHEN 'store_error' THEN 'Not Recorded' ELSE 'Dust Left' END END,\n         initcap(c.direction) || ', ' || CASE WHEN c.end_reason = 'one_leg' AND EXISTS (SELECT 1 FROM trade.lot x WHERE x.live = c.live AND x.cycle_id = c.cycle_id AND to_jsonb(x) ->> 'end_state' IS NOT NULL) THEN 'every batch unwound' ELSE lower(coalesce(CASE c.end_reason WHEN 'exit_line' THEN 'Exit Line' WHEN 'close_window' THEN 'Flattened Before Close' WHEN 'stop' THEN 'Program Stopped' WHEN 'session_changed' THEN 'Session Ended' WHEN 'no_fill' THEN 'No Fill' WHEN 'one_leg' THEN 'One Leg Only' WHEN 'dust_only' THEN 'Trimmed to Dust' WHEN 'store_error' THEN 'Not Recorded' ELSE initcap(replace(c.end_reason, '_', ' ')) END, 'Open')) END || ', net ' || CASE WHEN c.funding_known THEN replace(to_char(c.net, 'FM999,990.0000'), '-', '−') || ' USDT' ELSE 'Pending' END\n           || CASE WHEN c.dust_bull <> 0 OR c.dust_bear <> 0 THEN '; dust left (recorded only): $bull ' || trim_scale((c.dust_bull)::numeric)::text || ', $bear ' || trim_scale((c.dust_bear)::numeric)::text || ' ct' ELSE '' END, c.cycle_id\n  FROM trade.cycle c WHERE c.live = (SELECT sel.live FROM sel) AND (c.run_id = (SELECT sel.run_id FROM sel) OR c.cycle_id IN (SELECT dr.cycle_id FROM trade.decision dr WHERE dr.run_id = (SELECT sel.run_id FROM sel) AND dr.live = (SELECT sel.live FROM sel) AND dr.cycle_id IS NOT NULL)) AND (c.end_reason IN ('one_leg', 'stop', 'session_changed', 'store_error', 'dust_only') OR c.dust_bull <> 0 OR c.dust_bear <> 0)\n  UNION ALL\n  SELECT d.ts_ms, 'serious', CASE WHEN c.status = 'open' AND (SELECT sel.stopped_ms IS NULL FROM sel) THEN 'In Progress' ELSE 'Recovered' END, 'Execution ' || coalesce(to_char(to_timestamp((c.opened_ms) / 1000.0) AT TIME ZONE 'Etc/GMT-8', 'MM‑DD HH24:MI:SS'), '–'),\n         'Forced Exit', CASE d.detail ->> 'cause' WHEN 'stop' THEN 'on the stop' WHEN 'close_window' THEN 'before the close' ELSE coalesce(d.detail ->> 'cause', 'forced') END\n           || ', IOC with ' || coalesce(d.detail ->> 'slip_bps', '–') || ' bps slip', d.cycle_id\n  FROM trade.decision d LEFT JOIN trade.cycle c ON c.live = d.live AND c.cycle_id = d.cycle_id WHERE d.run_id = (SELECT sel.run_id FROM sel) AND d.live = (SELECT sel.live FROM sel) AND d.kind = 'forced'\n  UNION ALL\n  SELECT d.ts_ms, 'warning', CASE WHEN c.status = 'open' AND (SELECT sel.stopped_ms IS NULL FROM sel) THEN 'In Progress' ELSE 'Recovered' END, 'Execution ' || coalesce(to_char(to_timestamp((c.opened_ms) / 1000.0) AT TIME ZONE 'Etc/GMT-8', 'MM‑DD HH24:MI:SS'), '–'),\n         CASE d.kind WHEN 'pair' THEN 'Thin Leg Unwound' ELSE 'Exit Hard Close' END,\n         CASE d.reason WHEN 'window' THEN 'the pair window ran out with ' || coalesce(trim_scale(round(((d.detail ->> 'thin_qty')::numeric - coalesce((d.detail ->> 'thick_qty')::numeric, 0) * c.pair_anchor_bull / c.pair_anchor_bear), 2))::text, '–') || ' ct of $bear not paired: unwound'\n                       WHEN 'stop_d' THEN 'the ideally paired spread ' || coalesce(replace(to_char(round((d.detail ->> 'd_ideal')::numeric, 1), 'FM9990.0'), '-', '−'), '–') || ' bps against ' || coalesce(replace(to_char(round((d.detail ->> 'd_dec')::numeric, 1), 'FM9990.0'), '-', '−'), '–') || ' bps at the decision: unwound'\n                       WHEN 'too_small' THEN 'what was not paired is too small to pair: unwound'\n                       WHEN 'exit_window' THEN 'the exit''s thick leg found no price within break-even in the exit pair window: closed whatever the price'\n                       WHEN 'exit_stop_d' THEN 'the ideal closing spread ' || coalesce(replace(to_char(round((d.detail ->> 'd_ideal')::numeric, 1), 'FM9990.0'), '-', '−'), '–') || ' bps against ' || coalesce(replace(to_char(round((d.detail ->> 'd_dec')::numeric, 1), 'FM9990.0'), '-', '−'), '–') || ' bps at the decision: closed whatever the price'\n                       ELSE coalesce(d.reason, '–') END, d.cycle_id\n  FROM trade.decision d LEFT JOIN trade.cycle c ON c.live = d.live AND c.cycle_id = d.cycle_id\n  WHERE d.run_id = (SELECT sel.run_id FROM sel) AND d.live = (SELECT sel.live FROM sel) AND d.kind IN ('pair', 'exit_pair') AND d.detail ->> 'action' = 'risk_exit'\n  UNION ALL\n  SELECT d.ts_ms, 'warning', CASE WHEN c.status = 'open' AND (SELECT sel.stopped_ms IS NULL FROM sel) THEN 'In Progress' ELSE 'Recovered' END, 'Execution ' || coalesce(to_char(to_timestamp((c.opened_ms) / 1000.0) AT TIME ZONE 'Etc/GMT-8', 'MM‑DD HH24:MI:SS'), '–'),\n         'Exit Below Break-Even', 'the batch''s pre-check expected a round net of ' || coalesce(replace(to_char((d.detail ->> 'expected_net')::numeric, 'FM9990.00'), '-', '−'), '–') || ' USDT; it exits all the same at '\n           || CASE d.detail ->> 'line' WHEN 'exit2' THEN 'exit 2' ELSE 'the exit line' END || ' (PRD 9.2)', d.cycle_id\n  FROM trade.decision d LEFT JOIN trade.cycle c ON c.live = d.live AND c.cycle_id = d.cycle_id WHERE d.run_id = (SELECT sel.run_id FROM sel) AND d.live = (SELECT sel.live FROM sel) AND d.kind = 'exit' AND d.reason = 'd1_loss'\n  UNION ALL\n  SELECT c.closed_ms, 'warning', CASE WHEN (SELECT sel.stopped_ms IS NULL FROM sel) THEN 'In Progress' ELSE 'Open' END, 'Execution ' || to_char(to_timestamp((c.opened_ms) / 1000.0) AT TIME ZONE 'Etc/GMT-8', 'MM‑DD HH24:MI:SS'), 'Funding Awaited',\n         jsonb_array_length(c.funding_awaited) || ' settlement(s) without a record: its net stays Pending', c.cycle_id\n  FROM trade.cycle c WHERE c.live = (SELECT sel.live FROM sel) AND (c.run_id = (SELECT sel.run_id FROM sel) OR c.cycle_id IN (SELECT dr.cycle_id FROM trade.decision dr WHERE dr.run_id = (SELECT sel.run_id FROM sel) AND dr.live = (SELECT sel.live FROM sel) AND dr.cycle_id IS NOT NULL)) AND jsonb_typeof(c.funding_awaited) = 'array' AND jsonb_array_length(c.funding_awaited) > 0\n  UNION ALL\n  SELECT o.submitted_ms, CASE WHEN o.status = 'not_sent' THEN 'warning' ELSE 'serious' END,\n         CASE WHEN o.unknown THEN CASE WHEN (SELECT sel.stopped_ms IS NULL FROM sel) THEN 'In Progress' ELSE 'Open' END ELSE 'Recovered' END,\n         'Order · ' || CASE o.leg WHEN 'bull' THEN '$bull' ELSE '$bear' END,\n         CASE WHEN o.unknown THEN 'Order Outcome Unknown' WHEN o.not_found THEN 'Order Not Found' WHEN o.status = 'rejected' THEN 'Order Rejected'\n              WHEN o.status = 'not_sent' THEN 'Order Not Sent' ELSE 'Order Never Arrived' END,\n         initcap(o.purpose) || ' ' || o.side || ' ' || trim_scale((o.qty)::numeric)::text || ' @ ' || trim_scale((o.price)::numeric)::text || coalesce(' · ' || nullif(concat_ws(' ', o.error_code, o.error_message), ''), ''), o.cycle_id\n  FROM trade.cex_order o WHERE o.run_id = (SELECT sel.run_id FROM sel) AND o.live = (SELECT sel.live FROM sel) AND (o.unknown OR o.not_found OR o.status IN ('rejected', 'not_sent', 'never_arrived'))\n  UNION ALL\n  SELECT e.ts_ms, CASE e.level WHEN 'error' THEN 'critical' ELSE 'warning' END, 'Open', 'Program · ' || e.module, initcap(replace(e.kind, '_', ' ')), e.message, NULL\n  FROM trade.event e WHERE e.run_id = (SELECT sel.run_id FROM sel) AND e.live = (SELECT sel.live FROM sel) AND e.level IN ('error', 'warn'))\nSELECT t.time, t.\"Severity\", t.\"Status\", t.\"Source\", t.\"What\", t.\"Detail\", t.cycle_id FROM (\n  SELECT to_timestamp(a.ts_ms / 1000.0) AS time, a.sev AS \"Severity\", a.status AS \"Status\", a.source AS \"Source\", a.what AS \"What\", a.detail AS \"Detail\",\n         a.cycle_id, CASE a.status WHEN 'Open' THEN 0 WHEN 'In Progress' THEN 1 ELSE 2 END AS k, a.ts_ms\n  FROM al a ORDER BY 8, a.ts_ms DESC LIMIT 200) t\nUNION ALL\nSELECT NULL, NULL, NULL, NULL, NULL, 'No alert in this Run: nothing stopped or held trading', NULL WHERE NOT EXISTS (SELECT 1 FROM al)"
+     "rawSql": "WITH sel AS MATERIALIZED (SELECT r.run_id, r.live, r.started_ms, r.stopped_ms, r.host, r.config, coalesce(r.stopped_ms, (extract(epoch FROM now()) * 1000)::bigint) AS end_ms\n                         FROM trade.process_run r WHERE r.run_id = (SELECT CASE '$run' WHEN '__live' THEN (SELECT x.run_id FROM trade.process_run x WHERE x.live ORDER BY x.started_ms DESC LIMIT 1) WHEN '__paper' THEN (SELECT x.run_id FROM trade.process_run x WHERE NOT x.live ORDER BY x.started_ms DESC LIMIT 1) ELSE '$run' END) AND coalesce(r.config #>> '{cex,pair,bull,ticker}', 'SOXL') || ' / ' || coalesce(r.config #>> '{cex,pair,bear,ticker}', 'SOXS') = '$combo'),\nrg AS MATERIALIZED (SELECT greatest(sel.started_ms, (CASE WHEN '${since}' ~ '^[0-9]{1,14}$' AND '${since}' <> '0' THEN '${since}'::bigint + CASE WHEN '${since_hour}' ~ '^[0-9]{1,2}$' THEN '${since_hour}'::int ELSE 0 END * 3600000 ELSE 0 END)) AS from_ms, least(sel.end_ms + 1, (CASE WHEN '${until}' ~ '^[0-9]{1,14}$' AND '${until}'::bigint < 99999999999999 THEN '${until}'::bigint + CASE WHEN '${until_hour}' ~ '^[0-9]{1,2}$' THEN '${until_hour}'::int ELSE 24 END * 3600000 ELSE 99999999999999 END)) AS to_ms FROM sel),\n     r AS (SELECT * FROM sel), sr AS (SELECT * FROM sel),\n     s AS (SELECT * FROM trade.signal_sample s WHERE s.run_id = (SELECT sel.run_id FROM sel) AND s.live = (SELECT sel.live FROM sel) AND s.ts_ms <= (SELECT sel.end_ms FROM sel)\n           AND s.ts_ms > (SELECT sel.end_ms FROM sel) - 172800000 ORDER BY s.ts_ms DESC LIMIT 1),\n     i AS (SELECT * FROM trade.inventory_sample i WHERE i.run_id = (SELECT sel.run_id FROM sel) AND i.live = (SELECT sel.live FROM sel) AND i.ts_ms <= (SELECT sel.end_ms FROM sel)\n           AND i.ts_ms > (SELECT sel.end_ms FROM sel) - 172800000 ORDER BY i.ts_ms DESC LIMIT 1),\nx AS MATERIALIZED (\n  SELECT q.ts_ms, q.idle_reason, q.ts_ms - lag(q.ts_ms) OVER w AS gap,\n         q.stats_ready AND (q.x_long_d / nullif(q.sigma_d, 0) <= -coalesce(sr.config #>> '{strategy,entry_in}', sr.config #>> '{strategy,d_in}')::float8 OR q.x_short_d / nullif(q.sigma_d, 0) >= coalesce(sr.config #>> '{strategy,entry_in}', sr.config #>> '{strategy,d_in}')::float8) AS at_line,\n         CASE WHEN q.idle_reason IS DISTINCT FROM lag(q.idle_reason) OVER w OR q.ts_ms - lag(q.ts_ms) OVER w > 3000 THEN 1 ELSE 0 END AS new_ep\n  FROM trade.signal_sample q CROSS JOIN sr WHERE q.run_id = (SELECT sel.run_id FROM sel) AND q.live = (SELECT sel.live FROM sel) WINDOW w AS (ORDER BY q.ts_ms)),\nep AS (SELECT x.idle_reason AS code, min(x.ts_ms) AS t0, count(*) AS n, count(*) FILTER (WHERE x.at_line) AS at_line\n       FROM (SELECT x.*, sum(x.new_ep) OVER (ORDER BY x.ts_ms) AS k FROM x WHERE x.idle_reason IN ('no_levels', 'depth_bull', 'depth_bear', 'conflict_bull', 'conflict_bear', 'fx_stale', 'rejected_backoff', 'no_anchor', 'depth', 'no_price', 'order_unknown', 'stopping', 'no_new_entries', 'settings', 'store_error', 'position_mismatch', 'valuation')) x GROUP BY x.idle_reason, x.k),\nheld AS (SELECT ep.code, min(ep.t0) AS first_ms, max(ep.t0) AS last_ms, count(*) AS times, sum(ep.n) AS seconds, max(ep.n) AS longest,\n                sum(ep.at_line) AS at_line FROM ep GROUP BY ep.code),\nmi AS (SELECT y.*, sum(y.st) OVER (ORDER BY y.ts_ms) AS k FROM (\n         SELECT m.ts_ms, m.mismatch, m.pos_bull, m.pos_bear, m.ledger_bull, m.ledger_bear,\n                CASE WHEN m.mismatch AND NOT coalesce(lag(m.mismatch) OVER (ORDER BY m.ts_ms), false) THEN 1 ELSE 0 END AS st\n         FROM trade.inventory_sample m WHERE m.run_id = (SELECT sel.run_id FROM sel) AND m.live = (SELECT sel.live FROM sel)) y),\nmis AS (SELECT min(mi.ts_ms) AS t0, max(mi.ts_ms) AS t1, (array_agg(mi.pos_bull ORDER BY mi.ts_ms))[1] AS pb, (array_agg(mi.ledger_bull ORDER BY mi.ts_ms))[1] AS lb,\n               (array_agg(mi.pos_bear ORDER BY mi.ts_ms))[1] AS pe, (array_agg(mi.ledger_bear ORDER BY mi.ts_ms))[1] AS le\n        FROM mi WHERE mi.mismatch GROUP BY mi.k),\nao AS MATERIALIZED (\n  SELECT o.*, row_number() OVER (ORDER BY o.submitted_ms, o.client_order_id) AS n,\n         CASE WHEN o.status = 'rejected' AND o.cum_exec_qty = 0 AND NOT o.unknown AND NOT o.not_found\n              THEN concat_ws('|', o.cycle_id, o.leg, o.purpose, o.side, o.qty::text, coalesce(o.error_code, '')) END AS fold\n  FROM trade.cex_order o WHERE o.run_id = (SELECT sel.run_id FROM sel) AND o.live = (SELECT sel.live FROM sel)),\nag AS (SELECT y.n, y.submitted_ms, y.price, sum(y.st) OVER (ORDER BY y.n) AS grp, y.unknown OR y.not_found OR y.status IN ('rejected', 'not_sent', 'never_arrived') AS alert\n       FROM (SELECT ao.*, CASE WHEN ao.fold IS NOT NULL AND ao.fold = lag(ao.fold) OVER (ORDER BY ao.n) THEN 0 ELSE 1 END AS st FROM ao) y),\naf AS (SELECT min(ag.n) AS n0, count(*) AS cnt, min(ag.submitted_ms) AS first_ms, max(ag.submitted_ms) AS last_ms, min(ag.price) AS lo, max(ag.price) AS hi\n       FROM ag WHERE ag.alert GROUP BY ag.grp),\nal AS (\n  SELECT h.last_ms AS ts_ms, CASE WHEN h.code IN ('settings', 'store_error', 'position_mismatch') THEN 'critical' ELSE 'warning' END AS sev,\n         CASE WHEN (SELECT sel.stopped_ms IS NULL FROM sel) AND h.code = (SELECT s.idle_reason FROM s) THEN CASE WHEN h.code IN ('settings', 'store_error', 'position_mismatch') THEN 'Open' ELSE 'In Progress' END\n              ELSE 'Recovered' END AS status,\n         'Entry' AS source, CASE WHEN h.code IS NULL THEN 'This Second' ELSE CASE h.code WHEN 'no_signal' THEN 'No Signal Yet' WHEN 'regular_hours' THEN 'Regular Hours' WHEN 'spacing' THEN 'Spacing After Entry' WHEN 'holding_other_side' THEN 'Holding Other Side' WHEN 'cost_not_covered' THEN 'Fees Not Covered' WHEN 'quota_exhausted' THEN 'Quota Used Up' WHEN 'too_small' THEN 'Below Minimum Size' WHEN 'warmup' THEN 'Mean/σ Warming Up' WHEN 'zero_sigma' THEN 'σ Is Zero' WHEN 'positions_read' THEN 'Reading Positions' WHEN 'await_orders' THEN 'Orders in Flight' WHEN 'await_depth' THEN 'Awaiting Book' WHEN 'await_close' THEN 'Awaiting Flat Confirm' WHEN 'action_window' THEN 'Dividend/Split Window' WHEN 'capital_pending' THEN 'Capital Change Pending' WHEN 'no_levels' THEN 'Book Too Thin' WHEN 'depth_bull' THEN '$bull Book Unusable' WHEN 'depth_bear' THEN '$bear Book Unusable' WHEN 'conflict_bull' THEN '$bull Book Conflict' WHEN 'conflict_bear' THEN '$bear Book Conflict' WHEN 'fx_stale' THEN 'USD/USDT Stale' WHEN 'rejected_backoff' THEN 'Rejected, Backing Off' WHEN 'no_anchor' THEN 'No Anchor Yet' WHEN 'depth' THEN 'Exit Book Unusable' WHEN 'no_price' THEN 'No Price to Reduce' WHEN 'order_unknown' THEN 'Order Outcome Unknown' WHEN 'not_ready' THEN 'Starting Up' WHEN 'stopping' THEN 'Stopping' WHEN 'no_new_entries' THEN 'Stop Pending' WHEN 'settings' THEN 'Account Settings' WHEN 'store_error' THEN 'Records Not Written' WHEN 'position_mismatch' THEN 'Position Mismatch' WHEN 'pair_bound' THEN 'Thick Leg Beyond Its Bound' WHEN 'window' THEN 'Pair Window Over' WHEN 'stop_d' THEN 'Ideal Spread Stop' WHEN 'profit' THEN 'Thin Leg Profit Close' WHEN 'exit_bound' THEN 'Exit: Thick Leg Beyond Break-Even' WHEN 'd1_loss' THEN 'Exit Below Break-Even' WHEN 'exit_window' THEN 'Exit: Thick Leg Hard Close' WHEN 'exit_stop_d' THEN 'Exit: Thick Leg Hard Close' WHEN 'valuation' THEN 'Close Not Valued' WHEN 'forced' THEN 'Forced Exit' WHEN 'no_profit' THEN 'Exit 1: Round Not in Profit' WHEN 'precheck' THEN 'Exit 1: Batch Short of Break-Even' WHEN 'half_done' THEN 'Half Closed, Rest at Exit 2' ELSE initcap(replace(h.code, '_', ' ')) END END AS what,\n         h.times || CASE WHEN h.times = 1 THEN ' time' ELSE ' times' END || ' since ' || to_char(to_timestamp((h.first_ms) / 1000.0) AT TIME ZONE 'Etc/GMT-8', 'HH24:MI:SS') || ', ' || h.seconds || ' s in all, longest ' || h.longest || ' s'\n           || CASE WHEN h.at_line > 0 THEN '; ' || h.at_line || ' s of them past an entry line' ELSE '' END AS detail, NULL::text AS cycle_id\n  FROM held h\n  UNION ALL\n  SELECT x.ts_ms - x.gap, 'serious', 'Recovered', 'Run', 'Sample Gap', 'no sample for ' || CASE WHEN (x.gap)::bigint IS NULL THEN NULL WHEN (x.gap)::bigint < 60000 THEN ((x.gap)::bigint / 1000) || 's' WHEN (x.gap)::bigint < 3600000 THEN ((x.gap)::bigint / 60000) || 'm ' || lpad((((x.gap)::bigint / 1000) % 60)::text, 2, '0') || 's' WHEN (x.gap)::bigint < 86400000 THEN ((x.gap)::bigint / 3600000) || 'h ' || lpad((((x.gap)::bigint / 60000) % 60)::text, 2, '0') || 'm' ELSE ((x.gap)::bigint / 86400000) || 'd ' || lpad((((x.gap)::bigint / 3600000) % 24)::text, 2, '0') || 'h' END || ': the loop stalled or the process was down', NULL\n  FROM x WHERE x.gap > 5000\n  UNION ALL\n  SELECT coalesce(s.ts_ms, r.started_ms), 'critical', 'Open', 'Run', CASE WHEN s.ts_ms IS NULL OR (extract(epoch FROM now()) * 1000)::bigint - s.ts_ms > 60000 THEN 'Run Lost' ELSE 'Samples Stale' END,\n         'no stop recorded and ' || CASE WHEN s.ts_ms IS NULL THEN 'no sample yet' ELSE 'the newest sample ' || CASE WHEN ((extract(epoch FROM now()) * 1000)::bigint - s.ts_ms)::bigint IS NULL THEN NULL WHEN ((extract(epoch FROM now()) * 1000)::bigint - s.ts_ms)::bigint < 60000 THEN (((extract(epoch FROM now()) * 1000)::bigint - s.ts_ms)::bigint / 1000) || 's' WHEN ((extract(epoch FROM now()) * 1000)::bigint - s.ts_ms)::bigint < 3600000 THEN (((extract(epoch FROM now()) * 1000)::bigint - s.ts_ms)::bigint / 60000) || 'm ' || lpad(((((extract(epoch FROM now()) * 1000)::bigint - s.ts_ms)::bigint / 1000) % 60)::text, 2, '0') || 's' WHEN ((extract(epoch FROM now()) * 1000)::bigint - s.ts_ms)::bigint < 86400000 THEN (((extract(epoch FROM now()) * 1000)::bigint - s.ts_ms)::bigint / 3600000) || 'h ' || lpad(((((extract(epoch FROM now()) * 1000)::bigint - s.ts_ms)::bigint / 60000) % 60)::text, 2, '0') || 'm' ELSE (((extract(epoch FROM now()) * 1000)::bigint - s.ts_ms)::bigint / 86400000) || 'd ' || lpad(((((extract(epoch FROM now()) * 1000)::bigint - s.ts_ms)::bigint / 3600000) % 24)::text, 2, '0') || 'h' END || ' old' END\n         || ': the process crashed, hung or cannot write', NULL\n  FROM r LEFT JOIN s ON true WHERE r.stopped_ms IS NULL AND (extract(epoch FROM now()) * 1000)::bigint - r.started_ms >= 60000 AND (s.ts_ms IS NULL OR (extract(epoch FROM now()) * 1000)::bigint - s.ts_ms > 10000)\n  UNION ALL\n  SELECT mis.t0, 'critical', CASE WHEN mis.t1 = (SELECT i.ts_ms FROM i) AND (SELECT sel.stopped_ms IS NULL FROM sel) THEN 'Open' ELSE 'Recovered' END, 'Positions', 'Position Mismatch',\n         'venue / ledger: $bull ' || coalesce(trim_scale((mis.pb)::numeric)::text, '–') || ' / ' || trim_scale((mis.lb)::numeric)::text || ', $bear ' || coalesce(trim_scale((mis.pe)::numeric)::text, '–') || ' / ' || trim_scale((mis.le)::numeric)::text || ' ct; no orders until a person checks', NULL\n  FROM mis\n  UNION ALL\n  SELECT coalesce(c.closed_ms, c.opened_ms), CASE WHEN c.end_reason = 'one_leg' AND NOT EXISTS (SELECT 1 FROM trade.lot x WHERE x.live = c.live AND x.cycle_id = c.cycle_id AND to_jsonb(x) ->> 'end_state' IS NOT NULL) THEN 'serious' ELSE 'warning' END,\n         CASE WHEN c.end_reason = 'dust_only' OR c.dust_bull <> 0 OR c.dust_bear <> 0 THEN 'Recorded' ELSE 'Recovered' END,\n         'Execution ' || to_char(to_timestamp((c.opened_ms) / 1000.0) AT TIME ZONE 'Etc/GMT-8', 'MM‑DD HH24:MI:SS'),\n         CASE WHEN c.end_reason = 'one_leg' AND EXISTS (SELECT 1 FROM trade.lot x WHERE x.live = c.live AND x.cycle_id = c.cycle_id AND to_jsonb(x) ->> 'end_state' IS NOT NULL) THEN 'Nothing Paired' ELSE CASE c.end_reason WHEN 'one_leg' THEN 'One Leg Only' WHEN 'stop' THEN 'Stopped While Holding' WHEN 'session_changed' THEN 'Session Ended While Holding'\n              WHEN 'store_error' THEN 'Not Recorded' ELSE 'Dust Left' END END,\n         initcap(c.direction) || ', ' || CASE WHEN c.end_reason = 'one_leg' AND EXISTS (SELECT 1 FROM trade.lot x WHERE x.live = c.live AND x.cycle_id = c.cycle_id AND to_jsonb(x) ->> 'end_state' IS NOT NULL) THEN 'every batch unwound' ELSE lower(coalesce(CASE c.end_reason WHEN 'exit_line' THEN 'Exit Line' WHEN 'close_window' THEN 'Flattened Before Close' WHEN 'stop' THEN 'Program Stopped' WHEN 'session_changed' THEN 'Session Ended' WHEN 'no_fill' THEN 'No Fill' WHEN 'one_leg' THEN 'One Leg Only' WHEN 'dust_only' THEN 'Trimmed to Dust' WHEN 'store_error' THEN 'Not Recorded' ELSE initcap(replace(c.end_reason, '_', ' ')) END, 'Open')) END || ', net ' || CASE WHEN c.funding_known THEN replace(to_char(c.net, 'FM999,990.0000'), '-', '−') || ' USDT' ELSE 'Pending' END\n           || CASE WHEN c.dust_bull <> 0 OR c.dust_bear <> 0 THEN '; dust left (recorded only): $bull ' || trim_scale((c.dust_bull)::numeric)::text || ', $bear ' || trim_scale((c.dust_bear)::numeric)::text || ' ct' ELSE '' END, c.cycle_id\n  FROM trade.cycle c WHERE c.live = (SELECT sel.live FROM sel) AND (c.run_id = (SELECT sel.run_id FROM sel) OR c.cycle_id IN (SELECT dr.cycle_id FROM trade.decision dr WHERE dr.run_id = (SELECT sel.run_id FROM sel) AND dr.live = (SELECT sel.live FROM sel) AND dr.cycle_id IS NOT NULL)) AND (c.end_reason IN ('one_leg', 'stop', 'session_changed', 'store_error', 'dust_only') OR c.dust_bull <> 0 OR c.dust_bear <> 0)\n  UNION ALL\n  SELECT max(d.ts_ms), 'serious', CASE WHEN c.status = 'open' AND (SELECT sel.stopped_ms IS NULL FROM sel) THEN 'In Progress' ELSE 'Recovered' END, 'Execution ' || coalesce(to_char(to_timestamp((c.opened_ms) / 1000.0) AT TIME ZONE 'Etc/GMT-8', 'MM‑DD HH24:MI:SS'), '–'),\n         'Forced Exit', CASE d.detail ->> 'cause' WHEN 'stop' THEN 'on the stop' WHEN 'close_window' THEN 'before the close' ELSE coalesce(d.detail ->> 'cause', 'forced') END\n           || ', IOC with ' || coalesce(d.detail ->> 'slip_bps', '–') || ' bps slip'\n           || CASE WHEN count(*) > 1 THEN ' · ' || to_char(count(*), 'FM999,999,990') || ' decisions, ' || CASE WHEN max(d.ts_ms) - min(d.ts_ms) < 1000 THEN 'within a second' ELSE to_char(to_timestamp((min(d.ts_ms)) / 1000.0) AT TIME ZONE 'Etc/GMT-8', 'HH24:MI:SS') || ' → ' || to_char(to_timestamp((max(d.ts_ms)) / 1000.0) AT TIME ZONE 'Etc/GMT-8', 'HH24:MI:SS') || ' (' || CASE WHEN (max(d.ts_ms) - min(d.ts_ms))::bigint IS NULL THEN NULL WHEN (max(d.ts_ms) - min(d.ts_ms))::bigint < 60000 THEN ((max(d.ts_ms) - min(d.ts_ms))::bigint / 1000) || 's' WHEN (max(d.ts_ms) - min(d.ts_ms))::bigint < 3600000 THEN ((max(d.ts_ms) - min(d.ts_ms))::bigint / 60000) || 'm ' || lpad((((max(d.ts_ms) - min(d.ts_ms))::bigint / 1000) % 60)::text, 2, '0') || 's' WHEN (max(d.ts_ms) - min(d.ts_ms))::bigint < 86400000 THEN ((max(d.ts_ms) - min(d.ts_ms))::bigint / 3600000) || 'h ' || lpad((((max(d.ts_ms) - min(d.ts_ms))::bigint / 60000) % 60)::text, 2, '0') || 'm' ELSE ((max(d.ts_ms) - min(d.ts_ms))::bigint / 86400000) || 'd ' || lpad((((max(d.ts_ms) - min(d.ts_ms))::bigint / 3600000) % 24)::text, 2, '0') || 'h' END || ')' END ELSE '' END, d.cycle_id\n  FROM trade.decision d LEFT JOIN trade.cycle c ON c.live = d.live AND c.cycle_id = d.cycle_id WHERE d.run_id = (SELECT sel.run_id FROM sel) AND d.live = (SELECT sel.live FROM sel) AND d.kind = 'forced'\n  GROUP BY d.cycle_id, c.status, c.opened_ms, d.detail ->> 'cause', d.detail ->> 'slip_bps'\n  UNION ALL\n  SELECT d.ts_ms, 'warning', CASE WHEN c.status = 'open' AND (SELECT sel.stopped_ms IS NULL FROM sel) THEN 'In Progress' ELSE 'Recovered' END, 'Execution ' || coalesce(to_char(to_timestamp((c.opened_ms) / 1000.0) AT TIME ZONE 'Etc/GMT-8', 'MM‑DD HH24:MI:SS'), '–'),\n         CASE d.kind WHEN 'pair' THEN 'Thin Leg Unwound' ELSE 'Exit Hard Close' END,\n         CASE d.reason WHEN 'window' THEN 'the pair window ran out with ' || coalesce(trim_scale(round(((d.detail ->> 'thin_qty')::numeric - coalesce((d.detail ->> 'thick_qty')::numeric, 0) * c.pair_anchor_bull / c.pair_anchor_bear), 2))::text, '–') || ' ct of $bear not paired: unwound'\n                       WHEN 'stop_d' THEN 'the ideally paired spread ' || coalesce(replace(to_char(round((d.detail ->> 'd_ideal')::numeric, 1), 'FM9990.0'), '-', '−'), '–') || ' bps against ' || coalesce(replace(to_char(round((d.detail ->> 'd_dec')::numeric, 1), 'FM9990.0'), '-', '−'), '–') || ' bps at the decision: unwound'\n                       WHEN 'too_small' THEN 'what was not paired is too small to pair: unwound'\n                       WHEN 'exit_window' THEN 'the exit''s thick leg found no price within break-even in the exit pair window: closed whatever the price'\n                       WHEN 'exit_stop_d' THEN 'the ideal closing spread ' || coalesce(replace(to_char(round((d.detail ->> 'd_ideal')::numeric, 1), 'FM9990.0'), '-', '−'), '–') || ' bps against ' || coalesce(replace(to_char(round((d.detail ->> 'd_dec')::numeric, 1), 'FM9990.0'), '-', '−'), '–') || ' bps at the decision: closed whatever the price'\n                       ELSE coalesce(d.reason, '–') END, d.cycle_id\n  FROM trade.decision d LEFT JOIN trade.cycle c ON c.live = d.live AND c.cycle_id = d.cycle_id\n  WHERE d.run_id = (SELECT sel.run_id FROM sel) AND d.live = (SELECT sel.live FROM sel) AND d.kind IN ('pair', 'exit_pair') AND d.detail ->> 'action' = 'risk_exit'\n  UNION ALL\n  SELECT d.ts_ms, 'warning', CASE WHEN c.status = 'open' AND (SELECT sel.stopped_ms IS NULL FROM sel) THEN 'In Progress' ELSE 'Recovered' END, 'Execution ' || coalesce(to_char(to_timestamp((c.opened_ms) / 1000.0) AT TIME ZONE 'Etc/GMT-8', 'MM‑DD HH24:MI:SS'), '–'),\n         'Exit Below Break-Even', 'the batch''s pre-check expected a round net of ' || coalesce(replace(to_char((d.detail ->> 'expected_net')::numeric, 'FM9990.00'), '-', '−'), '–') || ' USDT; it exits all the same at '\n           || CASE d.detail ->> 'line' WHEN 'exit2' THEN 'exit 2' ELSE 'the exit line' END || ' (PRD 9.2)', d.cycle_id\n  FROM trade.decision d LEFT JOIN trade.cycle c ON c.live = d.live AND c.cycle_id = d.cycle_id WHERE d.run_id = (SELECT sel.run_id FROM sel) AND d.live = (SELECT sel.live FROM sel) AND d.kind = 'exit' AND d.reason = 'd1_loss'\n  UNION ALL\n  SELECT c.closed_ms, 'warning', CASE WHEN (SELECT sel.stopped_ms IS NULL FROM sel) THEN 'In Progress' ELSE 'Open' END, 'Execution ' || to_char(to_timestamp((c.opened_ms) / 1000.0) AT TIME ZONE 'Etc/GMT-8', 'MM‑DD HH24:MI:SS'), 'Funding Awaited',\n         jsonb_array_length(c.funding_awaited) || ' settlement(s) without a record: its net stays Pending', c.cycle_id\n  FROM trade.cycle c WHERE c.live = (SELECT sel.live FROM sel) AND (c.run_id = (SELECT sel.run_id FROM sel) OR c.cycle_id IN (SELECT dr.cycle_id FROM trade.decision dr WHERE dr.run_id = (SELECT sel.run_id FROM sel) AND dr.live = (SELECT sel.live FROM sel) AND dr.cycle_id IS NOT NULL)) AND jsonb_typeof(c.funding_awaited) = 'array' AND jsonb_array_length(c.funding_awaited) > 0\n  UNION ALL\n  SELECT CASE WHEN f.cnt > 1 THEN f.last_ms ELSE o.submitted_ms END, CASE WHEN o.status = 'not_sent' THEN 'warning' ELSE 'serious' END,\n         CASE WHEN o.unknown THEN CASE WHEN (SELECT sel.stopped_ms IS NULL FROM sel) THEN 'In Progress' ELSE 'Open' END ELSE 'Recovered' END,\n         'Order · ' || CASE o.leg WHEN 'bull' THEN '$bull' ELSE '$bear' END,\n         CASE WHEN o.unknown THEN 'Order Outcome Unknown' WHEN o.not_found THEN 'Order Not Found' WHEN f.cnt > 1 THEN 'Orders Rejected'\n              WHEN o.status = 'rejected' THEN 'Order Rejected' WHEN o.status = 'not_sent' THEN 'Order Not Sent' ELSE 'Order Never Arrived' END,\n         initcap(o.purpose) || ' ' || o.side || ' ' || trim_scale((o.qty)::numeric)::text || ' @ ' || CASE WHEN f.lo <> f.hi THEN trim_scale((f.lo)::numeric)::text || '–' || trim_scale((f.hi)::numeric)::text ELSE trim_scale((o.price)::numeric)::text END\n           || coalesce(' · ' || nullif(concat_ws(' ', o.error_code, o.error_message), ''), '')\n           || CASE WHEN f.cnt > 1 THEN ' · ' || to_char(f.cnt, 'FM999,999,990') || ' in a row, ' || CASE WHEN f.last_ms - f.first_ms < 1000 THEN 'within a second' ELSE to_char(to_timestamp((f.first_ms) / 1000.0) AT TIME ZONE 'Etc/GMT-8', 'HH24:MI:SS') || ' → ' || to_char(to_timestamp((f.last_ms) / 1000.0) AT TIME ZONE 'Etc/GMT-8', 'HH24:MI:SS') || ' (' || CASE WHEN (f.last_ms - f.first_ms)::bigint IS NULL THEN NULL WHEN (f.last_ms - f.first_ms)::bigint < 60000 THEN ((f.last_ms - f.first_ms)::bigint / 1000) || 's' WHEN (f.last_ms - f.first_ms)::bigint < 3600000 THEN ((f.last_ms - f.first_ms)::bigint / 60000) || 'm ' || lpad((((f.last_ms - f.first_ms)::bigint / 1000) % 60)::text, 2, '0') || 's' WHEN (f.last_ms - f.first_ms)::bigint < 86400000 THEN ((f.last_ms - f.first_ms)::bigint / 3600000) || 'h ' || lpad((((f.last_ms - f.first_ms)::bigint / 60000) % 60)::text, 2, '0') || 'm' ELSE ((f.last_ms - f.first_ms)::bigint / 86400000) || 'd ' || lpad((((f.last_ms - f.first_ms)::bigint / 3600000) % 24)::text, 2, '0') || 'h' END || ')' END ELSE '' END,\n         o.cycle_id\n  FROM af f JOIN ao o ON o.n = f.n0\n  UNION ALL\n  SELECT e.ts_ms, CASE e.level WHEN 'error' THEN 'critical' ELSE 'warning' END, 'Open', 'Program · ' || e.module, initcap(replace(e.kind, '_', ' ')), e.message, NULL\n  FROM trade.event e WHERE e.run_id = (SELECT sel.run_id FROM sel) AND e.live = (SELECT sel.live FROM sel) AND e.level IN ('error', 'warn') AND e.kind <> 'orders_rejected'\n  UNION ALL\n  SELECT e.ts_ms, CASE e.level WHEN 'error' THEN 'critical' ELSE 'warning' END, 'Open',\n         CASE e.detail ->> 'leg' WHEN 'bull' THEN 'Order · $bull' WHEN 'bear' THEN 'Order · $bear' ELSE 'Program · ' || e.module END, 'Refused in a Row',\n         coalesce(nullif(concat_ws('; ',\n           to_char((CASE WHEN (e.detail ->> 'count') ~ '^[0-9]+(\\.[0-9]+)?$' THEN (e.detail ->> 'count')::numeric END), 'FM999,999,990') || ' orders refused in a row' || CASE WHEN (CASE WHEN (e.detail ->> 'lasted_s') ~ '^[0-9]+(\\.[0-9]+)?$' THEN (e.detail ->> 'lasted_s')::numeric END) >= 1 THEN ' over ' || CASE WHEN ((CASE WHEN (e.detail ->> 'lasted_s') ~ '^[0-9]+(\\.[0-9]+)?$' THEN (e.detail ->> 'lasted_s')::numeric END) * 1000)::bigint IS NULL THEN NULL WHEN ((CASE WHEN (e.detail ->> 'lasted_s') ~ '^[0-9]+(\\.[0-9]+)?$' THEN (e.detail ->> 'lasted_s')::numeric END) * 1000)::bigint < 60000 THEN (((CASE WHEN (e.detail ->> 'lasted_s') ~ '^[0-9]+(\\.[0-9]+)?$' THEN (e.detail ->> 'lasted_s')::numeric END) * 1000)::bigint / 1000) || 's' WHEN ((CASE WHEN (e.detail ->> 'lasted_s') ~ '^[0-9]+(\\.[0-9]+)?$' THEN (e.detail ->> 'lasted_s')::numeric END) * 1000)::bigint < 3600000 THEN (((CASE WHEN (e.detail ->> 'lasted_s') ~ '^[0-9]+(\\.[0-9]+)?$' THEN (e.detail ->> 'lasted_s')::numeric END) * 1000)::bigint / 60000) || 'm ' || lpad(((((CASE WHEN (e.detail ->> 'lasted_s') ~ '^[0-9]+(\\.[0-9]+)?$' THEN (e.detail ->> 'lasted_s')::numeric END) * 1000)::bigint / 1000) % 60)::text, 2, '0') || 's' WHEN ((CASE WHEN (e.detail ->> 'lasted_s') ~ '^[0-9]+(\\.[0-9]+)?$' THEN (e.detail ->> 'lasted_s')::numeric END) * 1000)::bigint < 86400000 THEN (((CASE WHEN (e.detail ->> 'lasted_s') ~ '^[0-9]+(\\.[0-9]+)?$' THEN (e.detail ->> 'lasted_s')::numeric END) * 1000)::bigint / 3600000) || 'h ' || lpad(((((CASE WHEN (e.detail ->> 'lasted_s') ~ '^[0-9]+(\\.[0-9]+)?$' THEN (e.detail ->> 'lasted_s')::numeric END) * 1000)::bigint / 60000) % 60)::text, 2, '0') || 'm' ELSE (((CASE WHEN (e.detail ->> 'lasted_s') ~ '^[0-9]+(\\.[0-9]+)?$' THEN (e.detail ->> 'lasted_s')::numeric END) * 1000)::bigint / 86400000) || 'd ' || lpad(((((CASE WHEN (e.detail ->> 'lasted_s') ~ '^[0-9]+(\\.[0-9]+)?$' THEN (e.detail ->> 'lasted_s')::numeric END) * 1000)::bigint / 3600000) % 24)::text, 2, '0') || 'h' END ELSE '' END\n             || coalesce(' since ' || to_char(to_timestamp(((CASE WHEN (e.detail ->> 'since_ms') ~ '^[0-9]+(\\.[0-9]+)?$' THEN (e.detail ->> 'since_ms')::numeric END)) / 1000.0) AT TIME ZONE 'Etc/GMT-8', 'MM‑DD HH24:MI:SS'), '') || coalesce(' (' || nullif(concat_ws('; ', (SELECT string_agg(initcap(x.key) || ' × ' || to_char(x.value::numeric, 'FM999,999,990'), ', ' ORDER BY x.value::numeric DESC, x.key) FROM jsonb_each_text(CASE WHEN jsonb_typeof(e.detail -> 'purposes') = 'object' THEN e.detail -> 'purposes' END) x WHERE x.value ~ '^[0-9]+$'), 'codes ' || (SELECT string_agg(coalesce(nullif(x.key, ''), '(none)') || ' × ' || to_char(x.value::numeric, 'FM999,999,990'), ', ' ORDER BY x.value::numeric DESC, x.key) FROM jsonb_each_text(CASE WHEN jsonb_typeof(e.detail -> 'codes') = 'object' THEN e.detail -> 'codes' END) x WHERE x.value ~ '^[0-9]+$')), '') || ')', ''),\n           'last ' || concat_ws(' ', initcap(e.detail ->> 'purpose'), e.detail ->> 'side', (e.detail ->> 'qty') || ' ct', '@ ' || (e.detail ->> 'price') || ' USDT')\n,\n           'venue ' || (e.detail ->> 'venue') || ' / ledger ' || (e.detail ->> 'ledger') || ' / round trip ' || (e.detail ->> 'hold') || ' ct',\n           CASE WHEN e.alarms > 1 THEN 'alarm raised ' || e.alarms || ' times' END, regexp_replace(e.message, '^[^:]*:\\s*', '')), ''), e.message),\n         e.detail ->> 'cycle_id'\n  FROM (SELECT DISTINCT ON (coalesce(e.detail ->> 'leg', ''), coalesce(e.detail ->> 'since_ms', e.seq::text)) e.*,\n               count(*) OVER (PARTITION BY coalesce(e.detail ->> 'leg', ''), coalesce(e.detail ->> 'since_ms', e.seq::text)) AS alarms\n        FROM trade.event e WHERE e.run_id = (SELECT sel.run_id FROM sel) AND e.live = (SELECT sel.live FROM sel) AND e.level IN ('error', 'warn') AND e.kind = 'orders_rejected'\n        ORDER BY coalesce(e.detail ->> 'leg', ''), coalesce(e.detail ->> 'since_ms', e.seq::text), e.ts_ms DESC, e.seq DESC) e)\nSELECT t.time, t.\"Severity\", t.\"Status\", t.\"Source\", t.\"What\", t.\"Detail\", t.cycle_id FROM (\n  SELECT to_timestamp(a.ts_ms / 1000.0) AS time, a.sev AS \"Severity\", a.status AS \"Status\", a.source AS \"Source\", a.what AS \"What\", a.detail AS \"Detail\",\n         a.cycle_id, CASE a.status WHEN 'Open' THEN 0 WHEN 'In Progress' THEN 1 ELSE 2 END AS k, a.ts_ms\n  FROM al a ORDER BY 8, a.ts_ms DESC LIMIT 200) t\nUNION ALL\nSELECT NULL, NULL, NULL, NULL, NULL, 'No alert in this Run: nothing stopped or held trading', NULL WHERE NOT EXISTS (SELECT 1 FROM al)"
     }
    ],
    "fieldConfig": {
@@ -10655,12 +10655,12 @@
    "id": 22,
    "type": "table",
    "title": "Orders · ct, USDT and ms",
-   "description": "Every order of the picked round trip (the Range's newest by default), in the order the program sent them, its fills folded in.\n\n- **Step**: what the order was for, from the decision that sent it (4.4; it replaces 4.3's Purpose column, which stays in the panel's data): Batch n · Thin Leg or Top-Up (purpose entry), Pair (complete: the other leg pairing the thin leg's fills), Unwind or Profit Close (trim: the thin leg's unpaired part closed back), n the entry batch of the round trip; Exit 1 · Thin, Exit 1 · Thick, Exit 2 · Hard Close (the thick leg closed whatever its break-even); with both legs together Batch n · Entry, Complete (the leg that filled less), Trim (the leg that filled more), Exit, Forced.\n- **Side**: Buy or Sell; RO: a reduce-only order.\n- **Qty, Filled**: contracts ordered and filled.\n- **Limit, Avg**: the limit and the fills' average price, USDT, to the leg's tick.\n- **Fee**: USDT paid, a cost shown as a positive amount (as in Summary); Pending while the venue has not reported it.\n- **Latency**: sent → final state in hand, ms, this host's clock (paper: the configured simulation).\n- **Status**: Filled, Partial, No Fill (an IOC that met nothing), Rejected (with the venue's code), Working, Unknown (being queried).",
+   "description": "The picked round trip's orders (the Range's newest by default), in the order the program sent them, its fills folded in. Every order with a fill has its own row; a run of consecutive orders without a fill, refused (Rejected) or cancelled (No Fill), on the same leg, purpose, step, side and quantity and with the same error code is one row (4.5): the whole run is in the folded row Every Order below. Status comes right after Side here, so that what happened to a run is in view at 1280 px.\n\n- **Time, Until**: when the order was sent, ms, UTC+8; for a run of orders the first and (Until) the last one's time.\n- **Orders**: how many orders the row stands for: 1, or the number in the run.\n- **Step**: what the order was for, from the decision that sent it (4.4; it replaces 4.3's Purpose column, which stays in the panel's data): Batch n · Thin Leg or Top-Up (purpose entry), Pair (complete: the other leg pairing the thin leg's fills), Unwind or Profit Close (trim: the thin leg's unpaired part closed back), n the entry batch of the round trip; Exit 1 · Thin, Exit 1 · Thick, Exit 2 · Hard Close (the thick leg closed whatever its break-even); with both legs together Batch n · Entry, Complete (the leg that filled less), Trim (the leg that filled more), Exit, Forced.\n- **Side**: Buy or Sell; RO: a reduce-only order.\n- **Qty, Filled**: contracts ordered and filled.\n- **Limit, Avg**: the limit and the fills' average price, USDT, to the leg's tick.\n- **Fee**: USDT paid, a cost shown as a positive amount (as in Summary); Pending while the venue has not reported it.\n- **Latency**: sent → final state in hand, ms, this host's clock (paper: the configured simulation).\n- **Status**: Filled, Partial, No Fill (an IOC that met nothing), Rejected (with the venue's code), Working, Unknown (being queried).\n- **Limit of a run**: the lowest–highest limit of its orders; a run has no latency.",
    "gridPos": {
     "x": 0,
     "y": 86,
     "w": 24,
-    "h": 7
+    "h": 10
    },
    "datasource": {
     "type": "grafana-postgresql-datasource",
@@ -10676,7 +10676,7 @@
      "format": "table",
      "rawQuery": true,
      "editorMode": "code",
-     "rawSql": "WITH z AS MATERIALIZED (WITH sel AS MATERIALIZED (SELECT r.run_id, r.live, r.started_ms, r.stopped_ms, r.host, r.config, coalesce(r.stopped_ms, (extract(epoch FROM now()) * 1000)::bigint) AS end_ms\n                         FROM trade.process_run r WHERE r.run_id = (SELECT CASE '$run' WHEN '__live' THEN (SELECT x.run_id FROM trade.process_run x WHERE x.live ORDER BY x.started_ms DESC LIMIT 1) WHEN '__paper' THEN (SELECT x.run_id FROM trade.process_run x WHERE NOT x.live ORDER BY x.started_ms DESC LIMIT 1) ELSE '$run' END) AND coalesce(r.config #>> '{cex,pair,bull,ticker}', 'SOXL') || ' / ' || coalesce(r.config #>> '{cex,pair,bear,ticker}', 'SOXS') = '$combo'),\nrg AS MATERIALIZED (SELECT greatest(sel.started_ms, (CASE WHEN '${since}' ~ '^[0-9]{1,14}$' AND '${since}' <> '0' THEN '${since}'::bigint + CASE WHEN '${since_hour}' ~ '^[0-9]{1,2}$' THEN '${since_hour}'::int ELSE 0 END * 3600000 ELSE 0 END)) AS from_ms, least(sel.end_ms + 1, (CASE WHEN '${until}' ~ '^[0-9]{1,14}$' AND '${until}'::bigint < 99999999999999 THEN '${until}'::bigint + CASE WHEN '${until_hour}' ~ '^[0-9]{1,2}$' THEN '${until_hour}'::int ELSE 24 END * 3600000 ELSE 99999999999999 END)) AS to_ms FROM sel), ko AS (\n  SELECT DISTINCT ON (x.id) x.id, k.kind, k.detail ->> 'action' AS action, k.detail ->> 'line' AS line, k.detail ? 'thin_leg' AS thin\n  FROM (SELECT DISTINCT o.live, o.cycle_id FROM trade.cex_order o WHERE o.live = (SELECT sel.live FROM sel) AND o.cycle_id = '$cycle') oc\n  JOIN trade.decision k ON k.live = oc.live AND k.cycle_id = oc.cycle_id\n  CROSS JOIN LATERAL (\n    SELECT k.detail ->> 'client_order_id' AS id\n    UNION ALL SELECT e #>> '{}' FROM jsonb_array_elements(CASE WHEN jsonb_typeof(k.detail -> 'client_order_ids') = 'array' THEN k.detail -> 'client_order_ids' END) e\n              WHERE jsonb_typeof(e) = 'string'\n    UNION ALL SELECT jsonb_object_keys(CASE WHEN jsonb_typeof(k.detail -> 'client_order_ids') = 'object' THEN k.detail -> 'client_order_ids' END)\n    UNION ALL SELECT k.detail ->> 'client_order_ids' WHERE jsonb_typeof(k.detail -> 'client_order_ids') = 'string') x\n  WHERE x.id IS NOT NULL\n  ORDER BY x.id, k.ts_ms)\nSELECT to_timestamp(o.submitted_ms / 1000.0) AS \"Time\", initcap(o.purpose) AS \"Purpose\", coalesce('Batch ' || l.seq || ' · ', '') || CASE\n  WHEN k.kind = 'entry' AND k.thin THEN 'Thin Leg' WHEN k.kind = 'entry' THEN 'Entry'\n  WHEN k.kind = 'pair' THEN CASE k.action WHEN 'send_thick' THEN 'Pair' WHEN 'send_thin' THEN 'Top-Up' WHEN 'close_thin' THEN 'Profit Close'\n                                          WHEN 'unwind' THEN 'Unwind' ELSE initcap(replace(k.action, '_', ' ')) END\n  WHEN k.kind = 'exit' THEN CASE k.line WHEN 'exit1' THEN 'Exit 1' WHEN 'exit2' THEN 'Exit 2' ELSE 'Exit' END || CASE WHEN k.thin THEN ' · Thin' ELSE '' END\n  WHEN k.kind = 'exit_pair' THEN CASE k.line WHEN 'exit1' THEN 'Exit 1' WHEN 'exit2' THEN 'Exit 2' ELSE 'Exit' END || CASE k.action WHEN 'hard_close' THEN ' · Hard Close' ELSE ' · Thick' END\n  ELSE initcap(replace(coalesce(k.kind, o.purpose), '_', ' ')) END AS \"Step\", CASE o.leg WHEN 'bull' THEN '$bull' ELSE '$bear' END AS \"Leg\",\n       initcap(o.side) || CASE WHEN o.reduce_only THEN ' · RO' ELSE '' END AS \"Side\", o.qty AS \"Qty\", o.cum_exec_qty AS \"Filled\",\n       CASE o.leg WHEN 'bull' THEN to_char(o.price, 'FM9990.00') ELSE to_char(o.price, 'FM9990.000') END AS \"Limit\", CASE o.leg WHEN 'bull' THEN to_char(o.avg_price, 'FM9990.00') ELSE to_char(o.avg_price, 'FM9990.000') END AS \"Avg\", CASE WHEN o.cum_exec_qty = 0 THEN NULL WHEN NOT o.fee_known THEN -9100000000 ELSE o.fee END AS \"Fee\",\n       o.final_ms - o.sent_ms AS \"Latency\",\n       CASE WHEN o.unknown THEN 'Unknown' WHEN o.status = 'filled' THEN 'Filled' WHEN o.status = 'cancelled' AND o.cum_exec_qty > 0 THEN 'Partial'\n            WHEN o.status = 'cancelled' THEN 'No Fill' WHEN o.status IN ('pending', 'acked') THEN 'Working'\n            ELSE initcap(replace(o.status, '_', ' ')) END || coalesce(' · ' || nullif(concat_ws(' ', o.error_code, o.error_message), ''), '') AS \"Status\"\nFROM trade.cex_order o\nLEFT JOIN ko k ON k.id = o.client_order_id\nLEFT JOIN trade.lot l ON l.live = o.live AND l.lot_id = o.lot_id\nWHERE o.live = (SELECT sel.live FROM sel) AND o.cycle_id = '$cycle' ORDER BY o.submitted_ms, o.client_order_id)\nSELECT * FROM z\nUNION ALL SELECT NULL AS \"Time\", NULL AS \"Purpose\", NULL AS \"Step\", NULL AS \"Leg\", NULL AS \"Side\", NULL AS \"Qty\", NULL AS \"Filled\", NULL AS \"Limit\", NULL AS \"Avg\", NULL AS \"Fee\", NULL AS \"Latency\", 'No order: no round trip in the Range' AS \"Status\" WHERE NOT EXISTS (SELECT 1 FROM z)"
+     "rawSql": "WITH z AS MATERIALIZED (WITH sel AS MATERIALIZED (SELECT r.run_id, r.live, r.started_ms, r.stopped_ms, r.host, r.config, coalesce(r.stopped_ms, (extract(epoch FROM now()) * 1000)::bigint) AS end_ms\n                         FROM trade.process_run r WHERE r.run_id = (SELECT CASE '$run' WHEN '__live' THEN (SELECT x.run_id FROM trade.process_run x WHERE x.live ORDER BY x.started_ms DESC LIMIT 1) WHEN '__paper' THEN (SELECT x.run_id FROM trade.process_run x WHERE NOT x.live ORDER BY x.started_ms DESC LIMIT 1) ELSE '$run' END) AND coalesce(r.config #>> '{cex,pair,bull,ticker}', 'SOXL') || ' / ' || coalesce(r.config #>> '{cex,pair,bear,ticker}', 'SOXS') = '$combo'),\nrg AS MATERIALIZED (SELECT greatest(sel.started_ms, (CASE WHEN '${since}' ~ '^[0-9]{1,14}$' AND '${since}' <> '0' THEN '${since}'::bigint + CASE WHEN '${since_hour}' ~ '^[0-9]{1,2}$' THEN '${since_hour}'::int ELSE 0 END * 3600000 ELSE 0 END)) AS from_ms, least(sel.end_ms + 1, (CASE WHEN '${until}' ~ '^[0-9]{1,14}$' AND '${until}'::bigint < 99999999999999 THEN '${until}'::bigint + CASE WHEN '${until_hour}' ~ '^[0-9]{1,2}$' THEN '${until_hour}'::int ELSE 24 END * 3600000 ELSE 99999999999999 END)) AS to_ms FROM sel), ko AS (\n  SELECT DISTINCT ON (x.id) x.id, k.kind, k.detail ->> 'action' AS action, k.detail ->> 'line' AS line, k.detail ? 'thin_leg' AS thin\n  FROM (SELECT DISTINCT o.live, o.cycle_id FROM trade.cex_order o WHERE o.live = (SELECT sel.live FROM sel) AND o.cycle_id = '$cycle') oc\n  JOIN trade.decision k ON k.live = oc.live AND k.cycle_id = oc.cycle_id\n  CROSS JOIN LATERAL (\n    SELECT k.detail ->> 'client_order_id' AS id\n    UNION ALL SELECT e #>> '{}' FROM jsonb_array_elements(CASE WHEN jsonb_typeof(k.detail -> 'client_order_ids') = 'array' THEN k.detail -> 'client_order_ids' END) e\n              WHERE jsonb_typeof(e) = 'string'\n    UNION ALL SELECT jsonb_object_keys(CASE WHEN jsonb_typeof(k.detail -> 'client_order_ids') = 'object' THEN k.detail -> 'client_order_ids' END)\n    UNION ALL SELECT k.detail ->> 'client_order_ids' WHERE jsonb_typeof(k.detail -> 'client_order_ids') = 'string') x\n  WHERE x.id IS NOT NULL\n  ORDER BY x.id, k.ts_ms),\nr AS MATERIALIZED (\n  SELECT to_timestamp(o.submitted_ms / 1000.0) AS \"Time\", initcap(o.purpose) AS \"Purpose\", coalesce('Batch ' || l.seq || ' · ', '') || CASE\n  WHEN k.kind = 'entry' AND k.thin THEN 'Thin Leg' WHEN k.kind = 'entry' THEN 'Entry'\n  WHEN k.kind = 'pair' THEN CASE k.action WHEN 'send_thick' THEN 'Pair' WHEN 'send_thin' THEN 'Top-Up' WHEN 'close_thin' THEN 'Profit Close'\n                                          WHEN 'unwind' THEN 'Unwind' ELSE initcap(replace(k.action, '_', ' ')) END\n  WHEN k.kind = 'exit' THEN CASE k.line WHEN 'exit1' THEN 'Exit 1' WHEN 'exit2' THEN 'Exit 2' ELSE 'Exit' END || CASE WHEN k.thin THEN ' · Thin' ELSE '' END\n  WHEN k.kind = 'exit_pair' THEN CASE k.line WHEN 'exit1' THEN 'Exit 1' WHEN 'exit2' THEN 'Exit 2' ELSE 'Exit' END || CASE k.action WHEN 'hard_close' THEN ' · Hard Close' ELSE ' · Thick' END\n  ELSE initcap(replace(coalesce(k.kind, o.purpose), '_', ' ')) END AS \"Step\", CASE o.leg WHEN 'bull' THEN '$bull' ELSE '$bear' END AS \"Leg\",\n       initcap(o.side) || CASE WHEN o.reduce_only THEN ' · RO' ELSE '' END AS \"Side\", o.qty AS \"Qty\", o.cum_exec_qty AS \"Filled\",\n       CASE o.leg WHEN 'bull' THEN to_char(o.price, 'FM9990.00') ELSE to_char(o.price, 'FM9990.000') END AS \"Limit\", CASE o.leg WHEN 'bull' THEN to_char(o.avg_price, 'FM9990.00') ELSE to_char(o.avg_price, 'FM9990.000') END AS \"Avg\", CASE WHEN o.cum_exec_qty = 0 THEN NULL WHEN NOT o.fee_known THEN -9100000000 ELSE o.fee END AS \"Fee\",\n       o.final_ms - o.sent_ms AS \"Latency\",\n       CASE WHEN o.unknown THEN 'Unknown' WHEN o.status = 'filled' THEN 'Filled' WHEN o.status = 'cancelled' AND o.cum_exec_qty > 0 THEN 'Partial'\n            WHEN o.status = 'cancelled' THEN 'No Fill' WHEN o.status IN ('pending', 'acked') THEN 'Working'\n            ELSE initcap(replace(o.status, '_', ' ')) END || coalesce(' · ' || nullif(concat_ws(' ', o.error_code, o.error_message), ''), '') AS \"Status\", o.leg, o.price, o.submitted_ms, CASE WHEN o.cum_exec_qty = 0 AND NOT o.unknown AND o.status IN ('rejected', 'cancelled') THEN concat_ws('|', o.leg, o.purpose, o.side, o.qty::text, o.status, coalesce(o.error_code, ''), coalesce('Batch ' || l.seq || ' · ', '') || CASE\n  WHEN k.kind = 'entry' AND k.thin THEN 'Thin Leg' WHEN k.kind = 'entry' THEN 'Entry'\n  WHEN k.kind = 'pair' THEN CASE k.action WHEN 'send_thick' THEN 'Pair' WHEN 'send_thin' THEN 'Top-Up' WHEN 'close_thin' THEN 'Profit Close'\n                                          WHEN 'unwind' THEN 'Unwind' ELSE initcap(replace(k.action, '_', ' ')) END\n  WHEN k.kind = 'exit' THEN CASE k.line WHEN 'exit1' THEN 'Exit 1' WHEN 'exit2' THEN 'Exit 2' ELSE 'Exit' END || CASE WHEN k.thin THEN ' · Thin' ELSE '' END\n  WHEN k.kind = 'exit_pair' THEN CASE k.line WHEN 'exit1' THEN 'Exit 1' WHEN 'exit2' THEN 'Exit 2' ELSE 'Exit' END || CASE k.action WHEN 'hard_close' THEN ' · Hard Close' ELSE ' · Thick' END\n  ELSE initcap(replace(coalesce(k.kind, o.purpose), '_', ' ')) END) END AS fold, row_number() OVER (ORDER BY o.submitted_ms, o.client_order_id) AS n\n  FROM trade.cex_order o\nLEFT JOIN ko k ON k.id = o.client_order_id\nLEFT JOIN trade.lot l ON l.live = o.live AND l.lot_id = o.lot_id\nWHERE o.live = (SELECT sel.live FROM sel) AND o.cycle_id = '$cycle'),\ng AS (SELECT r.n, sum(r.st) OVER (ORDER BY r.n) AS grp FROM (\n        SELECT r.n, CASE WHEN r.fold IS NOT NULL AND r.fold = lag(r.fold) OVER (ORDER BY r.n) THEN 0 ELSE 1 END AS st FROM r) r),\na AS (SELECT min(g.n) AS n0, count(*) AS cnt, max(r.submitted_ms) AS last_ms, min(r.price) AS lo, max(r.price) AS hi\n      FROM g JOIN r ON r.n = g.n GROUP BY g.grp)\nSELECT o.\"Time\", CASE WHEN a.cnt > 1 THEN to_timestamp(a.last_ms / 1000.0) END AS \"Until\", a.cnt AS \"Orders\", o.\"Purpose\", o.\"Step\", o.\"Leg\", o.\"Side\",\n       o.\"Status\", o.\"Qty\", o.\"Filled\", CASE WHEN a.cnt > 1 AND a.lo <> a.hi THEN CASE o.leg WHEN 'bull' THEN to_char(a.lo, 'FM9990.00') ELSE to_char(a.lo, 'FM9990.000') END || '–' || CASE o.leg WHEN 'bull' THEN to_char(a.hi, 'FM9990.00') ELSE to_char(a.hi, 'FM9990.000') END ELSE o.\"Limit\" END AS \"Limit\", o.\"Avg\", o.\"Fee\",\n       CASE WHEN a.cnt = 1 THEN o.\"Latency\" END AS \"Latency\"\nFROM a JOIN r o ON o.n = a.n0 ORDER BY a.n0)\nSELECT * FROM z\nUNION ALL SELECT NULL AS \"Time\", NULL AS \"Until\", NULL AS \"Orders\", NULL AS \"Purpose\", NULL AS \"Step\", NULL AS \"Leg\", NULL AS \"Side\", 'No order: no round trip in the Range' AS \"Status\", NULL AS \"Qty\", NULL AS \"Filled\", NULL AS \"Limit\", NULL AS \"Avg\", NULL AS \"Fee\", NULL AS \"Latency\" WHERE NOT EXISTS (SELECT 1 FROM z)"
     }
    ],
    "fieldConfig": {
@@ -10712,6 +10712,50 @@
        {
         "id": "custom.width",
         "value": 96
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "Until"
+      },
+      "properties": [
+       {
+        "id": "unit",
+        "value": "time:HH:mm:ss.SSS"
+       },
+       {
+        "id": "noValue",
+        "value": " "
+       },
+       {
+        "id": "custom.width",
+        "value": 96
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "Orders"
+      },
+      "properties": [
+       {
+        "id": "custom.align",
+        "value": "right"
+       },
+       {
+        "id": "unit",
+        "value": "none"
+       },
+       {
+        "id": "decimals",
+        "value": 0
+       },
+       {
+        "id": "custom.width",
+        "value": 64
        }
       ]
      },
@@ -10867,7 +10911,7 @@
        },
        {
         "id": "custom.width",
-        "value": 72
+        "value": 104
        }
       ]
      },
@@ -11007,7 +11051,11 @@
       "properties": [
        {
         "id": "custom.minWidth",
-        "value": 100
+        "value": 240
+       },
+       {
+        "id": "custom.inspect",
+        "value": true
        },
        {
         "id": "custom.cellOptions",
@@ -11073,26 +11121,465 @@
    }
   },
   {
-   "id": 23,
+   "id": 24,
+   "type": "row",
+   "title": "Every Order · ${cycle:text}",
+   "collapsed": true,
+   "gridPos": {
+    "x": 0,
+    "y": 96,
+    "w": 24,
+    "h": 1
+   },
+   "panels": [
+    {
+     "id": 23,
+     "type": "table",
+     "title": "Every Order · ct, USDT and ms",
+     "description": "Every order of the picked round trip, one row each, in the order the program sent them (Orders above folds the runs of refused or cancelled orders without a fill). Queried only while this row is open: a round trip can hold tens of thousands of orders (11‑27 02:48: 21,802).\n\n- **Step**: what the order was for, from the decision that sent it (4.4; it replaces 4.3's Purpose column, which stays in the panel's data): Batch n · Thin Leg or Top-Up (purpose entry), Pair (complete: the other leg pairing the thin leg's fills), Unwind or Profit Close (trim: the thin leg's unpaired part closed back), n the entry batch of the round trip; Exit 1 · Thin, Exit 1 · Thick, Exit 2 · Hard Close (the thick leg closed whatever its break-even); with both legs together Batch n · Entry, Complete (the leg that filled less), Trim (the leg that filled more), Exit, Forced.\n- **Side**: Buy or Sell; RO: a reduce-only order.\n- **Qty, Filled**: contracts ordered and filled.\n- **Limit, Avg**: the limit and the fills' average price, USDT, to the leg's tick.\n- **Fee**: USDT paid, a cost shown as a positive amount (as in Summary); Pending while the venue has not reported it.\n- **Latency**: sent → final state in hand, ms, this host's clock (paper: the configured simulation).\n- **Status**: Filled, Partial, No Fill (an IOC that met nothing), Rejected (with the venue's code), Working, Unknown (being queried).",
+     "gridPos": {
+      "x": 0,
+      "y": 97,
+      "w": 24,
+      "h": 10
+     },
+     "datasource": {
+      "type": "grafana-postgresql-datasource",
+      "uid": "etfpair-trade"
+     },
+     "targets": [
+      {
+       "refId": "A",
+       "datasource": {
+        "type": "grafana-postgresql-datasource",
+        "uid": "etfpair-trade"
+       },
+       "format": "table",
+       "rawQuery": true,
+       "editorMode": "code",
+       "rawSql": "WITH z AS MATERIALIZED (WITH sel AS MATERIALIZED (SELECT r.run_id, r.live, r.started_ms, r.stopped_ms, r.host, r.config, coalesce(r.stopped_ms, (extract(epoch FROM now()) * 1000)::bigint) AS end_ms\n                         FROM trade.process_run r WHERE r.run_id = (SELECT CASE '$run' WHEN '__live' THEN (SELECT x.run_id FROM trade.process_run x WHERE x.live ORDER BY x.started_ms DESC LIMIT 1) WHEN '__paper' THEN (SELECT x.run_id FROM trade.process_run x WHERE NOT x.live ORDER BY x.started_ms DESC LIMIT 1) ELSE '$run' END) AND coalesce(r.config #>> '{cex,pair,bull,ticker}', 'SOXL') || ' / ' || coalesce(r.config #>> '{cex,pair,bear,ticker}', 'SOXS') = '$combo'),\nrg AS MATERIALIZED (SELECT greatest(sel.started_ms, (CASE WHEN '${since}' ~ '^[0-9]{1,14}$' AND '${since}' <> '0' THEN '${since}'::bigint + CASE WHEN '${since_hour}' ~ '^[0-9]{1,2}$' THEN '${since_hour}'::int ELSE 0 END * 3600000 ELSE 0 END)) AS from_ms, least(sel.end_ms + 1, (CASE WHEN '${until}' ~ '^[0-9]{1,14}$' AND '${until}'::bigint < 99999999999999 THEN '${until}'::bigint + CASE WHEN '${until_hour}' ~ '^[0-9]{1,2}$' THEN '${until_hour}'::int ELSE 24 END * 3600000 ELSE 99999999999999 END)) AS to_ms FROM sel), ko AS (\n  SELECT DISTINCT ON (x.id) x.id, k.kind, k.detail ->> 'action' AS action, k.detail ->> 'line' AS line, k.detail ? 'thin_leg' AS thin\n  FROM (SELECT DISTINCT o.live, o.cycle_id FROM trade.cex_order o WHERE o.live = (SELECT sel.live FROM sel) AND o.cycle_id = '$cycle') oc\n  JOIN trade.decision k ON k.live = oc.live AND k.cycle_id = oc.cycle_id\n  CROSS JOIN LATERAL (\n    SELECT k.detail ->> 'client_order_id' AS id\n    UNION ALL SELECT e #>> '{}' FROM jsonb_array_elements(CASE WHEN jsonb_typeof(k.detail -> 'client_order_ids') = 'array' THEN k.detail -> 'client_order_ids' END) e\n              WHERE jsonb_typeof(e) = 'string'\n    UNION ALL SELECT jsonb_object_keys(CASE WHEN jsonb_typeof(k.detail -> 'client_order_ids') = 'object' THEN k.detail -> 'client_order_ids' END)\n    UNION ALL SELECT k.detail ->> 'client_order_ids' WHERE jsonb_typeof(k.detail -> 'client_order_ids') = 'string') x\n  WHERE x.id IS NOT NULL\n  ORDER BY x.id, k.ts_ms)\nSELECT to_timestamp(o.submitted_ms / 1000.0) AS \"Time\", initcap(o.purpose) AS \"Purpose\", coalesce('Batch ' || l.seq || ' · ', '') || CASE\n  WHEN k.kind = 'entry' AND k.thin THEN 'Thin Leg' WHEN k.kind = 'entry' THEN 'Entry'\n  WHEN k.kind = 'pair' THEN CASE k.action WHEN 'send_thick' THEN 'Pair' WHEN 'send_thin' THEN 'Top-Up' WHEN 'close_thin' THEN 'Profit Close'\n                                          WHEN 'unwind' THEN 'Unwind' ELSE initcap(replace(k.action, '_', ' ')) END\n  WHEN k.kind = 'exit' THEN CASE k.line WHEN 'exit1' THEN 'Exit 1' WHEN 'exit2' THEN 'Exit 2' ELSE 'Exit' END || CASE WHEN k.thin THEN ' · Thin' ELSE '' END\n  WHEN k.kind = 'exit_pair' THEN CASE k.line WHEN 'exit1' THEN 'Exit 1' WHEN 'exit2' THEN 'Exit 2' ELSE 'Exit' END || CASE k.action WHEN 'hard_close' THEN ' · Hard Close' ELSE ' · Thick' END\n  ELSE initcap(replace(coalesce(k.kind, o.purpose), '_', ' ')) END AS \"Step\", CASE o.leg WHEN 'bull' THEN '$bull' ELSE '$bear' END AS \"Leg\",\n       initcap(o.side) || CASE WHEN o.reduce_only THEN ' · RO' ELSE '' END AS \"Side\", o.qty AS \"Qty\", o.cum_exec_qty AS \"Filled\",\n       CASE o.leg WHEN 'bull' THEN to_char(o.price, 'FM9990.00') ELSE to_char(o.price, 'FM9990.000') END AS \"Limit\", CASE o.leg WHEN 'bull' THEN to_char(o.avg_price, 'FM9990.00') ELSE to_char(o.avg_price, 'FM9990.000') END AS \"Avg\", CASE WHEN o.cum_exec_qty = 0 THEN NULL WHEN NOT o.fee_known THEN -9100000000 ELSE o.fee END AS \"Fee\",\n       o.final_ms - o.sent_ms AS \"Latency\",\n       CASE WHEN o.unknown THEN 'Unknown' WHEN o.status = 'filled' THEN 'Filled' WHEN o.status = 'cancelled' AND o.cum_exec_qty > 0 THEN 'Partial'\n            WHEN o.status = 'cancelled' THEN 'No Fill' WHEN o.status IN ('pending', 'acked') THEN 'Working'\n            ELSE initcap(replace(o.status, '_', ' ')) END || coalesce(' · ' || nullif(concat_ws(' ', o.error_code, o.error_message), ''), '') AS \"Status\"\nFROM trade.cex_order o\nLEFT JOIN ko k ON k.id = o.client_order_id\nLEFT JOIN trade.lot l ON l.live = o.live AND l.lot_id = o.lot_id\nWHERE o.live = (SELECT sel.live FROM sel) AND o.cycle_id = '$cycle' ORDER BY o.submitted_ms, o.client_order_id)\nSELECT * FROM z\nUNION ALL SELECT NULL AS \"Time\", NULL AS \"Purpose\", NULL AS \"Step\", NULL AS \"Leg\", NULL AS \"Side\", NULL AS \"Qty\", NULL AS \"Filled\", NULL AS \"Limit\", NULL AS \"Avg\", NULL AS \"Fee\", NULL AS \"Latency\", 'No order: no round trip in the Range' AS \"Status\" WHERE NOT EXISTS (SELECT 1 FROM z)"
+      }
+     ],
+     "fieldConfig": {
+      "defaults": {
+       "color": {
+        "mode": "fixed",
+        "fixedColor": "text"
+       },
+       "custom": {
+        "align": "auto",
+        "cellOptions": {
+         "type": "auto"
+        },
+        "filterable": false,
+        "inspect": false,
+        "minWidth": 60,
+        "wrapHeaderText": true
+       },
+       "mappings": [],
+       "noValue": "–"
+      },
+      "overrides": [
+       {
+        "matcher": {
+         "id": "byName",
+         "options": "Time"
+        },
+        "properties": [
+         {
+          "id": "unit",
+          "value": "time:HH:mm:ss.SSS"
+         },
+         {
+          "id": "custom.width",
+          "value": 96
+         }
+        ]
+       },
+       {
+        "matcher": {
+         "id": "byName",
+         "options": "Purpose"
+        },
+        "properties": [
+         {
+          "id": "custom.hidden",
+          "value": true
+         }
+        ]
+       },
+       {
+        "matcher": {
+         "id": "byName",
+         "options": "Step"
+        },
+        "properties": [
+         {
+          "id": "custom.width",
+          "value": 148
+         }
+        ]
+       },
+       {
+        "matcher": {
+         "id": "byName",
+         "options": "Leg"
+        },
+        "properties": [
+         {
+          "id": "custom.width",
+          "value": 52
+         }
+        ]
+       },
+       {
+        "matcher": {
+         "id": "byName",
+         "options": "Side"
+        },
+        "properties": [
+         {
+          "id": "custom.width",
+          "value": 64
+         }
+        ]
+       },
+       {
+        "matcher": {
+         "id": "byName",
+         "options": "Qty"
+        },
+        "properties": [
+         {
+          "id": "displayName",
+          "value": "Qty ct"
+         },
+         {
+          "id": "custom.align",
+          "value": "right"
+         },
+         {
+          "id": "unit",
+          "value": "none"
+         },
+         {
+          "id": "decimals",
+          "value": 2
+         },
+         {
+          "id": "mappings",
+          "value": [
+           {
+            "type": "special",
+            "options": {
+             "match": "null",
+             "result": {
+              "text": "–",
+              "color": "#898781",
+              "index": 0
+             }
+            }
+           }
+          ]
+         },
+         {
+          "id": "custom.width",
+          "value": 56
+         }
+        ]
+       },
+       {
+        "matcher": {
+         "id": "byName",
+         "options": "Filled"
+        },
+        "properties": [
+         {
+          "id": "displayName",
+          "value": "Filled ct"
+         },
+         {
+          "id": "custom.align",
+          "value": "right"
+         },
+         {
+          "id": "unit",
+          "value": "none"
+         },
+         {
+          "id": "decimals",
+          "value": 2
+         },
+         {
+          "id": "mappings",
+          "value": [
+           {
+            "type": "special",
+            "options": {
+             "match": "null",
+             "result": {
+              "text": "–",
+              "color": "#898781",
+              "index": 0
+             }
+            }
+           }
+          ]
+         },
+         {
+          "id": "custom.width",
+          "value": 56
+         }
+        ]
+       },
+       {
+        "matcher": {
+         "id": "byName",
+         "options": "Limit"
+        },
+        "properties": [
+         {
+          "id": "displayName",
+          "value": "Limit USDT"
+         },
+         {
+          "id": "custom.align",
+          "value": "right"
+         },
+         {
+          "id": "custom.width",
+          "value": 72
+         }
+        ]
+       },
+       {
+        "matcher": {
+         "id": "byName",
+         "options": "Avg"
+        },
+        "properties": [
+         {
+          "id": "displayName",
+          "value": "Avg USDT"
+         },
+         {
+          "id": "custom.align",
+          "value": "right"
+         },
+         {
+          "id": "custom.width",
+          "value": 72
+         }
+        ]
+       },
+       {
+        "matcher": {
+         "id": "byName",
+         "options": "Fee"
+        },
+        "properties": [
+         {
+          "id": "displayName",
+          "value": "Fee USDT"
+         },
+         {
+          "id": "custom.align",
+          "value": "right"
+         },
+         {
+          "id": "unit",
+          "value": "none"
+         },
+         {
+          "id": "decimals",
+          "value": 5
+         },
+         {
+          "id": "mappings",
+          "value": [
+           {
+            "type": "special",
+            "options": {
+             "match": "null",
+             "result": {
+              "text": "–",
+              "color": "#898781",
+              "index": 0
+             }
+            }
+           },
+           {
+            "type": "value",
+            "options": {
+             "-9000000000": {
+              "text": "Pending",
+              "color": "#fab219",
+              "index": 0
+             },
+             "-9100000000": {
+              "text": "Pending",
+              "color": "#fab219",
+              "index": 1
+             },
+             "-9200000000": {
+              "text": "Open",
+              "color": "text",
+              "index": 2
+             }
+            }
+           }
+          ]
+         },
+         {
+          "id": "custom.width",
+          "value": 76
+         }
+        ]
+       },
+       {
+        "matcher": {
+         "id": "byName",
+         "options": "Latency"
+        },
+        "properties": [
+         {
+          "id": "displayName",
+          "value": "Latency ms"
+         },
+         {
+          "id": "custom.align",
+          "value": "right"
+         },
+         {
+          "id": "unit",
+          "value": "none"
+         },
+         {
+          "id": "decimals",
+          "value": 0
+         },
+         {
+          "id": "mappings",
+          "value": [
+           {
+            "type": "special",
+            "options": {
+             "match": "null",
+             "result": {
+              "text": "–",
+              "color": "#898781",
+              "index": 0
+             }
+            }
+           }
+          ]
+         },
+         {
+          "id": "custom.width",
+          "value": 64
+         }
+        ]
+       },
+       {
+        "matcher": {
+         "id": "byName",
+         "options": "Status"
+        },
+        "properties": [
+         {
+          "id": "custom.minWidth",
+          "value": 100
+         },
+         {
+          "id": "custom.inspect",
+          "value": true
+         },
+         {
+          "id": "custom.cellOptions",
+          "value": {
+           "type": "color-text"
+          }
+         },
+         {
+          "id": "mappings",
+          "value": [
+           {
+            "type": "regex",
+            "options": {
+             "pattern": "^Rejected.*",
+             "result": {
+              "color": "#d03b3b",
+              "index": 0
+             }
+            }
+           },
+           {
+            "type": "regex",
+            "options": {
+             "pattern": "^Unknown.*",
+             "result": {
+              "color": "#fab219",
+              "index": 1
+             }
+            }
+           },
+           {
+            "type": "regex",
+            "options": {
+             "pattern": "^Partial.*",
+             "result": {
+              "color": "#fab219",
+              "index": 2
+             }
+            }
+           },
+           {
+            "type": "regex",
+            "options": {
+             "pattern": "^No Fill.*",
+             "result": {
+              "color": "#898781",
+              "index": 3
+             }
+            }
+           }
+          ]
+         }
+        ]
+       }
+      ]
+     },
+     "options": {
+      "showHeader": true,
+      "cellHeight": "sm",
+      "footer": {
+       "show": false
+      }
+     }
+    }
+   ]
+  },
+  {
+   "id": 25,
    "type": "row",
    "title": "Inventory · ${runtext}",
    "collapsed": false,
    "gridPos": {
     "x": 0,
-    "y": 93,
+    "y": 97,
     "w": 24,
     "h": 1
    },
    "panels": []
   },
   {
-   "id": 24,
+   "id": 26,
    "type": "table",
    "title": "Positions Now · ct, USDT and Bps",
    "description": "Each leg at the Run's newest inventory sample (every 10 s), whatever the Range; the venue's figures live only (the paper venue reports positions alone).\n\n- **Venue, Ledger**: the venue's position and the program's ledger (dust included), contracts, signed (+ long, − short); they must match.\n- **Mark, Liq Price**: the venue's mark and liquidation price, USDT.\n- **Liq Distance**: the liquidation price from the mark, in % of the mark: amber within 25 %, red within 10 %.\n- **Venue UPL**: the venue's unrealised P&L of the leg, USDT.\n- **Exposure**: the position at the newest second's mid, USDT, signed.\n- **Funding**: the newest settled funding rate × 10⁴ (bps of the position's value per settlement), as Bitget publishes it: + longs pay shorts.\n- **Age**: seconds since the sample while the Run runs; amber past a minute.",
    "gridPos": {
     "x": 0,
-    "y": 94,
+    "y": 98,
     "w": 24,
     "h": 5
    },
@@ -11600,26 +12087,26 @@
    }
   },
   {
-   "id": 25,
+   "id": 27,
    "type": "row",
    "title": "Settings · ${runtext}",
    "collapsed": false,
    "gridPos": {
     "x": 0,
-    "y": 99,
+    "y": 103,
     "w": 24,
     "h": 1
    },
    "panels": []
   },
   {
-   "id": 26,
+   "id": 28,
    "type": "table",
    "title": "Signal and Sizing",
    "description": "What else the program trades on (the mean model, its scale, the entry and exit points, M, L and N are in Parameters above): the taker fee it counts, the margin over costs an entry needs (spread bps), whether the mean warms up again when the anchor changes; the smallest batch (USDT); take ratio: the share of the depth up to the pricing level an order takes; the time and the spread bps between entries of a cycle. · process_run.config of the Run.",
    "gridPos": {
     "x": 0,
-    "y": 100,
+    "y": 104,
     "w": 6,
     "h": 8
    },
@@ -11708,13 +12195,13 @@
    }
   },
   {
-   "id": 27,
+   "id": 29,
    "type": "table",
    "title": "Execution",
    "description": "How it trades: Live (real orders on Bitget) or Paper; the book level each leg's limit sits at ($bull / $bear); the order channel (WS or REST) and the book feed × its connections; how long it waits to complete the other leg; the slip a forced exit may pay; the order latency paper simulates ($bull / $bear; a paper Run only). · process_run.config of the Run.",
    "gridPos": {
     "x": 6,
-    "y": 100,
+    "y": 104,
     "w": 6,
     "h": 8
    },
@@ -11803,13 +12290,13 @@
    }
   },
   {
-   "id": 28,
+   "id": 30,
    "type": "table",
    "title": "Risk & Session",
    "description": "When it stops and what it trusts: how long before the regular close it flattens; how old a book or the USD/USDT rate F may be; how long a NAV must stay unchanged to be confirmed; how long a stop may take before an alarm; the ex-dates of the dividends (and splits) it knows; edits to the market calendar. · process_run.config of the Run.",
    "gridPos": {
     "x": 12,
-    "y": 100,
+    "y": 104,
     "w": 6,
     "h": 8
    },
@@ -11898,13 +12385,13 @@
    }
   },
   {
-   "id": 29,
+   "id": 31,
    "type": "table",
    "title": "Run",
    "description": "Which start this is (its name and mode are in the row titles and the Execution tiles): start and stop (UTC+8), host and run_id. · process_run.config of the Run.",
    "gridPos": {
     "x": 18,
-    "y": 100,
+    "y": 104,
     "w": 6,
     "h": 8
    },
@@ -11993,25 +12480,25 @@
    }
   },
   {
-   "id": 35,
+   "id": 37,
    "type": "row",
    "title": "Execution Statistics · ${span}",
    "collapsed": true,
    "gridPos": {
     "x": 0,
-    "y": 108,
+    "y": 112,
     "w": 24,
     "h": 1
    },
    "panels": [
     {
-     "id": 30,
+     "id": 32,
      "type": "table",
      "title": "Entry Answers · Share of Seconds",
      "description": "Each second's answer in the Range (signal_sample.idle_reason) in words.\n\n- **Answer**: the state and the reason.\n- **Seconds, Share**: how many seconds, and their share of the Range's.",
      "gridPos": {
       "x": 0,
-      "y": 109,
+      "y": 113,
       "w": 9,
       "h": 8
      },
@@ -12138,13 +12625,13 @@
      }
     },
     {
-     "id": 31,
+     "id": 33,
      "type": "table",
      "title": "At the Line, Not Entered · Seconds",
      "description": "Seconds in the Range the executable deviation was past an entry line but no entry went out (decision at_line_blocked).\n\n- **Reason, Side**: why, and the side it would have entered.\n- **Last**: the newest such second, UTC+8.",
      "gridPos": {
       "x": 9,
-      "y": 109,
+      "y": 113,
       "w": 8,
       "h": 8
      },
@@ -12287,13 +12774,13 @@
      }
     },
     {
-     "id": 32,
+     "id": 34,
      "type": "table",
      "title": "End Reasons · USDT",
      "description": "Why the Run's round trips of the Range that closed ended (no-fill ones included).\n\n- **Cycles**: how many.\n- **Net**: their net, USDT (Pending ones out of it).\n- **Pending**: those whose funding is not known yet.",
      "gridPos": {
       "x": 17,
-      "y": 109,
+      "y": 113,
       "w": 7,
       "h": 8
      },
@@ -12480,13 +12967,13 @@
      }
     },
     {
-     "id": 33,
+     "id": 35,
      "type": "table",
      "title": "Batch Ends · USDT and s",
      "description": "How the Run's entry batches opened in the Range ended (4.4, core/SPEC.md 12.4; one batch is one lot).\n\n- **Batch End**: Built, Built Partial, Unwound at a Profit or at the Stop, Entry Failed (the thin leg filled nothing); a Run trading both legs together: Built, Unwound (a leg filled and was trimmed back), No Fill.\n- **Net**: the lots' own net, USDT: of a void lot what its unwind or profit close made; an open lot's is not in it.\n- **Pairing s**: the median time from the thin leg's first fill to the end of the pairing, seconds (thin leg first only).",
      "gridPos": {
       "x": 14,
-      "y": 117,
+      "y": 121,
       "w": 10,
       "h": 6
      },
@@ -12697,13 +13184,13 @@
      }
     },
     {
-     "id": 34,
+     "id": 36,
      "type": "table",
      "title": "Order Latency by Stage · ms",
      "description": "Each stage over the Run's orders submitted in the Range; paper: the configured simulated latency, not a measurement.\n\n- **Clock**: local: this host's clock; venue: Bitget's.\n- **Orders**: orders measured.\n- **Median, P90, Max**: the median, 90th percentile and largest, ms.",
      "gridPos": {
       "x": 0,
-      "y": 117,
+      "y": 121,
       "w": 14,
       "h": 6
      },
@@ -12925,25 +13412,25 @@
    ]
   },
   {
-   "id": 40,
+   "id": 42,
    "type": "row",
    "title": "System · ${span}",
    "collapsed": true,
    "gridPos": {
     "x": 0,
-    "y": 109,
+    "y": 113,
     "w": 24,
     "h": 1
    },
    "panels": [
     {
-     "id": 36,
+     "id": 38,
      "type": "table",
      "title": "Runs · Both Modes",
      "description": "Every start of the program, both modes, newest first, as the Run picker lists them (the one shown marked), whatever the filters.\n\n- **Run**: click to show that Run, its whole life on the charts.\n- **State**: Running (a sample in the last minute), Stopped (in order), Lost (neither: crashed or killed).\n- **Ran**: start to stop, or to now.\n- **N**: the notional M × L it may hold, USDT.\n- **Run ID**: process_run.run_id.",
      "gridPos": {
       "x": 0,
-      "y": 110,
+      "y": 114,
       "w": 24,
       "h": 6
      },
@@ -13190,13 +13677,13 @@
      }
     },
     {
-     "id": 37,
+     "id": 39,
      "type": "table",
      "title": "Program Events",
      "description": "Every event a module of the Run recorded (trade.event) in the Range, newest first, at most 200; the errors are also in Alerts.\n\n- **Level**: Error (a person is needed), Warn, or another level the program writes.\n- **Module, Kind**: who wrote it and what it is.\n- **Message, Detail**: its words and its figures.",
      "gridPos": {
       "x": 0,
-      "y": 116,
+      "y": 120,
       "w": 24,
       "h": 5
      },
@@ -13363,13 +13850,13 @@
      }
     },
     {
-     "id": 38,
+     "id": 40,
      "type": "table",
      "title": "Anchors Read · Sessions in the Range",
      "description": "Every anchor, NAV and dividend the program read in the Run's mode for the sessions of the Run in the Range, newest first; its own reading, apart from Combo Spread's Anchors table.\n\n- **Kind**: bell_f (the F inside the bell), bell (F × Binance's index at the close), nav_seen (a NAV first seen), nav (confirmed after 1 h unchanged), dividend.\n- **Value**: USD per share.\n- **Known**: when the program learned it, UTC+8.",
      "gridPos": {
       "x": 0,
-      "y": 121,
+      "y": 125,
       "w": 14,
       "h": 7
      },
@@ -13589,13 +14076,13 @@
      }
     },
     {
-     "id": 39,
+     "id": 41,
      "type": "table",
      "title": "Funding Records · USDT",
      "description": "Each funding record of the Run's two contracts settled in the Range, and each settlement a finished round trip still waits for.\n\n- **Status**: Booked (to the round trip whose interval holds the settlement) or Awaited (amber).\n- **Amount**: + received.\n- **Execution ID**: the round trip it is booked to, by its opening time (UTC+8).",
      "gridPos": {
       "x": 14,
-      "y": 121,
+      "y": 125,
       "w": 10,
       "h": 7
      },

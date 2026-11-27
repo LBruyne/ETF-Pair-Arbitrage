@@ -37,7 +37,7 @@ SELECTIONS = [
 TEXT = {"venue": {"binance": "Binance", "bitget": "Bitget"}, "ma": {"sma": "SMA", "ema": "EMA"}}
 ZWSP = "\u200b"
 # What each panel that shows another's result takes it from.
-SHARED = {"Spread · Latest Second": "Prices · Latest Second", "Signal · Latest Second · Notional ${n_text} USDT": "Prices · Latest Second",
+SHARED = {"Spread · Latest Second": "Prices · Latest Second", "Signal · Latest Second · Notional ${n_text} USDT · Sweep Average": "Prices · Latest Second",
           "Book · Latest Second · Pricing Levels": "Prices · Latest Second", "Deviation · Bps": "Spread · Bps", "Entry Points · Bps": "Spread · Bps",
           "Entry Points by Phase · Bps": "Spread · Bps",
           "${bear} Price · USDT": "${bull} Price · USDT", "${ref} Price · USDT": "${bull} Price · USDT", "Implied Return · %": "${bull} Price · USDT"}
@@ -423,7 +423,7 @@ class Boards(unittest.TestCase):
         b = board.build()
         sizes = {p["title"]: p["options"]["text"] for p in b["panels"] if p["type"] == "stat"}
         self.assertEqual(sizes, {"Prices · Latest Second": {"titleSize": 12, "valueSize": 20}, "Spread · Latest Second": {"titleSize": 13, "valueSize": 20},
-                                 "Signal · Latest Second · Notional ${n_text} USDT": {"titleSize": 13, "valueSize": 20},
+                                 "Signal · Latest Second · Notional ${n_text} USDT · Sweep Average": {"titleSize": 13, "valueSize": 20},
                                  "Trading Phases · UTC+8": {"titleSize": 13, "valueSize": 18}})
         # 3.4: the Book table, a row a leg (Q_LAST's two rows): tick, levels, each side's depth in ct (two decimals) and USDT
         # (none), separators of thousands; the tooltip's depth rows likewise, the unit in their names.

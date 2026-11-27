@@ -2,6 +2,13 @@
 database (core/store/schema.sql, core/SPEC.md 5.6), read by the read-only role etfpair_trade_reader through the data source
 etfpair-trade (dashboard/SPEC.md section 7).
 
+Version 4.5 (the auditor's review of the first thin-first live run, owner item 100): Orders folds each run of consecutive
+orders without a fill that were refused or cancelled, on the same leg, purpose, step, side, quantity and error code, into one
+row (first and last time, how many, the range of their limits); the folded row Every Order below it lists every order, queried
+only while it is open. Alerts folds the same runs of rejected orders and a round trip's repeated forced exits into one row each,
+and shows the program's alarm orders_rejected (core/exec watchRejects) as Refused in a Row: the leg, how many in a row and for
+how long, by purpose and by error code, the last order beside the positions; repeats of one run are one row.
+
 Version 4.4 (core/SPEC.md 12, step 10.9: the thin leg first): the lines read strategy.entry_in / entry_out (d_in / d_out of
 the Runs before) and exit2; Parameters adds Exit 2 and a Thin Leg First strip (thin leg, pair window, pair stop, top-up max,
 exit pair window); a batch's marker reads its end state (built and built partial an entry, entry failed the grey triangle,
@@ -604,8 +611,11 @@ STATUS_WORDS = [
 #   mismatch       an episode of inventory_sample.mismatch (the venue's positions and the ledger disagree);
 #   round trips    ended on one leg, on a stop or a session change while holding, a forced exit, dust left (recorded only,
 #                  owner item 47), funding awaited;
-#   orders         rejected, not sent, never arrived, not found, or with an unknown outcome;
-#   events         trade.event of level error or warn.
+#   orders         rejected, not sent, never arrived, not found, or with an unknown outcome (4.5: a run of consecutive orders
+#                  rejected without a fill, same round trip, leg, purpose, side, quantity and error code, is one row);
+#   events         trade.event of level error or warn; orders_rejected (the program's alarm on a leg's orders refused in a
+#                  row, core/exec rejectAlarm) in words, the alarms of one run (leg, since_ms) one row.
+#   A round trip's forced-exit decisions with the same cause and slip are one row (4.5: 293 in a minute at the 11-27 stop).
 # Status: Open (a person is needed), In Progress (the program is still on it, while the Run runs), Recovered (it ended by
 # itself), Recorded (dust: recorded, not processed).
 GAP_MS = 5000
@@ -622,6 +632,23 @@ def quoted(codes):
 
 def ct(x):
     return "trim_scale((%s)::numeric)::text" % x
+
+
+def time_span(first, last):
+    """From first to last (ms) as text: 05:06:52 → 11:41:41 (6h 34m), or within a second."""
+    return ("CASE WHEN %s - %s < 1000 THEN 'within a second' ELSE %s || ' → ' || %s || ' (' || %s || ')' END"
+            % (last, first, clock(first, "HH24:MI:SS"), clock(last, "HH24:MI:SS"), span("%s - %s" % (last, first))))
+
+
+def detail_num(key):
+    """A number in the event's detail, NULL when it is missing or not a plain number (core may still change what it writes)."""
+    return "(CASE WHEN (e.detail ->> '%s') ~ '^[0-9]+(\\.[0-9]+)?$' THEN (e.detail ->> '%s')::numeric END)" % (key, key)
+
+
+def word_counts(obj, word):
+    """A JSON object of counts ({"40804": 21790, "25231": 3}) as text, the largest first: 40804 × 21,790, 25231 × 3."""
+    return ("(SELECT string_agg(%s || ' × ' || to_char(x.value::numeric, 'FM999,999,990'), ', ' ORDER BY x.value::numeric DESC, x.key) "
+            "FROM jsonb_each_text(CASE WHEN jsonb_typeof(%s) = 'object' THEN %s END) x WHERE x.value ~ '^[0-9]+$')" % (word, obj, obj))
 
 
 Q_ALERTS = sql("""
@@ -642,6 +669,15 @@ mi AS (SELECT y.*, sum(y.st) OVER (ORDER BY y.ts_ms) AS k FROM (
 mis AS (SELECT min(mi.ts_ms) AS t0, max(mi.ts_ms) AS t1, (array_agg(mi.pos_bull ORDER BY mi.ts_ms))[1] AS pb, (array_agg(mi.ledger_bull ORDER BY mi.ts_ms))[1] AS lb,
                (array_agg(mi.pos_bear ORDER BY mi.ts_ms))[1] AS pe, (array_agg(mi.ledger_bear ORDER BY mi.ts_ms))[1] AS le
         FROM mi WHERE mi.mismatch GROUP BY mi.k),
+ao AS MATERIALIZED (
+  SELECT o.*, row_number() OVER (ORDER BY o.submitted_ms, o.client_order_id) AS n,
+         CASE WHEN o.status = 'rejected' AND o.cum_exec_qty = 0 AND NOT o.unknown AND NOT o.not_found
+              THEN concat_ws('|', o.cycle_id, o.leg, o.purpose, o.side, o.qty::text, coalesce(o.error_code, '')) END AS fold
+  FROM trade.cex_order o WHERE @RUN_O@),
+ag AS (SELECT y.n, y.submitted_ms, y.price, sum(y.st) OVER (ORDER BY y.n) AS grp, y.unknown OR y.not_found OR y.status IN ('rejected', 'not_sent', 'never_arrived') AS alert
+       FROM (SELECT ao.*, CASE WHEN ao.fold IS NOT NULL AND ao.fold = lag(ao.fold) OVER (ORDER BY ao.n) THEN 0 ELSE 1 END AS st FROM ao) y),
+af AS (SELECT min(ag.n) AS n0, count(*) AS cnt, min(ag.submitted_ms) AS first_ms, max(ag.submitted_ms) AS last_ms, min(ag.price) AS lo, max(ag.price) AS hi
+       FROM ag WHERE ag.alert GROUP BY ag.grp),
 al AS (
   SELECT h.last_ms AS ts_ms, CASE WHEN h.code IN @CRITICAL@ THEN 'critical' ELSE 'warning' END AS sev,
          CASE WHEN @LIVE_RUN@ AND h.code = (SELECT s.idle_reason FROM s) THEN CASE WHEN h.code IN @CRITICAL@ THEN 'Open' ELSE 'In Progress' END
@@ -672,10 +708,12 @@ al AS (
            || CASE WHEN c.dust_bull <> 0 OR c.dust_bear <> 0 THEN '; dust left (recorded only): $bull ' || @DB@ || ', $bear ' || @DE@ || ' ct' ELSE '' END, c.cycle_id
   FROM trade.cycle c WHERE @RUN_C@ AND (c.end_reason IN ('one_leg', 'stop', 'session_changed', 'store_error', 'dust_only') OR c.dust_bull <> 0 OR c.dust_bear <> 0)
   UNION ALL
-  SELECT d.ts_ms, 'serious', CASE WHEN c.status = 'open' AND @LIVE_RUN@ THEN 'In Progress' ELSE 'Recovered' END, 'Execution ' || coalesce(@OPENED@, '–'),
+  SELECT max(d.ts_ms), 'serious', CASE WHEN c.status = 'open' AND @LIVE_RUN@ THEN 'In Progress' ELSE 'Recovered' END, 'Execution ' || coalesce(@OPENED@, '–'),
          'Forced Exit', CASE d.detail ->> 'cause' WHEN 'stop' THEN 'on the stop' WHEN 'close_window' THEN 'before the close' ELSE coalesce(d.detail ->> 'cause', 'forced') END
-           || ', IOC with ' || coalesce(d.detail ->> 'slip_bps', '–') || ' bps slip', d.cycle_id
+           || ', IOC with ' || coalesce(d.detail ->> 'slip_bps', '–') || ' bps slip'
+           || CASE WHEN count(*) > 1 THEN ' · ' || to_char(count(*), 'FM999,999,990') || ' decisions, ' || @FORCED_SPAN@ ELSE '' END, d.cycle_id
   FROM trade.decision d LEFT JOIN trade.cycle c ON c.live = d.live AND c.cycle_id = d.cycle_id WHERE @RUN_D@ AND d.kind = 'forced'
+  GROUP BY d.cycle_id, c.status, c.opened_ms, d.detail ->> 'cause', d.detail ->> 'slip_bps'
   UNION ALL
   SELECT d.ts_ms, 'warning', CASE WHEN c.status = 'open' AND @LIVE_RUN@ THEN 'In Progress' ELSE 'Recovered' END, 'Execution ' || coalesce(@OPENED@, '–'),
          CASE d.kind WHEN 'pair' THEN 'Thin Leg Unwound' ELSE 'Exit Hard Close' END,
@@ -697,16 +735,34 @@ al AS (
          jsonb_array_length(c.funding_awaited) || ' settlement(s) without a record: its net stays Pending', c.cycle_id
   FROM trade.cycle c WHERE @RUN_C@ AND jsonb_typeof(c.funding_awaited) = 'array' AND jsonb_array_length(c.funding_awaited) > 0
   UNION ALL
-  SELECT o.submitted_ms, CASE WHEN o.status = 'not_sent' THEN 'warning' ELSE 'serious' END,
+  SELECT CASE WHEN f.cnt > 1 THEN f.last_ms ELSE o.submitted_ms END, CASE WHEN o.status = 'not_sent' THEN 'warning' ELSE 'serious' END,
          CASE WHEN o.unknown THEN CASE WHEN @LIVE_RUN@ THEN 'In Progress' ELSE 'Open' END ELSE 'Recovered' END,
          'Order · ' || CASE o.leg WHEN 'bull' THEN '$bull' ELSE '$bear' END,
-         CASE WHEN o.unknown THEN 'Order Outcome Unknown' WHEN o.not_found THEN 'Order Not Found' WHEN o.status = 'rejected' THEN 'Order Rejected'
-              WHEN o.status = 'not_sent' THEN 'Order Not Sent' ELSE 'Order Never Arrived' END,
-         initcap(o.purpose) || ' ' || o.side || ' ' || @QTY@ || ' @ ' || @PRICE@ || coalesce(' · ' || nullif(concat_ws(' ', o.error_code, o.error_message), ''), ''), o.cycle_id
-  FROM trade.cex_order o WHERE @RUN_O@ AND (o.unknown OR o.not_found OR o.status IN ('rejected', 'not_sent', 'never_arrived'))
+         CASE WHEN o.unknown THEN 'Order Outcome Unknown' WHEN o.not_found THEN 'Order Not Found' WHEN f.cnt > 1 THEN 'Orders Rejected'
+              WHEN o.status = 'rejected' THEN 'Order Rejected' WHEN o.status = 'not_sent' THEN 'Order Not Sent' ELSE 'Order Never Arrived' END,
+         initcap(o.purpose) || ' ' || o.side || ' ' || @QTY@ || ' @ ' || CASE WHEN f.lo <> f.hi THEN @LO@ || '–' || @HI@ ELSE @PRICE@ END
+           || coalesce(' · ' || nullif(concat_ws(' ', o.error_code, o.error_message), ''), '')
+           || CASE WHEN f.cnt > 1 THEN ' · ' || to_char(f.cnt, 'FM999,999,990') || ' in a row, ' || @ORDERS_SPAN@ ELSE '' END,
+         o.cycle_id
+  FROM af f JOIN ao o ON o.n = f.n0
   UNION ALL
   SELECT e.ts_ms, CASE e.level WHEN 'error' THEN 'critical' ELSE 'warning' END, 'Open', 'Program · ' || e.module, initcap(replace(e.kind, '_', ' ')), e.message, NULL
-  FROM trade.event e WHERE @RUN_E@ AND e.level IN ('error', 'warn'))
+  FROM trade.event e WHERE @RUN_E@ AND e.level IN ('error', 'warn') AND e.kind <> 'orders_rejected'
+  UNION ALL
+  SELECT e.ts_ms, CASE e.level WHEN 'error' THEN 'critical' ELSE 'warning' END, 'Open',
+         CASE e.detail ->> 'leg' WHEN 'bull' THEN 'Order · $bull' WHEN 'bear' THEN 'Order · $bear' ELSE 'Program · ' || e.module END, 'Refused in a Row',
+         coalesce(nullif(concat_ws('; ',
+           to_char(@COUNT@, 'FM999,999,990') || ' orders refused in a row' || CASE WHEN @LASTED_S@ >= 1 THEN ' over ' || @LASTED@ ELSE '' END
+             || coalesce(' since ' || @SINCE@, '') || coalesce(' (' || nullif(concat_ws('; ', @PURPOSES@, 'codes ' || @CODES@), '') || ')', ''),
+           'last ' || concat_ws(' ', initcap(e.detail ->> 'purpose'), e.detail ->> 'side', (e.detail ->> 'qty') || ' ct', '@ ' || (e.detail ->> 'price') || ' USDT')
+,
+           'venue ' || (e.detail ->> 'venue') || ' / ledger ' || (e.detail ->> 'ledger') || ' / round trip ' || (e.detail ->> 'hold') || ' ct',
+           CASE WHEN e.alarms > 1 THEN 'alarm raised ' || e.alarms || ' times' END, regexp_replace(e.message, '^[^:]*:\\s*', '')), ''), e.message),
+         e.detail ->> 'cycle_id'
+  FROM (SELECT DISTINCT ON (coalesce(e.detail ->> 'leg', ''), coalesce(e.detail ->> 'since_ms', e.seq::text)) e.*,
+               count(*) OVER (PARTITION BY coalesce(e.detail ->> 'leg', ''), coalesce(e.detail ->> 'since_ms', e.seq::text)) AS alarms
+        FROM trade.event e WHERE @RUN_E@ AND e.level IN ('error', 'warn') AND e.kind = 'orders_rejected'
+        ORDER BY coalesce(e.detail ->> 'leg', ''), coalesce(e.detail ->> 'since_ms', e.seq::text), e.ts_ms DESC, e.seq DESC) e)
 SELECT t.time, t."Severity", t."Status", t."Source", t."What", t."Detail", t.cycle_id FROM (
   SELECT to_timestamp(a.ts_ms / 1000.0) AS time, a.sev AS "Severity", a.status AS "Status", a.source AS "Source", a.what AS "What", a.detail AS "Detail",
          a.cycle_id, CASE a.status WHEN 'Open' THEN 0 WHEN 'In Progress' THEN 1 ELSE 2 END AS k, a.ts_ms
@@ -718,7 +774,10 @@ SELECT NULL, NULL, NULL, NULL, NULL, 'No alert in this Run: nothing stopped or h
                FIRST=clock("h.first_ms", "HH24:MI:SS"), GAP=span("x.gap"), GAP_MS=str(GAP_MS), NOW=NOW_MS, AGE=span("%s - s.ts_ms" % NOW_MS),
                STALE_MS=str(SAMPLE_AGE_S * 1000), PB=ct("mis.pb"), LB=ct("mis.lb"), PE=ct("mis.pe"), LE=ct("mis.le"),
                OPENED=clock("c.opened_ms", "MM-DD HH24:MI:SS"), REASON="lower(%s)" % end_reason("c.end_reason"), DB=ct("c.dust_bull"),
-               DE=ct("c.dust_bear"), QTY=ct("o.qty"), PRICE=ct("o.price"),
+               DE=ct("c.dust_bear"), QTY=ct("o.qty"), PRICE=ct("o.price"), LO=ct("f.lo"), HI=ct("f.hi"),
+               ORDERS_SPAN=time_span("f.first_ms", "f.last_ms"), FORCED_SPAN=time_span("min(d.ts_ms)", "max(d.ts_ms)"),
+               LASTED=span("%s * 1000" % detail_num("lasted_s")), SINCE=clock(detail_num("since_ms"), "MM-DD HH24:MI:SS"), COUNT=detail_num("count"), LASTED_S=detail_num("lasted_s"),
+               PURPOSES=word_counts("e.detail -> 'purposes'", "initcap(x.key)"), CODES=word_counts("e.detail -> 'codes'", "coalesce(nullif(x.key, ''), '(none)')"),
                THIN_C="EXISTS (SELECT 1 FROM trade.lot x WHERE x.live = c.live AND x.cycle_id = c.cycle_id AND to_jsonb(x) ->> 'end_state' IS NOT NULL)",
                UNPAIRED="trim_scale(round(((d.detail ->> 'thin_qty')::numeric - coalesce((d.detail ->> 'thick_qty')::numeric, 0) * c.pair_anchor_bull / c.pair_anchor_bear), 2))::text",
                IDEAL="replace(to_char(round((d.detail ->> 'd_ideal')::numeric, 1), 'FM9990.0'), '-', '−')",
@@ -1350,22 +1409,48 @@ ORDER_DECISION = """ko AS (
     UNION ALL SELECT k.detail ->> 'client_order_ids' WHERE jsonb_typeof(k.detail -> 'client_order_ids') = 'string') x
   WHERE x.id IS NOT NULL
   ORDER BY x.id, k.ts_ms)""" % of_mode("o")
-Q_ORDERS = or_say(sql("""
-WITH @SEL@, @KO@
-SELECT to_timestamp(o.submitted_ms / 1000.0) AS "Time", initcap(o.purpose) AS "Purpose", @STEP@ AS "Step", CASE o.leg WHEN 'bull' THEN '$bull' ELSE '$bear' END AS "Leg",
+ORDER_COLUMNS = ['Time', 'Purpose', 'Step', 'Leg', 'Side', 'Qty', 'Filled', 'Limit', 'Avg', 'Fee', 'Latency', 'Status']
+ORDER_ROW = sql("""to_timestamp(o.submitted_ms / 1000.0) AS "Time", initcap(o.purpose) AS "Purpose", @STEP@ AS "Step", CASE o.leg WHEN 'bull' THEN '$bull' ELSE '$bear' END AS "Leg",
        initcap(o.side) || CASE WHEN o.reduce_only THEN ' · RO' ELSE '' END AS "Side", o.qty AS "Qty", o.cum_exec_qty AS "Filled",
        @LIMIT@ AS "Limit", @AVG@ AS "Avg", CASE WHEN o.cum_exec_qty = 0 THEN NULL WHEN NOT o.fee_known THEN @FEE_PENDING@ ELSE o.fee END AS "Fee",
        o.final_ms - o.sent_ms AS "Latency",
        CASE WHEN o.unknown THEN 'Unknown' WHEN o.status = 'filled' THEN 'Filled' WHEN o.status = 'cancelled' AND o.cum_exec_qty > 0 THEN 'Partial'
             WHEN o.status = 'cancelled' THEN 'No Fill' WHEN o.status IN ('pending', 'acked') THEN 'Working'
-            ELSE initcap(replace(o.status, '_', ' ')) END || coalesce(' · ' || nullif(concat_ws(' ', o.error_code, o.error_message), ''), '') AS "Status"
-FROM trade.cex_order o
+            ELSE initcap(replace(o.status, '_', ' ')) END || coalesce(' · ' || nullif(concat_ws(' ', o.error_code, o.error_message), ''), '') AS "Status" """,
+                FEE_PENDING=str(FEE_PENDING), LIMIT=leg_price("o.price"), AVG=leg_price("o.avg_price"), STEP=ORDER_STEP)
+ORDER_FROM = sql("""FROM trade.cex_order o
 LEFT JOIN ko k ON k.id = o.client_order_id
 LEFT JOIN trade.lot l ON l.live = o.live AND l.lot_id = o.lot_id
-WHERE @RUN_O@ AND o.cycle_id = @CYCLE@ ORDER BY o.submitted_ms, o.client_order_id""",
-               SEL=SEL, RUN_O=of_mode("o"), CYCLE=CYCLE, FEE_PENDING=str(FEE_PENDING), LIMIT=leg_price("o.price"), AVG=leg_price("o.avg_price"), STEP=ORDER_STEP,
-               KO=ORDER_DECISION.format(cycle=CYCLE)),
-                  ['Time', 'Purpose', 'Step', 'Leg', 'Side', 'Qty', 'Filled', 'Limit', 'Avg', 'Fee', 'Latency', 'Status'], 'Status', 'No order: no round trip in the Range')
+WHERE @RUN_O@ AND o.cycle_id = @CYCLE@""", RUN_O=of_mode("o"), CYCLE=CYCLE)
+# Every order of the picked round trip, one row each (4.4.1's Orders, since 4.5 the folded row Every Order).
+Q_ORDERS_EVERY = or_say(sql("""
+WITH @SEL@, @KO@
+SELECT @ROW@
+@FROM@ ORDER BY o.submitted_ms, o.client_order_id""", SEL=SEL, KO=ORDER_DECISION.format(cycle=CYCLE), ROW=ORDER_ROW, FROM=ORDER_FROM),
+                        ORDER_COLUMNS, 'Status', 'No order: no round trip in the Range')
+# 4.5 (the auditor's review of the first thin-first live run, owner item 100): Orders shows every order with a fill in full and
+# folds each run of consecutive orders without a fill that were refused (rejected) or cancelled, and that share the leg,
+# purpose, side, quantity, status, error code and step, into one row: its first order's figures, Until (the last order's
+# time), Orders (how many), Limit as the range of their limits, no latency; a run of one stays its own row, as in 4.4.1. The
+# round trip c1795718904692 (11-27 02:48, 21,802 orders, 21,796 refused) reads in a handful of rows.
+FOLD = ("CASE WHEN o.cum_exec_qty = 0 AND NOT o.unknown AND o.status IN ('rejected', 'cancelled') "
+        "THEN concat_ws('|', o.leg, o.purpose, o.side, o.qty::text, o.status, coalesce(o.error_code, ''), @STEP@) END")
+Q_ORDERS = or_say(sql("""
+WITH @SEL@, @KO@,
+r AS MATERIALIZED (
+  SELECT @ROW@, o.leg, o.price, o.submitted_ms, @FOLD@ AS fold, row_number() OVER (ORDER BY o.submitted_ms, o.client_order_id) AS n
+  @FROM@),
+g AS (SELECT r.n, sum(r.st) OVER (ORDER BY r.n) AS grp FROM (
+        SELECT r.n, CASE WHEN r.fold IS NOT NULL AND r.fold = lag(r.fold) OVER (ORDER BY r.n) THEN 0 ELSE 1 END AS st FROM r) r),
+a AS (SELECT min(g.n) AS n0, count(*) AS cnt, max(r.submitted_ms) AS last_ms, min(r.price) AS lo, max(r.price) AS hi
+      FROM g JOIN r ON r.n = g.n GROUP BY g.grp)
+SELECT o."Time", CASE WHEN a.cnt > 1 THEN to_timestamp(a.last_ms / 1000.0) END AS "Until", a.cnt AS "Orders", o."Purpose", o."Step", o."Leg", o."Side",
+       o."Status", o."Qty", o."Filled", CASE WHEN a.cnt > 1 AND a.lo <> a.hi THEN @LO@ || '–' || @HI@ ELSE o."Limit" END AS "Limit", o."Avg", o."Fee",
+       CASE WHEN a.cnt = 1 THEN o."Latency" END AS "Latency"
+FROM a JOIN r o ON o.n = a.n0 ORDER BY a.n0""", SEL=SEL, KO=ORDER_DECISION.format(cycle=CYCLE), ROW=ORDER_ROW, FROM=ORDER_FROM,
+                      FOLD=sql(FOLD, STEP=ORDER_STEP), LO=leg_price("a.lo"), HI=leg_price("a.hi")),
+                  ['Time', 'Until', 'Orders', 'Purpose', 'Step', 'Leg', 'Side', 'Status', 'Qty', 'Filled', 'Limit', 'Avg', 'Fee', 'Latency'], 'Status',
+                  'No order: no round trip in the Range')
 
 # -------------------------------------------------------------------------------------------------------------- Inventory
 # Each leg at the Run's newest inventory sample (every 10 s), as the sibling board's Positions Now: the venue's position and
@@ -1669,7 +1754,7 @@ def build():
     panels.append(table("Alerts", Q_ALERTS, 0, y, 24, 8, description=bullets(
         "What stopped or held trading in the picked Run and what became of it: the unfinished first, each group newest first, at most 200.",
         [("Severity", "critical: position mismatch, a lost or stale Run, an entry held for a person (settings, records, mismatch), a program "
-                      "error; serious: a sample gap, one leg only, a forced exit, an order rejected, unknown, never arrived or not found; "
+                      "error (Refused in a Row among them); serious: a sample gap, one leg only, a forced exit, an order rejected, unknown, never arrived or not found; "
                       "warning: an entry held back (a book, F, no anchor, backing off, a stop pending), a stop or session end while holding, "
                       "dust, funding awaited, an order not sent."),
          ("Status", "Open: a person is needed; In Progress: the program is still on it (only while the Run runs, else Open); Recovered: it "
@@ -1678,7 +1763,13 @@ def build():
          ("Source", "the part it belongs to: the Run, the positions, the entry, an order or a round trip (click a round trip's Source for its "
                     "orders below)."),
          ("What, Detail", "what happened, and its figures: for an entry held back, how often, how long in all and at most, and the "
-                          "seconds an executable deviation was past an entry line meanwhile (the entries it cost).")]), overrides=[
+                          "seconds an executable deviation was past an entry line meanwhile (the entries it cost); a run of orders "
+                          "rejected in a row (same round trip, leg, purpose, side, quantity and code) is one row, Orders Rejected, with "
+                          "how many and from when to when, and a round trip's repeated forced-exit decisions one Forced Exit row (4.5)."),
+         ("Refused in a Row", "the program's alarm (critical, Open; again every stop_alarm_after while the refusals go on, one row "
+                              "with how often it was raised): Source names the leg; Detail how many orders in a row and for how long, by "
+                              "purpose and by error code, the last order and the venue's, the ledger's and the round trip's position "
+                              "(check the quantity against the venue's position).")]), overrides=[
         col("time", 116, displayName="Time", unit="time:MM-DD HH:mm:ss"), col("Severity", **word_cells(SEVERITY, 66)),
         col("Status", **word_cells(ALERT_STATUS, 90)),
         col("Source", 184, links=[{"title": "Show this round trip's orders", "url": link, "targetBlank": False}]),
@@ -1983,25 +2074,41 @@ def build():
         col("Bull", 68, displayName="${bull} ct", **num(2)), col("Bear", 68, displayName="${bear} ct", **num(2)), col("Back", 64, displayName="Back ct", **num(2)),
         col("Pairing", 64, displayName="Pairing s", **num(2)), col("Net", custom_minWidth=84, displayName="Net USDT", **dict(money_col, mappings=[NO_FIGURE, PENDING_TEXT]))]))
     y += 6
-    panels.append(table("Orders · ct, USDT and ms", Q_ORDERS, 0, y, 24, 7, description=bullets(
-        "Every order of the picked round trip (the Range's newest by default), in the order the program sent them, its fills folded in.",
-        [("Step", "what the order was for, from the decision that sent it (4.4; it replaces 4.3's Purpose column, which stays in the "
-                  "panel's data): Batch n · Thin Leg or Top-Up (purpose entry), Pair (complete: the other leg pairing the thin leg's "
-                  "fills), Unwind or Profit Close (trim: the thin leg's unpaired part closed back), n the entry batch of the round "
-                  "trip; Exit 1 · Thin, Exit 1 · Thick, Exit 2 · Hard Close (the thick leg closed whatever its break-even); with both "
-                  "legs together Batch n · Entry, Complete (the leg that filled less), Trim (the leg that filled more), Exit, Forced."),
-         ("Side", "Buy or Sell; RO: a reduce-only order."), ("Qty, Filled", "contracts ordered and filled."),
-         ("Limit, Avg", "the limit and the fills' average price, USDT, to the leg's tick."),
-         ("Fee", "USDT paid, a cost shown as a positive amount (as in Summary); Pending while the venue has not reported it."),
-         ("Latency", "sent → final state in hand, ms, this host's clock (paper: the configured simulation)."),
-         ("Status", "Filled, Partial, No Fill (an IOC that met nothing), Rejected (with the venue's code), Working, Unknown (being queried).")]),
-        overrides=[
-        col("Time", 96, unit="time:HH:mm:ss.SSS"), col("Purpose", custom_hidden=True), col("Step", 148), col("Leg", 52), col("Side", 64),
-        col("Qty", 56, displayName="Qty ct", **num(2)), col("Filled", 56, displayName="Filled ct", **num(2)),
-        col("Limit", 72, displayName="Limit USDT", custom_align="right"), col("Avg", 72, displayName="Avg USDT", custom_align="right"),
-        col("Fee", 76, displayName="Fee USDT", custom_align="right", unit="none", decimals=5, mappings=[NO_FIGURE, PENDING_TEXT]), col("Latency", 64, displayName="Latency ms", **num(0)),
-        col("Status", custom_minWidth=100, custom_cellOptions={"type": "color-text"},
-            mappings=regex_colors([("Rejected", BAD), ("Unknown", WARN), ("Partial", WARN), ("No Fill", GREY)]))])); y += 7
+    order_about = [
+        ("Step", "what the order was for, from the decision that sent it (4.4; it replaces 4.3's Purpose column, which stays in the "
+                 "panel's data): Batch n · Thin Leg or Top-Up (purpose entry), Pair (complete: the other leg pairing the thin leg's "
+                 "fills), Unwind or Profit Close (trim: the thin leg's unpaired part closed back), n the entry batch of the round "
+                 "trip; Exit 1 · Thin, Exit 1 · Thick, Exit 2 · Hard Close (the thick leg closed whatever its break-even); with both "
+                 "legs together Batch n · Entry, Complete (the leg that filled less), Trim (the leg that filled more), Exit, Forced."),
+        ("Side", "Buy or Sell; RO: a reduce-only order."), ("Qty, Filled", "contracts ordered and filled."),
+        ("Limit, Avg", "the limit and the fills' average price, USDT, to the leg's tick."),
+        ("Fee", "USDT paid, a cost shown as a positive amount (as in Summary); Pending while the venue has not reported it."),
+        ("Latency", "sent → final state in hand, ms, this host's clock (paper: the configured simulation)."),
+        ("Status", "Filled, Partial, No Fill (an IOC that met nothing), Rejected (with the venue's code), Working, Unknown (being queried).")]
+
+    def order_columns(folded):
+        status = col("Status", None, custom_minWidth=240 if folded else 100, custom_inspect=True, custom_cellOptions={"type": "color-text"},
+                     mappings=regex_colors([("Rejected", BAD), ("Unknown", WARN), ("Partial", WARN), ("No Fill", GREY)]))
+        return ([col("Time", 96, unit="time:HH:mm:ss.SSS")] +
+                ([col("Until", 96, unit="time:HH:mm:ss.SSS", noValue=" "), col("Orders", 64, custom_align="right", unit="none", decimals=0)] if folded else []) + [
+            col("Purpose", custom_hidden=True), col("Step", 148), col("Leg", 52), col("Side", 64),
+            col("Qty", 56, displayName="Qty ct", **num(2)), col("Filled", 56, displayName="Filled ct", **num(2)),
+            col("Limit", 104 if folded else 72, displayName="Limit USDT", custom_align="right"), col("Avg", 72, displayName="Avg USDT", custom_align="right"),
+            col("Fee", 76, displayName="Fee USDT", custom_align="right", unit="none", decimals=5, mappings=[NO_FIGURE, PENDING_TEXT]),
+            col("Latency", 64, displayName="Latency ms", **num(0)), status])
+    panels.append(table("Orders · ct, USDT and ms", Q_ORDERS, 0, y, 24, 10, description=bullets(
+        "The picked round trip's orders (the Range's newest by default), in the order the program sent them, its fills folded in. Every "
+        "order with a fill has its own row; a run of consecutive orders without a fill, refused (Rejected) or cancelled (No Fill), on the "
+        "same leg, purpose, step, side and quantity and with the same error code is one row (4.5): the whole run is in the folded row "
+        "Every Order below. Status comes right after Side here, so that what happened to a run is in view at 1280 px.",
+        [("Time, Until", "when the order was sent, ms, UTC+8; for a run of orders the first and (Until) the last one's time."),
+         ("Orders", "how many orders the row stands for: 1, or the number in the run.")] + order_about +
+        [("Limit of a run", "the lowest–highest limit of its orders; a run has no latency.")]), overrides=order_columns(True))); y += 10
+    panels.append(collapsed_row("Every Order · ${cycle:text}", y, [
+        table("Every Order · ct, USDT and ms", Q_ORDERS_EVERY, 0, y + 1, 24, 10, description=bullets(
+            "Every order of the picked round trip, one row each, in the order the program sent them (Orders above folds the runs of "
+            "refused or cancelled orders without a fill). Queried only while this row is open: a round trip can hold tens of "
+            "thousands of orders (11‑27 02:48: 21,802).", order_about), overrides=order_columns(False))])); y += 1
 
     # ------------------------------------------------------------------ Inventory
     panels.append(row("Inventory · ${runtext}", y)); y += 1
