@@ -2681,6 +2681,14 @@ func (m *Manager) onPairTick(now time.Time) {
    - `trade.lot.end_state` 记五种结束状态。
 10. **一点没配上、只剩零头的批**：记 `unwound_stop`，原因为 too_small，零头照第 47 条记下。这一条推翻了 10.4 的 `built`。
 
+**10.8 回放（2026-11-27，冻结构建 `089728e` 加 core/cmd/replay；结果在 `experiments/replay_seq_20261127/`）**：
+- **网格键与报告列**：网格键 `thin=bear|none`、`exit2=…|none`；grid.csv 加 12.10 的各列，另有 `exit_batches`、`exit_batch_max_s`、`refused`、`refused_reduce_qty`、`residual_cycles`、`residual_bull`、`residual_bear`。
+- **`refusingPaper`**：只减仓单超过纸面持仓时，回放照 Bitget 的做法整单拒绝（`VenueError` 40804，`ErrorReduceQty`），不再只成交持仓那一部分。这样 exec 的数量拒单处理在回放里也走得到。
+- **结果**：48 个模拟加上事故回归，拒单都是 0，出场批最长 1.3 s，薄腿先行的各组都没有残留轮。
+  - 薄腿先行把回吐损失压到接近 0：N = 10,000 时，11-24 从 −8.42 降到 −0.01，11-25 / 26 合并窗口（W4）从 −9.72 降到 −1.04。
+  - 两段出场主要是占用额度，额度紧时净额更低。
+  - exit2 −0.9 在 N = 20,000 时四个窗口的净额都比 −1 高。
+
 **首次实盘之后的修复**（2026-11-27，`befe3cb`、`402cd43`；PRD 5.22；证据 `experiments/live_thin_first_20261127/timeline.txt`）：
 1. `strategy.Reducible`：只减仓单以**账本推算的净额**（持有量加上反号零头，零头是账本记下的）为上限。用于 ExitInput 和 ExitPairInput 的 Hold、强平（`positionHold` 和 `forcedExit`）、回吐（`GapInput.Dust`），以及配平中的 unwind 和盈利平（`PairInput.Dust`）。它是推算，不是交易所读回的持仓；两者只在数量拒单之后才合用（下面“第 100 条”第 1 点）。
 2. `strategy.ExitThickTarget`：出场厚腿目标按整轮累计取整；薄腿平完时平掉厚腿剩下的全部。`ExitPairInput.Before` 由 exec 的 `closedBefore` 给出。
