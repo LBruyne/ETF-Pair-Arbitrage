@@ -308,6 +308,7 @@ func TestTradeOrderErrors(t *testing.T) {
 		{answer: `{"event":"error","id":%q,"code":41117,"msg":"The price is too high"}`, wantCode: "41117", wantKind: cex.ErrorPriceLimit},
 		{answer: `{"event":"error","id":%q,"code":"25004","msg":"Operation too frequent, please try again later"}`, wantCode: "25004", wantKind: cex.ErrorRateLimited},
 		{answer: `{"event":"error","id":%q,"code":30006,"msg":"request too many"}`, wantCode: "30006", wantKind: cex.ErrorRateLimited},
+		{answer: `{"event":"error","id":%q,"code":"40804","msg":"The number of closed positions cannot exceed the number of positions held"}`, wantCode: "40804", wantKind: cex.ErrorReduceQty},
 		{answer: `{"event":"trade","id":%q,"code":"25212","msg":"Duplicate clientOid","args":[]}`, wantCode: "25212", wantKind: cex.ErrorOther},
 		{answer: `{"event":"error","id":%q,"code":"40010","msg":"Request timed out"}`, unknown: true},
 		{answer: `{"event":"error","id":%q,"code":40725,"msg":"service return an error"}`, unknown: true},

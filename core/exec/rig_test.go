@@ -49,7 +49,7 @@ type pairBook struct {
 // and carries the book streams the test feeds. It must never receive an
 // order or an account request.
 type fakeVenue struct {
-	t      *testing.T
+	t      testing.TB
 	mu     sync.Mutex
 	stream map[cex.Symbol]func(cex.BookEvent)
 }
@@ -486,7 +486,7 @@ func (s teeSink) WriteSync(rows ...store.Row) error {
 // rig is one loop on the real components, with its clock in the test's
 // hands.
 type rig struct {
-	t       *testing.T
+	t       testing.TB
 	mu      sync.Mutex
 	now     time.Time
 	fxFixed bool // F is not refreshed when the clock moves: it goes stale
@@ -517,7 +517,7 @@ func testStrategy() strategy.Config {
 
 // newRig starts cex on the paper venue, restores an empty ledger and builds
 // the loop at now, with the bell anchors 40 / 60 of the Session now is in.
-func newRig(t *testing.T, now time.Time, opts rigOptions) *rig {
+func newRig(t testing.TB, now time.Time, opts rigOptions) *rig {
 	t.Helper()
 	if opts.capital == "" {
 		opts.capital = "2000"
@@ -597,6 +597,7 @@ func newRig(t *testing.T, now time.Time, opts rigOptions) *rig {
 	r.m.Restore(state.MinuteBars, state.AnchorFacts, state.LastEntry, opts.perp)
 	r.m.RestoreExitStage(state.ExitStage)
 	r.m.RestoreEntryDecision(state.EntryDecision)
+	r.m.RestoreExitDecision(state.ExitDecision)
 	r.m.timing.clock = r.clock
 
 	// cex runs its own loops; its first reference pass reads the rules, the
@@ -795,7 +796,7 @@ func (r *rig) decisions() []store.DecisionRow {
 }
 
 // decodeDetail reads a decision's or an event's detail.
-func decodeDetail(t *testing.T, raw json.RawMessage) map[string]any {
+func decodeDetail(t testing.TB, raw json.RawMessage) map[string]any {
 	t.Helper()
 	var out map[string]any
 	if err := json.Unmarshal(raw, &out); err != nil {
@@ -855,7 +856,7 @@ func legSymbol(leg cex.Leg) cex.Symbol {
 
 // waitFor polls cond until it holds: cex and the paper venue work on their
 // own goroutines.
-func waitFor(t *testing.T, what string, cond func() bool) {
+func waitFor(t testing.TB, what string, cond func() bool) {
 	t.Helper()
 	for deadline := time.Now().Add(3 * time.Second); !cond(); time.Sleep(200 * time.Microsecond) {
 		if time.Now().After(deadline) {

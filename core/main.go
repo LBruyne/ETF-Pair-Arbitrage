@@ -199,13 +199,15 @@ func run(cfg *config.Config, signals chan os.Signal) error {
 		paper.SeedPositions(imgr.LedgerPositions())
 	}
 	// The loop's own: the Session's minutes, the last built entry, the half
-	// target of exit1, the entry decision of a batch still building, and the
+	// target of exit1, the entry decision of a batch still building, the
+	// cycle's last exit decision (the rules of an exit batch taken up), and the
 	// recorder's per-second rows for the minutes it
 	// did not record. Its
 	// recovery (reading the venue's orders and positions) runs in Run.
 	emgr.Restore(state.MinuteBars, state.AnchorFacts, state.LastEntry, st)
 	emgr.RestoreExitStage(state.ExitStage)
 	emgr.RestoreEntryDecision(state.EntryDecision)
+	emgr.RestoreExitDecision(state.ExitDecision)
 	log.Info("ETF-arbitrage core state loaded", "session", sessionID, "anchor_facts", len(state.AnchorFacts),
 		"unfinished_cycle", state.Cycle != nil, "orders", len(orders), "funding_records", len(state.Funding), "minute_bars", len(state.MinuteBars))
 

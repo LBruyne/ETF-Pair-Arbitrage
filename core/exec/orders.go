@@ -3,6 +3,7 @@ package exec
 import (
 	"context"
 	"errors"
+	"sort"
 	"time"
 
 	"github.com/shopspring/decimal"
@@ -250,7 +251,7 @@ func (m *ExecManager) forcedExit(r *round, byPositions bool) (done bool) {
 	if !r.rulesOK {
 		return m.idle(strategy.ReasonNotReady)
 	}
-	hold := m.reducibleHold(c)
+	hold := m.reducibleHold(r)
 	if byPositions {
 		pos := m.venuePositions(r)
 		if !pos.Loaded {
@@ -284,10 +285,14 @@ func (m *ExecManager) forcedExit(r *round, byPositions bool) (done bool) {
 	var reqs []cex.OrderRequest
 	for _, leg := range cex.Legs {
 		o := orders[leg]
-		if o == nil || !m.maySend(r, leg, o.Price) {
+		if o == nil {
 			continue
 		}
-		req := m.orderRequest(c, r.orders, leg, cex.PurposeForced, o.Side, o.Price, o.Qty, r.rules[leg].Symbol)
+		qty, ok := m.reduceQty(r, leg, o.Qty, o.Price)
+		if !ok || !m.maySend(r, leg, o.Price) {
+			continue
+		}
+		req := m.orderRequest(c, r.orders, leg, cex.PurposeForced, o.Side, o.Price, qty, r.rules[leg].Symbol)
 		req.ReduceOnly = true
 		reqs = append(reqs, req)
 		m.lastSentAt[leg] = r.now
@@ -413,9 +418,14 @@ func (m *ExecManager) gapByPositions(r *round) bool {
 	in := m.gapInput(r)
 	in.Hold, in.Dust, in.Batch = m.positionHold(r, r.cycle.Direction, pos), [2]decimal.Decimal{}, nil // the venue's holding, within its net already
 	a := m.strat.EvaluateGap(in)
-	if a.Kind != strategy.GapTrim || !m.maySend(r, a.Leg, a.Price) {
+	if a.Kind != strategy.GapTrim {
 		return false
 	}
+	q, ok := m.reduceQty(r, a.Leg, a.Qty, a.Price)
+	if !ok || !m.maySend(r, a.Leg, a.Price) {
+		return false
+	}
+	a.Qty = q
 	m.sendGap(r, a, true)
 	return true
 }
@@ -459,9 +469,9 @@ func (m *ExecManager) readPositions(r *round) {
 // lastFinal is when the latest final state among the orders arrived, on
 // cex's clock.
 func lastFinal(orders []cex.OrderRecord) (last time.Time) {
-	for _, o := range orders {
-		if o.FinalAt.After(last) {
-			last = o.FinalAt
+	for i := range orders {
+		if t := orders[i].FinalAt; t.After(last) {
+			last = t
 		}
 	}
 	return last
@@ -493,8 +503,10 @@ const rejectAlarmAfter = 3
 // in, in the order the orders were sent: a refusal extends its leg's run,
 // any other result ends it. Once a leg has rejectAlarmAfter refusals in a
 // row, of any purpose (entries, completions, trims, exits, forced exits,
-// top-ups), the alarm is raised - an Error line and an error event, as the
-// stop's alarm - and again every stop_alarm_after while the run lasts, not
+// top-ups), the alarm is raised - an Error line and an error event
+// (trade.event, level error, kind orders_rejected: the Live Monitor's
+// Alerts list it, critical and Open), as the stop's alarm - and again
+// every stop_alarm_after while the run lasts, not
 // on every refusal. A run outlives its cycle: entries refused cycle after
 // cycle are one run. An order without a result yet holds the later ones
 // back until it has one.
@@ -506,7 +518,14 @@ func (m *ExecManager) watchRejects(r *round) {
 	if m.rejectSeen.cycle != c.ID {
 		m.rejectSeen = rejectCursor{cycle: c.ID}
 	}
-	for _, o := range r.orders {
+	// The snapshot is sorted by id, which within a cycle is the order of the
+	// sequence numbers: the results not taken yet start where the cursor is.
+	from := sort.Search(len(r.orders), func(i int) bool {
+		seq, ok := cex.ClientOrderSeq(r.orders[i].Request.ClientOrderID)
+		return ok && seq > m.rejectSeen.seq
+	})
+	for i := from; i < len(r.orders); i++ {
+		o := &r.orders[i]
 		seq, ok := cex.ClientOrderSeq(o.Request.ClientOrderID)
 		if !ok || seq <= m.rejectSeen.seq {
 			continue
@@ -528,7 +547,7 @@ func (m *ExecManager) watchRejects(r *round) {
 		run.count++
 		run.codes[o.ErrorCode]++
 		run.purposes[o.Request.Purpose]++
-		run.last = o
+		run.last = *o
 	}
 	for _, leg := range cex.Legs {
 		if run := m.rejects[leg]; run != nil && run.count >= rejectAlarmAfter && !r.now.Before(run.nextAlarm) {
@@ -548,7 +567,7 @@ func (m *ExecManager) rejectAlarm(r *round, leg cex.Leg, run *rejectRun) {
 	logger.GlobalLogger.Error("exec: orders refused in a row", "leg", leg.String(), "count", run.count, "lasted", lasted.Round(time.Second), "codes", run.codes, "purposes", run.purposes,
 		"last_purpose", string(o.Purpose), "side", string(o.Side), "price", o.Price, "qty", o.Qty, "hold", hold, "ledger", ledger, "venue", venue,
 		"error", run.last.ErrorMessage, "cycle", r.cycle.ID)
-	m.event(r.now, "error", "orders_rejected", "the venue has refused the leg's orders in a row: they are sent on as before; check the quantity against the venue's position",
+	m.event(r.now, "error", "orders_rejected", "the venue has refused the leg's orders in a row: one refused as larger than the position reads the venue's positions and the next is sized within them, never at the refused quantity again; check the leg against the venue's position",
 		map[string]any{"leg": leg.String(), "count": run.count, "since_ms": run.since.UnixMilli(), "lasted_s": lasted.Seconds(), "codes": run.codes, "purposes": run.purposes,
 			"client_order_id": o.ClientOrderID, "purpose": o.Purpose, "side": o.Side, "price": o.Price, "qty": o.Qty, "error": run.last.ErrorMessage,
 			"hold": hold, "ledger": ledger, "venue": venue, "cycle_id": r.cycle.ID})
@@ -703,8 +722,26 @@ func reducible(hold [2]decimal.Decimal, dir strategy.Direction, dust [2]decimal.
 	return strategy.Reducible(hold, dir, dust)
 }
 
-// reducibleHold is the open cycle's holding within what reducing orders
-// may close (reducible).
-func (m *ExecManager) reducibleHold(c *inventory.Cycle) [2]decimal.Decimal {
+// ledgerReducible is the open cycle's holding within what reducing orders
+// may close by the ledger (reducible): the net the ledger derives from the
+// holding and the dust it recorded.
+func (m *ExecManager) ledgerReducible(c *inventory.Cycle) [2]decimal.Decimal {
 	return reducible(c.Hold(), c.Direction, m.inv.Dust())
+}
+
+// reducibleHold is the round's cycle's holding within what reducing orders
+// may close: the ledger's (ledgerReducible) and, on a leg whose last
+// reducing order was refused for its quantity, the venue's positions read
+// after the refusal (venueReducible). Exits and the forced exit size on it,
+// so their targets stay within both.
+func (m *ExecManager) reducibleHold(r *round) [2]decimal.Decimal {
+	hold := m.ledgerReducible(r.cycle)
+	for _, leg := range cex.Legs {
+		if o, refused := lastQtyRefusal(r.orders, leg); refused {
+			if v, read := m.venueReducible(r, leg, o); read {
+				hold[leg] = decimal.Min(hold[leg], v)
+			}
+		}
+	}
+	return hold
 }

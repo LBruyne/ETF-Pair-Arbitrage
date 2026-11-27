@@ -240,6 +240,7 @@ const (
 	ReasonOrderUnknown    Reason = "order_unknown"    // the outcome of an order is not known
 	ReasonRejectedBackoff Reason = "rejected_backoff" // the venue refused an order of the last batch a moment ago
 	ReasonPositionsRead   Reason = "positions_read"   // the round read the venue's positions, which takes up to seconds: the next round decides on facts read after it
+	ReasonQtyRefused      Reason = "qty_refused"      // a reducing order of this quantity was refused as larger than the venue's position, and the venue's positions show nothing smaller: it waits for new evidence
 
 	// Step 4: the mean and sigma.
 	ReasonWarmup    Reason = "warmup"     // the run of valid minutes is shorter than max(X, Y)

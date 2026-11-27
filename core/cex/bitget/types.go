@@ -86,6 +86,11 @@ var outcomeUnknownCodes = map[string]bool{"40010": true, "40725": true, "45001":
 var priceLimitCodes = map[string]bool{"41117": true, "41118": true, "25205": true, "25206": true, "22046": true, "22047": true,
 	"40815": true, "40816": true, "43008": true, "43009": true, "25654": true, "25655": true}
 
+// reduceQtyCodes are the refusals of a reduce-only order larger than the
+// position it closes: 40804 by WebSocket, 25231 by REST (live 2026-11-27,
+// SOXL 7.80 against a net of 7.79).
+var reduceQtyCodes = map[string]bool{"40804": true, "25231": true}
+
 // rateLimitCodes are the refusals of a request that came too often: by
 // REST, and 30006 on a WebSocket connection.
 var rateLimitCodes = map[string]bool{"429": true, "25004": true, "40500": true, "30006": true}

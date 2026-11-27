@@ -651,6 +651,8 @@ func TestThinFirstTwoStageExit(t *testing.T) {
 	}
 	if exit := r.pairRows("exit")[0]; detailOf(t, exit)["line"] != "exit1" {
 		t.Errorf("first exit line %v, want exit1", detailOf(t, exit)["line"])
+	} else if d := detailOf(t, exit); d["stage_closed_bull"] != "0" || d["stage_closed_bear"] != "0" {
+		t.Errorf("exit1 decision's half-target base %v / %v, want 0 / 0: a restart counts the batch's fills from it", d["stage_closed_bull"], d["stage_closed_bear"])
 	}
 
 	// exit1 again: H is done, nothing more closes there.

@@ -500,6 +500,9 @@ func (m *InventoryManager) fundingAwaited(from, until time.Time, seen map[fundin
 func (m *InventoryManager) heldAt(leg cex.Leg, t time.Time) bool {
 	net := decimal.Zero
 	for _, o := range m.orders {
+		if o.CumExecQty.IsZero() {
+			continue // nothing filled (a refusal, a cancel): no arithmetic for it
+		}
 		at := o.ExchangeUpdatedAt
 		if at.IsZero() {
 			at = o.UpdateReceivedAt

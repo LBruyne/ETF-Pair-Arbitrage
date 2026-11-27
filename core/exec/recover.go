@@ -358,6 +358,14 @@ func (m *ExecManager) RestoreEntryDecision(row *store.DecisionRow) {
 	m.restoredEntry = row
 }
 
+// RestoreExitDecision takes the unfinished cycle's last exit decision, as
+// the previous run stored it, before Run; nil when there is none. An exit
+// batch taken up from its orders reads its rules from it when it is the
+// batch's (restoreExit).
+func (m *ExecManager) RestoreExitDecision(row *store.DecisionRow) {
+	m.restoredExit = row
+}
+
 // decisionBasis is the anchors and F the entry decision of lot was taken
 // under, from its stored detail (anchor_bull, anchor_bear, f); ok is false
 // without that record or with a number missing from it.
@@ -436,9 +444,13 @@ func (m *ExecManager) restorePair(b *batchState, lot *inventory.Lot) {
 // (PRD 9.13): the last thin exit order with a fill and the thick exit
 // orders after it, when nothing but those orders came after it. Its fills
 // come from those orders, exit_pair_window runs from the arrival of the thin
-// order's final state; the decision's spread and D1 are not in the order
-// records, so the spread stop does not apply and the thick leg is held to
-// its break-even bound until the window ends it.
+// order's final state. The exit's rules are not in the order records: they
+// come from the batch's exit decision (restoreExitRules) - the line, D1 and
+// the protection, the decision's spread with its anchors and F, and the half
+// target's closed quantities at the batch's start, so that its fills count
+// towards H once. Without that decision the spread stop does not apply, the
+// thick leg is held to its break-even bound until the window ends it, and
+// the batch counts towards no half target.
 func (m *ExecManager) restoreExit(c *inventory.Cycle) {
 	thin := m.pairing.Thin
 	orders := m.cex.CycleOrders(string(c.ID))
@@ -479,10 +491,68 @@ func (m *ExecManager) restoreExit(c *inventory.Cycle) {
 	}
 	if rule, ok := m.cex.Rule(otherLeg(thin)); ok && b.exit.started {
 		fills := strategy.Fills{ThinQty: q[thin], ThickQty: q[otherLeg(thin)]}
-		if !strategy.ExitThickTarget(m.pairing, c.PairAnchors, rule.QtyStep, closedBefore(orders, b.exit.thinID), fills, m.reducibleHold(c)).IsPositive() {
+		if !strategy.ExitThickTarget(m.pairing, c.PairAnchors, rule.QtyStep, closedBefore(orders, b.exit.thinID), fills, m.ledgerReducible(c)).IsPositive() {
 			return
 		}
 	}
+	read := m.restoreExitRules(b.exit, q)
+	b.line = b.exit.batch.Line
 	m.batch = b
-	logger.GlobalLogger.Info("exec: exit batch taken up", "cycle", c.ID, "orders", len(b.orders), "first_fill", showTime(b.exit.batch.FirstFill))
+	logger.GlobalLogger.Info("exec: exit batch taken up", "cycle", c.ID, "orders", len(b.orders), "first_fill", showTime(b.exit.batch.FirstFill),
+		"decision_read", read, "line", string(b.line), "d1", b.exit.batch.D1, "protect", b.exit.batch.Protect, "d_dec", b.exit.batch.DecisionD,
+		"stage_base_bull", b.exit.base[cex.Bull], "stage_base_bear", b.exit.base[cex.Bear])
+}
+
+// restoreExitRules reads the rules of the exit batch e taken up from its
+// orders out of the exit decision the previous run stored
+// (RestoreExitDecision), when its client_order_ids hold the batch's thin
+// order: the line, D1 and the protection, the expected net, the decision's
+// spread and the anchors and F it is under. With exit1 the half target's
+// closed quantities when the batch began are its base: from the decision
+// (stage_closed_bull, stage_closed_bear), or, in a decision written before
+// they were recorded, the stored closed quantities less the batch's fills
+// (filled, per leg), which the stored ones held already. Its fills then
+// count towards H from that base, each once. It reports whether it read
+// the decision; e is unchanged otherwise.
+func (m *ExecManager) restoreExitRules(e *exitState, filled [2]decimal.Decimal) bool {
+	row := m.restoredExit
+	if row == nil {
+		return false
+	}
+	var d struct {
+		IDs         []cex.ClientOrderID `json:"client_order_ids"`
+		Line        strategy.ExitLine   `json:"line"`
+		DDec        *float64            `json:"d_dec"`
+		ExpectedNet decimal.NullDecimal `json:"expected_net"`
+		D1          bool                `json:"d1"`
+		Protect     decimal.NullDecimal `json:"protect"`
+		Kind        cex.AnchorKind      `json:"anchor_kind"`
+		AnchorBull  decimal.NullDecimal `json:"anchor_bull"`
+		AnchorBear  decimal.NullDecimal `json:"anchor_bear"`
+		F           decimal.NullDecimal `json:"f"`
+		BaseBull    decimal.NullDecimal `json:"stage_closed_bull"`
+		BaseBear    decimal.NullDecimal `json:"stage_closed_bear"`
+	}
+	if err := json.Unmarshal(row.Detail, &d); err != nil || !slices.Contains(d.IDs, e.thinID) {
+		return false
+	}
+	b := &e.batch
+	b.Line, b.D1, b.ExpectedNet, b.Protect = d.Line, d.D1, d.ExpectedNet.Decimal, d.Protect.Decimal
+	if d.DDec != nil {
+		b.DecisionD = *d.DDec
+	}
+	if d.AnchorBull.Decimal.IsPositive() && d.AnchorBear.Decimal.IsPositive() && d.F.Decimal.IsPositive() {
+		b.DecisionAnchors = cex.Anchors{SessionID: m.session.ID, Kind: d.Kind, Bull: d.AnchorBull.Decimal, Bear: d.AnchorBear.Decimal}
+		b.DecisionF = d.F.Decimal.InexactFloat64()
+	}
+	if b.Line == strategy.ExitLine1 {
+		if d.BaseBull.Valid && d.BaseBear.Valid {
+			e.base = [2]decimal.Decimal{d.BaseBull.Decimal, d.BaseBear.Decimal}
+		} else {
+			for _, leg := range cex.Legs {
+				e.base[leg] = decimal.Max(decimal.Zero, e.base[leg].Sub(filled[leg]))
+			}
+		}
+	}
+	return true
 }

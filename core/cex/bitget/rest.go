@@ -130,6 +130,8 @@ func errorKind(code string) cex.ErrorKind {
 		return cex.ErrorPriceLimit
 	case rateLimitCodes[code]:
 		return cex.ErrorRateLimited
+	case reduceQtyCodes[code]:
+		return cex.ErrorReduceQty
 	}
 	return cex.ErrorOther
 }

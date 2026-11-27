@@ -31,6 +31,7 @@ import (
 type process struct {
 	*rig
 	st    *store.Store
+	run   store.RunID
 	close func()
 }
 
@@ -46,7 +47,8 @@ func dbProcess(t *testing.T, now time.Time, ex *exchange) *process {
 // pair_stop_d, latency); its exchange, store and recorder are set here.
 func dbProcessWith(t *testing.T, now time.Time, ex *exchange, opts rigOptions) *process {
 	t.Helper()
-	st, err := store.New(store.Config{}, store.RunID(fmt.Sprintf("test-%d", time.Now().UnixNano())), dbtest.DSN(t))
+	run := store.RunID(fmt.Sprintf("test-%d", time.Now().UnixNano()))
+	st, err := store.New(store.Config{}, run, dbtest.DSN(t))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -64,7 +66,7 @@ func dbProcessWith(t *testing.T, now time.Time, ex *exchange, opts rigOptions) *
 		}
 		opts.state = &state
 	}
-	return &process{rig: newRig(t, now, opts), st: st, close: closeStore}
+	return &process{rig: newRig(t, now, opts), st: st, run: run, close: closeStore}
 }
 
 // restartTest holds the database for the test and clears it.

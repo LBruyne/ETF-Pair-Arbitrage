@@ -65,6 +65,7 @@ type ExecManager struct {
 	restoredBars  []store.MinuteBarRow  // the Session's minutes the previous run recorded
 	restoredFacts []store.AnchorFactRow // the Session's anchor facts the previous run recorded
 	restoredEntry *store.DecisionRow    // the entry decision of the lot still building, as the previous run recorded it; nil when none
+	restoredExit  *store.DecisionRow    // the cycle's last exit decision, as the previous run recorded it; nil when none
 	perp          minuteSource          // the recorder's per-second rows; nil: none
 
 	// owned by Run: recovery

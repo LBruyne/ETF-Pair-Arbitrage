@@ -57,6 +57,11 @@ func (m *ExecManager) sendThinExit(r *round, plan *strategy.ExitPlan, in strateg
 	m.logExit(r, plan, in)
 	detail := m.exitDetail(r, plan, in, []cex.OrderRequest{req})
 	detail["thin_leg"] = thin.String()
+	if plan.Line == strategy.ExitLine1 {
+		// The half target's closed quantities at the batch's start: a restart
+		// counts the batch's fills from here (restoreExitRules).
+		detail["stage_closed_bull"], detail["stage_closed_bear"] = e.base[cex.Bull], e.base[cex.Bear]
+	}
 	m.recordDecision(r.now, "exit", c, "", c.Direction, exitReason(plan), detail)
 	m.send(r, req)
 }
@@ -94,7 +99,7 @@ func (m *ExecManager) workExitPair(r *round, e *exitState) (ended bool) {
 	}
 	m.countExitStage(r, e)
 
-	in := strategy.ExitPairInput{Batch: e.batch, Pairing: m.pairing, Hold: m.reducibleHold(r.cycle), Before: closedBefore(r.orders, e.thinID), Books: r.books.ByLeg, Rules: r.rules, F: r.fx.Price.InexactFloat64(),
+	in := strategy.ExitPairInput{Batch: e.batch, Pairing: m.pairing, Hold: m.reducibleHold(r), Before: closedBefore(r.orders, e.thinID), Books: r.books.ByLeg, Rules: r.rules, F: r.fx.Price.InexactFloat64(),
 		Anchors: m.anchors, PairAnchors: r.cycle.PairAnchors, Value: m.closeValuer(""), Stopping: m.stop.stopping, Forced: m.forced != "", Now: r.now}
 	for _, leg := range cex.Legs {
 		in.DepthOK[leg] = r.books.DepthOK(leg, r.now)
@@ -141,6 +146,11 @@ func (m *ExecManager) workExitPair(r *round, e *exitState) (ended bool) {
 			return true
 		}
 	}
+	qty, ok := m.reduceQty(r, thick, a.Qty, a.Price)
+	if !ok {
+		return true
+	}
+	a.Qty = qty
 	req := m.orderRequest(r.cycle, r.orders, thick, cex.PurposeExit, a.Side, a.Price, a.Qty, r.rules[thick].Symbol)
 	req.ReduceOnly = true
 	e.sent[thick], e.lastWhy = true, ""
@@ -160,7 +170,7 @@ func (m *ExecManager) refreshExit(r *round, e *exitState) {
 	thin := m.pairing.Thin
 	var q, v [2]decimal.Decimal
 	for _, id := range m.batch.orders {
-		if o, found := orderIn(r.orders, id); found {
+		if o, found := orderIn(r.orders, id); found && !o.CumExecQty.IsZero() {
 			leg := o.Request.Leg
 			q[leg], v[leg] = q[leg].Add(o.CumExecQty), v[leg].Add(o.CumExecValue)
 		}
@@ -174,8 +184,10 @@ func (m *ExecManager) refreshExit(r *round, e *exitState) {
 // from which the batch's thick target is counted (strategy.ExitThickTarget).
 // The batch's orders are the thin one and those after it (ids grow).
 func closedBefore(orders []cex.OrderRecord, thin cex.ClientOrderID) (q [2]decimal.Decimal) {
-	for _, o := range orders {
-		if p := o.Request.Purpose; (p == cex.PurposeExit || p == cex.PurposeForced) && o.Request.ClientOrderID < thin {
+	for i := range orders {
+		if o := &orders[i]; o.Request.ClientOrderID >= thin {
+			break // sorted by id: the batch's orders and later ones
+		} else if p := o.Request.Purpose; p == cex.PurposeExit || p == cex.PurposeForced {
 			q[o.Request.Leg] = q[o.Request.Leg].Add(o.CumExecQty)
 		}
 	}
@@ -328,6 +340,6 @@ func unixMsOf(t time.Time) int64 {
 	return t.UnixMilli()
 }
 
-// nan is the decision spread of an exit batch restored from its orders: the
-// decision is not in them, so its spread stop does not apply.
+// nan is the decision spread of an exit batch restored from its orders
+// without its exit decision: its spread stop does not apply.
 var nan = math.NaN()

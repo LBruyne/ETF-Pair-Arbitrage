@@ -572,6 +572,9 @@ func TestPlaceOrderOutcomes(t *testing.T) {
 		}, wantKind: cex.ErrorOther, wantCode: "45110"},
 		{name: "price above the band", answer: func() (int, string) { return refusal("41117", "The price is too high") }, wantKind: cex.ErrorPriceLimit, wantCode: "41117"},
 		{name: "price below the band", answer: func() (int, string) { return refusal("25206", "The price is too low") }, wantKind: cex.ErrorPriceLimit, wantCode: "25206"},
+		{name: "close above the position", answer: func() (int, string) {
+			return refusal("25231", "The number of closed positions cannot exceed the number of positions held")
+		}, wantKind: cex.ErrorReduceQty, wantCode: "25231"},
 		{name: "too frequent", answer: func() (int, string) { return refusal("25004", "Operation too frequent, please try again later") }, wantKind: cex.ErrorRateLimited, wantCode: "25004"},
 		{name: "http 429 without an envelope", answer: func() (int, string) { return http.StatusTooManyRequests, "Too Many Requests" }, wantKind: cex.ErrorRateLimited, wantCode: "429"},
 		{name: "request timed out at the exchange", answer: func() (int, string) { return refusal("40010", "Request timed out") }, unknown: true},

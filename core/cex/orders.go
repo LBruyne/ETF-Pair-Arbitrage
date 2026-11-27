@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -24,8 +25,9 @@ import (
 type orderStore struct {
 	mu      sync.Mutex
 	orders  map[ClientOrderID]*orderEntry
-	seq     uint64        // the UpdateSeq last given; one counter for the table, so each order's sequence only grows
-	changed chan struct{} // closed at the next change of any record
+	byCycle map[string][]*orderEntry // the same entries by cycle, each sorted by id: a cycle's snapshot is copied without a scan of the table or a sort
+	seq     uint64                   // the UpdateSeq last given; one counter for the table, so each order's sequence only grows
+	changed chan struct{}            // closed at the next change of any record
 
 	queryFailing bool // the last order query failed for a reason other than "no such order"; the order loop's own
 }
@@ -38,7 +40,23 @@ type orderEntry struct {
 }
 
 func newOrderStore() *orderStore {
-	return &orderStore{orders: map[ClientOrderID]*orderEntry{}, changed: make(chan struct{})}
+	return &orderStore{orders: map[ClientOrderID]*orderEntry{}, byCycle: map[string][]*orderEntry{}, changed: make(chan struct{})}
+}
+
+// put adds e to the table under its id, in place of an entry of that id,
+// and to its cycle's list at its place by id: an order sent after another
+// of its cycle has the larger id, so it is appended. The caller holds the
+// lock.
+func (t *orderStore) put(e *orderEntry) {
+	id, cycle := e.rec.Request.ClientOrderID, e.rec.Request.CycleID
+	list := t.byCycle[cycle]
+	i := sort.Search(len(list), func(i int) bool { return list[i].rec.Request.ClientOrderID >= id })
+	if _, held := t.orders[id]; held && i < len(list) && list[i].rec.Request.ClientOrderID == id {
+		list[i] = e
+	} else {
+		list = slices.Insert(list, i, e)
+	}
+	t.orders[id], t.byCycle[cycle] = e, list
 }
 
 // --- client order ids ---
@@ -124,7 +142,7 @@ func (m *CexManager) PlaceOrders(reqs ...OrderRequest) error {
 		e := &orderEntry{rec: OrderRecord{Request: req, Status: StatusPending, SubmittedAt: now}}
 		t.seq++
 		e.rec.UpdateSeq = t.seq
-		t.orders[req.ClientOrderID] = e
+		t.put(e)
 		rows = append(rows, orderRow(e.rec))
 		reduceOnly = reduceOnly && req.ReduceOnly
 		log.Info("cex: order registered", "client_order_id", req.ClientOrderID, "cycle", req.CycleID, "lot", req.LotID, "purpose", string(req.Purpose),
@@ -363,9 +381,22 @@ func (m *CexManager) OrdersChanged() <-chan struct{} {
 }
 
 // CycleOrders returns one consistent snapshot of the cycle's orders, in the
-// order they were sent (their ids sort that way).
+// order they were sent (their ids sort that way): a copy of the cycle's
+// list, made under the lock, without a scan of the other cycles' orders or
+// a sort (exec takes one every round; audit 四). nil when the cycle has none.
 func (m *CexManager) CycleOrders(cycleID string) []OrderRecord {
-	return m.ordersWhere(func(r *OrderRecord) bool { return r.Request.CycleID == cycleID })
+	t := m.orders
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	list := t.byCycle[cycleID]
+	if len(list) == 0 {
+		return nil
+	}
+	out := make([]OrderRecord, len(list))
+	for i, e := range list {
+		out[i] = e.rec
+	}
+	return out
 }
 
 // UnresolvedOrders returns the orders without a final state, of any cycle.
@@ -400,7 +431,7 @@ func (m *CexManager) restoreOrders(orders []OrderRecord) {
 	defer t.mu.Unlock()
 	for _, rec := range orders {
 		e := &orderEntry{rec: rec}
-		t.orders[rec.Request.ClientOrderID] = e
+		t.put(e)
 		if !rec.Status.Terminal() && !rec.Unknown {
 			markUnknown(&e.rec, now)
 			m.commitOrder(e, rec)
@@ -483,7 +514,7 @@ func (m *CexManager) recogniseOrder(in OrderRecord, cycleID string) (rec OrderRe
 			markUnknown(&rec, now)
 		}
 		e := &orderEntry{rec: rec}
-		t.orders[id] = e
+		t.put(e)
 		m.commitOrder(e, OrderRecord{Status: rec.Status, Unknown: rec.Unknown})
 		rec = e.rec
 		logger.GlobalLogger.Info("cex: order recognised at the venue", "client_order_id", id, "cycle", cycleID, "leg", leg.String(), "purpose", string(purpose),

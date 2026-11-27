@@ -613,6 +613,7 @@ type ErrorKind string
 const (
 	ErrorRateLimited ErrorKind = "rate_limited" // the same order may be sent again later
 	ErrorPriceLimit  ErrorKind = "price_limit"  // the price is outside the venue's band: not resent at the same price
+	ErrorReduceQty   ErrorKind = "reduce_qty"   // a reduce-only order larger than the position it reduces: the positions are read, and the same quantity is not sent again
 	ErrorOther       ErrorKind = "other"
 )
 

@@ -3,6 +3,7 @@ package exec
 import (
 	"context"
 	"errors"
+	"sort"
 	"time"
 
 	"github.com/shopspring/decimal"
@@ -53,6 +54,9 @@ func (m *ExecManager) step(now time.Time) (done bool) {
 	}
 	clear(m.unknown)
 	m.noteBatchDone(r)
+	if m.readAfterRefusal(r) {
+		return false
+	}
 
 	// Holding: the forced exit, the gap, the line exit. A round that waits
 	// there still lets the routine comparison run, except while a batch is
@@ -159,8 +163,8 @@ func (m *ExecManager) syncOrders(r *round) {
 // anyInFlight reports whether an order has neither a final state nor an
 // unknown outcome: cex has it on its way, and its result comes soon.
 func anyInFlight(orders []cex.OrderRecord) bool {
-	for _, o := range orders {
-		if !o.Status.Terminal() && !o.Unknown {
+	for i := range orders {
+		if o := &orders[i]; !o.Status.Terminal() && !o.Unknown {
 			return true
 		}
 	}
@@ -170,9 +174,9 @@ func anyInFlight(orders []cex.OrderRecord) bool {
 // unknownOf returns the orders whose outcome is not known: cex queries them
 // and never sends them again.
 func unknownOf(orders []cex.OrderRecord) (unknown []cex.OrderRecord) {
-	for _, o := range orders {
-		if !o.Status.Terminal() && o.Unknown {
-			unknown = append(unknown, o)
+	for i := range orders {
+		if o := &orders[i]; !o.Status.Terminal() && o.Unknown {
+			unknown = append(unknown, *o)
 		}
 	}
 	return unknown
@@ -271,12 +275,14 @@ func (m *ExecManager) mismatched(r *round) bool {
 	return m.idle(strategy.ReasonPositionMismatch)
 }
 
-// orderIn finds an order of the snapshot by its id.
+// orderIn finds an order of the snapshot by its id. A snapshot is sorted
+// by id (cex.CycleOrders), so the search takes log n steps: a batch whose
+// orders run into the thousands is read every round (audit 四: 21,796
+// refusals made a round of 1.4 s).
 func orderIn(orders []cex.OrderRecord, id cex.ClientOrderID) (cex.OrderRecord, bool) {
-	for _, o := range orders {
-		if o.Request.ClientOrderID == id {
-			return o, true
-		}
+	i := sort.Search(len(orders), func(i int) bool { return orders[i].Request.ClientOrderID >= id })
+	if i < len(orders) && orders[i].Request.ClientOrderID == id {
+		return orders[i], true
 	}
 	return cex.OrderRecord{}, false
 }
@@ -328,6 +334,13 @@ func (m *ExecManager) workGap(r *round) (decided bool) {
 		m.idle(strategy.ReasonNoPrice)
 		return true
 	}
+	if a.Kind == strategy.GapTrim {
+		q, ok := m.reduceQty(r, a.Leg, a.Qty, a.Price)
+		if !ok {
+			return true
+		}
+		a.Qty = q
+	}
 	if m.maySend(r, a.Leg, a.Price) {
 		m.sendGap(r, a, false)
 	}
@@ -356,11 +369,93 @@ func (m *ExecManager) maySend(r *round, leg cex.Leg, price decimal.Decimal) bool
 // rejected at once, or accepted and then cancelled for it.
 func refusedAt(orders []cex.OrderRecord, leg cex.Leg, price decimal.Decimal) bool {
 	for i := len(orders) - 1; i >= 0; i-- {
-		if o := orders[i]; o.Request.Leg == leg && (o.Request.ReduceOnly || o.Request.Purpose == cex.PurposeComplete) {
+		if o := &orders[i]; o.Request.Leg == leg && (o.Request.ReduceOnly || o.Request.Purpose == cex.PurposeComplete) {
 			return o.ErrorKind == cex.ErrorPriceLimit && o.Request.Price.Equal(price)
 		}
 	}
 	return false
+}
+
+// --- a reducing order refused for its quantity (audit 一.3, SPEC 12.12) ---
+
+// lastQtyRefusal is the last reduce-only order of leg in the snapshot when
+// the venue refused it as larger than the position it closes
+// (cex.ErrorReduceQty: Bitget 40804, 25231 by REST); ok is false when the
+// leg's last reduce-only order is anything else. A later result of the leg
+// is new evidence and ends what the refusal holds back.
+func lastQtyRefusal(orders []cex.OrderRecord, leg cex.Leg) (refused cex.OrderRecord, ok bool) {
+	for i := len(orders) - 1; i >= 0; i-- {
+		if o := &orders[i]; o.Request.Leg == leg && o.Request.ReduceOnly {
+			return *o, o.Status == cex.StatusRejected && o.ErrorKind == cex.ErrorReduceQty
+		}
+	}
+	return cex.OrderRecord{}, false
+}
+
+// readAfterRefusal reads the venue's positions once after a leg's reducing
+// order was refused for its quantity, through readPositions: the round ends
+// with the read, and the next one sizes that leg's next reducing order
+// within them on its own books (reduceQty). Positions that arrived after
+// the refusal (a push, an earlier read) need no read. While the last read
+// is less than positionsRead old, the leg waits and the round goes on.
+func (m *ExecManager) readAfterRefusal(r *round) bool {
+	if r.cycle == nil || r.read {
+		return false
+	}
+	pos := m.cex.Positions()
+	for _, leg := range cex.Legs {
+		o, refused := lastQtyRefusal(r.orders, leg)
+		if !refused || (pos.Loaded && !pos.ReceivedAt.Before(o.FinalAt)) || r.now.Before(m.nextPositionsRead) {
+			continue
+		}
+		m.readPositions(r)
+		logger.GlobalLogger.Info("exec: reducing order refused for its quantity; the venue's positions read", "leg", leg.String(), "client_order_id", o.Request.ClientOrderID,
+			"qty", o.Request.Qty, "error_code", o.ErrorCode, "venue", m.cex.Positions().BySymbol[r.rules[leg].Symbol].Qty, "ledger", m.inv.LedgerPositions()[leg])
+		m.idle(strategy.ReasonPositionsRead)
+		return true
+	}
+	return false
+}
+
+// venueReducible is what a reduce-only order of leg may close by the
+// venue's positions that arrived after refusal, the leg's last refusal for
+// its quantity: the net position on the cycle's side, zero when it is on
+// the other. ok is false while no positions arrived after the refusal.
+// This is the venue's evidence, read back; Reducible is the ledger's, its
+// holding next to the dust it recorded.
+func (m *ExecManager) venueReducible(r *round, leg cex.Leg, refusal cex.OrderRecord) (decimal.Decimal, bool) {
+	pos := m.cex.Positions()
+	if !pos.Loaded || pos.ReceivedAt.Before(refusal.FinalAt) {
+		return decimal.Zero, false
+	}
+	q := pos.BySymbol[r.rules[leg].Symbol].Qty
+	if r.cycle.Direction == strategy.Short {
+		q = q.Neg()
+	}
+	return decimal.Max(q, decimal.Zero), true
+}
+
+// reduceQty is the quantity a reducing order of leg goes with when strategy
+// sized it qty at price. After the leg's last reducing order was refused
+// for its quantity it is min(qty, the venue's reducible amount read after
+// the refusal); qty is already within the round's ledger (reducibleHold,
+// strategy.Reducible). ok is false when it may not go: the refused
+// quantity again, or nothing the venue takes at price. The round then waits
+// (qty_refused) for new positions or a new result of the leg, the alarm of
+// the refusals going on (watchRejects); the other leg's orders go on.
+func (m *ExecManager) reduceQty(r *round, leg cex.Leg, qty, price decimal.Decimal) (decimal.Decimal, bool) {
+	o, refused := lastQtyRefusal(r.orders, leg)
+	if !refused {
+		return qty, true
+	}
+	if v, read := m.venueReducible(r, leg, o); read {
+		qty = decimal.Min(qty, v)
+	}
+	if qty.Equal(o.Request.Qty) || !r.rules[leg].Sendable(qty, price) {
+		m.idle(strategy.ReasonQtyRefused)
+		return qty, false
+	}
+	return qty, true
 }
 
 // gapInput gathers the facts of one gap decision. The entry batch that is
@@ -414,11 +509,30 @@ func (m *ExecManager) exitAtLine(r *round) bool {
 		logger.GlobalLogger.Debug("exec: no exit at the line", "cycle", r.cycle.ID, "reason", string(d.Reason))
 		return false
 	}
-	if m.pairing.ThinFirst && plan.Qty[m.pairing.Thin].IsPositive() {
+	thin := m.pairing.Thin
+	if m.pairing.ThinFirst && plan.Qty[thin].IsPositive() {
+		q, ok := m.reduceQty(r, thin, plan.Qty[thin], plan.Price[thin])
+		if !ok {
+			return true // the thin leg waits; the thick leg does not go before it
+		}
+		plan.Qty[thin] = q
 		m.sendThinExit(r, plan, in)
 		return true
 	}
-	m.sendExit(r, plan, in)
+	sendable := false
+	for _, leg := range cex.Legs {
+		if plan.Qty[leg].IsPositive() {
+			q, ok := m.reduceQty(r, leg, plan.Qty[leg], plan.Price[leg])
+			if !ok {
+				q = decimal.Zero // this leg waits, the other goes
+			}
+			plan.Qty[leg], sendable = q, sendable || ok
+		}
+	}
+	if sendable {
+		m.idleReason = ""
+		m.sendExit(r, plan, in)
+	}
 	return true
 }
 
@@ -433,7 +547,7 @@ func (m *ExecManager) exitInput(r *round) strategy.ExitInput {
 	if !stats.Ready {
 		stats = m.lastReady
 	}
-	in := strategy.ExitInput{Direction: c.Direction, Hold: m.reducibleHold(c), Books: r.books.ByLeg, Rules: r.rules, F: r.fx.Price.InexactFloat64(),
+	in := strategy.ExitInput{Direction: c.Direction, Hold: m.reducibleHold(r), Books: r.books.ByLeg, Rules: r.rules, F: r.fx.Price.InexactFloat64(),
 		Anchors: m.anchors, PairAnchors: c.PairAnchors, Stats: stats,
 		Pairing: m.pairing, Stage: m.stageOf(c), BuiltLots: builtLots(c), Value: m.closeValuer("")}
 	for _, leg := range cex.Legs {

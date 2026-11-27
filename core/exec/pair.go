@@ -220,6 +220,13 @@ func (m *ExecManager) doPair(r *round, p *pairState, a strategy.PairAction) (end
 	case strategy.PairCloseThin, strategy.PairUnwind:
 		purpose = cex.PurposeTrim
 	}
+	if purpose == cex.PurposeTrim {
+		qty, ok := m.reduceQty(r, a.Leg, a.Qty, a.Price)
+		if !ok {
+			return true
+		}
+		a.Qty = qty
+	}
 	req := m.orderRequest(c, r.orders, a.Leg, purpose, a.Side, a.Price, a.Qty, r.rules[a.Leg].Symbol)
 	req.LotID = string(b.lotID)
 	if purpose == cex.PurposeTrim {
