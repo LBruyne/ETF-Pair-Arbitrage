@@ -530,3 +530,25 @@ func TestEvaluateEntry_SpacingAfterEntryFailed(t *testing.T) {
 		t.Errorf("after 60 s: %q, want a plan", reason)
 	}
 }
+
+// The unpaired thin leg is closed reduce-only, within what the venue's net
+// position lets it close: SOXS dust of -0.05 next to a long batch's 3 SOXS
+// leaves 2.95 to unwind (Bitget refuses a reducing order above the net,
+// 40804); what the dust takes is left, and the batch ends with it.
+func TestPairStep_UnwindWithinTheVenueNet(t *testing.T) {
+	s := seqStrategy(t, nil)
+	in := pairInput(ex1Batch(), book(lv("33.25x20"), lv("33.27x6", "33.28x20")), soxsShallow())
+	in.Batch.Unwind, in.Batch.ThinClosed = ReasonStopD, dec("2")
+	in.Dust[cex.Bear] = dec("-0.05")
+	if a := s.PairStep(in); a.Kind != PairUnwind || !a.Qty.Equal(dec("2.95")) {
+		t.Errorf("unwinding: %s %s, want unwind 2.95", a.Kind, a.Qty)
+	}
+	in.Dust[cex.Bear] = dec("0.05") // dust of the batch's own sign changes nothing
+	if a := s.PairStep(in); a.Kind != PairUnwind || !a.Qty.Equal(dec("3")) {
+		t.Errorf("dust with the batch: %s %s, want unwind 3", a.Kind, a.Qty)
+	}
+	in.Dust[cex.Bear], in.Batch.ThinClosed = dec("-3"), dec("2")
+	if a := s.PairStep(in); a.Kind != PairDone || a.End != PairEndUnwoundStop {
+		t.Errorf("nothing the venue lets close: %s %s, want done unwound_stop", a.Kind, a.End)
+	}
+}

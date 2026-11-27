@@ -67,10 +67,7 @@ func (s *Strategy) ExitPairStep(in ExitPairInput) ExitPairAction {
 		return act
 	}
 
-	// The thick leg's target: floor(thin closed x A_thin / A_thick) less
-	// what it closed, within what the cycle holds.
-	ratio := anchorOf(in.PairAnchors, thin).Div(anchorOf(in.PairAnchors, thick))
-	target := decimal.Min(in.Hold[thick], floorToStep(b.ThinQty.Mul(ratio), in.Rules[thick].QtyStep).Sub(b.ThickQty))
+	target := ExitThickTarget(in.Pairing, in.PairAnchors, in.Rules[thick].QtyStep, in.Before, b.Fills, in.Hold)
 	if !target.IsPositive() {
 		act.Kind = ExitPairDone
 		return act
@@ -115,6 +112,25 @@ func (s *Strategy) ExitPairStep(in ExitPairInput) ExitPairAction {
 	}
 	act.Kind, act.Why = ExitPairWait, ReasonExitBound
 	return act
+}
+
+// ExitThickTarget is what the thick leg of a thin-first exit batch still
+// has to close (SPEC 12.7 step 2): the round's cumulative target, floor((the
+// thin leg closed before the batch + its thin fills) x A_thin / A_thick) at
+// the pairing anchors and the thick leg's step, less the thick leg closed
+// before it and by it, within what the cycle holds. Once a batch with a
+// thin fill has closed the last of the thin leg, it is everything the thick
+// leg still holds. A floor per batch would lose up to one step per batch
+// and leave it as dust (live 2026-11-27: SOXL 15.57 of 15.58 closed).
+// before and hold are per leg, as ExitPairInput's Before and Hold.
+func ExitThickTarget(p Pairing, pair cex.Anchors, step decimal.Decimal, before [2]decimal.Decimal, fills Fills, hold [2]decimal.Decimal) decimal.Decimal {
+	thin, thick := p.Thin, p.thick()
+	if fills.ThinQty.IsPositive() && !hold[thin].IsPositive() {
+		return hold[thick]
+	}
+	ratio := anchorOf(pair, thin).Div(anchorOf(pair, thick))
+	total := floorToStep(before[thin].Add(fills.ThinQty).Mul(ratio), step)
+	return decimal.Min(hold[thick], total.Sub(before[thick]).Sub(fills.ThickQty))
 }
 
 // ExitThickBound is the break-even bound of an exit batch's thick leg (SPEC

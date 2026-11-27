@@ -147,7 +147,7 @@ func (m *ExecManager) pairInput(r *round, p *pairState) strategy.PairInput {
 	}
 	_, _, left := m.inv.Quota()
 	in := strategy.PairInput{Batch: p.batch, Pairing: m.pairing, Books: r.books.ByLeg, Rules: r.rules, F: r.fx.Price.InexactFloat64(),
-		Anchors: m.anchors, PairAnchors: r.cycle.PairAnchors, Stats: stats, QuotaLeft: left, Value: m.closeValuer(m.batch.lotID),
+		Anchors: m.anchors, PairAnchors: r.cycle.PairAnchors, Stats: stats, QuotaLeft: left, Value: m.closeValuer(m.batch.lotID), Dust: m.inv.Dust(),
 		Stopping: m.stop.stopping, Forced: m.forced != "", NoNewEntries: m.stop.noEntries || p.noTopUps, TopUpBlocked: m.topUpBlocked(r), Now: r.now}
 	for _, leg := range cex.Legs {
 		in.DepthOK[leg] = r.books.DepthOK(leg, r.now)

@@ -17,8 +17,8 @@ import (
 // of the two-stage exit (SPEC 12.6, PRD 9.11). A line exit batch sends the
 // thin leg's reduce-only order alone; once it filled, every round runs
 // ExitPairStep and carries it out until the thick leg matches the thin
-// leg's closing fills (or only dust is left). No exit decision is taken
-// while the batch is open.
+// leg's closing fills, counted over the round (strategy.ExitThickTarget),
+// or only dust is left. No exit decision is taken while the batch is open.
 
 // exitState is what the loop keeps of a thin-leg-first line exit batch
 // beside its orders.
@@ -94,7 +94,7 @@ func (m *ExecManager) workExitPair(r *round, e *exitState) (ended bool) {
 	}
 	m.countExitStage(r, e)
 
-	in := strategy.ExitPairInput{Batch: e.batch, Pairing: m.pairing, Hold: m.reducibleHold(r.cycle), Books: r.books.ByLeg, Rules: r.rules, F: r.fx.Price.InexactFloat64(),
+	in := strategy.ExitPairInput{Batch: e.batch, Pairing: m.pairing, Hold: m.reducibleHold(r.cycle), Before: closedBefore(r.orders, e.thinID), Books: r.books.ByLeg, Rules: r.rules, F: r.fx.Price.InexactFloat64(),
 		Anchors: m.anchors, PairAnchors: r.cycle.PairAnchors, Value: m.closeValuer(""), Stopping: m.stop.stopping, Forced: m.forced != "", Now: r.now}
 	for _, leg := range cex.Legs {
 		in.DepthOK[leg] = r.books.DepthOK(leg, r.now)
@@ -167,6 +167,19 @@ func (m *ExecManager) refreshExit(r *round, e *exitState) {
 	}
 	thick := otherLeg(thin)
 	e.batch.Fills = strategy.Fills{ThinQty: q[thin], ThinVWAP: vwap(v[thin], q[thin]), ThickQty: q[thick], ThickVWAP: vwap(v[thick], q[thick])}
+}
+
+// closedBefore is what the cycle's exit and forced orders sent before the
+// batch's thin order (thin) closed, per leg: the round's closing so far,
+// from which the batch's thick target is counted (strategy.ExitThickTarget).
+// The batch's orders are the thin one and those after it (ids grow).
+func closedBefore(orders []cex.OrderRecord, thin cex.ClientOrderID) (q [2]decimal.Decimal) {
+	for _, o := range orders {
+		if p := o.Request.Purpose; (p == cex.PurposeExit || p == cex.PurposeForced) && o.Request.ClientOrderID < thin {
+			q[o.Request.Leg] = q[o.Request.Leg].Add(o.CumExecQty)
+		}
+	}
+	return q
 }
 
 // endExit ends the line exit batch: its fills count towards the half target

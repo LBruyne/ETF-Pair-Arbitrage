@@ -239,6 +239,24 @@ type unknownOrder struct {
 	notFoundAt time.Time // the round that first saw cex's NotFound: the verdict needs a read of the positions from then on
 }
 
+// rejectRun is one leg's run of orders the venue refused in a row (owner
+// item 99).
+type rejectRun struct {
+	count     int
+	since     time.Time                // the round that saw the run's first refusal, on the loop's clock
+	codes     map[string]int           // refusals by error code
+	purposes  map[cex.OrderPurpose]int // refusals by purpose
+	last      cex.OrderRecord          // the latest refused order
+	nextAlarm time.Time                // the next alarm is due from here; zero before the first
+}
+
+// rejectCursor is how far watchRejects has taken the results: the orders
+// of cycle up to sequence number seq.
+type rejectCursor struct {
+	cycle inventory.CycleID
+	seq   int
+}
+
 // --- timings ---
 
 // timings are the manager's clock and its fixed intervals. They are not

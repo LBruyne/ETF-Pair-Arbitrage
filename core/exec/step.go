@@ -38,6 +38,7 @@ func (m *ExecManager) step(now time.Time) (done bool) {
 
 	// One snapshot of the cycle's orders, booked; every check below reads it.
 	m.syncOrders(r)
+	m.watchRejects(r)
 	if m.stopCheck(r, now) {
 		return true
 	}
@@ -367,7 +368,7 @@ func refusedAt(orders []cex.OrderRecord, leg cex.Leg, price decimal.Decimal) boo
 // only be trimmed.
 func (m *ExecManager) gapInput(r *round) strategy.GapInput {
 	c := r.cycle
-	in := strategy.GapInput{Direction: c.Direction, Hold: c.Hold(), PairAnchors: c.PairAnchors, Books: r.books.ByLeg, Rules: r.rules, Now: r.now}
+	in := strategy.GapInput{Direction: c.Direction, Hold: c.Hold(), Dust: m.inv.Dust(), PairAnchors: c.PairAnchors, Books: r.books.ByLeg, Rules: r.rules, Now: r.now}
 	_, _, in.QuotaLeft = m.inv.Quota()
 	settingsOK, _ := m.cex.SettingsOK(m.leverage)
 	mayAdd := r.now.Before(m.session.RegularOpen) && !m.stop.stopping && !m.stop.noEntries && settingsOK // PRD 8.5

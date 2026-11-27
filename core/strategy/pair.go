@@ -74,7 +74,12 @@ func (s *Strategy) PairStep(in PairInput) PairAction {
 	held := b.ThinQty.Sub(b.ThinClosed)
 	need := b.need(thin, in.PairAnchors, in.Rules[thick].QtyStep)
 	open := decimal.Max(decimal.Zero, held.Sub(b.ThickQty.Div(ratio)))
-	unwind, priced := s.unwindOrder(in, open)
+	// The unpaired part is closed reduce-only: within what the venue's net
+	// position lets the batch's thin leg close (Reducible with the dust).
+	var heldThin [2]decimal.Decimal
+	heldThin[thin] = held
+	closable := decimal.Min(open, Reducible(heldThin, b.Dir, in.Dust)[thin])
+	unwind, priced := s.unwindOrder(in, closable)
 
 	// An unwind in progress goes on with what is left unpaired.
 	if b.Unwind != "" {
@@ -141,7 +146,7 @@ func (s *Strategy) PairStep(in PairInput) PairAction {
 	// 7: x back inside the entry line: the unpaired part may close on its
 	// own at or above break-even.
 	if xOK && !s.AtEntryLine(b.Dir, act.X, sigma) && in.DepthOK[thin] {
-		q, limit, be, ok, err := s.profitClose(in, open)
+		q, limit, be, ok, err := s.profitClose(in, closable)
 		if err != nil {
 			act.Err = err
 			return act.wait(ReasonValuation)

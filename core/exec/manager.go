@@ -77,6 +77,8 @@ type ExecManager struct {
 	nextReconcile     time.Time                           // the next comparison of the venue's positions with the ledger
 	agreedAt          time.Time                           // the round of the last comparison that agreed: a stop leaves only after one made since the stop
 	nextMismatchAlarm time.Time                           // the next repetition of the mismatch alarm
+	rejects           [2]*rejectRun                       // by leg: the orders the venue refused in a row; nil while the last result was not a refusal
+	rejectSeen        rejectCursor                        // the orders whose results watchRejects has taken
 	forced            string                              // the end reason of the forced exit in progress (inventory.End*); empty while none
 	lateLogged        bool                                // the forced exit of a cycle of an ended Session was reported
 	atLine            strategy.Reason                     // the at_line_blocked reason recorded last; empty when the last entry check did not stop there

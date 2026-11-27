@@ -411,7 +411,7 @@ func (m *ExecManager) gapByPositions(r *round) bool {
 		return false // a round that read the positions prices nothing on its older books
 	}
 	in := m.gapInput(r)
-	in.Hold, in.Batch = m.positionHold(r, r.cycle.Direction, pos), nil
+	in.Hold, in.Dust, in.Batch = m.positionHold(r, r.cycle.Direction, pos), [2]decimal.Decimal{}, nil // the venue's holding, within its net already
 	a := m.strat.EvaluateGap(in)
 	if a.Kind != strategy.GapTrim || !m.maySend(r, a.Leg, a.Price) {
 		return false
@@ -481,6 +481,77 @@ func (m *ExecManager) positionHold(r *round, dir strategy.Direction, pos cex.Pos
 		hold[leg] = decimal.Max(q, decimal.Zero)
 	}
 	return reducible(hold, dir, dust)
+}
+
+// --- orders refused in a row ---
+
+// rejectAlarmAfter is how many orders of one leg the venue refuses in a row
+// before the alarm (owner item 99).
+const rejectAlarmAfter = 3
+
+// watchRejects takes the results of the open cycle's orders as they come
+// in, in the order the orders were sent: a refusal extends its leg's run,
+// any other result ends it. Once a leg has rejectAlarmAfter refusals in a
+// row, of any purpose (entries, completions, trims, exits, forced exits,
+// top-ups), the alarm is raised - an Error line and an error event, as the
+// stop's alarm - and again every stop_alarm_after while the run lasts, not
+// on every refusal. A run outlives its cycle: entries refused cycle after
+// cycle are one run. An order without a result yet holds the later ones
+// back until it has one.
+func (m *ExecManager) watchRejects(r *round) {
+	c := r.cycle
+	if c == nil {
+		return
+	}
+	if m.rejectSeen.cycle != c.ID {
+		m.rejectSeen = rejectCursor{cycle: c.ID}
+	}
+	for _, o := range r.orders {
+		seq, ok := cex.ClientOrderSeq(o.Request.ClientOrderID)
+		if !ok || seq <= m.rejectSeen.seq {
+			continue
+		}
+		if !o.Status.Terminal() {
+			break
+		}
+		m.rejectSeen.seq = seq
+		leg := o.Request.Leg
+		if o.Status != cex.StatusRejected {
+			m.rejects[leg] = nil
+			continue
+		}
+		run := m.rejects[leg]
+		if run == nil {
+			run = &rejectRun{since: r.now, codes: map[string]int{}, purposes: map[cex.OrderPurpose]int{}}
+			m.rejects[leg] = run
+		}
+		run.count++
+		run.codes[o.ErrorCode]++
+		run.purposes[o.Request.Purpose]++
+		run.last = o
+	}
+	for _, leg := range cex.Legs {
+		if run := m.rejects[leg]; run != nil && run.count >= rejectAlarmAfter && !r.now.Before(run.nextAlarm) {
+			run.nextAlarm = r.now.Add(m.cfg.StopAlarmAfter)
+			m.rejectAlarm(r, leg, run)
+		}
+	}
+}
+
+// rejectAlarm raises the alarm of leg's run of refusals: the leg, the
+// purposes and error codes, the last order beside the cycle's holding, the
+// ledger's position and the venue's, and how long the run has lasted.
+func (m *ExecManager) rejectAlarm(r *round, leg cex.Leg, run *rejectRun) {
+	o := run.last.Request
+	hold, ledger, venue := r.cycle.Hold()[leg], m.inv.LedgerPositions()[leg], m.cex.Positions().BySymbol[o.Symbol].Qty
+	lasted := r.now.Sub(run.since)
+	logger.GlobalLogger.Error("exec: orders refused in a row", "leg", leg.String(), "count", run.count, "lasted", lasted.Round(time.Second), "codes", run.codes, "purposes", run.purposes,
+		"last_purpose", string(o.Purpose), "side", string(o.Side), "price", o.Price, "qty", o.Qty, "hold", hold, "ledger", ledger, "venue", venue,
+		"error", run.last.ErrorMessage, "cycle", r.cycle.ID)
+	m.event(r.now, "error", "orders_rejected", "the venue has refused the leg's orders in a row: they are sent on as before; check the quantity against the venue's position",
+		map[string]any{"leg": leg.String(), "count": run.count, "since_ms": run.since.UnixMilli(), "lasted_s": lasted.Seconds(), "codes": run.codes, "purposes": run.purposes,
+			"client_order_id": o.ClientOrderID, "purpose": o.Purpose, "side": o.Side, "price": o.Price, "qty": o.Qty, "error": run.last.ErrorMessage,
+			"hold": hold, "ledger": ledger, "venue": venue, "cycle_id": r.cycle.ID})
 }
 
 // --- closing the cycle ---
@@ -627,21 +698,9 @@ func ids(reqs []cex.OrderRequest) []cex.ClientOrderID {
 	return out
 }
 
-// reducible caps a cycle's holding per leg at what a reduce-only order may
-// close on the venue: the net position there, which also carries the dust
-// of earlier cycles. Dust of the other sign (a long cycle's 7.80 next to
-// dust of -0.01) leaves 7.79 to reduce; dust of the same sign changes
-// nothing. A reducing order above the venue's net is refused (Bitget
-// 40804), so every reducing order is sized within this.
-func reducible(hold [2]decimal.Decimal, dir strategy.Direction, dust [2]decimal.Decimal) (out [2]decimal.Decimal) {
-	for _, leg := range cex.Legs {
-		d := dust[leg]
-		if dir == strategy.Short {
-			d = d.Neg()
-		}
-		out[leg] = decimal.Max(decimal.Zero, decimal.Min(hold[leg], hold[leg].Add(d)))
-	}
-	return out
+// reducible is strategy.Reducible: the holding within the venue's net.
+func reducible(hold [2]decimal.Decimal, dir strategy.Direction, dust [2]decimal.Decimal) [2]decimal.Decimal {
+	return strategy.Reducible(hold, dir, dust)
 }
 
 // reducibleHold is the open cycle's holding within what reducing orders

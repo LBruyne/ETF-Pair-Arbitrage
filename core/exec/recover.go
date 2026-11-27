@@ -432,7 +432,7 @@ func (m *ExecManager) restorePair(b *batchState, lot *inventory.Lot) {
 }
 
 // restoreExit takes up a thin-leg-first line exit batch whose thick leg had
-// not matched its thin leg's closing fills when the previous process ended
+// not reached its target (strategy.ExitThickTarget) when the previous process ended
 // (PRD 9.13): the last thin exit order with a fill and the thick exit
 // orders after it, when nothing but those orders came after it. Its fills
 // come from those orders, exit_pair_window runs from the arrival of the thin
@@ -469,17 +469,17 @@ func (m *ExecManager) restoreExit(c *inventory.Cycle) {
 	if b == nil {
 		return
 	}
-	// A batch whose thick leg matched its thin leg already ended.
+	// A batch whose thick leg matched its thin leg already ended: nothing is
+	// left of the round's cumulative thick target (strategy.ExitThickTarget).
 	var q [2]decimal.Decimal
 	for _, o := range orders {
-		if slices.Contains(b.orders, o.Request.ClientOrderID) {
+		if o.Request.ClientOrderID >= b.exit.thinID {
 			q[o.Request.Leg] = q[o.Request.Leg].Add(o.CumExecQty)
 		}
 	}
-	thick := otherLeg(thin)
-	if rule, ok := m.cex.Rule(thick); ok && b.exit.started {
-		target := q[thin].Mul(anchorOf(c.PairAnchors, thin)).Div(anchorOf(c.PairAnchors, thick)).Div(rule.QtyStep).Floor().Mul(rule.QtyStep)
-		if !target.GreaterThan(q[thick]) {
+	if rule, ok := m.cex.Rule(otherLeg(thin)); ok && b.exit.started {
+		fills := strategy.Fills{ThinQty: q[thin], ThickQty: q[otherLeg(thin)]}
+		if !strategy.ExitThickTarget(m.pairing, c.PairAnchors, rule.QtyStep, closedBefore(orders, b.exit.thinID), fills, m.reducibleHold(c)).IsPositive() {
 			return
 		}
 	}

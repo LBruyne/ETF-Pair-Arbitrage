@@ -26,7 +26,9 @@ import (
 // completion's result.
 //
 // When both orders can be sent, the one with the smaller expected loss on
-// the raw books wins, and a tie goes to the trim.
+// the raw books wins, and a tie goes to the trim. The trim is sized within
+// the venue's net position (Reducible with the ledger's dust): what it
+// cannot close of the gap is dust.
 //
 // Preconditions, which the caller guarantees and which are not checked: the
 // contract rules are loaded (a positive quantity step and price tick), the
@@ -42,7 +44,9 @@ func (s *Strategy) EvaluateGap(in GapInput) GapAction {
 	if gap.IsNegative() {
 		lead, lag = cex.Bear, cex.Bull
 	}
-	trimQty := floorToStep(gap.Abs().Div(anchor[lead]), in.Rules[lead].QtyStep)
+	// A trim is reduce-only: within what the venue's net position lets it
+	// close (Reducible).
+	trimQty := decimal.Min(floorToStep(gap.Abs().Div(anchor[lead]), in.Rules[lead].QtyStep), Reducible(in.Hold, in.Direction, in.Dust)[lead])
 	compQty := floorToStep(gap.Abs().Div(anchor[lag]), in.Rules[lag].QtyStep)
 	if trimQty.IsZero() && compQty.IsZero() {
 		return GapAction{Kind: GapNone}
@@ -107,4 +111,22 @@ func (s *Strategy) EvaluateGap(in GapInput) GapAction {
 		return comp
 	}
 	return trim
+}
+
+// Reducible caps a cycle's holding per leg at what a reduce-only order may
+// close at the venue: the net position there, which also carries the dust
+// of earlier cycles (signed, as the ledger keeps it). Dust of the other
+// sign (a long cycle's 7.80 next to dust of -0.01) leaves 7.79 to reduce;
+// dust of the same sign changes nothing. A reducing order above the
+// venue's net is refused (Bitget 40804, 25231 by REST), so every reducing
+// order is sized within this.
+func Reducible(hold [2]decimal.Decimal, dir Direction, dust [2]decimal.Decimal) (out [2]decimal.Decimal) {
+	for _, leg := range cex.Legs {
+		d := dust[leg]
+		if dir == Short {
+			d = d.Neg()
+		}
+		out[leg] = decimal.Max(decimal.Zero, decimal.Min(hold[leg], hold[leg].Add(d)))
+	}
+	return out
 }

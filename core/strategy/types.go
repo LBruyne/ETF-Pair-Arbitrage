@@ -436,6 +436,7 @@ type LegOrder struct {
 type GapInput struct {
 	Direction   Direction          // of the cycle
 	Hold        [2]decimal.Decimal // the cycle's quantity per leg, from the ledger synced with the order snapshot
+	Dust        [2]decimal.Decimal // the ledger's dust per leg (signed): a trim stays within Reducible(Hold, Direction, Dust); zero when Hold is the venue's already
 	PairAnchors cex.Anchors        // the cycle's pairing anchors
 	Books       [2]*cex.Book       // read level by level, as received
 	HasPrice    [2]bool            // per leg: a best price recent enough to price a reducing order
@@ -555,6 +556,10 @@ type PairInput struct {
 	// Quota with WithThinLeg), in USDT.
 	QuotaLeft decimal.Decimal
 	Value     CloseValuer // CloseNet bound to this batch's lot; a profit close values cex.PurposeTrim
+	// Dust is the ledger's dust per leg (signed, inventory Dust): the
+	// unpaired thin leg is closed within Reducible of what the batch holds
+	// of it.
+	Dust [2]decimal.Decimal
 
 	OrderPending bool // an order of the batch has no result yet, or its outcome is unknown
 	Stopping     bool // a stop signal: the round is taken over
@@ -635,9 +640,13 @@ type ExitBatch struct {
 
 // ExitPairInput is every fact one step of an exit batch's thick leg reads.
 type ExitPairInput struct {
-	Batch       ExitBatch
-	Pairing     Pairing
-	Hold        [2]decimal.Decimal // the cycle's quantity left per leg
+	Batch   ExitBatch
+	Pairing Pairing
+	Hold    [2]decimal.Decimal // the cycle's quantity left per leg, within what reduce-only orders may close
+	// Before is what the cycle's closing orders sent before this batch
+	// (exits and forced exits) closed, per leg: the thick target is the
+	// round's cumulative one (ExitThickTarget).
+	Before      [2]decimal.Decimal
 	Books       [2]*cex.Book
 	DepthOK     [2]bool
 	Rules       [2]cex.MarketRule

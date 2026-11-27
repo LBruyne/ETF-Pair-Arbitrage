@@ -336,6 +336,7 @@ func TestExitPairStep(t *testing.T) {
 
 	matched := in
 	matched.Batch.ThickQty, matched.Batch.ThickVWAP = dec("15.60"), dec("33.22")
+	matched.Hold = [2]decimal.Decimal{decimal.Zero, decimal.Zero} // the ledger has booked the thick fills
 	if a := s.ExitPairStep(matched); a.Kind != ExitPairDone {
 		t.Errorf("matched: %s, want done", a.Kind)
 	}
@@ -408,6 +409,7 @@ func TestExitPairStep_D2(t *testing.T) {
 	// The hard close goes on with the rest, whatever the clock.
 	in.Now = t0.Add(time.Second)
 	in.Batch.HardEnd, in.Batch.ThickQty, in.Batch.ThickVWAP = ReasonExitWindow, dec("10"), dec("33.17")
+	in.Hold[cex.Bull] = dec("5.60") // the ledger has booked the 10
 	if a := s.ExitPairStep(in); a.Kind != ExitPairHardClose || a.Why != ReasonExitWindow || !a.Qty.Equal(dec("5.60")) {
 		t.Errorf("hard close in progress: %s %s %s, want hard_close exit_window 5.60", a.Kind, a.Why, a.Qty)
 	}
@@ -415,8 +417,50 @@ func TestExitPairStep_D2(t *testing.T) {
 	// The spread stop: SOXL's second bid 33.18 is 12.47 worse than the
 	// decision's 33.22.
 	in.Batch.HardEnd, in.Batch.ThickQty, in.Batch.ThickVWAP = "", decimal.Zero, decimal.Zero
+	in.Hold[cex.Bull] = dec("15.60")
 	in.Books[cex.Bull] = book(lv("33.19x20", "33.18x20"), lv("33.30x20", "33.31x20"))
 	if a := s.ExitPairStep(in); a.Kind != ExitPairHardClose || a.Why != ReasonExitStopD {
 		t.Errorf("stop: %s %s, want hard_close exit_stop_d", a.Kind, a.Why)
+	}
+}
+
+// The thick target of an exit batch is the round's cumulative one: floor of
+// all the thin leg the round's exits closed x A_thin / A_thick, less all the
+// thick leg they closed; the batch that closes the last of the thin leg
+// closes everything the thick leg still holds. Live 2026-11-27, cycle
+// c…154775 (short SOXS 8.03 / SOXL 15.58, bell anchors): per-batch floors
+// closed SOXL 0.32 (0.17 SOXS), 7.45 (3.84) and 7.80 (4.02), 15.57 in all,
+// and left 0.01 SOXL short as dust.
+func TestExitPairStep_CumulativeThickTarget(t *testing.T) {
+	s := seqStrategy(t, seqExit2)
+	live := anchors("32.0287420270484", "62.1463560859516")
+	legs := func(bull, bear string) [2]decimal.Decimal { return [2]decimal.Decimal{dec(bull), dec(bear)} }
+	target := func(before [2]decimal.Decimal, thin string, hold [2]decimal.Decimal) decimal.Decimal {
+		in := exitPairInput(ex7Ledger())
+		in.Batch.Dir, in.Batch.ThinQty, in.Batch.ThinVWAP = Short, dec(thin), dec("59.62")
+		in.Batch.HardEnd = ReasonExitWindow // the hard close sends the whole target, whatever the bound
+		in.Anchors, in.PairAnchors, in.Before, in.Hold = live, live, before, hold
+		a := s.ExitPairStep(in)
+		if a.Kind != ExitPairHardClose {
+			t.Fatalf("before %v, thin %s, hold %v: %s %s, want hard_close", before, thin, hold, a.Kind, a.Why)
+		}
+		return a.Qty
+	}
+	cases := []struct {
+		name   string
+		before [2]decimal.Decimal
+		thin   string
+		hold   [2]decimal.Decimal
+		want   string
+	}{
+		{"exit1, SOXS 0.17", legs("0", "0"), "0.17", legs("15.58", "7.86"), "0.32"},                  // floor(0.3298)
+		{"exit1, SOXS 3.84", legs("0.32", "0.17"), "3.84", legs("15.26", "4.02"), "7.46"},            // floor(4.01 x 1.94033) - 0.32, not floor(7.4509)
+		{"exit2, the last SOXS 4.02", legs("7.78", "4.01"), "4.02", legs("7.80", "0"), "7.80"},       // all that is left
+		{"after the live per-batch floors", legs("7.77", "4.01"), "4.02", legs("7.81", "0"), "7.81"}, // not floor(7.8001): no 0.01 left
+	}
+	for _, c := range cases {
+		if got := target(c.before, c.thin, c.hold); !got.Equal(dec(c.want)) {
+			t.Errorf("%s: SOXL %s, want %s", c.name, got, c.want)
+		}
 	}
 }
