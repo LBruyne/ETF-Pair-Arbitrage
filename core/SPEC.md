@@ -778,7 +778,7 @@ func (s *Strategy) entrySize(lv [2][]cex.BookLevel, p [2]decimal.Decimal, in Ent
 
 例（附录 A 例一，做空，F = 1，A = 40 / 60，μ = 3.33，σ = 4，d_in = 2，d_out = −0.5）：有效买盘第 2 档 40.44 / 59.42 → x = 10000 × (40.44/40 + 59.42/60 − 2) − 3.33 = +10.00 ≥ 8；往返手续费 2 × 0.65 × (1.011 + 0.9903) = 2.60 ≤ (2 + 0.5) × 4 = 10；可用 400 / 70.2 份 → 锚定金额 16,000 / 4,212 → K = 4,212（额度折合 9,993.34，不封顶）→ 卖 105.30 / 70.20 份。测试直接用这组数。
 
-`Reason` 是成组的常量，值就是落库和日志里的字符串：步骤 1 `stopping`、`no_new_entries`、`not_ready`（规则 / 连接 / 持仓没读到）、`settings`、`store_error`、`position_mismatch`；步骤 2 `regular_hours`、`no_anchor`、`action_window`（上一 Session 的轮不需要原因：强制平仓占住每一拍直到关轮）；步骤 3 `depth_bull`、`depth_bear`、`conflict_bull`、`conflict_bear`、`fx_stale`、`await_depth`、`await_orders`、`order_unknown`、`rejected_backoff`；步骤 4 `warmup`、`zero_sigma`；步骤 5 `no_levels`；步骤 6 `no_signal`、`holding_other_side`；步骤 7 `cost_not_covered`；步骤 8 `spacing`；步骤 9 `quota_exhausted`、`too_small`。平仓和强制平仓另有 `depth`、`no_price`。
+`Reason` 是成组的常量，值就是落库和日志里的字符串：步骤 1 `stopping`、`no_new_entries`、`not_ready`（规则 / 连接 / 持仓没读到）、`settings`、`store_error`、`position_mismatch`；步骤 2 `close_near`（第 108 条：收盘前 `entry_stop_before_close` 起；原为盘中 `regular_hours`）、`no_anchor`、`action_window`（上一 Session 的轮不需要原因：强制平仓占住每一拍直到关轮）；步骤 3 `depth_bull`、`depth_bear`、`conflict_bull`、`conflict_bear`、`fx_stale`、`await_depth`、`await_orders`、`order_unknown`、`rejected_backoff`；步骤 4 `warmup`、`zero_sigma`；步骤 5 `no_levels`；步骤 6 `no_signal`、`holding_other_side`；步骤 7 `cost_not_covered`；步骤 8 `spacing`；步骤 9 `quota_exhausted`、`too_small`。平仓和强制平仓另有 `depth`、`no_price`。
 
 #### 平仓（PRD 第 9 节）
 
@@ -1351,7 +1351,7 @@ func (m *ExecManager) observe(now time.Time, books cex.Books) {
 
 - `mid(book)` 取 `BestBid`、`BestAsk` 的中点（两路里较新的最优价）。冲突不影响分钟 bar（PRD 3.1）。
 - `m.lastReady` 不随 Session 或重新开始清空：它就是 PRD 9.7 说的“最近一次有效的均值和 σ”，平仓时按当前锚点表达。
-- 时段（`signal_sample.phase`）由 exec 从 `Session` 算：`now < RegularOpen` 是 `off_hours`，`now < End − forced_exit_before_close` 是 `regular`，之后是 `close_window`。
+- 时段（`signal_sample.phase`）由 exec 从 `Session` 算：`now < RegularOpen` 是 `off_hours`，`now < End − forced_exit_before_close` 是 `regular`，之后是 `close_window`。开仓和补薄腿只看 `now < End − entry_stop_before_close`（第 108 条，默认 2h，原为 `now < RegularOpen`），`regular` 时段照常开仓。
 
 #### 发单与结清（`orders.go`）
 
@@ -1625,7 +1625,8 @@ strategy:
   entry_step_spacing: 1             # in spread units
   completion_window: 5s       # after an entry batch is sent, its short leg may still be completed this long
   forced_slip_bps: 10         # forced exits and trims give up this much past the best price, of each leg's price
-  forced_exit_before_close: 1h   # owner item 107: one hour before the regular close
+  forced_exit_before_close: 1m   # owner item 108: one minute before the regular close
+  entry_stop_before_close: 2h    # owner item 108: from two hours before the close, exits only
   rewarm_on_anchor_change: true    # owner item 96: the mean and sigma warm up again after bell → NAV, and after a NAV switch of nav_hot_switch_d or more
 
 inventory:
@@ -2688,6 +2689,8 @@ func (m *Manager) onPairTick(now time.Time) {
   - 薄腿先行把回吐损失压到接近 0：N = 10,000 时，11-24 从 −8.42 降到 −0.01，11-25 / 26 合并窗口（W4）从 −9.72 降到 −1.04。
   - 两段出场主要是占用额度，额度紧时净额更低。
   - exit2 −0.9 在 N = 20,000 时四个窗口的净额都比 −1 高。
+
+**第 108 条**（2026-11-27 17:10）：盘中也执行策略。新参数 `strategy.entry_stop_before_close`（默认 2h，不得短于 `forced_exit_before_close`）：`exec` 的开仓第 2 步和补薄腿（`gapInput` 的 `mayAdd`）都改看 `entryCutoff() = Session.End − entry_stop_before_close`，不再看 `RegularOpen`；原因 `regular_hours` 改为 `close_near`。`forced_exit_before_close` 回到 1m（第 107 条的 1h 被替换）。测试：`TestEntryDuringRegularHours`（22:33 开仓）、`TestNearTheCloseOnlyTrim`、`TestNoEntryAcrossTheEntryCutoffDuringARead`（03:00 截止），其余原先按常规开盘挡开仓的用例改为按截止时刻；改回旧截止时这三项都失败。
 
 **第 107 条与恢复修复**（2026-11-27 17:00）：`forced_exit_before_close` 改为 1h（PRD 10.1，用户第 107 条；17:00 的 `close_window` 从收盘前 1 小时起，11-27 提前收盘日为 01:00）。同一次重启暴露 `cex/bitget` 的 `feeOf` 不接受 Bitget 订单历史里的空手续费（零成交撤销的 IOC 返回 `{"feeCoin":"","fee":""}`），带着仓位重启时整轮的恢复一直重试、不管理持仓（16:58:18–16:59:59，没有发单）；改为空串记 0（`a2143ec`，`fee_test.go`），恢复随即完成、`mismatch=false`。
 
