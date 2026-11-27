@@ -759,6 +759,8 @@ experiments/board_live_v3_20261126/scripts/env.sh python3 -B perf.py            
 
 ## 10. 变更记录
 
+- **4.5.1**（2026-11-27 15:34:49，第 105 条）：Settings 里的两个开仓间隔改读新键 `strategy.entry_time_spacing` / `strategy.entry_step_spacing`，读不到再读旧键 `entry_spacing` / `entry_step_d`（第 105 条之前的运行），标题改为 Entry Time Spacing / Entry Step Spacing。只改了这两格，其余与 4.5 相同。4.5 的线上 JSON 备份在 `experiments/board451_20261127/live-monitor.published.v45.json`。
+
 | 日期（UTC+8） | 变更 |
 |---|---|
 | 2026-11-27 | **Live Monitor 4.5 与 Combo Spread 3.6.1**（审计对第一次薄腿先行实盘的意见第三、四节，用户第 100 条；13:26:16 发布，第 9 节末）：Orders 把连续的零成交拒单 / 撤单（腿、用途、Step、方向、数量、状态、错误码都相同）合为一行（首末时刻、张数、限价范围），有成交的单照旧一张一行，Status 移到 Side 之后，24 × 10；新折叠行 Every Order 是 4.4.1 的 Orders，打开才查；Alerts 合并同样的拒单和一个回合的重复强平，交易程序的 `orders_rejected` 写作 Refused in a Row（腿、张数、时长、按用途与错误码、最后一张单、三方持仓，同一段的多次报警一行）。Combo Spread 只改文字：Signal 条与 Spread 行的标题加 Sweep Average，四处说明写明是按名义量扫档均价、不是交易程序的取价，控制栏加 Live Monitor 链接；文件开头 3.4 那句“与交易程序 PRD 3.2 相同”改为只有档数相同、取价不同。快照、测试、加载与五轮审阅见第 8 节。 |

@@ -1259,8 +1259,9 @@ SETTINGS = [
         ("Rewarm", "CASE WHEN %s = 'true' THEN 'Yes' ELSE 'No' END" % cfg("strategy,rewarm_on_anchor_change")),
         ("Min Batch", cfg_num("strategy,min_batch_notional", " U")),
         ("Take Ratio", cfg_num("strategy,take_ratio")),
-        ("Entry Spacing", dur("strategy,entry_spacing")),
-        ("Entry Step", cfg_num("strategy,entry_step_d", " bps"))]),
+        # Owner item 105 renamed the keys; runs before it carry the old names.
+        ("Entry Time Spacing", go_dur("coalesce(%s, %s)" % (cfg("strategy,entry_time_spacing"), cfg("strategy,entry_spacing")))),
+        ("Entry Step Spacing", "trim_scale((coalesce(%s, %s))::numeric)::text || ' bps'" % (cfg("strategy,entry_step_spacing"), cfg("strategy,entry_step_d")))]),
     ("Execution", [
         ("Mode", "CASE WHEN r.live THEN 'Live' ELSE 'Paper' END"),
         ("Pricing Level", "%s || ' / ' || %s" % (ordinal("strategy,pricing_level,bull"), ordinal("strategy,pricing_level,bear"))),

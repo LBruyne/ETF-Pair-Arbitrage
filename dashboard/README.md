@@ -2,7 +2,7 @@
 
 ETF-Pair 看板的生成、检查、发布和预览。设计与口径见 [SPEC.md](SPEC.md)。**改动看板、查询、采集器或表时，同一次修改里更新 SPEC.md 和本文件。**
 
-当前状态（2026-11-27 13:30，UTC+8）：**线上是 Combo Spread 3.6.1 和 Live Monitor 4.5**（2026-11-27 13:26:16 一起发布，md5 `a8c7731b…` / `e59b429c…`；审计对第一次薄腿先行实盘的意见，用户第 100 条；**打开着的两块看板页面要刷新一次**；发布前的 3.6 与 4.4.1 在 `experiments/board45_20261127/deploy/combo-spread.published.v36.json`、`live-monitor.published.v441.json`，回退把它们复制回 `published/`）：
+当前状态（2026-11-27 13:30，UTC+8）：**线上是 Combo Spread 3.6.1 和 Live Monitor 4.5.1**（2026-11-27 13:26:16 一起发布，md5 `a8c7731b…` / `e59b429c…`；审计对第一次薄腿先行实盘的意见，用户第 100 条；**打开着的两块看板页面要刷新一次**；发布前的 3.6 与 4.4.1 在 `experiments/board45_20261127/deploy/combo-spread.published.v36.json`、`live-monitor.published.v441.json`，回退把它们复制回 `published/`）：
   - **Live Monitor 4.5 · Orders**：有成交的单一张一行；连续的、没有成交的被拒（Rejected）或撤单（No Fill）订单，腿、用途、Step、方向、数量、状态和错误码都相同时合为一行——Time 是第一张、**Until** 是最后一张的时刻，**Orders** 是张数，Limit 写最低–最高，Latency 空。Status 紧跟 Side。11‑27 02:48 那个回合的 21,802 张单显示为 11 行，其他回合显示的单与 4.4.1 相同。要看每一张：打开下面折叠的 **Every Order · <回合>**（就是 4.4.1 的 Orders，折叠时不查询）。
   - **Live Monitor 4.5 · Alerts**：连续被拒的单、一个回合重复的强平各合为一行（写张数和起止时刻）；交易程序的拒单报警 `orders_rejected` 显示为 critical / Open 的 **Refused in a Row**，Source 是那条腿，Detail 写连续多少张、多久、按用途和错误码的分布、最后一张单、交易所 / 账本 / 回合的持仓（同一段的多次报警一行，写报警次数）。
   - **Combo Spread 3.6.1**（只改文字）：Real Long / Short Spread 和 Signal 是**按名义量扫档均价**（N 吃第 1 至第 L 档的均价），不是交易程序的取价（程序用第 L 档的价、只吃一半，档数相同）。Signal 条和 Spread 行的标题末尾写 Sweep Average，几张图的说明开头写明这一点；控制栏多了 **Live Monitor · Why an Order Was Sent** 链接——程序为什么发单看 Live Monitor。
