@@ -1625,7 +1625,7 @@ strategy:
   entry_step_spacing: 1             # in spread units
   completion_window: 5s       # after an entry batch is sent, its short leg may still be completed this long
   forced_slip_bps: 10         # forced exits and trims give up this much past the best price, of each leg's price
-  forced_exit_before_close: 1m
+  forced_exit_before_close: 1h   # owner item 107: one hour before the regular close
   rewarm_on_anchor_change: true    # owner item 96: the mean and sigma warm up again after bell → NAV, and after a NAV switch of nav_hot_switch_d or more
 
 inventory:
@@ -2688,6 +2688,8 @@ func (m *Manager) onPairTick(now time.Time) {
   - 薄腿先行把回吐损失压到接近 0：N = 10,000 时，11-24 从 −8.42 降到 −0.01，11-25 / 26 合并窗口（W4）从 −9.72 降到 −1.04。
   - 两段出场主要是占用额度，额度紧时净额更低。
   - exit2 −0.9 在 N = 20,000 时四个窗口的净额都比 −1 高。
+
+**第 107 条与恢复修复**（2026-11-27 17:00）：`forced_exit_before_close` 改为 1h（PRD 10.1，用户第 107 条；17:00 的 `close_window` 从收盘前 1 小时起，11-27 提前收盘日为 01:00）。同一次重启暴露 `cex/bitget` 的 `feeOf` 不接受 Bitget 订单历史里的空手续费（零成交撤销的 IOC 返回 `{"feeCoin":"","fee":""}`），带着仓位重启时整轮的恢复一直重试、不管理持仓（16:58:18–16:59:59，没有发单）；改为空串记 0（`a2143ec`，`fee_test.go`），恢复随即完成、`mismatch=false`。
 
 **首次实盘之后的修复**（2026-11-27，`befe3cb`、`402cd43`；PRD 5.22；证据 `experiments/live_thin_first_20261127/timeline.txt`）：
 1. `strategy.Reducible`：只减仓单以**账本推算的净额**（持有量加上反号零头，零头是账本记下的）为上限。用于 ExitInput 和 ExitPairInput 的 Hold、强平（`positionHold` 和 `forcedExit`）、回吐（`GapInput.Dust`），以及配平中的 unwind 和盈利平（`PairInput.Dust`）。它是推算，不是交易所读回的持仓；两者只在数量拒单之后才合用（下面“第 100 条”第 1 点）。

@@ -54,7 +54,7 @@ strategy:
   entry_step_spacing: 1       # in spread units (was entry_step_d)
   completion_window: 5s       # this long after a batch is sent, its short leg may still be completed; later it is trimmed back. Used only while exec.thin_leg is ""
   forced_slip_bps: 10         # forced exits and trims give up this much past the best price, of each leg's price
-  forced_exit_before_close: 1m   # positions are closed this long before the regular close
+  forced_exit_before_close: 1h   # positions are closed this long before the regular close (owner item 107)
   rewarm_on_anchor_change: true  # true (the owner's value, item 96): the mean and sigma warm up again when the NAV replaces the bell anchor, and after a NAV switch of cex.nav_hot_switch_d or more; false keeps them through every anchor change
 
 # The capital and the quota. Both keys must be written.
